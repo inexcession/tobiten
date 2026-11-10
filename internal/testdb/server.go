@@ -319,15 +319,18 @@ func connectExternalServer(testURL string, managedByM bool) (*serverInstance, er
 }
 
 func stopInstance(binDir, dataDir string, pid int) {
+	stopped := false
 	if binDir != "" && dataDir != "" {
 		pgCtlPath := filepath.Join(binDir, "pg_ctl")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		stopCmd := exec.CommandContext(ctx, pgCtlPath, "-w", "-D", dataDir, "-m", "immediate", "stop")
-		_ = stopCmd.Run()
+		if err := stopCmd.Run(); err == nil {
+			stopped = true
+		}
 	}
 
-	if pid > 0 {
+	if !stopped && pid > 0 {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 
