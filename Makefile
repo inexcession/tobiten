@@ -1,4 +1,4 @@
-.PHONY: all build check fmt fmt-check vet lint test clean
+.PHONY: all build check fmt fmt-check vet lint sqlc-diff sqlc-generate test clean
 
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/tobitend
@@ -6,6 +6,7 @@ CMD_DIR := ./cmd/tobitend
 
 GO ?= go
 GOLANGCI_LINT ?= golangci-lint
+SQLC ?= sqlc
 
 all: check build
 
@@ -13,7 +14,7 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -o $(BINARY) $(CMD_DIR)
 
-check: fmt-check vet lint test
+check: fmt-check vet lint sqlc-diff test
 
 fmt:
 	$(GO) fmt ./...
@@ -34,6 +35,13 @@ vet:
 lint:
 	@echo "Running golangci-lint..."
 	$(GOLANGCI_LINT) run ./...
+
+sqlc-diff:
+	@echo "Running sqlc diff..."
+	$(SQLC) diff
+
+sqlc-generate:
+	$(SQLC) generate
 
 test:
 	@echo "Running tests..."

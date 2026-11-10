@@ -1,0 +1,28 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "internal/storage/postgres/migrations"
+    queries: "internal/storage/postgres/queries"
+    gen:
+      go:
+        package: "postgres"
+        out: "internal/storage/postgres"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        overrides:
+          - db_type: "timestamptz"
+            go_type:
+              type: "time.Time"
+              pointer: true
+            nullable: true
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+            nullable: false
+          - db_type: "text"
+            go_type:
+              type: "string"
+              pointer: true
+            nullable: true
+          - db_type: "text"
+            go_type: "string"
+            nullable: false
