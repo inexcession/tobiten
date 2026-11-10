@@ -11,7 +11,7 @@ import (
 
 type precedenceTestCase struct {
 	envKey      string
-	flagName    string
+	flagName    string // empty if no CLI flag exists (I-7: secrets)
 	defaultVal  any
 	envFileVal  string
 	envVal      string
@@ -19,9 +19,8 @@ type precedenceTestCase struct {
 	expectedEnv any
 	expectedFlg any
 	getVal      func(c *Config) any
-	// extraEnv or extraFlags needed to make semantic validation pass (e.g. for DATABASE_URL or STORAGE_MODE)
-	extraEnv   []string
-	extraFlags []string
+	extraEnv    []string
+	extraFlags  []string
 }
 
 func TestPrecedence_TableDriven(t *testing.T) {
@@ -127,24 +126,24 @@ func TestPrecedence_TableDriven(t *testing.T) {
 		},
 		{
 			envKey:      "TOBITEN_ADMIN_PASS",
-			flagName:    "admin-pass",
+			flagName:    "", // I-7: secret, no CLI flag
 			defaultVal:  "",
 			envFileVal:  "pass_file",
 			envVal:      "pass_env",
-			flagVal:     "pass_flag",
+			flagVal:     "",
 			expectedEnv: "pass_env",
-			expectedFlg: "pass_flag",
+			expectedFlg: "",
 			getVal:      func(c *Config) any { return c.AdminPass },
 		},
 		{
 			envKey:      "TOBITEN_SECRET_KEY",
-			flagName:    "secret-key",
+			flagName:    "", // I-7: secret, no CLI flag
 			defaultVal:  "",
 			envFileVal:  "secret_file",
 			envVal:      "secret_env",
-			flagVal:     "secret_flag",
+			flagVal:     "",
 			expectedEnv: "secret_env",
-			expectedFlg: "secret_flag",
+			expectedFlg: "",
 			getVal:      func(c *Config) any { return c.SecretKey },
 		},
 		{
@@ -181,17 +180,6 @@ func TestPrecedence_TableDriven(t *testing.T) {
 			getVal:      func(c *Config) any { return c.OIDCDefaultLabels },
 		},
 		{
-			envKey:      "TOBITEN_API_KEY",
-			flagName:    "api-key",
-			defaultVal:  "",
-			envFileVal:  "key_file",
-			envVal:      "key_env",
-			flagVal:     "key_flag",
-			expectedEnv: "key_env",
-			expectedFlg: "key_flag",
-			getVal:      func(c *Config) any { return c.APIKey },
-		},
-		{
 			envKey:      "TOBITEN_LOG_LEVEL",
 			flagName:    "log-level",
 			defaultVal:  "info",
@@ -224,20 +212,19 @@ func TestPrecedence_TableDriven(t *testing.T) {
 			expectedFlg: "postgres",
 			getVal:      func(c *Config) any { return c.StorageMode },
 			extraEnv:    []string{"TOBITEN_DATABASE_URL=postgres://localhost:5432/tobiten"},
-			extraFlags:  []string{"-database-url=postgres://localhost:5432/tobiten"},
+			extraFlags:  []string{},
 		},
 		{
 			envKey:      "TOBITEN_DATABASE_URL",
-			flagName:    "database-url",
+			flagName:    "", // I-7: secret, no CLI flag
 			defaultVal:  "",
 			envFileVal:  "postgres://localhost:5432/file_db",
 			envVal:      "postgres://localhost:5432/env_db",
-			flagVal:     "postgres://localhost:5432/flag_db",
+			flagVal:     "",
 			expectedEnv: "postgres://localhost:5432/env_db",
-			expectedFlg: "postgres://localhost:5432/flag_db",
+			expectedFlg: "",
 			getVal:      func(c *Config) any { return c.DatabaseURL },
 			extraEnv:    []string{"TOBITEN_STORAGE_MODE=postgres"},
-			extraFlags:  []string{"-storage-mode=postgres"},
 		},
 		{
 			envKey:      "TOBITEN_PG_BIN",
@@ -352,28 +339,135 @@ func TestPrecedence_TableDriven(t *testing.T) {
 				}
 			})
 
-			// 4. CLI flag overrides OS environment, .env file, and compiled default
-			t.Run("flag_overrides_all", func(t *testing.T) {
-				envFileContent := fmt.Sprintf("%s=%s\n", tc.envKey, tc.envFileVal)
-				envList := append([]string{fmt.Sprintf("%s=%s", tc.envKey, tc.envVal)}, tc.extraEnv...)
-				flagList := append([]string{fmt.Sprintf("-%s=%s", tc.flagName, tc.flagVal)}, tc.extraFlags...)
+			// 4. CLI flag overrides OS environment, .env file, and compiled default (if flag exists)
+			if tc.flagName != "" {
+				t.Run("flag_overrides_all", func(t *testing.T) {
+					envFileContent := fmt.Sprintf("%s=%s\n", tc.envKey, tc.envFileVal)
+					envList := append([]string{fmt.Sprintf("%s=%s", tc.envKey, tc.envVal)}, tc.extraEnv...)
+					flagList := append([]string{fmt.Sprintf("-%s=%s", tc.flagName, tc.flagVal)}, tc.extraFlags...)
 
-				cfg, err := Load(flagList, WithEnviron(envList), WithEnvFileReader(strings.NewReader(envFileContent)))
-				if err != nil {
-					t.Fatalf("Load() unexpected error: %v", err)
-				}
-				if got := tc.getVal(cfg); got != tc.expectedFlg {
-					t.Errorf("%s flag = %v, want %v", tc.envKey, got, tc.expectedFlg)
-				}
-				if src := cfg.SourceOf(tc.envKey); src != SourceFlag {
-					t.Errorf("%s SourceOf() = %v, want %v", tc.envKey, src, SourceFlag)
-				}
-				if !cfg.IsEnvLocked(tc.envKey) {
-					t.Errorf("%s IsEnvLocked() = false, want true for flag", tc.envKey)
-				}
-			})
+					cfg, err := Load(flagList, WithEnviron(envList), WithEnvFileReader(strings.NewReader(envFileContent)))
+					if err != nil {
+						t.Fatalf("Load() unexpected error: %v", err)
+					}
+					if got := tc.getVal(cfg); got != tc.expectedFlg {
+						t.Errorf("%s flag = %v, want %v", tc.envKey, got, tc.expectedFlg)
+					}
+					if src := cfg.SourceOf(tc.envKey); src != SourceFlag {
+						t.Errorf("%s SourceOf() = %v, want %v", tc.envKey, src, SourceFlag)
+					}
+					if !cfg.IsEnvLocked(tc.envKey) {
+						t.Errorf("%s IsEnvLocked() = false, want true for flag", tc.envKey)
+					}
+				})
+			} else {
+				// I-7: Assert that secret keys cannot be passed via CLI flag
+				t.Run("no_cli_flag_allowed", func(t *testing.T) {
+					flagArg := fmt.Sprintf("-%s=secret", strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(tc.envKey, "TOBITEN_"), "_", "-")))
+					_, err := Load([]string{flagArg}, WithEnviron(nil), WithoutEnvFile())
+					if err == nil || !errors.Is(err, ErrInvalidFlag) {
+						t.Errorf("expected ErrInvalidFlag when passing %s, got %v", flagArg, err)
+					}
+				})
+			}
 		})
 	}
+}
+
+func TestBlankValuesUnset(t *testing.T) {
+	// I-6: A TOBITEN_* key that is empty or whitespace-only in env or .env
+	// is treated exactly as absent: falls through to default, source is default, IsEnvLocked is false.
+
+	t.Run("blank TOBITEN_DATA_DIR in env gives ./data and ./data/postgres", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron([]string{"TOBITEN_DATA_DIR=   "}), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.DataDir != "./data" {
+			t.Errorf("DataDir = %q, want ./data", cfg.DataDir)
+		}
+		wantPG := filepath.Join("./data", "postgres")
+		if cfg.PostgresDir != wantPG {
+			t.Errorf("PostgresDir = %q, want %q", cfg.PostgresDir, wantPG)
+		}
+		if cfg.SourceOf("TOBITEN_DATA_DIR") != SourceDefault {
+			t.Errorf("SourceOf(TOBITEN_DATA_DIR) = %v, want SourceDefault", cfg.SourceOf("TOBITEN_DATA_DIR"))
+		}
+		if cfg.IsEnvLocked("TOBITEN_DATA_DIR") {
+			t.Errorf("IsEnvLocked(TOBITEN_DATA_DIR) = true, want false for blank env")
+		}
+	})
+
+	t.Run("blank integer in env falls through to default", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron([]string{"TOBITEN_PORT="}), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.Port != 8080 {
+			t.Errorf("Port = %d, want 8080", cfg.Port)
+		}
+		if cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = true, want false for blank env")
+		}
+	})
+
+	t.Run("loading .env.example locks only its non-blank keys", func(t *testing.T) {
+		bytes, err := os.ReadFile("../../.env.example")
+		if err != nil {
+			t.Fatalf("failed to read .env.example: %v", err)
+		}
+
+		cfg, err := Load(nil, WithEnviron(nil), WithEnvFileReader(strings.NewReader(string(bytes))))
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+
+		// Non-blank keys in .env.example MUST be locked
+		nonBlankKeys := []string{
+			"TOBITEN_HOST",
+			"TOBITEN_PORT",
+			"TOBITEN_BASE_URL",
+			"TOBITEN_DATA_DIR",
+			"TOBITEN_THUMB_CACHE_MAX_MB",
+			"TOBITEN_EXTRACT_CACHE_MAX_MB",
+			"TOBITEN_LOG_LEVEL",
+			"TOBITEN_LOG_FORMAT",
+			"TOBITEN_STORAGE_MODE",
+			"TOBITEN_LIBRARY_MODE",
+			"TOBITEN_INTAKE_MODE",
+		}
+		for _, k := range nonBlankKeys {
+			if !cfg.IsEnvLocked(k) {
+				t.Errorf(".env.example key %s is non-blank but IsEnvLocked() = false", k)
+			}
+			if src := cfg.SourceOf(k); src != SourceEnvFile {
+				t.Errorf(".env.example key %s SourceOf() = %v, want SourceEnvFile", k, src)
+			}
+		}
+
+		// Blank or commented-out keys in .env.example MUST NOT be locked
+		blankKeys := []string{
+			"TOBITEN_COVERS_DIR",
+			"TOBITEN_CACHE_DIR",
+			"TOBITEN_ADMIN_USER",
+			"TOBITEN_ADMIN_PASS",
+			"TOBITEN_SECRET_KEY",
+			"TOBITEN_TRUSTED_PROXIES",
+			"TOBITEN_OIDC_DEFAULT_ROLE",
+			"TOBITEN_OIDC_DEFAULT_LABELS",
+			"TOBITEN_DATABASE_URL",
+			"TOBITEN_PG_BIN",
+			"TOBITEN_SCANNER_WORKERS",
+		}
+		for _, k := range blankKeys {
+			if cfg.IsEnvLocked(k) {
+				t.Errorf(".env.example key %s is blank but IsEnvLocked() = true", k)
+			}
+			if src := cfg.SourceOf(k); src != SourceDefault {
+				t.Errorf(".env.example key %s SourceOf() = %v, want SourceDefault", k, src)
+			}
+		}
+	})
 }
 
 func TestDocumentedKeysCoverage(t *testing.T) {
@@ -388,22 +482,33 @@ func TestDocumentedKeysCoverage(t *testing.T) {
 		t.Fatalf("failed to parse .env.example: %v", err)
 	}
 
-	keyMap := make(map[string]bool)
-	for _, k := range DocumentedEnvKeys {
-		keyMap[k] = true
+	daemonKeyMap := make(map[string]bool)
+	for _, k := range DaemonEnvKeys {
+		daemonKeyMap[k] = true
+	}
+
+	cliKeyMap := make(map[string]bool)
+	for _, k := range CLIEnvKeys {
+		cliKeyMap[k] = true
 	}
 
 	for k := range envVars {
 		if !strings.HasPrefix(k, "TOBITEN_") {
 			continue
 		}
-		if !keyMap[k] {
-			t.Errorf(".env.example contains %q which is missing from DocumentedEnvKeys", k)
+		isDaemon := daemonKeyMap[k]
+		isCLI := cliKeyMap[k]
+		if !isDaemon && !isCLI {
+			t.Errorf(".env.example contains %q which is neither in DaemonEnvKeys nor in CLIEnvKeys", k)
 		}
 	}
 
-	if len(DocumentedEnvKeys) != 23 {
-		t.Errorf("DocumentedEnvKeys length = %d, want 23", len(DocumentedEnvKeys))
+	// Verify exact counts (22 daemon keys + 1 CLI key = 23 total)
+	if len(DaemonEnvKeys) != 22 {
+		t.Errorf("DaemonEnvKeys length = %d, want 22", len(DaemonEnvKeys))
+	}
+	if len(CLIEnvKeys) != 1 || CLIEnvKeys[0] != "TOBITEN_API_KEY" {
+		t.Errorf("CLIEnvKeys = %v, want [TOBITEN_API_KEY]", CLIEnvKeys)
 	}
 }
 
@@ -507,31 +612,37 @@ func TestDataDirDerivedPaths(t *testing.T) {
 }
 
 func TestStorageModeValidation(t *testing.T) {
-	t.Run("local mode with database URL refuses startup", func(t *testing.T) {
-		cfg, err := Load([]string{
-			"-storage-mode=local",
-			"-database-url=postgres://user:pass@localhost:5432/tobiten",
-		}, WithEnviron(nil), WithoutEnvFile())
+	t.Run("local mode with database URL refuses startup without password leakage", func(t *testing.T) {
+		secretURL := "postgres://user:super_secret_password@localhost:5432/tobiten"
+		_, err := Load(nil, WithEnviron([]string{
+			"TOBITEN_STORAGE_MODE=local",
+			"TOBITEN_DATABASE_URL=" + secretURL,
+		}), WithoutEnvFile())
 
 		if err == nil {
-			t.Fatalf("expected error, got nil (cfg = %+v)", cfg)
+			t.Fatalf("expected error, got nil")
 		}
 		if !errors.Is(err, ErrLocalStorageConflict) {
 			t.Errorf("error = %v, want ErrLocalStorageConflict", err)
 		}
-		if !strings.Contains(err.Error(), "storage mode 'local' requires an empty TOBITEN_DATABASE_URL") {
-			t.Errorf("error message = %q, want documented message", err.Error())
+		errStr := err.Error()
+		if !strings.Contains(errStr, "storage mode 'local' requires an empty TOBITEN_DATABASE_URL") {
+			t.Errorf("error message = %q, want documented message", errStr)
+		}
+		// Item 3: Never echo TOBITEN_DATABASE_URL in errors
+		if strings.Contains(errStr, "super_secret_password") || strings.Contains(errStr, "postgres://") {
+			t.Errorf("error message leaked database URL/credentials: %q", errStr)
 		}
 	})
 
 	t.Run("postgres mode without database URL refuses startup", func(t *testing.T) {
-		cfg, err := Load([]string{
-			"-storage-mode=postgres",
-			"-database-url=",
-		}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load(nil, WithEnviron([]string{
+			"TOBITEN_STORAGE_MODE=postgres",
+			"TOBITEN_DATABASE_URL=",
+		}), WithoutEnvFile())
 
 		if err == nil {
-			t.Fatalf("expected error, got nil (cfg = %+v)", cfg)
+			t.Fatalf("expected error, got nil")
 		}
 		if !errors.Is(err, ErrPostgresStorageConflict) {
 			t.Errorf("error = %v, want ErrPostgresStorageConflict", err)
@@ -542,11 +653,7 @@ func TestStorageModeValidation(t *testing.T) {
 	})
 
 	t.Run("local mode with empty database URL succeeds", func(t *testing.T) {
-		cfg, err := Load([]string{
-			"-storage-mode=local",
-			"-database-url=",
-		}, WithEnviron(nil), WithoutEnvFile())
-
+		cfg, err := Load([]string{"-storage-mode=local"}, WithEnviron([]string{"TOBITEN_DATABASE_URL="}), WithoutEnvFile())
 		if err != nil {
 			t.Fatalf("Load() unexpected error: %v", err)
 		}
@@ -556,10 +663,9 @@ func TestStorageModeValidation(t *testing.T) {
 	})
 
 	t.Run("postgres mode with database URL succeeds", func(t *testing.T) {
-		cfg, err := Load([]string{
-			"-storage-mode=postgres",
-			"-database-url=postgres://user:pass@localhost:5432/tobiten",
-		}, WithEnviron(nil), WithoutEnvFile())
+		cfg, err := Load([]string{"-storage-mode=postgres"}, WithEnviron([]string{
+			"TOBITEN_DATABASE_URL=postgres://user:pass@localhost:5432/tobiten",
+		}), WithoutEnvFile())
 
 		if err != nil {
 			t.Fatalf("Load() unexpected error: %v", err)
@@ -584,16 +690,15 @@ func TestStorageModeValidation(t *testing.T) {
 }
 
 func TestOtherValidation(t *testing.T) {
-	validPostgresArgs := []string{
-		"-storage-mode=postgres",
-		"-database-url=postgres://user:pass@localhost:5432/tobiten",
+	validPostgresEnv := []string{
+		"TOBITEN_STORAGE_MODE=postgres",
+		"TOBITEN_DATABASE_URL=postgres://user:pass@localhost:5432/tobiten",
 	}
 
 	t.Run("invalid port numbers", func(t *testing.T) {
 		invalidPorts := []string{"-port=0", "-port=-1", "-port=65536"}
 		for _, p := range invalidPorts {
-			args := append([]string{p}, validPostgresArgs...)
-			_, err := Load(args, WithEnviron(nil), WithoutEnvFile())
+			_, err := Load([]string{p}, WithEnviron(validPostgresEnv), WithoutEnvFile())
 			if err == nil || !errors.Is(err, ErrInvalidPort) {
 				t.Errorf("expected ErrInvalidPort for %s, got %v", p, err)
 			}
@@ -629,7 +734,15 @@ func TestOtherValidation(t *testing.T) {
 	})
 
 	t.Run("invalid base URL", func(t *testing.T) {
-		invalidURLs := []string{"ftp://localhost", "not-a-url", "http://"}
+		invalidURLs := []string{
+			"ftp://localhost",
+			"not-a-url",
+			"http://",
+			"http://localhost:8080?query=1",   // query rejected
+			"http://localhost:8080#section",   // fragment rejected
+			"http://user:pass@localhost:8080", // userinfo rejected
+			"https://user@books.example.com",  // user rejected
+		}
 		for _, u := range invalidURLs {
 			_, err := Load([]string{"-base-url=" + u}, WithEnviron(nil), WithoutEnvFile())
 			if err == nil || !errors.Is(err, ErrInvalidBaseURL) {
@@ -691,5 +804,50 @@ TOBITEN_LOG_LEVEL=debug # inline comment
 	}
 	if parsed["TOBITEN_LOG_LEVEL"] != "debug" {
 		t.Errorf("TOBITEN_LOG_LEVEL = %q, want debug", parsed["TOBITEN_LOG_LEVEL"])
+	}
+}
+
+func TestEnvFileDoubleQuotedUnescape(t *testing.T) {
+	// Item 4: unescape in a single left-to-right pass so \\n yields literal \n, not newline
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: `KEY="hello\nworld"`,
+			want:  "hello\nworld",
+		},
+		{
+			input: `KEY="hello\\nworld"`,
+			want:  "hello\\nworld", // literal backslash + n
+		},
+		{
+			input: `KEY="path\\to\\file"`,
+			want:  "path\\to\\file",
+		},
+		{
+			input: `KEY="tab\there"`,
+			want:  "tab\there",
+		},
+		{
+			input: `KEY="carriage\rreturn"`,
+			want:  "carriage\rreturn",
+		},
+		{
+			input: `KEY="with\"escaped\"quote"`,
+			want:  `with"escaped"quote`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			parsed, err := parseEnv(strings.NewReader(tc.input))
+			if err != nil {
+				t.Fatalf("parseEnv() error: %v", err)
+			}
+			if got := parsed["KEY"]; got != tc.want {
+				t.Errorf("parseEnv(%s) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
 	}
 }

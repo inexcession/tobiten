@@ -45,13 +45,7 @@ func parseEnv(r io.Reader) (map[string]string, error) {
 
 func unquoteEnvVal(val string) string {
 	if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
-		val = val[1 : len(val)-1]
-		val = strings.ReplaceAll(val, `\n`, "\n")
-		val = strings.ReplaceAll(val, `\t`, "\t")
-		val = strings.ReplaceAll(val, `\r`, "\r")
-		val = strings.ReplaceAll(val, `\"`, "\"")
-		val = strings.ReplaceAll(val, `\\`, "\\")
-		return val
+		return unescapeDoubleQuoted(val[1 : len(val)-1])
 	}
 	if len(val) >= 2 && val[0] == '\'' && val[len(val)-1] == '\'' {
 		return val[1 : len(val)-1]
@@ -61,6 +55,39 @@ func unquoteEnvVal(val string) string {
 		val = strings.TrimSpace(val[:idx])
 	}
 	return val
+}
+
+// unescapeDoubleQuoted unescapes standard escape sequences in a single left-to-right pass
+// so that `\\n` yields literal `\n`, not a newline.
+func unescapeDoubleQuoted(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+				i++
+			case 't':
+				b.WriteByte('\t')
+				i++
+			case 'r':
+				b.WriteByte('\r')
+				i++
+			case '"':
+				b.WriteByte('"')
+				i++
+			case '\\':
+				b.WriteByte('\\')
+				i++
+			default:
+				b.WriteByte('\\')
+			}
+		} else {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 func loadEnvFile(path string) (map[string]string, error) {

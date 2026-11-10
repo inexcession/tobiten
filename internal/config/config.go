@@ -28,9 +28,8 @@ const (
 	DefaultScannerWorkers    = 0
 )
 
-// DocumentedEnvKeys contains all 23 canonical TOBITEN_* environment variables
-// defined in .env.example and documented in the ADRs.
-var DocumentedEnvKeys = []string{
+// DaemonEnvKeys contains all 22 TOBITEN_* environment variables recognized by tobitend (I-7).
+var DaemonEnvKeys = []string{
 	"TOBITEN_HOST",
 	"TOBITEN_PORT",
 	"TOBITEN_BASE_URL",
@@ -45,7 +44,6 @@ var DocumentedEnvKeys = []string{
 	"TOBITEN_TRUSTED_PROXIES",
 	"TOBITEN_OIDC_DEFAULT_ROLE",
 	"TOBITEN_OIDC_DEFAULT_LABELS",
-	"TOBITEN_API_KEY",
 	"TOBITEN_LOG_LEVEL",
 	"TOBITEN_LOG_FORMAT",
 	"TOBITEN_STORAGE_MODE",
@@ -55,6 +53,14 @@ var DocumentedEnvKeys = []string{
 	"TOBITEN_SCANNER_WORKERS",
 	"TOBITEN_INTAKE_MODE",
 }
+
+// CLIEnvKeys contains environment variables owned by the CLI rather than the daemon (I-7).
+var CLIEnvKeys = []string{
+	"TOBITEN_API_KEY",
+}
+
+// DocumentedEnvKeys is kept as an alias to DaemonEnvKeys for backwards compatibility.
+var DocumentedEnvKeys = DaemonEnvKeys
 
 // Sentinel errors for configuration and validation failures.
 var (
@@ -66,7 +72,7 @@ var (
 	ErrInvalidLogLevel         = errors.New("unsupported log level: supported levels are 'debug', 'info', 'warn', and 'error'")
 	ErrInvalidLogFormat        = errors.New("unsupported log format: supported formats are 'json', 'text', and 'table'")
 	ErrInvalidPort             = errors.New("invalid port: port must be between 1 and 65535")
-	ErrInvalidBaseURL          = errors.New("invalid base URL: must be an absolute URL with http or https scheme")
+	ErrInvalidBaseURL          = errors.New("invalid base URL: must be an absolute URL with http or https scheme, without query, fragment, or userinfo")
 	ErrInvalidFlag             = errors.New("invalid CLI flag")
 )
 
@@ -104,7 +110,6 @@ type Config struct {
 	TrustedProxies    string `json:"trusted_proxies"`
 	OIDCDefaultRole   string `json:"oidc_default_role"`
 	OIDCDefaultLabels string `json:"oidc_default_labels"`
-	APIKey            string `json:"-"`
 
 	// Logging (ADR-0013)
 	LogLevel  string `json:"log_level"`
@@ -154,7 +159,7 @@ func (c *Config) SourceOf(envKey string) Source {
 }
 
 // IsEnvLocked returns true if the setting was explicitly configured via CLI flags
-// or environment / .env variables (ADR-0014 §2).
+// or environment / .env variables (ADR-0014 §2, I-6).
 func (c *Config) IsEnvLocked(envKey string) bool {
 	src := c.SourceOf(envKey)
 	return src == SourceFlag || src == SourceEnv || src == SourceEnvFile
@@ -162,11 +167,12 @@ func (c *Config) IsEnvLocked(envKey string) bool {
 
 // Validate checks configuration invariants and storage-mode conflict rules.
 func (c *Config) Validate() error {
-	// Storage mode conflict validation (ADR-0001 §3, ROADMAP M1-AC2, M1-T1)
+	// Storage mode conflict validation (ADR-0001 §3, ROADMAP M1-AC2, M1-T1, I-6/I-7)
 	switch strings.ToLower(c.StorageMode) {
 	case "local":
 		if strings.TrimSpace(c.DatabaseURL) != "" {
-			return fmt.Errorf("%w: got %q (did you mean TOBITEN_STORAGE_MODE=postgres?)", ErrLocalStorageConflict, c.DatabaseURL)
+			// Never echo database URL or credentials in errors (item 3)
+			return ErrLocalStorageConflict
 		}
 	case "postgres":
 		if strings.TrimSpace(c.DatabaseURL) == "" {
@@ -220,10 +226,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("scanner_workers cannot be negative: %d", c.ScannerWorkers)
 	}
 
-	// BaseURL validation (ADR-0014, ADR-0020)
+	// BaseURL validation (ADR-0014, ADR-0020): absolute URL, http/https, no query, no fragment, no userinfo
 	parsed, err := url.ParseRequestURI(c.BaseURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return fmt.Errorf("%w: %q", ErrInvalidBaseURL, c.BaseURL)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return fmt.Errorf("%w: %q (base URL must not contain query parameters, fragment, or user credentials)", ErrInvalidBaseURL, c.BaseURL)
 	}
 
 	return nil
@@ -271,8 +280,69 @@ func WithoutEnvFile() Option {
 	}
 }
 
+type flagValues struct {
+	host              string
+	port              int
+	baseURL           string
+	dataDir           string
+	coversDir         string
+	cacheDir          string
+	thumbCacheMaxMB   int
+	extractCacheMaxMB int
+	adminUser         string
+	trustedProxies    string
+	oidcDefaultRole   string
+	oidcDefaultLabels string
+	logLevel          string
+	logFormat         string
+	storageMode       string
+	pgBin             string
+	libraryMode       string
+	scannerWorkers    int
+	intakeMode        string
+	envFile           string
+	version           bool
+	v                 bool
+}
+
+func registerFlags(fs *flag.FlagSet, fv *flagValues) {
+	fs.StringVar(&fv.host, "host", "", "server listen host")
+	fs.IntVar(&fv.port, "port", 0, "server listen port")
+	fs.StringVar(&fv.baseURL, "base-url", "", "public base URL for absolute links")
+	fs.StringVar(&fv.dataDir, "data-dir", "", "path to data directory")
+	fs.StringVar(&fv.coversDir, "covers-dir", "", "path to persistent covers directory")
+	fs.StringVar(&fv.cacheDir, "cache-dir", "", "path to ephemeral cache directory")
+	fs.IntVar(&fv.thumbCacheMaxMB, "thumb-cache-max-mb", 0, "max disk budget for preview thumbnails in MB")
+	fs.IntVar(&fv.extractCacheMaxMB, "extract-cache-max-mb", 0, "max disk budget for extracted pages in MB")
+	fs.StringVar(&fv.adminUser, "admin-user", "", "first-run admin bootstrap username")
+	fs.StringVar(&fv.trustedProxies, "trusted-proxies", "", "trusted reverse-proxy CIDRs")
+	fs.StringVar(&fv.oidcDefaultRole, "oidc-default-role", "", "default role for auto-provisioned OIDC users")
+	fs.StringVar(&fv.oidcDefaultLabels, "oidc-default-labels", "", "default SERVER label names for auto-provisioned OIDC users")
+	fs.StringVar(&fv.logLevel, "log-level", "", "log level (debug, info, warn, error)")
+	fs.StringVar(&fv.logFormat, "log-format", "", "log format (json, text, table)")
+	fs.StringVar(&fv.storageMode, "storage-mode", "", "storage mode (local, postgres)")
+	fs.StringVar(&fv.pgBin, "pg-bin", "", "directory containing PostgreSQL binaries for local mode")
+	fs.StringVar(&fv.libraryMode, "library-mode", "", "default mode for new libraries (virtual, managed)")
+	fs.IntVar(&fv.scannerWorkers, "scanner-workers", 0, "scanner worker concurrency")
+	fs.StringVar(&fv.intakeMode, "intake-mode", "", "managed intake mode (hardlink, copy, move)")
+	fs.StringVar(&fv.envFile, "env-file", "", "path to .env file")
+	fs.BoolVar(&fv.version, "version", false, "print version and exit")
+	fs.BoolVar(&fv.v, "v", false, "print version and exit")
+}
+
+// PrintUsage writes daemon command-line flag usage to the given writer.
+func PrintUsage(w io.Writer) {
+	fs := flag.NewFlagSet("tobitend", flag.ContinueOnError)
+	fs.SetOutput(w)
+	var fv flagValues
+	registerFlags(fs, &fv)
+	fs.Usage()
+}
+
 // Load loads, resolves, and validates configuration according to precedence:
 // CLI Flags > Environment Variables / .env > Compiled Defaults.
+// Empty or whitespace-only values in env/.env are treated as absent (I-6).
+// Secrets (admin-pass, secret-key, database-url) have no CLI flags (I-7).
 func Load(args []string, opts ...Option) (*Config, error) {
 	lo := &loadOptions{
 		envFile: ".env",
@@ -285,61 +355,8 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	fs := flag.NewFlagSet("tobitend", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	var (
-		flagHost              string
-		flagPort              int
-		flagBaseURL           string
-		flagDataDir           string
-		flagCoversDir         string
-		flagCacheDir          string
-		flagThumbCacheMaxMB   int
-		flagExtractCacheMaxMB int
-		flagAdminUser         string
-		flagAdminPass         string
-		flagSecretKey         string
-		flagTrustedProxies    string
-		flagOIDCDefaultRole   string
-		flagOIDCDefaultLabels string
-		flagAPIKey            string
-		flagLogLevel          string
-		flagLogFormat         string
-		flagStorageMode       string
-		flagDatabaseURL       string
-		flagPgBin             string
-		flagLibraryMode       string
-		flagScannerWorkers    int
-		flagIntakeMode        string
-		flagEnvFile           string
-		flagVersion           bool
-		flagV                 bool
-	)
-
-	fs.StringVar(&flagHost, "host", "", "server listen host")
-	fs.IntVar(&flagPort, "port", 0, "server listen port")
-	fs.StringVar(&flagBaseURL, "base-url", "", "public base URL for absolute links")
-	fs.StringVar(&flagDataDir, "data-dir", "", "path to data directory")
-	fs.StringVar(&flagCoversDir, "covers-dir", "", "path to persistent covers directory")
-	fs.StringVar(&flagCacheDir, "cache-dir", "", "path to ephemeral cache directory")
-	fs.IntVar(&flagThumbCacheMaxMB, "thumb-cache-max-mb", 0, "max disk budget for preview thumbnails in MB")
-	fs.IntVar(&flagExtractCacheMaxMB, "extract-cache-max-mb", 0, "max disk budget for extracted pages in MB")
-	fs.StringVar(&flagAdminUser, "admin-user", "", "first-run admin bootstrap username")
-	fs.StringVar(&flagAdminPass, "admin-pass", "", "first-run admin bootstrap password")
-	fs.StringVar(&flagSecretKey, "secret-key", "", "encryption key for stored secrets")
-	fs.StringVar(&flagTrustedProxies, "trusted-proxies", "", "trusted reverse-proxy CIDRs")
-	fs.StringVar(&flagOIDCDefaultRole, "oidc-default-role", "", "default role for auto-provisioned OIDC users")
-	fs.StringVar(&flagOIDCDefaultLabels, "oidc-default-labels", "", "default SERVER label names for auto-provisioned OIDC users")
-	fs.StringVar(&flagAPIKey, "api-key", "", "API key / PAT for CLI MCP proxy")
-	fs.StringVar(&flagLogLevel, "log-level", "", "log level (debug, info, warn, error)")
-	fs.StringVar(&flagLogFormat, "log-format", "", "log format (json, text, table)")
-	fs.StringVar(&flagStorageMode, "storage-mode", "", "storage mode (local, postgres)")
-	fs.StringVar(&flagDatabaseURL, "database-url", "", "PostgreSQL database connection URL")
-	fs.StringVar(&flagPgBin, "pg-bin", "", "directory containing PostgreSQL binaries for local mode")
-	fs.StringVar(&flagLibraryMode, "library-mode", "", "default mode for new libraries (virtual, managed)")
-	fs.IntVar(&flagScannerWorkers, "scanner-workers", 0, "scanner worker concurrency")
-	fs.StringVar(&flagIntakeMode, "intake-mode", "", "managed intake mode (hardlink, copy, move)")
-	fs.StringVar(&flagEnvFile, "env-file", "", "path to .env file")
-	fs.BoolVar(&flagVersion, "version", false, "print version and exit")
-	fs.BoolVar(&flagV, "v", false, "print version and exit")
+	var fv flagValues
+	registerFlags(fs, &fv)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -354,8 +371,8 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	})
 
 	// Override env file if set via CLI flag
-	if visited["env-file"] {
-		lo.envFile = flagEnvFile
+	if visited["env-file"] && strings.TrimSpace(fv.envFile) != "" {
+		lo.envFile = fv.envFile
 		lo.hasEnvFile = true
 	}
 
@@ -404,7 +421,7 @@ func Load(args []string, opts ...Option) (*Config, error) {
 		sources: make(map[string]Source),
 	}
 
-	if flagVersion || flagV {
+	if fv.version || fv.v {
 		cfg.ShowVersion = true
 		return cfg, nil
 	}
@@ -412,31 +429,34 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	var err error
 
 	// 4. Resolve settings by precedence: Flag > Env > EnvFile > Default
-	cfg.Host = resolveString(visited["host"], flagHost, "TOBITEN_HOST", envMap, envFileMap, DefaultHost, cfg.sources)
-	cfg.Port, err = resolveInt(visited["port"], flagPort, "TOBITEN_PORT", envMap, envFileMap, DefaultPort, cfg.sources)
+	// Blank values in env/.env are treated as absent (I-6).
+	cfg.Host = resolveString(visited["host"], fv.host, "TOBITEN_HOST", envMap, envFileMap, DefaultHost, cfg.sources)
+	cfg.Port, err = resolveInt(visited["port"], fv.port, "TOBITEN_PORT", envMap, envFileMap, DefaultPort, cfg.sources)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg.BaseURL = resolveString(visited["base-url"], flagBaseURL, "TOBITEN_BASE_URL", envMap, envFileMap, DefaultBaseURL, cfg.sources)
+	cfg.BaseURL = resolveString(visited["base-url"], fv.baseURL, "TOBITEN_BASE_URL", envMap, envFileMap, DefaultBaseURL, cfg.sources)
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL
 	}
 
-	// Storage Directories & Derived Paths (ADR-0014 §2, ADR-0015 §1)
-	cfg.DataDir = resolveString(visited["data-dir"], flagDataDir, "TOBITEN_DATA_DIR", envMap, envFileMap, DefaultDataDir, cfg.sources)
+	// Storage Directories & Derived Paths (ADR-0014 §2, ADR-0015 §1, I-6)
+	cfg.DataDir = resolveString(visited["data-dir"], fv.dataDir, "TOBITEN_DATA_DIR", envMap, envFileMap, DefaultDataDir, cfg.sources)
 
-	rawCoversDir := resolveString(visited["covers-dir"], flagCoversDir, "TOBITEN_COVERS_DIR", envMap, envFileMap, "", cfg.sources)
+	rawCoversDir := resolveString(visited["covers-dir"], fv.coversDir, "TOBITEN_COVERS_DIR", envMap, envFileMap, "", cfg.sources)
 	if strings.TrimSpace(rawCoversDir) == "" {
 		cfg.CoversDir = filepath.Join(cfg.DataDir, "covers")
+		cfg.sources["TOBITEN_COVERS_DIR"] = SourceDefault
 	} else {
 		cfg.CoversDir = rawCoversDir
 	}
 
-	rawCacheDir := resolveString(visited["cache-dir"], flagCacheDir, "TOBITEN_CACHE_DIR", envMap, envFileMap, "", cfg.sources)
+	rawCacheDir := resolveString(visited["cache-dir"], fv.cacheDir, "TOBITEN_CACHE_DIR", envMap, envFileMap, "", cfg.sources)
 	if strings.TrimSpace(rawCacheDir) == "" {
 		cfg.CacheDir = filepath.Join(cfg.DataDir, "cache")
+		cfg.sources["TOBITEN_CACHE_DIR"] = SourceDefault
 	} else {
 		cfg.CacheDir = rawCacheDir
 	}
@@ -446,42 +466,45 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	cfg.BackupsDir = filepath.Join(cfg.DataDir, "backups")
 	cfg.SecretKeyPath = filepath.Join(cfg.DataDir, "secret.key")
 
-	cfg.ThumbCacheMaxMB, err = resolveInt(visited["thumb-cache-max-mb"], flagThumbCacheMaxMB, "TOBITEN_THUMB_CACHE_MAX_MB", envMap, envFileMap, DefaultThumbCacheMaxMB, cfg.sources)
+	cfg.ThumbCacheMaxMB, err = resolveInt(visited["thumb-cache-max-mb"], fv.thumbCacheMaxMB, "TOBITEN_THUMB_CACHE_MAX_MB", envMap, envFileMap, DefaultThumbCacheMaxMB, cfg.sources)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg.ExtractCacheMaxMB, err = resolveInt(visited["extract-cache-max-mb"], flagExtractCacheMaxMB, "TOBITEN_EXTRACT_CACHE_MAX_MB", envMap, envFileMap, DefaultExtractCacheMaxMB, cfg.sources)
+	cfg.ExtractCacheMaxMB, err = resolveInt(visited["extract-cache-max-mb"], fv.extractCacheMaxMB, "TOBITEN_EXTRACT_CACHE_MAX_MB", envMap, envFileMap, DefaultExtractCacheMaxMB, cfg.sources)
 	if err != nil {
 		return nil, err
 	}
 
 	// First-run admin & security
-	cfg.AdminUser = resolveString(visited["admin-user"], flagAdminUser, "TOBITEN_ADMIN_USER", envMap, envFileMap, "", cfg.sources)
-	cfg.AdminPass = resolveString(visited["admin-pass"], flagAdminPass, "TOBITEN_ADMIN_PASS", envMap, envFileMap, "", cfg.sources)
-	cfg.SecretKey = resolveString(visited["secret-key"], flagSecretKey, "TOBITEN_SECRET_KEY", envMap, envFileMap, "", cfg.sources)
-	cfg.TrustedProxies = resolveString(visited["trusted-proxies"], flagTrustedProxies, "TOBITEN_TRUSTED_PROXIES", envMap, envFileMap, "", cfg.sources)
-	cfg.OIDCDefaultRole = resolveString(visited["oidc-default-role"], flagOIDCDefaultRole, "TOBITEN_OIDC_DEFAULT_ROLE", envMap, envFileMap, "", cfg.sources)
-	cfg.OIDCDefaultLabels = resolveString(visited["oidc-default-labels"], flagOIDCDefaultLabels, "TOBITEN_OIDC_DEFAULT_LABELS", envMap, envFileMap, "", cfg.sources)
-	cfg.APIKey = resolveString(visited["api-key"], flagAPIKey, "TOBITEN_API_KEY", envMap, envFileMap, "", cfg.sources)
+	cfg.AdminUser = resolveString(visited["admin-user"], fv.adminUser, "TOBITEN_ADMIN_USER", envMap, envFileMap, "", cfg.sources)
+
+	// Secrets have NO flags (I-7)
+	cfg.AdminPass = resolveSecret("TOBITEN_ADMIN_PASS", envMap, envFileMap, cfg.sources)
+	cfg.SecretKey = resolveSecret("TOBITEN_SECRET_KEY", envMap, envFileMap, cfg.sources)
+
+	cfg.TrustedProxies = resolveString(visited["trusted-proxies"], fv.trustedProxies, "TOBITEN_TRUSTED_PROXIES", envMap, envFileMap, "", cfg.sources)
+	cfg.OIDCDefaultRole = resolveString(visited["oidc-default-role"], fv.oidcDefaultRole, "TOBITEN_OIDC_DEFAULT_ROLE", envMap, envFileMap, "", cfg.sources)
+	cfg.OIDCDefaultLabels = resolveString(visited["oidc-default-labels"], fv.oidcDefaultLabels, "TOBITEN_OIDC_DEFAULT_LABELS", envMap, envFileMap, "", cfg.sources)
 
 	// Logging
-	cfg.LogLevel = resolveString(visited["log-level"], flagLogLevel, "TOBITEN_LOG_LEVEL", envMap, envFileMap, DefaultLogLevel, cfg.sources)
-	cfg.LogFormat = resolveString(visited["log-format"], flagLogFormat, "TOBITEN_LOG_FORMAT", envMap, envFileMap, DefaultLogFormat, cfg.sources)
+	cfg.LogLevel = resolveString(visited["log-level"], fv.logLevel, "TOBITEN_LOG_LEVEL", envMap, envFileMap, DefaultLogLevel, cfg.sources)
+	cfg.LogFormat = resolveString(visited["log-format"], fv.logFormat, "TOBITEN_LOG_FORMAT", envMap, envFileMap, DefaultLogFormat, cfg.sources)
 
 	// Storage Engine
-	cfg.StorageMode = resolveString(visited["storage-mode"], flagStorageMode, "TOBITEN_STORAGE_MODE", envMap, envFileMap, DefaultStorageMode, cfg.sources)
-	cfg.DatabaseURL = resolveString(visited["database-url"], flagDatabaseURL, "TOBITEN_DATABASE_URL", envMap, envFileMap, "", cfg.sources)
-	cfg.PgBin = resolveString(visited["pg-bin"], flagPgBin, "TOBITEN_PG_BIN", envMap, envFileMap, "", cfg.sources)
+	cfg.StorageMode = resolveString(visited["storage-mode"], fv.storageMode, "TOBITEN_STORAGE_MODE", envMap, envFileMap, DefaultStorageMode, cfg.sources)
+	// DatabaseURL has NO flag (I-7)
+	cfg.DatabaseURL = resolveSecret("TOBITEN_DATABASE_URL", envMap, envFileMap, cfg.sources)
+	cfg.PgBin = resolveString(visited["pg-bin"], fv.pgBin, "TOBITEN_PG_BIN", envMap, envFileMap, "", cfg.sources)
 
 	// Library & Scanner
-	cfg.LibraryMode = resolveString(visited["library-mode"], flagLibraryMode, "TOBITEN_LIBRARY_MODE", envMap, envFileMap, DefaultLibraryMode, cfg.sources)
-	cfg.ScannerWorkers, err = resolveInt(visited["scanner-workers"], flagScannerWorkers, "TOBITEN_SCANNER_WORKERS", envMap, envFileMap, DefaultScannerWorkers, cfg.sources)
+	cfg.LibraryMode = resolveString(visited["library-mode"], fv.libraryMode, "TOBITEN_LIBRARY_MODE", envMap, envFileMap, DefaultLibraryMode, cfg.sources)
+	cfg.ScannerWorkers, err = resolveInt(visited["scanner-workers"], fv.scannerWorkers, "TOBITEN_SCANNER_WORKERS", envMap, envFileMap, DefaultScannerWorkers, cfg.sources)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg.IntakeMode = resolveString(visited["intake-mode"], flagIntakeMode, "TOBITEN_INTAKE_MODE", envMap, envFileMap, DefaultIntakeMode, cfg.sources)
+	cfg.IntakeMode = resolveString(visited["intake-mode"], fv.intakeMode, "TOBITEN_INTAKE_MODE", envMap, envFileMap, DefaultIntakeMode, cfg.sources)
 
 	// Normalize casing
 	cfg.StorageMode = strings.ToLower(cfg.StorageMode)
@@ -499,17 +522,23 @@ func Load(args []string, opts ...Option) (*Config, error) {
 }
 
 func resolveString(flagVisited bool, flagVal string, envKey string, envMap, envFileMap map[string]string, defaultVal string, sources map[string]Source) string {
-	if flagVisited {
+	if flagVisited && strings.TrimSpace(flagVal) != "" {
 		sources[envKey] = SourceFlag
 		return flagVal
 	}
 	if val, ok := envMap[envKey]; ok {
-		sources[envKey] = SourceEnv
-		return val
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			sources[envKey] = SourceEnv
+			return val
+		}
 	}
 	if val, ok := envFileMap[envKey]; ok {
-		sources[envKey] = SourceEnvFile
-		return val
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			sources[envKey] = SourceEnvFile
+			return val
+		}
 	}
 	sources[envKey] = SourceDefault
 	return defaultVal
@@ -522,30 +551,45 @@ func resolveInt(flagVisited bool, flagVal int, envKey string, envMap, envFileMap
 	}
 	if val, ok := envMap[envKey]; ok {
 		trimmed := strings.TrimSpace(val)
-		if trimmed == "" {
+		if trimmed != "" {
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return 0, fmt.Errorf("invalid integer value for %s: %q", envKey, val)
+			}
 			sources[envKey] = SourceEnv
-			return defaultVal, nil
+			return n, nil
 		}
-		n, err := strconv.Atoi(trimmed)
-		if err != nil {
-			return 0, fmt.Errorf("invalid integer value for %s: %q", envKey, val)
-		}
-		sources[envKey] = SourceEnv
-		return n, nil
 	}
 	if val, ok := envFileMap[envKey]; ok {
 		trimmed := strings.TrimSpace(val)
-		if trimmed == "" {
+		if trimmed != "" {
+			n, err := strconv.Atoi(trimmed)
+			if err != nil {
+				return 0, fmt.Errorf("invalid integer value for %s in env file: %q", envKey, val)
+			}
 			sources[envKey] = SourceEnvFile
-			return defaultVal, nil
+			return n, nil
 		}
-		n, err := strconv.Atoi(trimmed)
-		if err != nil {
-			return 0, fmt.Errorf("invalid integer value for %s in env file: %q", envKey, val)
-		}
-		sources[envKey] = SourceEnvFile
-		return n, nil
 	}
 	sources[envKey] = SourceDefault
 	return defaultVal, nil
+}
+
+func resolveSecret(envKey string, envMap, envFileMap map[string]string, sources map[string]Source) string {
+	if val, ok := envMap[envKey]; ok {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			sources[envKey] = SourceEnv
+			return val
+		}
+	}
+	if val, ok := envFileMap[envKey]; ok {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			sources[envKey] = SourceEnvFile
+			return val
+		}
+	}
+	sources[envKey] = SourceDefault
+	return ""
 }

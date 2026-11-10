@@ -20,6 +20,7 @@ func run(args []string) int {
 	cfg, err := config.Load(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			config.PrintUsage(os.Stderr)
 			return 0
 		}
 		if errors.Is(err, config.ErrInvalidFlag) {
