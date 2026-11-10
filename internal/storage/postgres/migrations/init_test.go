@@ -86,10 +86,12 @@ func TestMigration0001_Applies(t *testing.T) {
 			builtIn: true,
 			permissions: []string{
 				"collections:manage",
+				"jobs:read_all",
 				"library:admin",
 				"library:read",
 				"metadata:edit",
 				"progress:write",
+				"trash:purge",
 				"users:admin",
 			},
 		},
@@ -351,6 +353,36 @@ func TestMigration0001_PublishedSequencePublishedAtPairing(t *testing.T) {
 	}
 	if !isCheckViolation(err) {
 		t.Fatalf("expected check violation, got %v", err)
+	}
+}
+
+func TestMigration0001_JobsStateCheck(t *testing.T) {
+	t.Parallel()
+	db := apply0001Init(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	validStates := []string{"QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"}
+	for i, state := range validStates {
+		jobID := "019318a0-0000-7000-8000-00000000005" + string(rune('0'+i))
+		_, err := db.Exec(ctx, `
+			INSERT INTO jobs (id, kind, state)
+			VALUES ($1, 'SCAN', $2)`, jobID, state)
+		if err != nil {
+			t.Fatalf("expected valid state %q to be accepted, got: %v", state, err)
+		}
+	}
+
+	// Invalid state must be rejected by CHECK constraint
+	_, err := db.Exec(ctx, `
+		INSERT INTO jobs (id, kind, state)
+		VALUES ('019318a0-0000-7000-8000-000000000059', 'SCAN', 'UNKNOWN_STATUS')`)
+	if err == nil {
+		t.Fatal("expected invalid state to be rejected by CHECK constraint, but it succeeded")
+	}
+	if !isCheckViolation(err) {
+		t.Fatalf("expected check violation on invalid state, got: %v", err)
 	}
 }
 

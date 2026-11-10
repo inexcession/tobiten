@@ -113,13 +113,17 @@ CREATE TABLE user_label_policies (
     PRIMARY KEY (user_id, label_id)                  -- one effect per (subject, label); RESTRICT wins across subjects/groups
 );
 
--- Triggers enforcing that user_label_policies only ever references SERVER labels:
+-- Triggers enforcing that user_label_policies only ever references SERVER labels.
+-- Using FOR SHARE on the label row prevents a race where a concurrent transaction
+-- updates the label's scope from SERVER to USER before this policy insert commits:
+-- the concurrent UPDATE will block waiting for this transaction's SHARE lock to release,
+-- and upon unblocking, trg_labels_prevent_server_scope_change will see this committed policy row.
 CREATE OR REPLACE FUNCTION trg_check_user_label_policy_scope()
 RETURNS TRIGGER AS $$
 DECLARE
     v_scope TEXT;
 BEGIN
-    SELECT scope INTO v_scope FROM labels WHERE id = NEW.label_id;
+    SELECT scope INTO v_scope FROM labels WHERE id = NEW.label_id FOR SHARE;
     IF v_scope IS DISTINCT FROM 'SERVER' THEN
         RAISE EXCEPTION 'user_label_policies only permit SERVER labels, got % for label_id %', v_scope, NEW.label_id;
     END IF;
@@ -192,7 +196,7 @@ CREATE TABLE event_subscribers (
 CREATE TABLE jobs (
     id               TEXT PRIMARY KEY,
     kind             TEXT NOT NULL,                  -- e.g. 'SCAN', 'INTAKE', 'REPACK', 'WRITE_BACK', 'SCRAPE', 'PURGE', 'EVENT_DELIVERY'
-    state            TEXT NOT NULL DEFAULT 'QUEUED', -- 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED'
+    state            TEXT NOT NULL DEFAULT 'QUEUED' CHECK (state IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
     payload          JSONB NOT NULL DEFAULT '{}',
     checkpoint       JSONB NOT NULL DEFAULT '{}',    -- Resume point after restart
     attempts         INT NOT NULL DEFAULT 0,
@@ -219,14 +223,16 @@ INSERT INTO roles (id, name, built_in) VALUES
     ('019318a0-0000-7000-8000-000000000003', 'Reader', TRUE),
     ('019318a0-0000-7000-8000-000000000004', 'Restricted reader', TRUE);
 
--- Admin: all permissions
+-- Admin: all permissions (including jobs:read_all and trash:purge per ADR-0006 §4)
 INSERT INTO role_permissions (role_id, permission) VALUES
     ('019318a0-0000-7000-8000-000000000001', 'library:read'),
     ('019318a0-0000-7000-8000-000000000001', 'progress:write'),
     ('019318a0-0000-7000-8000-000000000001', 'metadata:edit'),
     ('019318a0-0000-7000-8000-000000000001', 'collections:manage'),
     ('019318a0-0000-7000-8000-000000000001', 'library:admin'),
-    ('019318a0-0000-7000-8000-000000000001', 'users:admin');
+    ('019318a0-0000-7000-8000-000000000001', 'users:admin'),
+    ('019318a0-0000-7000-8000-000000000001', 'jobs:read_all'),
+    ('019318a0-0000-7000-8000-000000000001', 'trash:purge');
 
 -- Curator: edit metadata and shared collections, read and track progress
 INSERT INTO role_permissions (role_id, permission) VALUES
