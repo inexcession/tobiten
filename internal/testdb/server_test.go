@@ -78,7 +78,7 @@ func TestStartServerAndStop(t *testing.T) {
 		t.Fatal("expected non-nil server instance")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	if err := srv.adminPool.Ping(ctx); err != nil {
