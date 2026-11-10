@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,6 +22,11 @@ import (
 // MigrationLockID is a 64-bit advisory lock key used to serialize
 // migration operations within PostgreSQL ("tobiten_" in ASCII hex).
 const MigrationLockID int64 = 0x746f626974656e5f
+
+// CoreFS embeds all core SQL migrations packaged in this directory.
+//
+//go:embed *.sql
+var CoreFS embed.FS
 
 // Sentinel errors returned by the migration runner.
 var (
