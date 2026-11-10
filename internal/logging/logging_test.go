@@ -439,3 +439,25 @@ func TestDomainHelpers(t *testing.T) {
 		t.Errorf("Err(nil) = %v", a)
 	}
 }
+
+func TestIsTerminal(t *testing.T) {
+	if IsTerminal(nil) {
+		t.Errorf("IsTerminal(nil) = true, want false")
+	}
+	var buf bytes.Buffer
+	if IsTerminal(&buf) {
+		t.Errorf("IsTerminal(&bytes.Buffer) = true, want false")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if IsTerminal(r) {
+		t.Errorf("IsTerminal(pipeReader) = true, want false")
+	}
+	if IsTerminal(w) {
+		t.Errorf("IsTerminal(pipeWriter) = true, want false")
+	}
+}

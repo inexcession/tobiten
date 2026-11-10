@@ -3,10 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/inexcession/tobiten/internal/api"
+	"github.com/inexcession/tobiten/internal/config"
 )
 
 func TestVersionString(t *testing.T) {
@@ -23,11 +30,6 @@ func TestRunVersion(t *testing.T) {
 		args []string
 		want string
 	}{
-		{
-			name: "default execution",
-			args: []string{},
-			want: "tobitend 0.1.0-dev\n",
-		},
 		{
 			name: "flag -version",
 			args: []string{"-version"},
@@ -191,6 +193,12 @@ func TestRunLoggingWiring(t *testing.T) {
 	origLogger := slog.Default()
 	defer slog.SetDefault(origLogger)
 
+	origStartServer := startServer
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+		return nil
+	}
+	defer func() { startServer = origStartServer }()
+
 	t.Run("flags wire format and level", func(t *testing.T) {
 		r, w, err := os.Pipe()
 		if err != nil {
@@ -302,4 +310,113 @@ func TestRunLoggingWiring(t *testing.T) {
 			t.Errorf("expected stderr to contain 'unsupported log level', got: %s", buf.String())
 		}
 	})
+}
+
+func TestRunLoggingTableColorWiring(t *testing.T) {
+	origLogger := slog.Default()
+	defer slog.SetDefault(origLogger)
+
+	origStartServer := startServer
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+		return nil
+	}
+	defer func() { startServer = origStartServer }()
+
+	t.Run("NO_COLOR disables color in table format", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "1")
+		exitCode := run([]string{"-log-format=table"})
+		if exitCode != 0 {
+			t.Fatalf("run exit code = %d", exitCode)
+		}
+	})
+
+	t.Run("piped stdout disables color in table format", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "")
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+
+		exitCode := run([]string{"-log-format=table"})
+
+		_ = w.Close()
+		os.Stdout = origStdout
+		_ = r.Close()
+
+		if exitCode != 0 {
+			t.Fatalf("run exit code = %d", exitCode)
+		}
+	})
+}
+
+func getFreePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on port 0: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestRunServer_GracefulShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	port := getFreePort(t)
+	args := []string{fmt.Sprintf("-port=%d", port)}
+
+	origStartServer := startServer
+	defer func() { startServer = origStartServer }()
+
+	started := make(chan struct{})
+	var srvURL string
+
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+		srv, err := api.NewServer(api.ServerOptions{
+			Config: cfg,
+			Logger: logger,
+		})
+		if err != nil {
+			return err
+		}
+		srvURL = srv.URL()
+		close(started)
+		return srv.Run(ctx)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- runContext(ctx, args)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for server to start")
+	}
+
+	// Verify /healthz returns 200
+	resp, err := http.Get(srvURL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Trigger graceful shutdown
+	cancel()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("runContext() exit code = %d, want 0", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
 }

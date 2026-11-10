@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/inexcession/tobiten/internal/api"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/logging"
 )
@@ -19,9 +23,16 @@ func versionString() string {
 }
 
 func setupLogging(cfg *config.Config) error {
+	noColor := true
+	if cfg.LogFormat == logging.FormatTable {
+		if os.Getenv("NO_COLOR") == "" && logging.IsTerminal(os.Stdout) {
+			noColor = false
+		}
+	}
 	logger, err := logging.New(logging.Options{
-		Format: cfg.LogFormat,
-		Level:  cfg.LogLevel,
+		Format:  cfg.LogFormat,
+		Level:   cfg.LogLevel,
+		NoColor: noColor,
 	})
 	if err != nil {
 		return err
@@ -30,7 +41,18 @@ func setupLogging(cfg *config.Config) error {
 	return nil
 }
 
-func run(args []string) int {
+var startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	srv, err := api.NewServer(api.ServerOptions{
+		Config: cfg,
+		Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+	return srv.Run(ctx)
+}
+
+func runContext(ctx context.Context, args []string) int {
 	cfg, err := config.Load(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -55,9 +77,24 @@ func run(args []string) int {
 		return 1
 	}
 
-	// Hello-world output for initial M1-T28.1 slice
-	fmt.Println(versionString())
+	if ctx.Err() != nil {
+		return 0
+	}
+
+	slog.Info("starting server daemon", slog.String("version", Version))
+
+	if err := startServer(ctx, cfg, slog.Default()); err != nil {
+		slog.Error("server error", logging.Err(err))
+		return 1
+	}
+
 	return 0
+}
+
+func run(args []string) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runContext(ctx, args)
 }
 
 func main() {

@@ -143,6 +143,22 @@ func ParseFormat(format string) (string, error) {
 	}
 }
 
+// IsTerminal reports whether w is connected to a terminal (character device).
+func IsTerminal(w io.Writer) bool {
+	if w == nil {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok || f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 // ParseLevel validates and converts a log level string into a slog.Level.
 // An empty string defaults to slog.LevelInfo.
 func ParseLevel(level string) (slog.Level, error) {
