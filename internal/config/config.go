@@ -59,9 +59,6 @@ var CLIEnvKeys = []string{
 	"TOBITEN_API_KEY",
 }
 
-// DocumentedEnvKeys is kept as an alias to DaemonEnvKeys for backwards compatibility.
-var DocumentedEnvKeys = DaemonEnvKeys
-
 // Sentinel errors for configuration and validation failures.
 var (
 	ErrLocalStorageConflict    = errors.New("storage mode 'local' requires an empty TOBITEN_DATABASE_URL; for a remote database, set TOBITEN_STORAGE_MODE=postgres")
@@ -227,12 +224,16 @@ func (c *Config) Validate() error {
 	}
 
 	// BaseURL validation (ADR-0014, ADR-0020): absolute URL, http/https, no query, no fragment, no userinfo
-	parsed, err := url.ParseRequestURI(c.BaseURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return fmt.Errorf("%w: %q", ErrInvalidBaseURL, c.BaseURL)
+	parsed, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid URL format", ErrInvalidBaseURL)
+	}
+	displayURL := parsed.Redacted()
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return fmt.Errorf("%w: %q", ErrInvalidBaseURL, displayURL)
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
-		return fmt.Errorf("%w: %q (base URL must not contain query parameters, fragment, or user credentials)", ErrInvalidBaseURL, c.BaseURL)
+		return fmt.Errorf("%w: %q (base URL must not contain query parameters, fragment, or user credentials)", ErrInvalidBaseURL, displayURL)
 	}
 
 	return nil

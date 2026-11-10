@@ -751,6 +751,25 @@ func TestOtherValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid base URL with credentials redacts password in error", func(t *testing.T) {
+		secretPass := "my_super_secret_password_987"
+		rawURL := fmt.Sprintf("http://user:%s@localhost:8080/books", secretPass)
+		_, err := Load([]string{"-base-url=" + rawURL}, WithEnviron(nil), WithoutEnvFile())
+		if err == nil {
+			t.Fatalf("expected error for base URL with credentials, got nil")
+		}
+		if !errors.Is(err, ErrInvalidBaseURL) {
+			t.Errorf("error = %v, want ErrInvalidBaseURL", err)
+		}
+		errStr := err.Error()
+		if strings.Contains(errStr, secretPass) {
+			t.Errorf("error message leaked base URL password: %q", errStr)
+		}
+		if !strings.Contains(errStr, "http://user:xxxxx@localhost:8080/books") {
+			t.Errorf("error message should contain redacted URL, got: %q", errStr)
+		}
+	})
+
 	t.Run("negative cache and worker budgets", func(t *testing.T) {
 		_, err := Load([]string{"-thumb-cache-max-mb=-1"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil {
