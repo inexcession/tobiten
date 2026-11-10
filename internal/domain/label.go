@@ -229,12 +229,12 @@ func NewEffectiveLabelPolicy(userPolicies []UserLabelPolicy, groupPolicies []Gro
 
 // NewEffectiveLabelPolicyForPrincipal builds an EffectiveLabelPolicy for a principal,
 // automatically determining requiresAllowLabels from the principal's roles (decision I-5).
+// A nil principal must fail closed: return a policy that denies everything.
 func NewEffectiveLabelPolicyForPrincipal(principal *Principal, userPolicies []UserLabelPolicy, groupPolicies []GroupLabelPolicy) *EffectiveLabelPolicy {
-	requiresAllow := false
-	if principal != nil {
-		requiresAllow = principal.RequiresAllowLabels()
+	if principal == nil {
+		return NewEffectiveLabelPolicy(nil, nil, true)
 	}
-	return NewEffectiveLabelPolicy(userPolicies, groupPolicies, requiresAllow)
+	return NewEffectiveLabelPolicy(userPolicies, groupPolicies, principal.RequiresAllowLabels())
 }
 
 // AllowCount returns the number of ALLOW policies in effect.

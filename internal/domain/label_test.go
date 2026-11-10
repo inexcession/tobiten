@@ -360,6 +360,14 @@ func TestTopDownAllowEvaluation(t *testing.T) {
 		}
 	})
 
+	t.Run("standalone volume without an allowed label holding an asset with an allowed label is hidden", func(t *testing.T) {
+		// Standalone volume has no allowed label (lbl_other_vol), but asset has lbl_allowed_asset.
+		// Since the standalone volume is not allowed, the asset must be hidden (asset labels never grant).
+		if policy.EvaluateAsset([]string{"lbl_allowed_asset"}, []string{"lbl_other_vol"}, nil) {
+			t.Errorf("asset with allowed label in a non-allowed standalone volume must be hidden (asset labels never grant)")
+		}
+	})
+
 	t.Run("volume with series membership where series has allowed label is visible", func(t *testing.T) {
 		// Volume itself has no labels (or unrelated label), but series has lbl_allowed_series
 		allowedSeries := [][]string{{"lbl_allowed_series"}}
@@ -494,6 +502,96 @@ func TestFailClosedRestrictedReader(t *testing.T) {
 			t.Errorf("asset in non-allowed series should be hidden")
 		}
 	})
+
+	t.Run("Restricted reader with user ALLOW X and group RESTRICT X sees nothing", func(t *testing.T) {
+		// Conflict on lbl_x between user ALLOW and group RESTRICT: RESTRICT wins!
+		// Result: restrictLabels has lbl_x, allowLabels is empty.
+		// Since Restricted reader requires allow labels and allowLabels is empty, everything is denied.
+		userPolicies := []domain.UserLabelPolicy{
+			{UserID: "child_1", LabelID: "lbl_x", Effect: domain.PolicyEffectAllow},
+		}
+		groupPolicies := []domain.GroupLabelPolicy{
+			{GroupClaim: "kids", LabelID: "lbl_x", Effect: domain.PolicyEffectRestrict},
+		}
+		policy := domain.NewEffectiveLabelPolicyForPrincipal(childPrincipal, userPolicies, groupPolicies)
+
+		if policy.HasAllowLabels() {
+			t.Errorf("expected 0 allow labels because RESTRICT wins over ALLOW")
+		}
+		if !policy.IsLabelRestricted("lbl_x") {
+			t.Errorf("lbl_x must be restricted")
+		}
+
+		// Evaluates to false for everything
+		if policy.EvaluateLabels(nil) {
+			t.Errorf("unlabeled content must be hidden")
+		}
+		if policy.EvaluateLabels([]string{"lbl_x"}) {
+			t.Errorf("content with lbl_x must be hidden")
+		}
+		if policy.EvaluateLabels([]string{"lbl_clean"}) {
+			t.Errorf("content with clean label must be hidden (0 allow labels)")
+		}
+		if policy.EvaluateSeries([]string{"lbl_x"}) {
+			t.Errorf("series with lbl_x must be hidden")
+		}
+		if policy.EvaluateSeries([]string{"lbl_clean"}) {
+			t.Errorf("series with clean label must be hidden")
+		}
+		if policy.EvaluateVolume([]string{"lbl_x"}, nil) {
+			t.Errorf("standalone volume with lbl_x must be hidden")
+		}
+		if policy.EvaluateVolume([]string{"lbl_clean"}, nil) {
+			t.Errorf("standalone volume with clean label must be hidden")
+		}
+		if policy.EvaluateVolume(nil, [][]string{{"lbl_x"}}) {
+			t.Errorf("series volume with lbl_x must be hidden")
+		}
+		if policy.EvaluateVolume(nil, [][]string{{"lbl_clean"}}) {
+			t.Errorf("series volume with clean label must be hidden")
+		}
+		if policy.EvaluateAsset(nil, nil, [][]string{{"lbl_x"}}) {
+			t.Errorf("asset with lbl_x must be hidden")
+		}
+		if policy.EvaluateAsset(nil, nil, [][]string{{"lbl_clean"}}) {
+			t.Errorf("asset with clean label must be hidden")
+		}
+	})
+}
+
+func TestNilPrincipalFailsClosed(t *testing.T) {
+	policy := domain.NewEffectiveLabelPolicyForPrincipal(nil, nil, nil)
+
+	if !policy.RequiresAllowLabels() {
+		t.Errorf("nil principal policy must have RequiresAllowLabels=true")
+	}
+
+	if policy.EvaluateSeries(nil) {
+		t.Errorf("nil principal: EvaluateSeries(nil) must be false")
+	}
+	if policy.EvaluateSeries([]string{"lbl_any"}) {
+		t.Errorf("nil principal: EvaluateSeries with labels must be false")
+	}
+
+	if policy.EvaluateVolume(nil, nil) {
+		t.Errorf("nil principal: EvaluateVolume(nil, nil) must be false")
+	}
+	if policy.EvaluateVolume([]string{"lbl_any"}, nil) {
+		t.Errorf("nil principal: EvaluateVolume with volume labels must be false")
+	}
+	if policy.EvaluateVolume(nil, [][]string{{"lbl_any"}}) {
+		t.Errorf("nil principal: EvaluateVolume with series labels must be false")
+	}
+
+	if policy.EvaluateAsset(nil, nil, nil) {
+		t.Errorf("nil principal: EvaluateAsset(nil, nil, nil) must be false")
+	}
+	if policy.EvaluateAsset([]string{"lbl_any"}, nil, nil) {
+		t.Errorf("nil principal: EvaluateAsset with asset labels must be false")
+	}
+	if policy.EvaluateAsset(nil, []string{"lbl_any"}, [][]string{{"lbl_any"}}) {
+		t.Errorf("nil principal: EvaluateAsset with series/volume labels must be false")
+	}
 }
 
 func TestPolicyValidation(t *testing.T) {
