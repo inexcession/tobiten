@@ -1,7 +1,10 @@
 package domain_test
 
 import (
+	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -302,6 +305,7 @@ func TestScopeCapArithmetic(t *testing.T) {
 func TestPrincipalConstructionAndPermissionChecks(t *testing.T) {
 	adminRole, _ := domain.BuiltInRoleByName(domain.RoleAdminName)
 	readerRole, _ := domain.BuiltInRoleByName(domain.RoleReaderName)
+	restrictedRole, _ := domain.BuiltInRoleByName(domain.RoleRestrictedReaderName)
 
 	user := domain.User{
 		ID:        "019318a0-0000-7000-8000-000000000010",
@@ -324,6 +328,29 @@ func TestPrincipalConstructionAndPermissionChecks(t *testing.T) {
 		}
 		if !p.HasAllPermissions(domain.PermissionLibraryRead, domain.PermissionTrashPurge) {
 			t.Errorf("expected principal to have all admin permissions")
+		}
+		if p.RequiresAllowLabels() {
+			t.Errorf("admin principal should not require allow labels")
+		}
+	})
+
+	t.Run("OIDC_LINK principal is unscoped like password", func(t *testing.T) {
+		p := domain.NewPrincipal(user, []domain.Role{adminRole}, domain.CredentialKindOIDCLink, "cred_oidc", nil)
+
+		if !p.HasPermission(domain.PermissionLibraryRead) {
+			t.Errorf("expected OIDC principal to have library:read")
+		}
+		if !p.HasPermission(domain.PermissionJobsReadAll) {
+			t.Errorf("expected OIDC principal to have jobs:read_all")
+		}
+	})
+
+	t.Run("unknown credential kind goes through scope-cap arithmetic and gets no permissions with no scopes", func(t *testing.T) {
+		unknownKind := domain.CredentialKind("UNKNOWN_FUTURE_KIND")
+		p := domain.NewPrincipal(user, []domain.Role{adminRole}, unknownKind, "cred_unk", nil)
+
+		if len(p.Permissions) != 0 {
+			t.Errorf("unknown credential kind with no scopes must receive 0 permissions, got %v", p.Permissions)
 		}
 	})
 
@@ -373,6 +400,23 @@ func TestPrincipalConstructionAndPermissionChecks(t *testing.T) {
 		}
 		if p.HasPermission(domain.PermissionJobsReadAll) {
 			t.Errorf("reader must NOT have jobs:read_all")
+		}
+		if p.RequiresAllowLabels() {
+			t.Errorf("reader principal should not require allow labels")
+		}
+	})
+
+	t.Run("restricted reader principal requires allow labels", func(t *testing.T) {
+		p := domain.NewPrincipal(
+			user,
+			[]domain.Role{restrictedRole},
+			domain.CredentialKindPassword,
+			"cred_restr",
+			nil,
+		)
+
+		if !p.RequiresAllowLabels() {
+			t.Errorf("restricted reader principal must require allow labels (decision I-5)")
 		}
 	})
 }
@@ -434,6 +478,32 @@ func TestCredentialRevocationAndExpiry(t *testing.T) {
 	})
 }
 
+func TestCredentialJSONExcludesSensitiveFields(t *testing.T) {
+	hash := "$argon2id$v=19$m=65536,t=3,p=4$secret"
+	scheme := "argon2id"
+	cred := domain.Credential{
+		ID:         "cred_sec",
+		UserID:     "user_sec",
+		Kind:       domain.CredentialKindPassword,
+		SecretHash: &hash,
+		HashScheme: &scheme,
+		CreatedAt:  time.Now(),
+	}
+
+	bytes, err := json.Marshal(cred)
+	if err != nil {
+		t.Fatalf("failed to marshal credential: %v", err)
+	}
+
+	jsonStr := string(bytes)
+	if strings.Contains(jsonStr, "secret_hash") || strings.Contains(jsonStr, "SecretHash") || strings.Contains(jsonStr, hash) {
+		t.Errorf("secret_hash must be excluded from JSON, got: %s", jsonStr)
+	}
+	if strings.Contains(jsonStr, "hash_scheme") || strings.Contains(jsonStr, "HashScheme") || strings.Contains(jsonStr, scheme) {
+		t.Errorf("hash_scheme must be excluded from JSON, got: %s", jsonStr)
+	}
+}
+
 func TestBuiltInRolesExactMatching(t *testing.T) {
 	roles := domain.BuiltInRoles()
 	if len(roles) != 4 {
@@ -444,6 +514,9 @@ func TestBuiltInRolesExactMatching(t *testing.T) {
 	if !ok || admin.Name != domain.RoleAdminName {
 		t.Fatalf("failed to find built-in Admin role by ID %s", domain.RoleAdminID)
 	}
+	if admin.RequiresAllowLabels {
+		t.Errorf("Admin role must have RequiresAllowLabels=false")
+	}
 	if !slices.Contains(admin.Permissions, domain.PermissionJobsReadAll) ||
 		!slices.Contains(admin.Permissions, domain.PermissionTrashPurge) {
 		t.Errorf("Admin role missing administrator-only permissions (decision I-3)")
@@ -453,14 +526,88 @@ func TestBuiltInRolesExactMatching(t *testing.T) {
 	if !ok || curator.Name != domain.RoleCuratorName {
 		t.Fatalf("failed to find built-in Curator role by ID %s", domain.RoleCuratorID)
 	}
+	if curator.RequiresAllowLabels {
+		t.Errorf("Curator role must have RequiresAllowLabels=false")
+	}
 
 	reader, ok := domain.BuiltInRoleByID(domain.RoleReaderID)
 	if !ok || reader.Name != domain.RoleReaderName {
 		t.Fatalf("failed to find built-in Reader role by ID %s", domain.RoleReaderID)
+	}
+	if reader.RequiresAllowLabels {
+		t.Errorf("Reader role must have RequiresAllowLabels=false")
 	}
 
 	restricted, ok := domain.BuiltInRoleByID(domain.RoleRestrictedReaderID)
 	if !ok || restricted.Name != domain.RoleRestrictedReaderName {
 		t.Fatalf("failed to find built-in Restricted reader role by ID %s", domain.RoleRestrictedReaderID)
 	}
+	if !restricted.RequiresAllowLabels {
+		t.Errorf("Restricted reader role must have RequiresAllowLabels=true (decision I-5)")
+	}
+}
+
+func TestValidationFunctions(t *testing.T) {
+	t.Run("User.Validate", func(t *testing.T) {
+		u := domain.User{}
+		if !errors.Is(u.Validate(), domain.ErrEmptyUserID) {
+			t.Errorf("expected ErrEmptyUserID, got %v", u.Validate())
+		}
+		u.ID = "u1"
+		if !errors.Is(u.Validate(), domain.ErrEmptyUsername) {
+			t.Errorf("expected ErrEmptyUsername, got %v", u.Validate())
+		}
+		u.Username = "alice"
+		if err := u.Validate(); err != nil {
+			t.Errorf("expected valid user, got %v", err)
+		}
+	})
+
+	t.Run("Credential.Validate", func(t *testing.T) {
+		c := domain.Credential{}
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected error on empty credential")
+		}
+		c.ID = "c1"
+		if !errors.Is(c.Validate(), domain.ErrEmptyUserID) {
+			t.Errorf("expected ErrEmptyUserID, got %v", c.Validate())
+		}
+		c.UserID = "u1"
+		c.Kind = "INVALID"
+		if !errors.Is(c.Validate(), domain.ErrInvalidCredentialKind) {
+			t.Errorf("expected ErrInvalidCredentialKind, got %v", c.Validate())
+		}
+		c.Kind = domain.CredentialKindPAT
+		if !errors.Is(c.Validate(), domain.ErrEmptyScopesForPAT) {
+			t.Errorf("expected ErrEmptyScopesForPAT, got %v", c.Validate())
+		}
+		c.Scopes = []domain.PATScope{"unknown_scope"}
+		if !errors.Is(c.Validate(), domain.ErrInvalidPATScope) {
+			t.Errorf("expected ErrInvalidPATScope, got %v", c.Validate())
+		}
+		c.Scopes = []domain.PATScope{domain.ScopeRead}
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected valid credential, got %v", err)
+		}
+	})
+
+	t.Run("Role.Validate", func(t *testing.T) {
+		r := domain.Role{}
+		if err := r.Validate(); err == nil {
+			t.Errorf("expected error on empty role")
+		}
+		r.ID = "r1"
+		if err := r.Validate(); err == nil {
+			t.Errorf("expected error on empty role name")
+		}
+		r.Name = "Custom"
+		r.Permissions = []domain.Permission{"invalid:perm"}
+		if !errors.Is(r.Validate(), domain.ErrInvalidPermission) {
+			t.Errorf("expected ErrInvalidPermission, got %v", r.Validate())
+		}
+		r.Permissions = []domain.Permission{domain.PermissionLibraryRead}
+		if err := r.Validate(); err != nil {
+			t.Errorf("expected valid role, got %v", err)
+		}
+	})
 }

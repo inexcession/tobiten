@@ -176,7 +176,7 @@ func TestEffectiveLabelPolicyMerging(t *testing.T) {
 			{GroupClaim: "kids", LabelID: "lbl_group_only", Effect: domain.PolicyEffectRestrict},
 		}
 
-		policy := domain.NewEffectiveLabelPolicy(userPolicies, groupPolicies)
+		policy := domain.NewEffectiveLabelPolicy(userPolicies, groupPolicies, false)
 
 		// lbl_shared_1 had user ALLOW and group RESTRICT -> RESTRICT wins
 		if !policy.IsLabelRestricted("lbl_shared_1") {
@@ -205,7 +205,7 @@ func TestEffectiveLabelPolicyMerging(t *testing.T) {
 			{GroupClaim: "general", LabelID: "lbl_shared_2", Effect: domain.PolicyEffectAllow},
 		}
 
-		policy := domain.NewEffectiveLabelPolicy(userPolicies, groupPolicies)
+		policy := domain.NewEffectiveLabelPolicy(userPolicies, groupPolicies, false)
 		if !policy.IsLabelRestricted("lbl_shared_2") {
 			t.Errorf("expected lbl_shared_2 to be restricted")
 		}
@@ -217,7 +217,7 @@ func TestEffectiveLabelPolicyMerging(t *testing.T) {
 
 func TestEffectiveLabelPolicyEvaluationRules(t *testing.T) {
 	t.Run("no policies configured: all content is allowed", func(t *testing.T) {
-		policy := domain.NewEffectiveLabelPolicy(nil, nil)
+		policy := domain.NewEffectiveLabelPolicy(nil, nil, false)
 
 		if !policy.EvaluateLabels(nil) {
 			t.Errorf("content with no labels should be allowed")
@@ -228,12 +228,11 @@ func TestEffectiveLabelPolicyEvaluationRules(t *testing.T) {
 	})
 
 	t.Run("blacklist mode (only RESTRICT policies)", func(t *testing.T) {
-		// User has restriction on "lbl_nsfw" and "lbl_trash"
 		userPolicies := []domain.UserLabelPolicy{
 			{UserID: "u1", LabelID: "lbl_nsfw", Effect: domain.PolicyEffectRestrict},
 			{UserID: "u1", LabelID: "lbl_trash", Effect: domain.PolicyEffectRestrict},
 		}
-		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil)
+		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil, false)
 
 		if policy.HasAllowLabels() {
 			t.Errorf("expected HasAllowLabels=false")
@@ -258,12 +257,11 @@ func TestEffectiveLabelPolicyEvaluationRules(t *testing.T) {
 	})
 
 	t.Run("whitelist mode (only ALLOW policies)", func(t *testing.T) {
-		// User has allow on "lbl_kids" and "lbl_shonen"
 		userPolicies := []domain.UserLabelPolicy{
 			{UserID: "u1", LabelID: "lbl_kids", Effect: domain.PolicyEffectAllow},
 			{UserID: "u1", LabelID: "lbl_shonen", Effect: domain.PolicyEffectAllow},
 		}
-		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil)
+		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil, false)
 
 		if !policy.HasAllowLabels() {
 			t.Errorf("expected HasAllowLabels=true")
@@ -288,14 +286,12 @@ func TestEffectiveLabelPolicyEvaluationRules(t *testing.T) {
 	})
 
 	t.Run("combined whitelist and blacklist mode (ALLOW and RESTRICT)", func(t *testing.T) {
-		// Allowed: "lbl_general", "lbl_teen"
-		// Restricted: "lbl_explicit"
 		userPolicies := []domain.UserLabelPolicy{
 			{UserID: "u1", LabelID: "lbl_general", Effect: domain.PolicyEffectAllow},
 			{UserID: "u1", LabelID: "lbl_teen", Effect: domain.PolicyEffectAllow},
 			{UserID: "u1", LabelID: "lbl_explicit", Effect: domain.PolicyEffectRestrict},
 		}
-		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil)
+		policy := domain.NewEffectiveLabelPolicy(userPolicies, nil, false)
 
 		// Unlabeled: denied (because ALLOW exists)
 		if policy.EvaluateLabels(nil) {
@@ -320,88 +316,224 @@ func TestEffectiveLabelPolicyEvaluationRules(t *testing.T) {
 	})
 }
 
-func TestHierarchicalItemEvaluation(t *testing.T) {
-	// Setup policy:
-	// Allow: "lbl_allowed_series", "lbl_allowed_volume"
-	// Restrict: "lbl_restricted"
+func TestTopDownAllowEvaluation(t *testing.T) {
+	// Setup policy with ALLOW on "lbl_allowed_series", "lbl_allowed_vol", "lbl_allowed_asset"
+	// and RESTRICT on "lbl_restricted"
 	userPolicies := []domain.UserLabelPolicy{
 		{UserID: "u1", LabelID: "lbl_allowed_series", Effect: domain.PolicyEffectAllow},
-		{UserID: "u1", LabelID: "lbl_allowed_volume", Effect: domain.PolicyEffectAllow},
+		{UserID: "u1", LabelID: "lbl_allowed_vol", Effect: domain.PolicyEffectAllow},
+		{UserID: "u1", LabelID: "lbl_allowed_asset", Effect: domain.PolicyEffectAllow},
 		{UserID: "u1", LabelID: "lbl_restricted", Effect: domain.PolicyEffectRestrict},
 	}
-	policy := domain.NewEffectiveLabelPolicy(userPolicies, nil)
+	policy := domain.NewEffectiveLabelPolicy(userPolicies, nil, false)
 
-	t.Run("series evaluation", func(t *testing.T) {
-		if !policy.EvaluateSeries([]string{"lbl_allowed_series"}) {
-			t.Errorf("series with allowed label should be permitted")
-		}
-		if policy.EvaluateSeries([]string{"lbl_restricted"}) {
-			t.Errorf("series with restricted label must be denied")
-		}
-		if policy.EvaluateSeries([]string{"lbl_allowed_series", "lbl_restricted"}) {
-			t.Errorf("series with both allowed and restricted label must be denied")
+	t.Run("allowed volume in a non-allowed series is hidden (I-4)", func(t *testing.T) {
+		// Volume carries lbl_allowed_vol, but belongs to a series with lbl_other_series.
+		// The volume's own ALLOW labels do not count when it belongs to a series.
+		nonAllowedSeries := [][]string{{"lbl_other_series"}}
+		if policy.EvaluateVolume([]string{"lbl_allowed_vol"}, nonAllowedSeries) {
+			t.Errorf("allowed volume in a non-allowed series must be hidden (I-4)")
 		}
 	})
 
-	t.Run("volume evaluation with series memberships", func(t *testing.T) {
-		// Standalone volume with allowed label: permitted
-		if !policy.EvaluateVolume([]string{"lbl_allowed_volume"}, nil) {
-			t.Errorf("standalone volume with allowed label should be permitted")
+	t.Run("allowed asset in a non-allowed volume is hidden (I-4)", func(t *testing.T) {
+		// Asset carries lbl_allowed_asset, but its parent volume belongs to a non-allowed series.
+		// Since the volume is hidden, the asset must also be hidden (asset labels only restrict, never grant).
+		nonAllowedSeries := [][]string{{"lbl_other_series"}}
+		if policy.EvaluateAsset([]string{"lbl_allowed_asset"}, []string{"lbl_allowed_vol"}, nonAllowedSeries) {
+			t.Errorf("allowed asset in a non-allowed volume must be hidden (I-4)")
+		}
+	})
+
+	t.Run("standalone volume with an allowed label is visible (I-4)", func(t *testing.T) {
+		// Standalone volume has no series memberships (nil/empty seriesLabelsList)
+		// It uses its own labels.
+		if !policy.EvaluateVolume([]string{"lbl_allowed_vol"}, nil) {
+			t.Errorf("standalone volume with an allowed label must be visible (I-4)")
+		}
+		if !policy.EvaluateVolume([]string{"lbl_allowed_vol"}, [][]string{}) {
+			t.Errorf("standalone volume with an allowed label must be visible (I-4)")
+		}
+		// Standalone volume without an allowed label is hidden
+		if policy.EvaluateVolume([]string{"lbl_other_vol"}, nil) {
+			t.Errorf("standalone volume without an allowed label must be hidden")
+		}
+	})
+
+	t.Run("volume with series membership where series has allowed label is visible", func(t *testing.T) {
+		// Volume itself has no labels (or unrelated label), but series has lbl_allowed_series
+		allowedSeries := [][]string{{"lbl_allowed_series"}}
+		if !policy.EvaluateVolume(nil, allowedSeries) {
+			t.Errorf("volume belonging to an allowed series must be visible")
+		}
+		if !policy.EvaluateVolume([]string{"lbl_other"}, allowedSeries) {
+			t.Errorf("volume belonging to an allowed series must be visible regardless of volume labels")
+		}
+	})
+
+	t.Run("RESTRICT on the volume or any series still hides it", func(t *testing.T) {
+		allowedSeries := [][]string{{"lbl_allowed_series"}}
+
+		// Volume itself has RESTRICT label
+		if policy.EvaluateVolume([]string{"lbl_restricted"}, allowedSeries) {
+			t.Errorf("volume with restricted label must be hidden even if series is allowed")
 		}
 
-		// Volume with no labels whose series has allowed label: permitted via inheritance
-		seriesMemberships := [][]string{
-			{"lbl_allowed_series"},
-		}
-		if !policy.EvaluateVolume(nil, seriesMemberships) {
-			t.Errorf("volume should inherit allowed status from its series")
-		}
-
-		// Volume in multiple series where one series is restricted:
-		// Alternate membership path CANNOT bypass a restriction (ADR-0006 §5)
-		multiSeriesWithOneRestricted := [][]string{
+		// A parent series has RESTRICT label
+		restrictedSeries := [][]string{
 			{"lbl_allowed_series"},
 			{"lbl_restricted"},
 		}
-		if policy.EvaluateVolume(nil, multiSeriesWithOneRestricted) {
-			t.Errorf("volume must be restricted if ANY parent series is restricted (alternate membership cannot bypass)")
+		if policy.EvaluateVolume(nil, restrictedSeries) {
+			t.Errorf("volume must be hidden if any parent series has a restricted label")
 		}
 
-		// Volume itself is restricted, even if parent series is allowed: denied
-		if policy.EvaluateVolume([]string{"lbl_restricted"}, seriesMemberships) {
-			t.Errorf("volume with restricted label must be denied regardless of parent series")
+		// Asset has RESTRICT label
+		if policy.EvaluateAsset([]string{"lbl_restricted"}, nil, allowedSeries) {
+			t.Errorf("asset with restricted label must be hidden even if volume is allowed")
+		}
+	})
+}
+
+func TestFailClosedRestrictedReader(t *testing.T) {
+	restrictedRole, ok := domain.BuiltInRoleByName(domain.RoleRestrictedReaderName)
+	if !ok {
+		t.Fatalf("Restricted reader role not found")
+	}
+	if !restrictedRole.RequiresAllowLabels {
+		t.Fatalf("Restricted reader must have RequiresAllowLabels=true")
+	}
+
+	readerRole, ok := domain.BuiltInRoleByName(domain.RoleReaderName)
+	if !ok {
+		t.Fatalf("Reader role not found")
+	}
+
+	user := domain.User{ID: "child_1", Username: "timmy"}
+	childPrincipal := domain.NewPrincipal(user, []domain.Role{restrictedRole}, domain.CredentialKindPassword, "cred_child", nil)
+	regularPrincipal := domain.NewPrincipal(user, []domain.Role{readerRole}, domain.CredentialKindPassword, "cred_reg", nil)
+
+	t.Run("Restricted reader with zero policy rows sees nothing (I-5)", func(t *testing.T) {
+		policy := domain.NewEffectiveLabelPolicyForPrincipal(childPrincipal, nil, nil)
+
+		if !policy.RequiresAllowLabels() {
+			t.Errorf("expected policy to have RequiresAllowLabels=true")
 		}
 
-		// Volume with no allowed labels and series with no allowed labels: denied
-		unrelatedSeries := [][]string{{"lbl_unrelated"}}
-		if policy.EvaluateVolume([]string{"lbl_unrelated_vol"}, unrelatedSeries) {
-			t.Errorf("volume with unlisted labels must be denied in whitelist mode")
+		// Everything denied
+		if policy.EvaluateLabels(nil) {
+			t.Errorf("unlabeled content must be hidden for restricted reader with 0 policy rows")
+		}
+		if policy.EvaluateLabels([]string{"lbl_any"}) {
+			t.Errorf("labeled content must be hidden for restricted reader with 0 policy rows")
+		}
+		if policy.EvaluateSeries([]string{"lbl_any"}) {
+			t.Errorf("series must be hidden for restricted reader with 0 policy rows")
+		}
+		if policy.EvaluateVolume([]string{"lbl_any"}, nil) {
+			t.Errorf("standalone volume must be hidden for restricted reader with 0 policy rows")
+		}
+		if policy.EvaluateVolume(nil, [][]string{{"lbl_any"}}) {
+			t.Errorf("volume with series must be hidden for restricted reader with 0 policy rows")
+		}
+		if policy.EvaluateAsset(nil, nil, [][]string{{"lbl_any"}}) {
+			t.Errorf("asset must be hidden for restricted reader with 0 policy rows")
 		}
 	})
 
-	t.Run("asset evaluation", func(t *testing.T) {
-		seriesMemberships := [][]string{{"lbl_allowed_series"}}
+	t.Run("regular Reader with zero policy rows sees all non-restricted content", func(t *testing.T) {
+		policy := domain.NewEffectiveLabelPolicyForPrincipal(regularPrincipal, nil, nil)
 
-		// Asset of permitted volume with no asset labels: permitted
-		if !policy.EvaluateAsset(nil, nil, seriesMemberships) {
-			t.Errorf("asset of permitted volume should be accessible")
+		if policy.RequiresAllowLabels() {
+			t.Errorf("regular reader policy must have RequiresAllowLabels=false")
 		}
-
-		// Asset of restricted volume: denied
-		deniedSeries := [][]string{{"lbl_restricted"}}
-		if policy.EvaluateAsset(nil, nil, deniedSeries) {
-			t.Errorf("asset of restricted volume must be inaccessible")
+		if !policy.EvaluateLabels(nil) {
+			t.Errorf("regular reader with 0 policy rows should see unlabeled content")
 		}
-
-		// Asset with its own RESTRICT label (e.g. marked_for_deletion or variant restriction):
-		// denied, while the volume remains permitted for another variant (ADR-0006 §5)
-		if policy.EvaluateAsset([]string{"lbl_restricted"}, nil, seriesMemberships) {
-			t.Errorf("asset with restricted label must be inaccessible")
+		if !policy.EvaluateSeries([]string{"lbl_clean"}) {
+			t.Errorf("regular reader with 0 policy rows should see clean series")
 		}
+	})
 
-		// The volume itself is still accessible for a clean variant
-		if !policy.EvaluateAsset([]string{"lbl_clean_variant"}, nil, seriesMemberships) {
-			t.Errorf("clean variant of permitted volume should be accessible")
+	t.Run("Restricted reader with one ALLOW row sees only that (I-5)", func(t *testing.T) {
+		userPolicies := []domain.UserLabelPolicy{
+			{UserID: "child_1", LabelID: "lbl_kids", Effect: domain.PolicyEffectAllow},
+		}
+		policy := domain.NewEffectiveLabelPolicyForPrincipal(childPrincipal, userPolicies, nil)
+
+		// Series with allowed label: visible
+		if !policy.EvaluateSeries([]string{"lbl_kids"}) {
+			t.Errorf("series with lbl_kids should be visible")
+		}
+		// Series without allowed label: hidden
+		if policy.EvaluateSeries([]string{"lbl_other"}) {
+			t.Errorf("series with lbl_other should be hidden")
+		}
+		// Volume in allowed series: visible
+		if !policy.EvaluateVolume(nil, [][]string{{"lbl_kids"}}) {
+			t.Errorf("volume in lbl_kids series should be visible")
+		}
+		// Volume in non-allowed series: hidden
+		if policy.EvaluateVolume(nil, [][]string{{"lbl_other"}}) {
+			t.Errorf("volume in non-allowed series should be hidden")
+		}
+		// Standalone volume with allowed label: visible
+		if !policy.EvaluateVolume([]string{"lbl_kids"}, nil) {
+			t.Errorf("standalone volume with lbl_kids should be visible")
+		}
+		// Standalone volume without allowed label: hidden
+		if policy.EvaluateVolume([]string{"lbl_other"}, nil) {
+			t.Errorf("standalone volume without lbl_kids should be hidden")
+		}
+		// Asset in allowed series: visible
+		if !policy.EvaluateAsset(nil, nil, [][]string{{"lbl_kids"}}) {
+			t.Errorf("asset in allowed series should be visible")
+		}
+		// Asset in non-allowed series: hidden
+		if policy.EvaluateAsset(nil, nil, [][]string{{"lbl_other"}}) {
+			t.Errorf("asset in non-allowed series should be hidden")
+		}
+	})
+}
+
+func TestPolicyValidation(t *testing.T) {
+	t.Run("UserLabelPolicy.Validate", func(t *testing.T) {
+		p := domain.UserLabelPolicy{}
+		if err := p.Validate(); !errors.Is(err, domain.ErrEmptyUserID) {
+			t.Errorf("expected ErrEmptyUserID, got %v", err)
+		}
+		p.UserID = "u1"
+		if err := p.Validate(); err == nil {
+			t.Errorf("expected error on empty label ID")
+		}
+		p.LabelID = "lbl1"
+		p.Effect = "UNKNOWN"
+		if err := p.Validate(); !errors.Is(err, domain.ErrInvalidPolicyEffect) {
+			t.Errorf("expected ErrInvalidPolicyEffect, got %v", err)
+		}
+		p.Effect = domain.PolicyEffectAllow
+		if err := p.Validate(); err != nil {
+			t.Errorf("expected valid policy, got %v", err)
+		}
+	})
+
+	t.Run("GroupLabelPolicy.Validate", func(t *testing.T) {
+		p := domain.GroupLabelPolicy{}
+		if err := p.Validate(); err == nil {
+			t.Errorf("expected error on empty group claim")
+		}
+		p.GroupClaim = "group1"
+		if err := p.Validate(); err == nil {
+			t.Errorf("expected error on empty label ID")
+		}
+		p.LabelID = "lbl1"
+		p.Effect = "INVALID"
+		if err := p.Validate(); !errors.Is(err, domain.ErrInvalidPolicyEffect) {
+			t.Errorf("expected ErrInvalidPolicyEffect, got %v", err)
+		}
+		p.Effect = domain.PolicyEffectRestrict
+		if err := p.Validate(); err != nil {
+			t.Errorf("expected valid policy, got %v", err)
 		}
 	})
 }

@@ -62,14 +62,15 @@ CREATE UNIQUE INDEX idx_credentials_password ON credentials (user_id) WHERE kind
 -- 2b. Roles = named permission sets (ADR-0006). Built-ins: Admin, Curator, Reader, Restricted reader
 --     (labels required); admins may add custom roles. (Core enforcement M1A; management UI/OIDC mapping M5)
 CREATE TABLE roles (
-    id       TEXT PRIMARY KEY,
-    name     TEXT UNIQUE NOT NULL,
-    built_in BOOLEAN NOT NULL DEFAULT FALSE
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT UNIQUE NOT NULL,
+    built_in              BOOLEAN NOT NULL DEFAULT FALSE,
+    requires_allow_labels BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE role_permissions (
     role_id    TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-    permission TEXT NOT NULL,                        -- 'library:read', 'progress:write', 'metadata:edit', 'collections:manage', 'library:admin', 'users:admin'
+    permission TEXT NOT NULL,                        -- 'library:read', 'progress:write', 'metadata:edit', 'collections:manage', 'library:admin', 'users:admin', 'jobs:read_all', 'trash:purge'
     PRIMARY KEY (role_id, permission)
 );
 
@@ -217,11 +218,11 @@ CREATE UNIQUE INDEX idx_jobs_active_dedupe ON jobs (dedupe_key) WHERE dedupe_key
 
 -- Built-in role seed rows (ADR-0006 §4). Roles are named permission sets.
 -- Standard built-in roles: Admin (all permissions), Curator, Reader, Restricted reader.
-INSERT INTO roles (id, name, built_in) VALUES
-    ('019318a0-0000-7000-8000-000000000001', 'Admin', TRUE),
-    ('019318a0-0000-7000-8000-000000000002', 'Curator', TRUE),
-    ('019318a0-0000-7000-8000-000000000003', 'Reader', TRUE),
-    ('019318a0-0000-7000-8000-000000000004', 'Restricted reader', TRUE);
+INSERT INTO roles (id, name, built_in, requires_allow_labels) VALUES
+    ('019318a0-0000-7000-8000-000000000001', 'Admin', TRUE, FALSE),
+    ('019318a0-0000-7000-8000-000000000002', 'Curator', TRUE, FALSE),
+    ('019318a0-0000-7000-8000-000000000003', 'Reader', TRUE, FALSE),
+    ('019318a0-0000-7000-8000-000000000004', 'Restricted reader', TRUE, TRUE);
 
 -- Admin: all permissions (including jobs:read_all and trash:purge per ADR-0006 §4)
 INSERT INTO role_permissions (role_id, permission) VALUES

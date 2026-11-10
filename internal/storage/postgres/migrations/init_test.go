@@ -75,15 +75,17 @@ func TestMigration0001_Applies(t *testing.T) {
 
 	// Verify built-in role seed rows and their permissions
 	type roleExpected struct {
-		name        string
-		builtIn     bool
-		permissions []string
+		name                string
+		builtIn             bool
+		requiresAllowLabels bool
+		permissions         []string
 	}
 
 	expectedRoles := map[string]roleExpected{
 		"019318a0-0000-7000-8000-000000000001": {
-			name:    "Admin",
-			builtIn: true,
+			name:                "Admin",
+			builtIn:             true,
+			requiresAllowLabels: false,
 			permissions: []string{
 				"collections:manage",
 				"jobs:read_all",
@@ -96,8 +98,9 @@ func TestMigration0001_Applies(t *testing.T) {
 			},
 		},
 		"019318a0-0000-7000-8000-000000000002": {
-			name:    "Curator",
-			builtIn: true,
+			name:                "Curator",
+			builtIn:             true,
+			requiresAllowLabels: false,
 			permissions: []string{
 				"collections:manage",
 				"library:read",
@@ -106,16 +109,18 @@ func TestMigration0001_Applies(t *testing.T) {
 			},
 		},
 		"019318a0-0000-7000-8000-000000000003": {
-			name:    "Reader",
-			builtIn: true,
+			name:                "Reader",
+			builtIn:             true,
+			requiresAllowLabels: false,
 			permissions: []string{
 				"library:read",
 				"progress:write",
 			},
 		},
 		"019318a0-0000-7000-8000-000000000004": {
-			name:    "Restricted reader",
-			builtIn: true,
+			name:                "Restricted reader",
+			builtIn:             true,
+			requiresAllowLabels: true,
 			permissions: []string{
 				"library:read",
 				"progress:write",
@@ -126,14 +131,15 @@ func TestMigration0001_Applies(t *testing.T) {
 	for id, expected := range expectedRoles {
 		var name string
 		var builtIn bool
-		err := db.QueryRow(ctx, "SELECT name, built_in FROM roles WHERE id = $1", id).Scan(&name, &builtIn)
+		var requiresAllowLabels bool
+		err := db.QueryRow(ctx, "SELECT name, built_in, requires_allow_labels FROM roles WHERE id = $1", id).Scan(&name, &builtIn, &requiresAllowLabels)
 		if err != nil {
 			t.Errorf("querying role %s: %v", id, err)
 			continue
 		}
-		if name != expected.name || builtIn != expected.builtIn {
-			t.Errorf("role %s: got name=%q, built_in=%v; want name=%q, built_in=%v",
-				id, name, builtIn, expected.name, expected.builtIn)
+		if name != expected.name || builtIn != expected.builtIn || requiresAllowLabels != expected.requiresAllowLabels {
+			t.Errorf("role %s: got name=%q, built_in=%v, requires_allow_labels=%v; want name=%q, built_in=%v, requires_allow_labels=%v",
+				id, name, builtIn, requiresAllowLabels, expected.name, expected.builtIn, expected.requiresAllowLabels)
 		}
 
 		rows, err := db.Query(ctx, "SELECT permission FROM role_permissions WHERE role_id = $1 ORDER BY permission ASC", id)

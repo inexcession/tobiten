@@ -129,11 +129,39 @@ type UserLabelPolicy struct {
 	Effect  PolicyEffect `json:"effect"`
 }
 
+// Validate checks UserLabelPolicy invariants.
+func (p *UserLabelPolicy) Validate() error {
+	if p.UserID == "" {
+		return ErrEmptyUserID
+	}
+	if p.LabelID == "" {
+		return errors.New("label ID cannot be empty")
+	}
+	if p.Effect != PolicyEffectAllow && p.Effect != PolicyEffectRestrict {
+		return ErrInvalidPolicyEffect
+	}
+	return nil
+}
+
 // GroupLabelPolicy represents an OIDC group-claim label access policy row (ADR-0006 §5).
 type GroupLabelPolicy struct {
 	GroupClaim string       `json:"group_claim"`
 	LabelID    string       `json:"label_id"`
 	Effect     PolicyEffect `json:"effect"`
+}
+
+// Validate checks GroupLabelPolicy invariants.
+func (p *GroupLabelPolicy) Validate() error {
+	if p.GroupClaim == "" {
+		return errors.New("group claim cannot be empty")
+	}
+	if p.LabelID == "" {
+		return errors.New("label ID cannot be empty")
+	}
+	if p.Effect != PolicyEffectAllow && p.Effect != PolicyEffectRestrict {
+		return ErrInvalidPolicyEffect
+	}
+	return nil
 }
 
 // EffectiveLabelPolicy represents the merged, effective SERVER label policy for a subject
@@ -143,16 +171,22 @@ type GroupLabelPolicy struct {
 //   - Only SERVER-scope labels drive policy.
 //   - A subject holds one effect per label.
 //   - Precedence between a user's own rows and groups' rows resolves by "RESTRICT wins" (M0 S-13).
-//   - No ALLOW policy rows means all content is allowed, subject to RESTRICT rows.
+//   - No ALLOW policy rows means all content is allowed, subject to RESTRICT rows (unless requiresAllowLabels is true).
 //   - RESTRICT always wins over ALLOW.
+//   - If requiresAllowLabels is true (decision I-5), the policy fails closed (denies everything) when no ALLOW rows exist.
+//   - Top-down ALLOW (decision I-4): series must be allowed; volume with series is allowed only via series;
+//     standalone volume uses its own labels; asset labels only restrict, never grant.
 type EffectiveLabelPolicy struct {
-	allowLabels    map[string]struct{}
-	restrictLabels map[string]struct{}
+	allowLabels         map[string]struct{}
+	restrictLabels      map[string]struct{}
+	requiresAllowLabels bool
 }
 
 // NewEffectiveLabelPolicy builds an EffectiveLabelPolicy from user and/or group policies,
 // enforcing the "RESTRICT wins across subjects/groups" rule for conflicting policies on the same label ID.
-func NewEffectiveLabelPolicy(userPolicies []UserLabelPolicy, groupPolicies []GroupLabelPolicy) *EffectiveLabelPolicy {
+// If requiresAllowLabels is true (e.g. for a Restricted reader, decision I-5), label evaluation fails
+// closed (denies everything) when there are no ALLOW policy rows.
+func NewEffectiveLabelPolicy(userPolicies []UserLabelPolicy, groupPolicies []GroupLabelPolicy, requiresAllowLabels bool) *EffectiveLabelPolicy {
 	effects := make(map[string]PolicyEffect)
 
 	apply := func(labelID string, effect PolicyEffect) {
@@ -187,9 +221,20 @@ func NewEffectiveLabelPolicy(userPolicies []UserLabelPolicy, groupPolicies []Gro
 	}
 
 	return &EffectiveLabelPolicy{
-		allowLabels:    allowMap,
-		restrictLabels: restrictMap,
+		allowLabels:         allowMap,
+		restrictLabels:      restrictMap,
+		requiresAllowLabels: requiresAllowLabels,
 	}
+}
+
+// NewEffectiveLabelPolicyForPrincipal builds an EffectiveLabelPolicy for a principal,
+// automatically determining requiresAllowLabels from the principal's roles (decision I-5).
+func NewEffectiveLabelPolicyForPrincipal(principal *Principal, userPolicies []UserLabelPolicy, groupPolicies []GroupLabelPolicy) *EffectiveLabelPolicy {
+	requiresAllow := false
+	if principal != nil {
+		requiresAllow = principal.RequiresAllowLabels()
+	}
+	return NewEffectiveLabelPolicy(userPolicies, groupPolicies, requiresAllow)
 }
 
 // AllowCount returns the number of ALLOW policies in effect.
@@ -207,6 +252,11 @@ func (p *EffectiveLabelPolicy) HasAllowLabels() bool {
 	return len(p.allowLabels) > 0
 }
 
+// RequiresAllowLabels reports whether this policy requires allow labels to grant any access (decision I-5).
+func (p *EffectiveLabelPolicy) RequiresAllowLabels() bool {
+	return p.requiresAllowLabels
+}
+
 // IsLabelRestricted reports whether the given label ID has a RESTRICT policy.
 func (p *EffectiveLabelPolicy) IsLabelRestricted(labelID string) bool {
 	_, ok := p.restrictLabels[labelID]
@@ -220,12 +270,13 @@ func (p *EffectiveLabelPolicy) IsLabelAllowed(labelID string) bool {
 }
 
 // EvaluateLabels evaluates whether a set of applied SERVER label IDs is permitted
-// under this policy (ADR-0006 §5).
+// under this policy (ADR-0006 §5, decision I-5).
 //
 // Evaluation rules:
 //  1. RESTRICT always wins: if ANY label is in restrictLabels, access is DENIED (returns false).
-//  2. If there are NO allowLabels: all content is allowed (returns true).
-//  3. If there ARE allowLabels: at least one label must be in allowLabels (returns true if any match, false otherwise).
+//  2. Fail closed (decision I-5): if requiresAllowLabels is true and no ALLOW rows exist, access is DENIED (returns false).
+//  3. If there are NO allowLabels: all content is allowed (returns true).
+//  4. If there ARE allowLabels: at least one label must be in allowLabels (returns true if any match, false otherwise).
 func (p *EffectiveLabelPolicy) EvaluateLabels(labelIDs []string) bool {
 	// 1. Check restrictions: RESTRICT always wins
 	for _, id := range labelIDs {
@@ -234,12 +285,17 @@ func (p *EffectiveLabelPolicy) EvaluateLabels(labelIDs []string) bool {
 		}
 	}
 
-	// 2. If no ALLOW rows exist, all non-restricted content is allowed
+	// 2. Fail closed for label-required roles (decision I-5)
+	if p.requiresAllowLabels && len(p.allowLabels) == 0 {
+		return false
+	}
+
+	// 3. If no ALLOW rows exist, all non-restricted content is allowed
 	if len(p.allowLabels) == 0 {
 		return true
 	}
 
-	// 3. If ALLOW rows exist, at least one label must match ALLOW
+	// 4. If ALLOW rows exist, at least one label must match ALLOW
 	for _, id := range labelIDs {
 		if _, allowed := p.allowLabels[id]; allowed {
 			return true
@@ -257,21 +313,23 @@ func (p *EffectiveLabelPolicy) EvaluateSeries(seriesLabels []string) bool {
 // EvaluateVolume evaluates whether a volume with its own SERVER labels and
 // memberships in series (each having their own SERVER labels) is accessible.
 //
-// ADR-0006 §5 / ARCHITECTURE §7.1:
-//   - "A restricted series or volume hides that bibliographic item and every file variant."
-//   - "Series-label inheritance follows all memberships, so an alternate membership path cannot bypass a restriction."
-//
-// Therefore:
-//   - If ANY parent series is restricted, the volume is restricted (returns false).
-//   - If the volume itself is restricted, it is restricted (returns false).
-//   - If ALLOW policies exist: either the volume itself or at least one of its series must have an ALLOW label.
+// Top-down ALLOW semantics (ADR-0006 §5, decisions I-4, I-5):
+//   - RESTRICT on the volume or any parent series always hides it.
+//   - Fail closed (I-5): if requiresAllowLabels is true and no ALLOW rows exist, hidden.
+//   - If no ALLOW rows exist: visible.
+//   - When ALLOW rows exist (I-4):
+//   - A volume with series memberships is visible only if at least one of its series
+//     carries an allowed label itself; the volume's own ALLOW labels do not count.
+//   - A standalone volume (no memberships) uses its own ALLOW labels.
 func (p *EffectiveLabelPolicy) EvaluateVolume(volumeLabels []string, seriesLabelsList [][]string) bool {
-	// First check: does the volume itself or any series carry a RESTRICT label?
+	// 1. Check RESTRICT on volume itself
 	for _, id := range volumeLabels {
 		if _, restricted := p.restrictLabels[id]; restricted {
 			return false
 		}
 	}
+
+	// 2. Check RESTRICT on any series membership
 	for _, sLabels := range seriesLabelsList {
 		for _, id := range sLabels {
 			if _, restricted := p.restrictLabels[id]; restricted {
@@ -280,17 +338,29 @@ func (p *EffectiveLabelPolicy) EvaluateVolume(volumeLabels []string, seriesLabel
 		}
 	}
 
-	// If no ALLOW policies exist, it is accessible
+	// 3. Fail closed for label-required roles (decision I-5)
+	if p.requiresAllowLabels && len(p.allowLabels) == 0 {
+		return false
+	}
+
+	// 4. If no ALLOW policies exist, all non-restricted content is allowed
 	if len(p.allowLabels) == 0 {
 		return true
 	}
 
-	// If ALLOW policies exist, at least one label on the volume or on any parent series must be allowed
-	for _, id := range volumeLabels {
-		if _, allowed := p.allowLabels[id]; allowed {
-			return true
+	// 5. When ALLOW policies exist (top-down ALLOW, decision I-4):
+	// A standalone volume (no memberships) uses its own labels
+	if len(seriesLabelsList) == 0 {
+		for _, id := range volumeLabels {
+			if _, allowed := p.allowLabels[id]; allowed {
+				return true
+			}
 		}
+		return false
 	}
+
+	// A volume with series memberships is visible only if at least one of its series
+	// carries an allowed label itself; the volume's own ALLOW labels do not count.
 	for _, sLabels := range seriesLabelsList {
 		for _, id := range sLabels {
 			if _, allowed := p.allowLabels[id]; allowed {
@@ -302,17 +372,13 @@ func (p *EffectiveLabelPolicy) EvaluateVolume(volumeLabels []string, seriesLabel
 	return false
 }
 
-// EvaluateAsset evaluates whether an asset is accessible.
+// EvaluateAsset evaluates whether an asset is accessible (ADR-0006 §5, decisions I-4, I-5).
 //
-// ADR-0006 §5:
-//   - "A restricted series or volume hides that bibliographic item and every file variant."
-//   - "A restricted asset hides only that file variant; an adapter may select another permitted manifestation of the same volume."
-//
-// Therefore:
-//   - The parent volume must be accessible (EvaluateVolume).
-//   - The asset itself must not carry any RESTRICT label.
-//   - If ALLOW policies exist: since the volume is already permitted (satisfying the whitelist),
-//     the asset itself is permitted unless specifically restricted.
+// Rules:
+//   - Asset labels can only restrict, never grant (I-4).
+//   - An asset is visible only if its parent volume is visible (EvaluateVolume).
+//   - An asset with its own RESTRICT label is hidden.
+//   - An allowed asset in a non-allowed volume is hidden.
 func (p *EffectiveLabelPolicy) EvaluateAsset(assetLabels []string, volumeLabels []string, seriesLabelsList [][]string) bool {
 	if !p.EvaluateVolume(volumeLabels, seriesLabelsList) {
 		return false

@@ -24,6 +24,17 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Validate checks User invariants.
+func (u *User) Validate() error {
+	if u.ID == "" {
+		return ErrEmptyUserID
+	}
+	if u.Username == "" {
+		return ErrEmptyUsername
+	}
+	return nil
+}
+
 // CredentialKind represents the kind of credential stored in credentials table (ADR-0006 §3, ADR-0018 S1).
 type CredentialKind string
 
@@ -53,14 +64,36 @@ type Credential struct {
 	UserID          string         `json:"user_id"`
 	Kind            CredentialKind `json:"kind"`
 	Scopes          []PATScope     `json:"scopes"`
-	SecretHash      *string        `json:"secret_hash,omitempty"`
-	HashScheme      *string        `json:"hash_scheme,omitempty"`
+	SecretHash      *string        `json:"-"`
+	HashScheme      *string        `json:"-"`
 	ExternalSubject *string        `json:"external_subject,omitempty"`
 	Label           *string        `json:"label,omitempty"`
 	CreatedAt       time.Time      `json:"created_at"`
 	LastUsedAt      *time.Time     `json:"last_used_at,omitempty"`
 	ExpiresAt       *time.Time     `json:"expires_at,omitempty"`
 	RevokedAt       *time.Time     `json:"revoked_at,omitempty"`
+}
+
+// Validate checks Credential invariants matching database constraints.
+func (c *Credential) Validate() error {
+	if c.ID == "" {
+		return errors.New("credential ID cannot be empty")
+	}
+	if c.UserID == "" {
+		return ErrEmptyUserID
+	}
+	if !c.Kind.IsValid() {
+		return ErrInvalidCredentialKind
+	}
+	if c.Kind == CredentialKindPAT && len(c.Scopes) == 0 {
+		return ErrEmptyScopesForPAT
+	}
+	for _, scope := range c.Scopes {
+		if !scope.IsValid() {
+			return ErrInvalidPATScope
+		}
+	}
+	return nil
 }
 
 // IsRevoked reports whether the credential has been revoked.
@@ -182,10 +215,27 @@ func ScopesToPermissions(scopes []PATScope) []Permission {
 
 // Role represents a named permission set (ADR-0006 §4).
 type Role struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	BuiltIn     bool         `json:"built_in"`
-	Permissions []Permission `json:"permissions"`
+	ID                  string       `json:"id"`
+	Name                string       `json:"name"`
+	BuiltIn             bool         `json:"built_in"`
+	RequiresAllowLabels bool         `json:"requires_allow_labels"`
+	Permissions         []Permission `json:"permissions"`
+}
+
+// Validate checks Role invariants.
+func (r *Role) Validate() error {
+	if r.ID == "" {
+		return errors.New("role ID cannot be empty")
+	}
+	if r.Name == "" {
+		return errors.New("role name cannot be empty")
+	}
+	for _, p := range r.Permissions {
+		if !p.IsValid() {
+			return ErrInvalidPermission
+		}
+	}
+	return nil
 }
 
 // Built-in role identifiers and names (ADR-0006 §4; 0001_init.sql).
@@ -205,9 +255,10 @@ const (
 func BuiltInRoles() []Role {
 	return []Role{
 		{
-			ID:      RoleAdminID,
-			Name:    RoleAdminName,
-			BuiltIn: true,
+			ID:                  RoleAdminID,
+			Name:                RoleAdminName,
+			BuiltIn:             true,
+			RequiresAllowLabels: false,
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
@@ -220,9 +271,10 @@ func BuiltInRoles() []Role {
 			},
 		},
 		{
-			ID:      RoleCuratorID,
-			Name:    RoleCuratorName,
-			BuiltIn: true,
+			ID:                  RoleCuratorID,
+			Name:                RoleCuratorName,
+			BuiltIn:             true,
+			RequiresAllowLabels: false,
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
@@ -231,18 +283,20 @@ func BuiltInRoles() []Role {
 			},
 		},
 		{
-			ID:      RoleReaderID,
-			Name:    RoleReaderName,
-			BuiltIn: true,
+			ID:                  RoleReaderID,
+			Name:                RoleReaderName,
+			BuiltIn:             true,
+			RequiresAllowLabels: false,
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
 			},
 		},
 		{
-			ID:      RoleRestrictedReaderID,
-			Name:    RoleRestrictedReaderName,
-			BuiltIn: true,
+			ID:                  RoleRestrictedReaderID,
+			Name:                RoleRestrictedReaderName,
+			BuiltIn:             true,
+			RequiresAllowLabels: true,
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
@@ -319,13 +373,15 @@ type Principal struct {
 }
 
 // NewPrincipal constructs a Principal and computes effective permissions via scope-cap arithmetic.
+// Only PASSWORD and OIDC_LINK are unscoped; every other kind (PAT and any future kind) goes through
+// scope-cap arithmetic, so an unknown kind with no scopes gets no permissions.
 func NewPrincipal(user User, roles []Role, credKind CredentialKind, credID string, scopes []PATScope) *Principal {
 	var allRolePerms []Permission
 	for _, r := range roles {
 		allRolePerms = append(allRolePerms, r.Permissions...)
 	}
 
-	isScoped := (credKind == CredentialKindPAT)
+	isScoped := credKind != CredentialKindPassword && credKind != CredentialKindOIDCLink
 	effectivePerms := CalculateEffectivePermissions(allRolePerms, scopes, isScoped)
 
 	return &Principal{
@@ -336,6 +392,17 @@ func NewPrincipal(user User, roles []Role, credKind CredentialKind, credID strin
 		Scopes:         scopes,
 		Permissions:    effectivePerms,
 	}
+}
+
+// RequiresAllowLabels reports whether any of the principal's roles requires mandatory
+// allow labels (fail closed when no ALLOW rows exist; ADR-0006 §4–5, decision I-5).
+func (p *Principal) RequiresAllowLabels() bool {
+	for _, r := range p.Roles {
+		if r.RequiresAllowLabels {
+			return true
+		}
+	}
+	return false
 }
 
 // HasPermission reports whether the principal holds the specified permission.
