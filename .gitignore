@@ -1,0 +1,57 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+/tobiten
+/tobitend
+
+# Test binary, output, and coverage
+*.test
+*.out
+coverage.html
+coverage.txt
+profile.pprof
+
+# Go workspace & vendor
+go.work
+go.work.sum
+
+# Environment & local secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data & caches (database, uploads, thumbnails)
+data/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors & IDEs
+.idea/
+.vscode/
+*.swp
+*~
+*.bak
+
+# Syncthing
+.stfolder/
+.stversions/
+
+# Project internal untracked workspace (discussions, research, scratch, planning)
+# Kept local and uncommitted until official public releases.
+untracked/
