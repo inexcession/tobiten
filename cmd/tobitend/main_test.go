@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"os"
 	"testing"
 )
@@ -183,4 +185,121 @@ func TestRunStorageModeRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunLoggingWiring(t *testing.T) {
+	origLogger := slog.Default()
+	defer slog.SetDefault(origLogger)
+
+	t.Run("flags wire format and level", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+
+		exitCode := run([]string{"-log-format=table", "-log-level=debug"})
+
+		_ = w.Close()
+		os.Stdout = origStdout
+
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+
+		if exitCode != 0 {
+			t.Fatalf("run() exit code = %d, want 0", exitCode)
+		}
+
+		logger := slog.Default()
+		// Debug level should be enabled
+		if !logger.Enabled(context.Background(), slog.LevelDebug) {
+			t.Errorf("expected LevelDebug to be enabled with -log-level=debug")
+		}
+	})
+
+	t.Run("env vars wire format and level", func(t *testing.T) {
+		t.Setenv("TOBITEN_LOG_FORMAT", "text")
+		t.Setenv("TOBITEN_LOG_LEVEL", "warn")
+
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+
+		exitCode := run([]string{})
+
+		_ = w.Close()
+		os.Stdout = origStdout
+
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+
+		if exitCode != 0 {
+			t.Fatalf("run() exit code = %d, want 0", exitCode)
+		}
+
+		logger := slog.Default()
+		// Info level should be disabled when Level=warn
+		if logger.Enabled(context.Background(), slog.LevelInfo) {
+			t.Errorf("expected LevelInfo to be disabled with TOBITEN_LOG_LEVEL=warn")
+		}
+		if !logger.Enabled(context.Background(), slog.LevelWarn) {
+			t.Errorf("expected LevelWarn to be enabled with TOBITEN_LOG_LEVEL=warn")
+		}
+	})
+
+	t.Run("invalid log format refuses execution", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		origStderr := os.Stderr
+		os.Stderr = w
+
+		exitCode := run([]string{"-log-format=invalid_fmt"})
+
+		_ = w.Close()
+		os.Stderr = origStderr
+
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+
+		if exitCode != 1 {
+			t.Errorf("run(-log-format=invalid_fmt) exit code = %d, want 1", exitCode)
+		}
+		if !bytes.Contains(buf.Bytes(), []byte("unsupported log format")) {
+			t.Errorf("expected stderr to contain 'unsupported log format', got: %s", buf.String())
+		}
+	})
+
+	t.Run("invalid log level refuses execution", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() error: %v", err)
+		}
+		origStderr := os.Stderr
+		os.Stderr = w
+
+		exitCode := run([]string{"-log-level=invalid_lvl"})
+
+		_ = w.Close()
+		os.Stderr = origStderr
+
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+
+		if exitCode != 1 {
+			t.Errorf("run(-log-level=invalid_lvl) exit code = %d, want 1", exitCode)
+		}
+		if !bytes.Contains(buf.Bytes(), []byte("unsupported log level")) {
+			t.Errorf("expected stderr to contain 'unsupported log level', got: %s", buf.String())
+		}
+	})
 }

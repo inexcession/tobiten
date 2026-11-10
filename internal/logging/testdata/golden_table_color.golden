@@ -1,0 +1,7 @@
+[90m2026-11-10 10:30:00.000[0m | [32mINFO [0m | [35mtobitend    [0m | starting server daemon
+[90m2026-11-10 10:30:01.000[0m | [32mINFO [0m | [35mtobitend    [0m | volume scanned               | [90mseries_id=[0m01931535-6490-7d7b-9c76-2e860bc81eb2 [90mvolume_id=[0m01931535-6490-7d7b-9c76-2e860bc81eb3 [90mduration_ms=[0m142 [90mjob_id=[0m01931535-6490-7d7b-9c76-2e860bc81eb4
+[90m2026-11-10 10:30:02.000[0m | [33mWARN [0m | [35mtobitend    [0m | retryable intake conflict    | [90merror=[0m"permission denied"
+[90m2026-11-10 10:30:03.000[0m | [31mERROR[0m | [35mtobitend    [0m | database connection failed   | [90merror=[0m"connection refused"
+[90m2026-11-10 10:30:04.000[0m | [32mINFO [0m | [35mtobitend    [0m | database pool configured     | [90mdb.host=[0mlocalhost [90mdb.port=[0m5432
+[90m2026-11-10 10:30:05.000[0m | [32mINFO [0m | [35mscanner     [0m | worker started
+[90m2026-11-10 10:30:06.000[0m | [32mINFO [0m | [35mtobitend    [0m | task completed               | [90mjob.job_id=[0m01931535-6490-7d7b-9c76-2e860bc81eb5 [90mjob.duration_ms=[0m450

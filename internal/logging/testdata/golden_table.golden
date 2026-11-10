@@ -1,0 +1,7 @@
+2026-11-10 10:30:00.000 | INFO  | tobitend     | starting server daemon
+2026-11-10 10:30:01.000 | INFO  | tobitend     | volume scanned               | series_id=01931535-6490-7d7b-9c76-2e860bc81eb2 volume_id=01931535-6490-7d7b-9c76-2e860bc81eb3 duration_ms=142 job_id=01931535-6490-7d7b-9c76-2e860bc81eb4
+2026-11-10 10:30:02.000 | WARN  | tobitend     | retryable intake conflict    | error="permission denied"
+2026-11-10 10:30:03.000 | ERROR | tobitend     | database connection failed   | error="connection refused"
+2026-11-10 10:30:04.000 | INFO  | tobitend     | database pool configured     | db.host=localhost db.port=5432
+2026-11-10 10:30:05.000 | INFO  | scanner      | worker started
+2026-11-10 10:30:06.000 | INFO  | tobitend     | task completed               | job.job_id=01931535-6490-7d7b-9c76-2e860bc81eb5 job.duration_ms=450
