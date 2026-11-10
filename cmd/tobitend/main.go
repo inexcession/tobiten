@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/inexcession/tobiten/internal/config"
 )
 
 // Version is the build version of tobitend.
@@ -14,15 +17,20 @@ func versionString() string {
 }
 
 func run(args []string) int {
-	fs := flag.NewFlagSet("tobitend", flag.ContinueOnError)
-	versionFlag := fs.Bool("version", false, "print version and exit")
-	vFlag := fs.Bool("v", false, "print version and exit")
-
-	if err := fs.Parse(args); err != nil {
-		return 2
+	cfg, err := config.Load(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		if errors.Is(err, config.ErrInvalidFlag) {
+			fmt.Fprintf(os.Stderr, "tobitend: %v\n", err)
+			return 2
+		}
+		fmt.Fprintf(os.Stderr, "tobitend: %v\n", err)
+		return 1
 	}
 
-	if *versionFlag || *vFlag {
+	if cfg.ShowVersion {
 		fmt.Println(versionString())
 		return 0
 	}
