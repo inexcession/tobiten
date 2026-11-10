@@ -297,7 +297,133 @@ func TestCredentialLifecycle(t *testing.T) {
 	}
 }
 
-// TestUserRoleAssignment tests assigning and removing roles to/from users.
+// TestRevokeCredentialIdempotentAndPreservesFirstTime tests that RevokeCredential
+// preserves the original revocation timestamp when called multiple times.
+func TestRevokeCredentialIdempotentAndPreservesFirstTime(t *testing.T) {
+	t.Parallel()
+	_, repo := setupTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	user := &domain.User{ID: domain.MustNewID(), Username: "revoke_test_user"}
+	if err := repo.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	cred := &domain.Credential{
+		ID:     domain.MustNewID(),
+		UserID: user.ID,
+		Kind:   domain.CredentialKindPassword,
+	}
+	if err := repo.CreateCredential(ctx, cred); err != nil {
+		t.Fatalf("CreateCredential failed: %v", err)
+	}
+
+	firstRevokeTime := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Microsecond)
+	if err := repo.RevokeCredential(ctx, cred.ID, firstRevokeTime); err != nil {
+		t.Fatalf("first RevokeCredential failed: %v", err)
+	}
+
+	readFirst, err := repo.GetCredentialByID(ctx, cred.ID)
+	if err != nil {
+		t.Fatalf("GetCredentialByID failed: %v", err)
+	}
+	if readFirst.RevokedAt == nil || !readFirst.RevokedAt.Equal(firstRevokeTime) {
+		t.Fatalf("expected revoked_at %v, got %v", firstRevokeTime, readFirst.RevokedAt)
+	}
+
+	// Second revocation with a later timestamp must succeed and NOT overwrite firstRevokeTime
+	secondRevokeTime := time.Now().UTC().Truncate(time.Microsecond)
+	if err := repo.RevokeCredential(ctx, cred.ID, secondRevokeTime); err != nil {
+		t.Fatalf("second RevokeCredential should succeed, got: %v", err)
+	}
+
+	readSecond, err := repo.GetCredentialByID(ctx, cred.ID)
+	if err != nil {
+		t.Fatalf("GetCredentialByID failed: %v", err)
+	}
+	if !readSecond.RevokedAt.Equal(firstRevokeTime) {
+		t.Errorf("revocation time changed! Expected original %v, got %v", firstRevokeTime, readSecond.RevokedAt)
+	}
+}
+
+// TestExpiredCredentialReturnsNotFound tests that expired credentials are excluded
+// from GetActivePasswordCredentialByUserID and GetActiveOIDCCredentialBySubject.
+func TestExpiredCredentialReturnsNotFound(t *testing.T) {
+	t.Parallel()
+	_, repo := setupTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	user := &domain.User{ID: domain.MustNewID(), Username: "expired_test_user"}
+	if err := repo.CreateUser(ctx, user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// 1. Expired password credential
+	past := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+	secretHash := "$argon2id$v=19$..."
+	hashScheme := "argon2id"
+	expiredPasswordCred := &domain.Credential{
+		ID:         domain.MustNewID(),
+		UserID:     user.ID,
+		Kind:       domain.CredentialKindPassword,
+		SecretHash: &secretHash,
+		HashScheme: &hashScheme,
+		ExpiresAt:  &past,
+	}
+	if err := repo.CreateCredential(ctx, expiredPasswordCred); err != nil {
+		t.Fatalf("CreateCredential failed: %v", err)
+	}
+
+	// GetActivePasswordCredentialByUserID must return storage.ErrNotFound
+	if _, err := repo.GetActivePasswordCredentialByUserID(ctx, user.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("expected ErrNotFound for expired password credential, got %v", err)
+	}
+
+	// 2. Expired OIDC credential
+	subject := "https://idp.example.com|sub123"
+	expiredOIDCCred := &domain.Credential{
+		ID:              domain.MustNewID(),
+		UserID:          user.ID,
+		Kind:            domain.CredentialKindOIDCLink,
+		ExternalSubject: &subject,
+		ExpiresAt:       &past,
+	}
+	if err := repo.CreateCredential(ctx, expiredOIDCCred); err != nil {
+		t.Fatalf("CreateCredential failed: %v", err)
+	}
+
+	// GetActiveOIDCCredentialBySubject must return storage.ErrNotFound
+	if _, err := repo.GetActiveOIDCCredentialBySubject(ctx, subject); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("expected ErrNotFound for expired OIDC credential, got %v", err)
+	}
+
+	// Non-expired credentials should still be found
+	future := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Microsecond)
+	validSubject := "https://idp.example.com|sub_valid"
+	validOIDCCred := &domain.Credential{
+		ID:              domain.MustNewID(),
+		UserID:          user.ID,
+		Kind:            domain.CredentialKindOIDCLink,
+		ExternalSubject: &validSubject,
+		ExpiresAt:       &future,
+	}
+	if err := repo.CreateCredential(ctx, validOIDCCred); err != nil {
+		t.Fatalf("CreateCredential failed: %v", err)
+	}
+	foundOIDC, err := repo.GetActiveOIDCCredentialBySubject(ctx, validSubject)
+	if err != nil {
+		t.Fatalf("expected to find active non-expired OIDC credential, got: %v", err)
+	}
+	if foundOIDC.ID != validOIDCCred.ID {
+		t.Errorf("expected credential ID %s, got %s", validOIDCCred.ID, foundOIDC.ID)
+	}
+}
+
+// TestUserRoleAssignment tests assigning, listing (in one query), and removing roles.
 func TestUserRoleAssignment(t *testing.T) {
 	t.Parallel()
 	_, repo := setupTestDB(t)
@@ -310,9 +436,12 @@ func TestUserRoleAssignment(t *testing.T) {
 		t.Fatalf("CreateUser failed: %v", err)
 	}
 
-	// Assign Reader role
+	// Assign Reader and Curator roles
 	if err := repo.AssignUserRole(ctx, user.ID, domain.RoleReaderID); err != nil {
-		t.Fatalf("AssignUserRole failed: %v", err)
+		t.Fatalf("AssignUserRole Reader failed: %v", err)
+	}
+	if err := repo.AssignUserRole(ctx, user.ID, domain.RoleCuratorID); err != nil {
+		t.Fatalf("AssignUserRole Curator failed: %v", err)
 	}
 
 	// Duplicate assignment should be a no-op (ON CONFLICT DO NOTHING)
@@ -320,12 +449,28 @@ func TestUserRoleAssignment(t *testing.T) {
 		t.Fatalf("AssignUserRole duplicate failed: %v", err)
 	}
 
+	// ListUserRoles loads all roles and their permissions in one query
 	userRoles, err := repo.ListUserRoles(ctx, user.ID)
 	if err != nil {
 		t.Fatalf("ListUserRoles failed: %v", err)
 	}
-	if len(userRoles) != 1 || userRoles[0].ID != domain.RoleReaderID {
-		t.Errorf("expected Reader role assigned, got %+v", userRoles)
+	if len(userRoles) != 2 {
+		t.Fatalf("expected 2 roles assigned, got %d", len(userRoles))
+	}
+
+	// Verify roles are returned ordered by name (Curator then Reader) with their permissions
+	if userRoles[0].ID != domain.RoleCuratorID || userRoles[0].Name != domain.RoleCuratorName {
+		t.Errorf("expected first role to be Curator, got %+v", userRoles[0])
+	}
+	if len(userRoles[0].Permissions) != 4 {
+		t.Errorf("expected 4 permissions for Curator, got %d (%v)", len(userRoles[0].Permissions), userRoles[0].Permissions)
+	}
+
+	if userRoles[1].ID != domain.RoleReaderID || userRoles[1].Name != domain.RoleReaderName {
+		t.Errorf("expected second role to be Reader, got %+v", userRoles[1])
+	}
+	if len(userRoles[1].Permissions) != 2 {
+		t.Errorf("expected 2 permissions for Reader, got %d (%v)", len(userRoles[1].Permissions), userRoles[1].Permissions)
 	}
 
 	// Remove role
@@ -337,8 +482,8 @@ func TestUserRoleAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListUserRoles after removal failed: %v", err)
 	}
-	if len(userRoles) != 0 {
-		t.Errorf("expected 0 roles, got %d", len(userRoles))
+	if len(userRoles) != 1 || userRoles[0].ID != domain.RoleCuratorID {
+		t.Errorf("expected only Curator role remaining, got %+v", userRoles)
 	}
 }
 
@@ -369,5 +514,56 @@ func TestTransactionRollback(t *testing.T) {
 	// Verify user was NOT committed due to rollback
 	if _, err := pgRepo.GetUserByID(ctx, user.ID); !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("expected ErrNotFound for rolled back user, got %v", err)
+	}
+}
+
+// TestNestedWithTxRollback tests that an inner WithTx does not escape an enclosing
+// outer WithTx: when the outer WithTx returns an error, neither inner nor outer mutations are committed.
+func TestNestedWithTxRollback(t *testing.T) {
+	t.Parallel()
+	db, _ := setupTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pgRepo := postgres.NewUserRepository(db.Pool)
+
+	outerUser := &domain.User{ID: domain.MustNewID(), Username: "outer_user"}
+	innerUser := &domain.User{ID: domain.MustNewID(), Username: "inner_user"}
+
+	simulatedOuterErr := errors.New("simulated error in outer transaction")
+
+	err := pgRepo.WithTx(ctx, func(outerRepo storage.UserRepository) error {
+		if err := outerRepo.CreateUser(ctx, outerUser); err != nil {
+			return err
+		}
+
+		// Inner WithTx begins from outer's transaction (creating a savepoint)
+		innerPgRepo, ok := outerRepo.(*postgres.UserRepository)
+		if !ok {
+			t.Fatalf("expected outerRepo to be *postgres.UserRepository")
+		}
+
+		innerErr := innerPgRepo.WithTx(ctx, func(innerRepo storage.UserRepository) error {
+			return innerRepo.CreateUser(ctx, innerUser)
+		})
+		if innerErr != nil {
+			return innerErr
+		}
+
+		// Outer transaction aborts after inner transaction succeeded
+		return simulatedOuterErr
+	})
+
+	if !errors.Is(err, simulatedOuterErr) {
+		t.Fatalf("expected simulatedOuterErr, got %v", err)
+	}
+
+	// Both outerUser and innerUser must NOT exist in the database
+	if _, err := pgRepo.GetUserByID(ctx, outerUser.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("expected outer_user not found after rollback, got %v", err)
+	}
+	if _, err := pgRepo.GetUserByID(ctx, innerUser.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("expected inner_user not found after rollback (savepoint rolled back), got %v", err)
 	}
 }

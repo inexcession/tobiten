@@ -14,27 +14,36 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TxBeginner abstracts the capability to execute queries and begin transactions/savepoints.
+// It is implemented by both *pgxpool.Pool and pgx.Tx (which creates pseudo-nested transactions via savepoints).
+type TxBeginner interface {
+	DBTX
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // UserRepository implements storage.UserRepository using PostgreSQL and sqlc.
 type UserRepository struct {
-	pool *pgxpool.Pool
-	q    *Queries
+	db TxBeginner
+	q  *Queries
 }
 
 // NewUserRepository creates a new UserRepository backed by a pgxpool.Pool.
 func NewUserRepository(pool *pgxpool.Pool) *UserRepository {
 	return &UserRepository{
-		pool: pool,
-		q:    New(pool),
+		db: pool,
+		q:  New(pool),
 	}
 }
 
 // Ensure UserRepository implements storage.UserRepository.
 var _ storage.UserRepository = (*UserRepository)(nil)
 
-// WithTx executes fn inside a transaction. If fn returns an error, the transaction
-// is rolled back; otherwise it is committed.
+// WithTx executes fn inside a transaction. If called from a repository that is
+// already running within a transaction (from an outer WithTx), it begins a nested
+// pseudo-transaction using a SAVEPOINT, ensuring operations do not escape the
+// enclosing transaction.
 func (r *UserRepository) WithTx(ctx context.Context, fn func(repo storage.UserRepository) error) error {
-	tx, err := r.pool.Begin(ctx)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
@@ -43,8 +52,8 @@ func (r *UserRepository) WithTx(ctx context.Context, fn func(repo storage.UserRe
 	}()
 
 	txRepo := &UserRepository{
-		pool: r.pool,
-		q:    r.q.WithTx(tx),
+		db: tx,
+		q:  r.q.WithTx(tx),
 	}
 	if err := fn(txRepo); err != nil {
 		return err
@@ -249,7 +258,7 @@ func (r *UserRepository) GetCredentialByID(ctx context.Context, id string) (*dom
 	return &dc, nil
 }
 
-// GetActivePasswordCredentialByUserID retrieves the active (non-revoked) PASSWORD credential for a user.
+// GetActivePasswordCredentialByUserID retrieves the active (non-revoked, non-expired) PASSWORD credential for a user.
 func (r *UserRepository) GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (*domain.Credential, error) {
 	c, err := r.q.GetActivePasswordCredentialByUserID(ctx, userID)
 	if err != nil {
@@ -259,7 +268,7 @@ func (r *UserRepository) GetActivePasswordCredentialByUserID(ctx context.Context
 	return &dc, nil
 }
 
-// GetActiveOIDCCredentialBySubject retrieves the active (non-revoked) OIDC_LINK credential for an external subject.
+// GetActiveOIDCCredentialBySubject retrieves the active (non-revoked, non-expired) OIDC_LINK credential for an external subject.
 func (r *UserRepository) GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject string) (*domain.Credential, error) {
 	c, err := r.q.GetActiveOIDCCredentialBySubject(ctx, &externalSubject)
 	if err != nil {
@@ -282,7 +291,7 @@ func (r *UserRepository) ListCredentialsByUserID(ctx context.Context, userID str
 	return res, nil
 }
 
-// RevokeCredential marks a credential as revoked.
+// RevokeCredential marks a credential as revoked. If already revoked, the earlier revoked_at timestamp is preserved.
 func (r *UserRepository) RevokeCredential(ctx context.Context, id string, revokedAt time.Time) error {
 	if revokedAt.IsZero() {
 		revokedAt = time.Now().UTC()
@@ -430,28 +439,24 @@ func (r *UserRepository) RemoveUserRole(ctx context.Context, userID, roleID stri
 	return nil
 }
 
-// ListUserRoles returns all roles assigned to a user with their permissions.
+// ListUserRoles returns all roles assigned to a user with their permissions in a single query.
 func (r *UserRepository) ListUserRoles(ctx context.Context, userID string) ([]domain.Role, error) {
-	roles, err := r.q.ListUserRoles(ctx, userID)
+	rows, err := r.q.ListUserRoles(ctx, userID)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	res := make([]domain.Role, len(roles))
-	for i, rl := range roles {
-		permsRaw, err := r.q.ListPermissionsForRole(ctx, rl.ID)
-		if err != nil {
-			return nil, mapPgError(err)
-		}
-		perms := make([]domain.Permission, len(permsRaw))
-		for j, p := range permsRaw {
+	res := make([]domain.Role, len(rows))
+	for i, row := range rows {
+		perms := make([]domain.Permission, len(row.Permissions))
+		for j, p := range row.Permissions {
 			perms[j] = domain.Permission(p)
 		}
 		sortPermissionsCanonical(perms)
 		res[i] = domain.Role{
-			ID:                  rl.ID,
-			Name:                rl.Name,
-			BuiltIn:             rl.BuiltIn,
-			RequiresAllowLabels: rl.RequiresAllowLabels,
+			ID:                  row.ID,
+			Name:                row.Name,
+			BuiltIn:             row.BuiltIn,
+			RequiresAllowLabels: row.RequiresAllowLabels,
 			Permissions:         perms,
 		}
 	}

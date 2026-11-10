@@ -26,7 +26,7 @@ type Querier interface {
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
 	ListRoles(ctx context.Context) ([]Role, error)
-	ListUserRoles(ctx context.Context, userID string) ([]Role, error)
+	ListUserRoles(ctx context.Context, userID string) ([]ListUserRolesRow, error)
 	ListUsers(ctx context.Context) ([]User, error)
 	RemoveUserRole(ctx context.Context, arg RemoveUserRoleParams) (int64, error)
 	RevokeCredential(ctx context.Context, arg RevokeCredentialParams) (int64, error)

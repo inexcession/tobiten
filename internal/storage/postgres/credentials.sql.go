@@ -67,7 +67,10 @@ func (q *Queries) DeleteCredential(ctx context.Context, id string) (int64, error
 const getActiveOIDCCredentialBySubject = `-- name: GetActiveOIDCCredentialBySubject :one
 SELECT id, user_id, kind, scopes, secret_hash, hash_scheme, external_subject, label, created_at, last_used_at, expires_at, revoked_at
 FROM credentials
-WHERE external_subject = $1 AND kind = 'OIDC_LINK' AND revoked_at IS NULL
+WHERE external_subject = $1
+  AND kind = 'OIDC_LINK'
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
 `
 
 func (q *Queries) GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error) {
@@ -93,7 +96,10 @@ func (q *Queries) GetActiveOIDCCredentialBySubject(ctx context.Context, external
 const getActivePasswordCredentialByUserID = `-- name: GetActivePasswordCredentialByUserID :one
 SELECT id, user_id, kind, scopes, secret_hash, hash_scheme, external_subject, label, created_at, last_used_at, expires_at, revoked_at
 FROM credentials
-WHERE user_id = $1 AND kind = 'PASSWORD' AND revoked_at IS NULL
+WHERE user_id = $1
+  AND kind = 'PASSWORD'
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
 `
 
 func (q *Queries) GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error) {
@@ -184,7 +190,7 @@ func (q *Queries) ListCredentialsByUserID(ctx context.Context, userID string) ([
 
 const revokeCredential = `-- name: RevokeCredential :execrows
 UPDATE credentials
-SET revoked_at = $2
+SET revoked_at = COALESCE(revoked_at, $2)
 WHERE id = $1
 `
 

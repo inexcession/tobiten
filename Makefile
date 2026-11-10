@@ -1,4 +1,4 @@
-.PHONY: all build check fmt fmt-check vet lint sqlc-diff sqlc-generate test clean
+.PHONY: all build check fmt fmt-check tidy-check vet lint sqlc-diff sqlc-generate test clean
 
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/tobitend
@@ -14,7 +14,7 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -o $(BINARY) $(CMD_DIR)
 
-check: fmt-check vet lint sqlc-diff test
+check: fmt-check tidy-check vet lint sqlc-diff test
 
 fmt:
 	$(GO) fmt ./...
@@ -27,6 +27,10 @@ fmt-check:
 		echo "$$unformatted"; \
 		exit 1; \
 	fi
+
+tidy-check:
+	@echo "Checking go mod tidy..."
+	$(GO) mod tidy -diff
 
 vet:
 	@echo "Running go vet..."

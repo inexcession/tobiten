@@ -34,8 +34,18 @@ DELETE FROM user_roles
 WHERE user_id = $1 AND role_id = $2;
 
 -- name: ListUserRoles :many
-SELECT r.id, r.name, r.built_in, r.requires_allow_labels
-FROM roles r
-JOIN user_roles ur ON ur.role_id = r.id
+SELECT
+    r.id,
+    r.name,
+    r.built_in,
+    r.requires_allow_labels,
+    COALESCE(
+        ARRAY_AGG(rp.permission) FILTER (WHERE rp.permission IS NOT NULL),
+        '{}'::text[]
+    )::text[] AS permissions
+FROM user_roles ur
+JOIN roles r ON r.id = ur.role_id
+LEFT JOIN role_permissions rp ON rp.role_id = r.id
 WHERE ur.user_id = $1
+GROUP BY r.id, r.name, r.built_in, r.requires_allow_labels
 ORDER BY r.name ASC;
