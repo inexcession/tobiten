@@ -41,7 +41,7 @@ func TestParsePgMajorVersion(t *testing.T) {
 func TestFindPgBinDir(t *testing.T) {
 	dir, err := findPgBinDir()
 	if err != nil {
-		t.Fatalf("findPgBinDir failed: %v", err)
+		t.Skipf("skipping TestFindPgBinDir: no local PostgreSQL 18 binaries found on host (%v)", err)
 	}
 	if dir == "" {
 		t.Fatal("expected non-empty bin dir")
