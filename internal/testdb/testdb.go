@@ -26,6 +26,11 @@ func (db *TestDB) Exec(ctx context.Context, sql string, arguments ...any) (pgcon
 	return db.Pool.Exec(ctx, sql, arguments...)
 }
 
+// Begin starts a transaction using the database connection pool.
+func (db *TestDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	return db.Pool.Begin(ctx)
+}
+
 // Query executes a query that returns rows using the database connection pool.
 func (db *TestDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return db.Pool.Query(ctx, sql, args...)
