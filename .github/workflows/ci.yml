@@ -66,4 +66,4 @@ jobs:
       - name: Verify binary prints version
         run: |
           ./bin/tobitend -version
-          ./bin/tobitend
+          ./bin/tobitend -v
