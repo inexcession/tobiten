@@ -68,6 +68,7 @@ func TestSupervisor_SocketPathTooLong(t *testing.T) {
 	longSocketDir := tmpDir + "/" + strings.Repeat("toolongpathsegment", 10)
 
 	s, err := New(Options{
+		BinDir:    tmpDir,
 		DataDir:   tmpDir,
 		SocketDir: longSocketDir,
 		isRoot:    func() bool { return false },

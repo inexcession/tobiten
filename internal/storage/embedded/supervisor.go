@@ -96,6 +96,17 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return ErrRootForbidden
 	}
 
+	// Maximum sun_path size for macOS is 104 bytes (Linux is 108).
+	const maxSunPath = 104
+	if s.opts.SocketDir != "" {
+		cleanSocketDir := filepath.Clean(s.opts.SocketDir)
+		sockPath := filepath.Join(cleanSocketDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
+		if len(sockPath) >= maxSunPath {
+			return fmt.Errorf("%w: path %q is %d bytes (maximum is %d)", ErrSocketPathTooLong, sockPath, len(sockPath), maxSunPath-1)
+		}
+		s.socketDir = cleanSocketDir
+	}
+
 	binDir := s.opts.BinDir
 	if binDir == "" {
 		var err error
@@ -110,16 +121,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	// Maximum sun_path size for macOS is 104 bytes (Linux is 108).
-	const maxSunPath = 104
-	if s.opts.SocketDir != "" {
-		cleanSocketDir := filepath.Clean(s.opts.SocketDir)
-		sockPath := filepath.Join(cleanSocketDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
-		if len(sockPath) >= maxSunPath {
-			return fmt.Errorf("%w: path %q is %d bytes (maximum is %d)", ErrSocketPathTooLong, sockPath, len(sockPath), maxSunPath-1)
-		}
-		s.socketDir = cleanSocketDir
-	} else {
+	if s.opts.SocketDir == "" {
 		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
 		if len(sockPath) < maxSunPath {
 			s.socketDir = s.dataDir
