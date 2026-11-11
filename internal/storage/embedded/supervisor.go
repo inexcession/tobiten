@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -44,8 +45,14 @@ type Options struct {
 	// NoSync instructs initdb to skip syncing to disk (--no-sync), useful for fast test runs.
 	NoSync bool
 
+	// Logger specifies the logger used by the supervisor. If nil, slog.Default() is used.
+	Logger *slog.Logger
+
 	// isRoot overrides the root-detection check (for testing root refusal).
 	isRoot func() bool
+
+	// fsProbe overrides filesystem detection (for testing network filesystem warnings).
+	fsProbe func(path string) (fsType string, isNetwork bool, err error)
 
 	// postLaunchHook is an optional hook executed immediately after postmaster is launched,
 	// before readiness/state finalization. Used for testing post-launch failures/cancellations.
@@ -71,6 +78,10 @@ type Supervisor struct {
 	running           bool
 	pendingLaunch     bool
 	tempSocket        bool
+	logger            *slog.Logger
+	isNetworkFS       bool
+	fsType            string
+	fsProbe           func(path string) (fsType string, isNetwork bool, err error)
 	confirmExit       func(pid int, timeout time.Duration) error
 	resolvePIDTimeout time.Duration
 }
@@ -126,6 +137,11 @@ func New(opts Options) (*Supervisor, error) {
 		resolveTimeout = 1500 * time.Millisecond
 	}
 
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Supervisor{
 		opts:              opts,
 		dataDir:           absDataDir,
@@ -133,6 +149,8 @@ func New(opts Options) (*Supervisor, error) {
 		socketDir:         absSocketDir,
 		logFile:           absLogFile,
 		port:              port,
+		logger:            logger,
+		fsProbe:           opts.fsProbe,
 		confirmExit:       confirmFn,
 		resolvePIDTimeout: resolveTimeout,
 	}, nil
@@ -258,6 +276,68 @@ func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 	return nil
 }
 
+func (s *Supervisor) validateBinaries() error {
+	binDir := s.binDir
+	if binDir == "" {
+		discovered, err := FindBinDir("")
+		if err != nil {
+			return err
+		}
+		binDir = discovered
+	}
+	if err := ValidateBinDir(binDir, func(m int) bool { return m == PinnedMajor }); err != nil {
+		return fmt.Errorf("invalid postgresql binary set: %w", err)
+	}
+	s.binDir = binDir
+	return nil
+}
+
+func (s *Supervisor) ensureClusterInitialized(ctx context.Context) error {
+	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	pgVersionFile := filepath.Join(s.dataDir, "PG_VERSION")
+	if _, err := os.Stat(pgVersionFile); os.IsNotExist(err) {
+		initdbArgs := []string{
+			"-D", s.dataDir,
+			"-U", "postgres",
+			"-A", "trust",
+			"-E", "UTF8",
+		}
+		if s.opts.NoSync {
+			initdbArgs = append(initdbArgs, "--no-sync")
+		}
+
+		cmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "initdb"), initdbArgs...)
+		out, initErr := cmd.CombinedOutput()
+		if initErr != nil {
+			return fmt.Errorf("initdb failed: %w (output: %s)", initErr, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+func (s *Supervisor) setupSocketDir() error {
+	const maxSunPath = 104
+	if s.socketDir == "" {
+		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
+		if len(sockPath) < maxSunPath {
+			s.socketDir = s.dataDir
+		} else {
+			h := sha256.Sum256([]byte(s.dataDir))
+			tmpSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
+			s.socketDir = tmpSockDir
+			s.tempSocket = true
+		}
+	}
+
+	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
+		return fmt.Errorf("failed to create socket directory: %w", err)
+	}
+	return nil
+}
+
 // Start initializes the database cluster if necessary, writes the configuration,
 // and starts the supervised PostgreSQL instance on a UNIX domain socket.
 func (s *Supervisor) Start(ctx context.Context) error {
@@ -286,18 +366,9 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 
 	// 1. Validate complete PostgreSQL 18 binary set (pg_ctl, initdb, postgres) before data mutation
-	binDir := s.binDir
-	if binDir == "" {
-		discovered, err := FindBinDir("")
-		if err != nil {
-			return err
-		}
-		binDir = discovered
+	if err := s.validateBinaries(); err != nil {
+		return err
 	}
-	if err := ValidateBinDir(binDir, func(m int) bool { return m == PinnedMajor }); err != nil {
-		return fmt.Errorf("invalid postgresql binary set: %w", err)
-	}
-	s.binDir = binDir
 
 	// 2. Check for pre-existing running server before mutating data or configuration
 	prePID, _ := readPostmasterPID(s.dataDir)
@@ -305,48 +376,25 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("embedded postgresql cannot start: another server (PID %d) is already running in %s", prePID, s.dataDir)
 	}
 
-	// 3. Initialize cluster into clean data directory BEFORE creating nested socket directories
-	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
-		return fmt.Errorf("failed to create data directory: %w", err)
+	// 3. Inspect existing cluster version before mutating configuration or starting PostgreSQL (ADR-0001 §4)
+	if err := ValidateClusterVersion(s.dataDir); err != nil {
+		return err
 	}
 
-	pgVersionFile := filepath.Join(s.dataDir, "PG_VERSION")
-	if _, err := os.Stat(pgVersionFile); os.IsNotExist(err) {
-		initdbArgs := []string{
-			"-D", s.dataDir,
-			"-U", "postgres",
-			"-A", "trust",
-			"-E", "UTF8",
-		}
-		if s.opts.NoSync {
-			initdbArgs = append(initdbArgs, "--no-sync")
-		}
+	// 4. Check whether data directory is located on a network filesystem (ADR-0001 §3)
+	s.checkNetworkFilesystem()
 
-		cmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "initdb"), initdbArgs...)
-		out, initErr := cmd.CombinedOutput()
-		if initErr != nil {
-			return fmt.Errorf("initdb failed: %w (output: %s)", initErr, strings.TrimSpace(string(out)))
-		}
+	// 5. Initialize cluster into clean data directory BEFORE creating nested socket directories
+	if err := s.ensureClusterInitialized(ctx); err != nil {
+		return err
 	}
 
-	// 4. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
-	if s.socketDir == "" {
-		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
-		if len(sockPath) < maxSunPath {
-			s.socketDir = s.dataDir
-		} else {
-			h := sha256.Sum256([]byte(s.dataDir))
-			tmpSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
-			s.socketDir = tmpSockDir
-			s.tempSocket = true
-		}
+	// 6. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
+	if err := s.setupSocketDir(); err != nil {
+		return err
 	}
 
-	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
-	}
-
-	// 5. Write postgresql.conf block
+	// 7. Write postgresql.conf block
 	confPath := filepath.Join(s.dataDir, "postgresql.conf")
 	settings := ConfigSettings{
 		ListenAddresses:       "''",
@@ -358,7 +406,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
 
-	// 6. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
+	// 8. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -603,4 +651,74 @@ func (s *Supervisor) ConnString() string {
 	defer s.mu.Unlock()
 	return fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres sslmode=disable",
 		EscapeConnStringValue(s.socketDir), s.port)
+}
+
+// IsNetworkFS reports whether the data directory resides on a network filesystem (e.g. NFS, SMB/CIFS).
+func (s *Supervisor) IsNetworkFS() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isNetworkFS
+}
+
+// FilesystemType returns the detected filesystem type of the data directory.
+func (s *Supervisor) FilesystemType() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fsType
+}
+
+// CheckFilesystem inspects the data directory's filesystem and returns its information.
+func (s *Supervisor) CheckFilesystem() (FilesystemInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	probe := s.fsProbe
+	if probe == nil {
+		probe = defaultFSProbe
+	}
+
+	targetPath := findExistingAncestor(s.dataDir)
+	fsType, isNetwork, err := probe(targetPath)
+	if err != nil {
+		return FilesystemInfo{}, err
+	}
+	s.fsType = fsType
+	s.isNetworkFS = isNetwork
+	return FilesystemInfo{Type: fsType, IsNetwork: isNetwork}, nil
+}
+
+func (s *Supervisor) checkNetworkFilesystem() {
+	probe := s.fsProbe
+	if probe == nil {
+		probe = defaultFSProbe
+	}
+
+	targetPath := findExistingAncestor(s.dataDir)
+	fsType, isNetwork, err := probe(targetPath)
+	if err != nil {
+		s.logger.Debug("failed to inspect data directory filesystem",
+			slog.String("data_dir", s.dataDir),
+			slog.String("target_path", targetPath),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	s.fsType = fsType
+	s.isNetworkFS = isNetwork
+
+	if isNetwork {
+		s.logger.Warn("embedded postgresql data directory is located on a network filesystem (NFS/SMB); PostgreSQL on network storage is prone to data corruption, file locking issues, and high latency - a local disk is strongly recommended",
+			slog.String("data_dir", s.dataDir),
+			slog.String("fs_type", fsType),
+		)
+	}
+}
+
+func defaultFSProbe(path string) (string, bool, error) {
+	info, err := DetectFilesystem(path)
+	if err != nil {
+		return "", false, err
+	}
+	return info.Type, info.IsNetwork, nil
 }
