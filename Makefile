@@ -1,4 +1,4 @@
-.PHONY: all build check fmt fmt-check tidy-check vet lint sqlc-diff sqlc-generate test clean
+.PHONY: all build check fmt fmt-check tidy-check vet lint sqlc-diff sqlc-generate test upgrade-test clean
 
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/tobitend
@@ -50,6 +50,10 @@ sqlc-generate:
 test:
 	@echo "Running tests..."
 	$(GO) test -v -race ./...
+
+upgrade-test:
+	@echo "Running database upgrade tests..."
+	$(GO) test -v -race -run 'TestUpgrade' ./internal/storage/postgres/migrations/...
 
 clean:
 	rm -rf $(BIN_DIR)

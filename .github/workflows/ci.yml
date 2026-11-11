@@ -67,3 +67,47 @@ jobs:
         run: |
           ./bin/tobitend --version
           ./bin/tobitend --help
+
+  upgrade:
+    name: Seeded Database Upgrade Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tobitenpassword
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Tune PostgreSQL service for tests
+        env:
+          TOBITEN_TEST_DATABASE_URL: postgres://postgres:tobitenpassword@localhost:5432/postgres?sslmode=disable
+        run: |
+          psql -v ON_ERROR_STOP=1 "$TOBITEN_TEST_DATABASE_URL" <<'EOF'
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          SELECT pg_reload_conf();
+          EOF
+
+      - name: Run database upgrade tests
+        env:
+          TOBITEN_TEST_DATABASE_URL: postgres://postgres:tobitenpassword@localhost:5432/postgres?sslmode=disable
+        run: make upgrade-test
+
