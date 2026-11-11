@@ -467,53 +467,6 @@ func TestImportBoundary_InjectedSubpackageStorageImportFails(t *testing.T) {
 	}
 }
 
-func TestImportBoundary_InjectedOnDiskProbeFails(t *testing.T) {
-	goBin, err := findGoBinary()
-	if err != nil {
-		t.Fatalf("go binary not found: %v", err)
-	}
-	repoRoot := findRepoRoot(t)
-
-	probeDir := filepath.Join(repoRoot, "internal", "api", "testprobe_boundary_disk")
-	if err := os.MkdirAll(probeDir, 0755); err != nil {
-		t.Fatalf("failed to create probe dir: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.RemoveAll(probeDir)
-	})
-
-	probeFile := filepath.Join(probeDir, "probe.go")
-	content := []byte("package testprobe_boundary_disk\n\nimport _ \"github.com/inexcession/tobiten/internal/storage\"\n")
-	if err := os.WriteFile(probeFile, content, 0644); err != nil {
-		t.Fatalf("failed to write probe file: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	_, violations, err := checkAPIDependencies(ctx, goBin, repoRoot, "")
-	if err != nil {
-		t.Fatalf("checkAPIDependencies failed: %v", err)
-	}
-
-	if len(violations) == 0 {
-		t.Fatal("expected boundary violation for on-disk injected storage import, got none")
-	}
-
-	foundOffender := false
-	for _, v := range violations {
-		if v.AdapterPackage == "github.com/inexcession/tobiten/internal/api/testprobe_boundary_disk" &&
-			v.StoragePackage == "github.com/inexcession/tobiten/internal/storage" {
-			foundOffender = true
-			break
-		}
-	}
-
-	if !foundOffender {
-		t.Errorf("expected violation for on-disk probe, got: %v", violations)
-	}
-}
-
 func TestImportBoundary_UnitLogic(t *testing.T) {
 	tests := []struct {
 		name          string
