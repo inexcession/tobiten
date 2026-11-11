@@ -15,7 +15,6 @@ import (
 
 	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/api/openapi"
-	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/module"
 )
@@ -68,7 +67,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if reg == nil {
 		reg = module.NewRegistry()
 		_ = reg.Register(NewSystemModule())
-		_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+		_ = reg.Register(openapi.NewModule(nil))
 	} else if reg.Module("system") == nil {
 		_ = reg.Register(NewSystemModule())
 	}

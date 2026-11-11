@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/api/openapi"
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/module"
 )
@@ -989,7 +991,8 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 	})
 }
 
-func TestServer_HealthzAndAuthThroughRegistry(t *testing.T) {
+func TestServer_DefaultWiringFailClosed(t *testing.T) {
+	// Daemon and nil-service defaults must fail closed/unavailable until real services land
 	cfg := &config.Config{
 		Host:    "127.0.0.1",
 		Port:    0,
@@ -1038,15 +1041,121 @@ func TestServer_HealthzAndAuthThroughRegistry(t *testing.T) {
 		}
 	})
 
-	t.Run("GET /api/v1/auth/setup resolves through registry", func(t *testing.T) {
+	t.Run("anonymous GET /api/v1/auth/setup is denied (405)", func(t *testing.T) {
 		resp, err := http.Get(baseURL + "/api/v1/auth/setup")
 		if err != nil {
 			t.Fatalf("GET /api/v1/auth/setup failed: %v", err)
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed (denied)", resp.StatusCode)
+		}
+	})
+
+	t.Run("anonymous HEAD /api/v1/auth/setup is denied (405)", func(t *testing.T) {
+		resp, err := http.Head(baseURL + "/api/v1/auth/setup")
+		if err != nil {
+			t.Fatalf("HEAD /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed (denied)", resp.StatusCode)
+		}
+	})
+
+	t.Run("POST /api/v1/auth/setup fails closed (503 Service Unavailable)", func(t *testing.T) {
+		setupPayload := `{"setup_token":"token-123","username":"admin","password":"secretpassword"}`
+		resp, err := http.Post(baseURL+"/api/v1/auth/setup", "application/json", strings.NewReader(setupPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 503 Service Unavailable (body: %s)", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("POST /api/v1/auth/login fails closed (503 Service Unavailable)", func(t *testing.T) {
+		loginPayload := `{"username":"admin","password":"secretpassword"}`
+		resp, err := http.Post(baseURL+"/api/v1/auth/login", "application/json", strings.NewReader(loginPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/login failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 503 Service Unavailable (body: %s)", resp.StatusCode, string(body))
+		}
+	})
+}
+
+func TestServer_ExplicitFakeServiceWiring(t *testing.T) {
+	// Permissive auth/setup fakes are explicitly test-injected
+	reg := module.NewRegistry()
+	_ = reg.Register(NewSystemModule())
+	_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+
+	cfg := &config.Config{
+		Host:    "127.0.0.1",
+		Port:    0,
+		BaseURL: "http://localhost:8080",
+	}
+	srv, err := NewServer(ServerOptions{
+		Config:   cfg,
+		Registry: reg,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(ctx)
+	}()
+
+	baseURL := srv.URL()
+
+	t.Run("GET /healthz returns 200 OK", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		defer resp.Body.Close()
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
+	t.Run("GET /api/v1/auth/setup denied (not allowlisted)", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/api/v1/auth/setup")
+		if err != nil {
+			t.Fatalf("GET /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed", resp.StatusCode)
+		}
+	})
+
+	t.Run("HEAD /api/v1/auth/setup denied (not allowlisted)", func(t *testing.T) {
+		resp, err := http.Head(baseURL + "/api/v1/auth/setup")
+		if err != nil {
+			t.Fatalf("HEAD /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed", resp.StatusCode)
 		}
 	})
 

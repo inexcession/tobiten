@@ -23,10 +23,6 @@ type domainUserResponse struct {
 	Username string `json:"username"`
 }
 
-type setupStatusResponse struct {
-	Sealed bool `json:"sealed"`
-}
-
 type setupResponse struct {
 	User    domainUserResponse `json:"user"`
 	Message string             `json:"message"`
@@ -50,6 +46,11 @@ func (m *Module) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if m.services == nil || m.services.Admin == nil {
+		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
 
@@ -87,6 +88,11 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if m.services == nil || m.services.Admin == nil {
+		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
 
@@ -133,23 +139,5 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 			Username: user.Username,
 		},
 		Message: "initial admin created",
-	})
-}
-
-func (m *Module) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	sealed, err := m.services.Admin.IsSetupSealed(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to check setup status")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, setupStatusResponse{
-		Sealed: sealed,
 	})
 }

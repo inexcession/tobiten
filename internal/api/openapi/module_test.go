@@ -10,7 +10,61 @@ import (
 	"github.com/inexcession/tobiten/internal/app"
 )
 
-func TestOpenAPIModule_AuthRoutes(t *testing.T) {
+func TestOpenAPIModule_NilServicesFailClosed(t *testing.T) {
+	// Daemon and nil-service defaults must fail closed/unavailable until real services land
+	for _, tc := range []struct {
+		name     string
+		services *app.Services
+	}{
+		{name: "nil services", services: nil},
+		{name: "empty services", services: &app.Services{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mod := NewModule(tc.services)
+			mounts := mod.RouteMounts()
+			if len(mounts) != 1 {
+				t.Fatalf("expected 1 RouteMount, got %d", len(mounts))
+			}
+			handler := mounts[0].Handler
+
+			// POST /api/v1/auth/login fails closed with 503 Service Unavailable
+			bodyLogin, _ := json.Marshal(loginRequest{Username: "admin", Password: "pwd"})
+			reqLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(bodyLogin))
+			recLogin := httptest.NewRecorder()
+			handler.ServeHTTP(recLogin, reqLogin)
+			if recLogin.Code != http.StatusServiceUnavailable {
+				t.Errorf("login status = %d, want 503 Service Unavailable", recLogin.Code)
+			}
+
+			// POST /api/v1/auth/setup fails closed with 503 Service Unavailable
+			bodySetup, _ := json.Marshal(app.SetupAdminRequest{Username: "admin", Password: "pwd", SetupToken: "tok"})
+			reqSetup := httptest.NewRequest(http.MethodPost, "/api/v1/auth/setup", bytes.NewReader(bodySetup))
+			recSetup := httptest.NewRecorder()
+			handler.ServeHTTP(recSetup, reqSetup)
+			if recSetup.Code != http.StatusServiceUnavailable {
+				t.Errorf("setup status = %d, want 503 Service Unavailable", recSetup.Code)
+			}
+
+			// Anonymous GET /api/v1/auth/setup must be denied / 405 Method Not Allowed
+			reqGetSetup := httptest.NewRequest(http.MethodGet, "/api/v1/auth/setup", nil)
+			recGetSetup := httptest.NewRecorder()
+			handler.ServeHTTP(recGetSetup, reqGetSetup)
+			if recGetSetup.Code != http.StatusMethodNotAllowed {
+				t.Errorf("GET setup status = %d, want 405 Method Not Allowed (denied)", recGetSetup.Code)
+			}
+
+			// Anonymous HEAD /api/v1/auth/setup must be denied / 405 Method Not Allowed
+			reqHeadSetup := httptest.NewRequest(http.MethodHead, "/api/v1/auth/setup", nil)
+			recHeadSetup := httptest.NewRecorder()
+			handler.ServeHTTP(recHeadSetup, reqHeadSetup)
+			if recHeadSetup.Code != http.StatusMethodNotAllowed {
+				t.Errorf("HEAD setup status = %d, want 405 Method Not Allowed (denied)", recHeadSetup.Code)
+			}
+		})
+	}
+}
+
+func TestOpenAPIModule_ExplicitFakeServices(t *testing.T) {
 	stubServices := app.NewStubServices()
 	mod := NewModule(stubServices)
 
@@ -24,21 +78,23 @@ func TestOpenAPIModule_AuthRoutes(t *testing.T) {
 
 	handler := mounts[0].Handler
 
-	t.Run("GET /api/v1/auth/setup status", func(t *testing.T) {
+	t.Run("GET /api/v1/auth/setup denied (not allowlisted)", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/setup", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rec.Code)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed", rec.Code)
 		}
+	})
 
-		var res setupStatusResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
-			t.Fatalf("json decode failed: %v", err)
-		}
-		if res.Sealed {
-			t.Errorf("expected sealed=false on initial run")
+	t.Run("HEAD /api/v1/auth/setup denied (not allowlisted)", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/api/v1/auth/setup", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed", rec.Code)
 		}
 	})
 
@@ -105,7 +161,7 @@ func TestOpenAPIModule_AuthRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("POST /api/v1/auth/login with invalid credentials fails with 401", func(t *testing.T) {
+	t.Run("POST /api/v1/auth/login with invalid credentials fails with 400 or 401", func(t *testing.T) {
 		body, _ := json.Marshal(loginRequest{
 			Username: "",
 			Password: "",

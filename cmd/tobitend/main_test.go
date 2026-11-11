@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/api"
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 )
 
@@ -446,7 +448,7 @@ func TestRunServer_GracefulShutdown(t *testing.T) {
 }
 
 func TestBuildRegistry(t *testing.T) {
-	t.Run("nil config returns registry with compiled-in modules", func(t *testing.T) {
+	t.Run("nil config returns registry with compiled-in modules failing closed by default", func(t *testing.T) {
 		reg := BuildRegistry(nil)
 		if reg == nil {
 			t.Fatal("BuildRegistry(nil) returned nil")
@@ -462,6 +464,53 @@ func TestBuildRegistry(t *testing.T) {
 		}
 		if !reg.IsEnabled("openapi") {
 			t.Errorf("expected 'openapi' module to be enabled by default")
+		}
+
+		// Defaults fail closed/unavailable with 503 until real services land
+		routes := reg.Routes()
+		var openapiHandler http.Handler
+		for _, m := range routes {
+			if m.ModuleName == "openapi" && m.Prefix == "/api/v1" {
+				openapiHandler = m.Handler
+				break
+			}
+		}
+		if openapiHandler == nil {
+			t.Fatal("could not find openapi route mount")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"pwd"}`))
+		rec := httptest.NewRecorder()
+		openapiHandler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("default openapi login status = %d, want 503 Service Unavailable", rec.Code)
+		}
+	})
+
+	t.Run("explicit fake services allow auth operations", func(t *testing.T) {
+		fakeServices := app.NewStubServices()
+		reg := BuildRegistryWithServices(nil, fakeServices)
+		if reg == nil {
+			t.Fatal("BuildRegistryWithServices returned nil")
+		}
+
+		routes := reg.Routes()
+		var openapiHandler http.Handler
+		for _, m := range routes {
+			if m.ModuleName == "openapi" && m.Prefix == "/api/v1" {
+				openapiHandler = m.Handler
+				break
+			}
+		}
+		if openapiHandler == nil {
+			t.Fatal("could not find openapi route mount")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/setup", strings.NewReader(`{"setup_token":"tok","username":"admin","password":"pwd"}`))
+		rec := httptest.NewRecorder()
+		openapiHandler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Errorf("fake-service setup status = %d, want 201 Created", rec.Code)
 		}
 	})
 

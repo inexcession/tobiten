@@ -14,10 +14,8 @@ type Module struct {
 }
 
 // NewModule constructs a new native REST API module wired with application services.
+// If services (or services.Admin) is nil, endpoints fail closed / return 503 Service Unavailable.
 func NewModule(services *app.Services) *Module {
-	if services == nil {
-		services = app.NewStubServices()
-	}
 	m := &Module{
 		services: services,
 	}
@@ -44,11 +42,10 @@ func (m *Module) RouteMounts() []module.RouteMount {
 func (m *Module) buildRouter() http.Handler {
 	mux := http.NewServeMux()
 
-	// Auth routes (closed unauthenticated allowlist, ADR-0006 §1, ADR-0014 §1)
+	// Auth routes (closed unauthenticated allowlist, ADR-0006 §1, ADR-0014 §1).
+	// Only POST is allowlisted; GET/HEAD are not allowlisted and return 405 Method Not Allowed.
 	mux.HandleFunc("POST /api/v1/auth/login", m.handleLogin)
 	mux.HandleFunc("POST /api/v1/auth/setup", m.handleSetup)
-	mux.HandleFunc("GET /api/v1/auth/setup", m.handleSetupStatus)
-	mux.HandleFunc("HEAD /api/v1/auth/setup", m.handleSetupStatus)
 
 	return mux
 }
