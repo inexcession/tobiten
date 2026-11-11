@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSupervisor_RelativePathsResolvedToAbsolute(t *testing.T) {
@@ -192,7 +194,7 @@ func TestSupervisor_StopNotRunning(t *testing.T) {
 	}
 }
 
-func TestSupervisor_StartupCancellationCleanup(t *testing.T) {
+func TestSupervisor_StartupPreCancelled(t *testing.T) {
 	binDir, err := FindBinDir("")
 	if err != nil {
 		t.Skipf("skipping test: no PostgreSQL %d binaries found on host: %v", PinnedMajor, err)
@@ -211,7 +213,7 @@ func TestSupervisor_StartupCancellationCleanup(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Start with already-cancelled context
+	// Start with already-cancelled context (fails before launch)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -225,5 +227,129 @@ func TestSupervisor_StartupCancellationCleanup(t *testing.T) {
 	}
 	if s.PID() != 0 {
 		t.Fatalf("expected PID() to be 0 after cancelled start, got %d", s.PID())
+	}
+}
+
+func TestSupervisor_PostLaunchCancellation(t *testing.T) {
+	binDir, err := FindBinDir("")
+	if err != nil {
+		t.Skipf("skipping test: no PostgreSQL %d binaries found on host: %v", PinnedMajor, err)
+	}
+
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "pgdata")
+
+	var launchedPID int
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+		postLaunchHook: func(sup *Supervisor, pid int) error {
+			launchedPID = pid
+			// Cancel context post-launch so Start must clean up the running postmaster
+			cancel()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = s.Start(ctx)
+	if err == nil {
+		t.Fatal("expected Start to fail due to post-launch cancellation, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled in error, got: %v", err)
+	}
+
+	if launchedPID <= 0 {
+		t.Fatal("expected postLaunchHook to capture a valid launched PID")
+	}
+
+	// Verify the launched postmaster was cleaned up and is confirmed dead
+	if killErr := syscall.Kill(launchedPID, 0); !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("expected launched postmaster process %d to be dead (ESRCH), got: %v", launchedPID, killErr)
+	}
+
+	if s.Running() {
+		t.Fatal("expected Running() to be false after cancelled start")
+	}
+	if s.PID() != 0 {
+		t.Fatalf("expected PID() to be 0 after cancelled start, got %d", s.PID())
+	}
+}
+
+func TestSupervisor_CleanupFailure(t *testing.T) {
+	binDir, err := FindBinDir("")
+	if err != nil {
+		t.Skipf("skipping test: no PostgreSQL %d binaries found on host: %v", PinnedMajor, err)
+	}
+
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "pgdata")
+
+	var launchedPID int
+	simulatedErr := errors.New("simulated exit failure: process hung")
+
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+		postLaunchHook: func(sup *Supervisor, pid int) error {
+			launchedPID = pid
+			return errors.New("post-launch trigger failure")
+		},
+		confirmExit: func(pid int, timeout time.Duration) error {
+			return simulatedErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = s.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start to fail, got nil")
+	}
+
+	// Verify cleanup failure error is returned and propagated
+	if !strings.Contains(err.Error(), "simulated exit failure: process hung") {
+		t.Fatalf("expected error to contain cleanup failure, got: %v", err)
+	}
+
+	// Verify owned PID is RETAINED
+	if s.PID() != launchedPID {
+		t.Fatalf("expected owned PID %d to be retained, got %d", launchedPID, s.PID())
+	}
+
+	// Verify retryable state is RETAINED
+	if !s.Running() {
+		t.Fatal("expected Running() to be true (retryable state) on cleanup failure")
+	}
+
+	// Verify socket directory is NOT cleared
+	if s.SocketDir() == "" {
+		t.Fatal("expected SocketDir to be retained on cleanup failure")
+	}
+
+	// Retry stop with restored exit confirmation to verify retryable state and avoid process leak
+	s.confirmExit = confirmProcessExit
+	if stopErr := s.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("expected retry Stop() to succeed, got %v", stopErr)
+	}
+
+	if s.Running() {
+		t.Fatal("expected Running() to be false after successful retry Stop")
+	}
+	if s.PID() != 0 {
+		t.Fatalf("expected PID() to be 0 after successful retry Stop, got %d", s.PID())
+	}
+	if killErr := syscall.Kill(launchedPID, 0); !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("expected postmaster process %d to be dead (ESRCH), got: %v", launchedPID, killErr)
 	}
 }

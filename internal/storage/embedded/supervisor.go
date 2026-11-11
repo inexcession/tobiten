@@ -46,20 +46,28 @@ type Options struct {
 
 	// isRoot overrides the root-detection check (for testing root refusal).
 	isRoot func() bool
+
+	// postLaunchHook is an optional hook executed immediately after postmaster is launched,
+	// before readiness/state finalization. Used for testing post-launch failures/cancellations.
+	postLaunchHook func(s *Supervisor, pid int) error
+
+	// confirmExit overrides the process exit confirmation check (for testing cleanup failures).
+	confirmExit func(pid int, timeout time.Duration) error
 }
 
 // Supervisor manages the lifecycle of an embedded PostgreSQL subprocess on a UNIX domain socket.
 type Supervisor struct {
-	mu         sync.Mutex
-	opts       Options
-	binDir     string
-	dataDir    string
-	socketDir  string
-	logFile    string
-	port       int
-	pid        int
-	running    bool
-	tempSocket bool
+	mu          sync.Mutex
+	opts        Options
+	binDir      string
+	dataDir     string
+	socketDir   string
+	logFile     string
+	port        int
+	pid         int
+	running     bool
+	tempSocket  bool
+	confirmExit func(pid int, timeout time.Duration) error
 }
 
 // New creates a new embedded PostgreSQL supervisor with the given options.
@@ -103,13 +111,19 @@ func New(opts Options) (*Supervisor, error) {
 		port = 5432
 	}
 
+	confirmFn := opts.confirmExit
+	if confirmFn == nil {
+		confirmFn = confirmProcessExit
+	}
+
 	return &Supervisor{
-		opts:      opts,
-		dataDir:   absDataDir,
-		binDir:    absBinDir,
-		socketDir: absSocketDir,
-		logFile:   absLogFile,
-		port:      port,
+		opts:        opts,
+		dataDir:     absDataDir,
+		binDir:      absBinDir,
+		socketDir:   absSocketDir,
+		logFile:     absLogFile,
+		port:        port,
+		confirmExit: confirmFn,
 	}, nil
 }
 
@@ -164,18 +178,36 @@ func deriveBoundedContext(parent context.Context, defaultTimeout time.Duration) 
 	return context.WithTimeout(parent, defaultTimeout)
 }
 
-func (s *Supervisor) cleanupFailedStart() {
-	pid, _ := readPostmasterPID(s.dataDir)
+func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
+	if pid > 0 {
+		s.pid = pid
+	}
+	targetPID := s.pid
+	if targetPID <= 0 {
+		return nil
+	}
+
+	s.running = true
+
+	var stopErrs []error
+
 	if s.binDir != "" {
 		pgCtl := filepath.Join(s.binDir, "pg_ctl")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		stopCmd := exec.CommandContext(ctx, pgCtl, "-w", "-D", s.dataDir, "-m", "immediate", "stop")
-		_ = stopCmd.Run()
+		if err := stopCmd.Run(); err != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("immediate stop failed: %w", err))
+		}
 	}
 
-	if pid > 0 {
-		_ = confirmProcessExit(pid, 3*time.Second)
+	if exitErr := s.confirmExit(targetPID, 3*time.Second); exitErr != nil {
+		stopErrs = append(stopErrs, fmt.Errorf("failed to confirm exit for postmaster process %d: %w", targetPID, exitErr))
+	}
+
+	if len(stopErrs) > 0 {
+		// Retain owned PID, retryable state, and socket directory when cleanup fails
+		return errors.Join(stopErrs...)
 	}
 
 	if s.tempSocket && s.socketDir != "" {
@@ -184,6 +216,7 @@ func (s *Supervisor) cleanupFailedStart() {
 
 	s.running = false
 	s.pid = 0
+	return nil
 }
 
 // Start initializes the database cluster if necessary, writes the configuration,
@@ -227,7 +260,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.binDir = binDir
 
-	// 2. Initialize cluster into clean data directory BEFORE creating nested socket directories
+	// 2. Check for pre-existing running server before mutating data or configuration
+	prePID, _ := readPostmasterPID(s.dataDir)
+	if prePID > 0 && syscall.Kill(prePID, 0) == nil {
+		return fmt.Errorf("embedded postgresql cannot start: another server (PID %d) is already running in %s", prePID, s.dataDir)
+	}
+
+	// 3. Initialize cluster into clean data directory BEFORE creating nested socket directories
 	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
@@ -251,7 +290,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 
-	// 3. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
+	// 4. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
 	if s.socketDir == "" {
 		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
 		if len(sockPath) < maxSunPath {
@@ -268,7 +307,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
-	// 4. Write postgresql.conf block
+	// 5. Write postgresql.conf block
 	confPath := filepath.Join(s.dataDir, "postgresql.conf")
 	settings := ConfigSettings{
 		ListenAddresses:       "''",
@@ -280,7 +319,11 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
 
-	// 5. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
+	// 6. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	logFile := s.logFile
 	if logFile == "" {
 		logFile = filepath.Join(s.dataDir, "postgresql.log")
@@ -294,22 +337,40 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	)
 	out, startErr := startCmd.CombinedOutput()
 	if startErr != nil {
-		s.cleanupFailedStart()
+		if postPID, err := readPostmasterPID(s.dataDir); err == nil && postPID > 0 && syscall.Kill(postPID, 0) == nil {
+			cleanupErr := s.cleanupLaunchedPostmaster(postPID)
+			return errors.Join(fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))), cleanupErr)
+		}
+		if s.tempSocket && s.socketDir != "" {
+			_ = os.RemoveAll(s.socketDir)
+		}
 		return fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
 	}
 
 	// Read postmaster.pid
 	pid, err := readPostmasterPID(s.dataDir)
 	if err != nil || pid <= 0 {
-		s.cleanupFailedStart()
 		return fmt.Errorf("server started but failed to read postmaster.pid: %w", err)
 	}
 	s.pid = pid
+	s.running = true
 
-	// Check if context was cancelled while waiting
+	// Post-launch checks: context cancellation or hook failure
 	if ctx.Err() != nil {
-		s.cleanupFailedStart()
-		return ctx.Err()
+		cleanupErr := s.cleanupLaunchedPostmaster(pid)
+		return errors.Join(ctx.Err(), cleanupErr)
+	}
+
+	if s.opts.postLaunchHook != nil {
+		if hookErr := s.opts.postLaunchHook(s, pid); hookErr != nil {
+			cleanupErr := s.cleanupLaunchedPostmaster(pid)
+			return errors.Join(hookErr, cleanupErr)
+		}
+	}
+
+	if ctx.Err() != nil {
+		cleanupErr := s.cleanupLaunchedPostmaster(pid)
+		return errors.Join(ctx.Err(), cleanupErr)
 	}
 
 	s.running = true
@@ -343,6 +404,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		"-m", "fast",
 		"stop",
 	)
+	var stopErrs []error
 	if runErr := stopCmd.Run(); runErr != nil {
 		// 2. Fall back to immediate stop bounded by 5s
 		immCtx, immCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -354,14 +416,17 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 			"-m", "immediate",
 			"stop",
 		)
-		_ = immCmd.Run()
+		if immErr := immCmd.Run(); immErr != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("immediate stop failed: %w", immErr))
+		}
 	}
 
 	// 3. Confirm owned-process exit
 	if pid > 0 {
-		if err := confirmProcessExit(pid, 5*time.Second); err != nil {
-			// Process failed to exit! Propagate failure and do NOT clear running state
-			return fmt.Errorf("failed to confirm postmaster process %d exit: %w", pid, err)
+		if err := s.confirmExit(pid, 5*time.Second); err != nil {
+			stopErrs = append(stopErrs, fmt.Errorf("failed to confirm postmaster process %d exit: %w", pid, err))
+			// Process failed to exit! Propagate failure and do NOT clear running state or PID
+			return errors.Join(stopErrs...)
 		}
 	}
 

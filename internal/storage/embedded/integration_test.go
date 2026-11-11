@@ -216,3 +216,108 @@ func TestSupervisor_RefuseRoot_Integration(t *testing.T) {
 		t.Fatalf("expected ErrRootForbidden, got %v", err)
 	}
 }
+
+func TestSupervisor_ExistingServerSurvival(t *testing.T) {
+	binDir, err := FindBinDir("")
+	if err != nil {
+		t.Skipf("skipping integration test: no PostgreSQL %d binaries found on host: %v", PinnedMajor, err)
+	}
+
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "pgdata")
+
+	s1, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		NoSync:  true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create supervisor s1: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	if err := s1.Start(ctx); err != nil {
+		t.Fatalf("failed to start s1: %v", err)
+	}
+	defer func() {
+		_ = s1.Stop(context.Background())
+	}()
+
+	if !s1.Running() {
+		t.Fatal("expected s1 to be running")
+	}
+	s1PID := s1.PID()
+	if s1PID <= 0 {
+		t.Fatalf("expected s1 to have positive PID, got %d", s1PID)
+	}
+
+	// Verify s1 is healthy and queryable
+	pool1, err := pgxpool.New(ctx, s1.DatabaseURL())
+	if err != nil {
+		t.Fatalf("failed to connect to s1: %v", err)
+	}
+	var val1 int
+	if err := pool1.QueryRow(ctx, "SELECT 1").Scan(&val1); err != nil {
+		pool1.Close()
+		t.Fatalf("query on s1 failed: %v", err)
+	}
+	if val1 != 1 {
+		pool1.Close()
+		t.Fatalf("expected 1, got %d", val1)
+	}
+
+	// Attempt to start a second supervisor s2 against the SAME data directory
+	s2, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		NoSync:  true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create supervisor s2: %v", err)
+	}
+
+	s2Err := s2.Start(ctx)
+	if s2Err == nil {
+		_ = s2.Stop(context.Background())
+		t.Fatal("expected s2.Start to fail against running server, got nil")
+	}
+
+	if s2.Running() {
+		t.Fatal("expected s2 to not be running")
+	}
+	if s2.PID() != 0 {
+		t.Fatalf("expected s2 PID to be 0, got %d", s2.PID())
+	}
+
+	// Verify existing server (s1) SURVIVED: process still alive
+	if err := syscall.Kill(s1PID, 0); err != nil {
+		t.Fatalf("expected existing server process %d to be alive, got: %v", s1PID, err)
+	}
+
+	// Verify s1 is still responsive and queryable
+	var val2 int
+	if err := pool1.QueryRow(ctx, "SELECT 42").Scan(&val2); err != nil {
+		pool1.Close()
+		t.Fatalf("query on s1 after failed s2.Start failed: %v", err)
+	}
+	if val2 != 42 {
+		pool1.Close()
+		t.Fatalf("expected 42, got %d", val2)
+	}
+	pool1.Close()
+
+	// Stop s1 cleanly
+	if err := s1.Stop(ctx); err != nil {
+		t.Fatalf("s1.Stop failed: %v", err)
+	}
+	if s1.Running() {
+		t.Fatal("expected s1 to not be running after Stop")
+	}
+
+	// Verify s1 process is confirmed dead
+	if err := syscall.Kill(s1PID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("expected s1 process %d to be dead (ESRCH), got: %v", s1PID, err)
+	}
+}
