@@ -53,21 +53,26 @@ type Options struct {
 
 	// confirmExit overrides the process exit confirmation check (for testing cleanup failures).
 	confirmExit func(pid int, timeout time.Duration) error
+
+	// resolvePIDTimeout overrides the timeout for resolving a pending postmaster PID (default 1500ms).
+	resolvePIDTimeout time.Duration
 }
 
 // Supervisor manages the lifecycle of an embedded PostgreSQL subprocess on a UNIX domain socket.
 type Supervisor struct {
-	mu          sync.Mutex
-	opts        Options
-	binDir      string
-	dataDir     string
-	socketDir   string
-	logFile     string
-	port        int
-	pid         int
-	running     bool
-	tempSocket  bool
-	confirmExit func(pid int, timeout time.Duration) error
+	mu                sync.Mutex
+	opts              Options
+	binDir            string
+	dataDir           string
+	socketDir         string
+	logFile           string
+	port              int
+	pid               int
+	running           bool
+	pendingLaunch     bool
+	tempSocket        bool
+	confirmExit       func(pid int, timeout time.Duration) error
+	resolvePIDTimeout time.Duration
 }
 
 // New creates a new embedded PostgreSQL supervisor with the given options.
@@ -116,14 +121,20 @@ func New(opts Options) (*Supervisor, error) {
 		confirmFn = confirmProcessExit
 	}
 
+	resolveTimeout := opts.resolvePIDTimeout
+	if resolveTimeout <= 0 {
+		resolveTimeout = 1500 * time.Millisecond
+	}
+
 	return &Supervisor{
-		opts:        opts,
-		dataDir:     absDataDir,
-		binDir:      absBinDir,
-		socketDir:   absSocketDir,
-		logFile:     absLogFile,
-		port:        port,
-		confirmExit: confirmFn,
+		opts:              opts,
+		dataDir:           absDataDir,
+		binDir:            absBinDir,
+		socketDir:         absSocketDir,
+		logFile:           absLogFile,
+		port:              port,
+		confirmExit:       confirmFn,
+		resolvePIDTimeout: resolveTimeout,
 	}, nil
 }
 
@@ -178,6 +189,32 @@ func deriveBoundedContext(parent context.Context, defaultTimeout time.Duration) 
 	return context.WithTimeout(parent, defaultTimeout)
 }
 
+func (s *Supervisor) resolvePostmasterPID(ctx context.Context, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		pid, err := readPostmasterPID(s.dataDir)
+		if err == nil && pid > 0 && syscall.Kill(pid, 0) == nil {
+			return pid, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if pid, err := readPostmasterPID(s.dataDir); err == nil && pid > 0 && syscall.Kill(pid, 0) == nil {
+		return pid, nil
+	}
+	return 0, os.ErrNotExist
+}
+
 func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 	if pid > 0 {
 		s.pid = pid
@@ -207,6 +244,7 @@ func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 
 	if len(stopErrs) > 0 {
 		// Retain owned PID, retryable state, and socket directory when cleanup fails
+		s.pendingLaunch = true
 		return errors.Join(stopErrs...)
 	}
 
@@ -214,6 +252,7 @@ func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 		_ = os.RemoveAll(s.socketDir)
 	}
 
+	s.pendingLaunch = false
 	s.running = false
 	s.pid = 0
 	return nil
@@ -225,7 +264,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.running {
+	if s.running || s.pendingLaunch {
 		return ErrAlreadyRunning
 	}
 
@@ -329,6 +368,9 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		logFile = filepath.Join(s.dataDir, "postgresql.log")
 	}
 
+	// Mark launch as pending from the moment we initiate startCmd
+	s.pendingLaunch = true
+
 	startCmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "pg_ctl"),
 		"-w",
 		"-D", s.dataDir,
@@ -337,23 +379,48 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	)
 	out, startErr := startCmd.CombinedOutput()
 	if startErr != nil {
-		if postPID, err := readPostmasterPID(s.dataDir); err == nil && postPID > 0 && syscall.Kill(postPID, 0) == nil {
+		// pg_ctl failed or was cancelled while running.
+		// A child process may have been forked by pg_ctl before it failed or was killed.
+		// One missing postmaster.pid read must not discard a possibly launched child!
+		// Resolve the pending launch with bounded, retryable cleanup until its child is accounted for.
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), s.resolvePIDTimeout+500*time.Millisecond)
+		postPID, resolveErr := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
+		resolveCancel()
+
+		if postPID > 0 {
 			cleanupErr := s.cleanupLaunchedPostmaster(postPID)
-			return errors.Join(fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))), cleanupErr)
+			if cleanupErr != nil {
+				return errors.Join(fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))), cleanupErr)
+			}
+			// Child has been accounted for and confirmed dead!
+			if ctx.Err() != nil {
+				return errors.Join(ctx.Err(), fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))))
+			}
+			return fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
 		}
-		if s.tempSocket && s.socketDir != "" {
-			_ = os.RemoveAll(s.socketDir)
+
+		// Child not yet accounted for! Retain pending launch with retryable cleanup!
+		s.running = true
+		s.pendingLaunch = true
+		startFailure := fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
+		if ctx.Err() != nil {
+			startFailure = errors.Join(ctx.Err(), startFailure)
 		}
-		return fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
+		return errors.Join(startFailure, fmt.Errorf("pending postmaster launch not yet accounted for: %w", resolveErr))
 	}
 
-	// Read postmaster.pid
-	pid, err := readPostmasterPID(s.dataDir)
+	// Read postmaster.pid after pg_ctl start succeeded
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), s.resolvePIDTimeout+500*time.Millisecond)
+	pid, err := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
+	resolveCancel()
 	if err != nil || pid <= 0 {
-		return fmt.Errorf("server started but failed to read postmaster.pid: %w", err)
+		s.running = true
+		s.pendingLaunch = true
+		return fmt.Errorf("server reported started but failed to resolve postmaster.pid: %w", err)
 	}
 	s.pid = pid
 	s.running = true
+	s.pendingLaunch = false
 
 	// Post-launch checks: context cancellation or hook failure
 	if ctx.Err() != nil {
@@ -373,7 +440,6 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return errors.Join(ctx.Err(), cleanupErr)
 	}
 
-	s.running = true
 	return nil
 }
 
@@ -383,58 +449,75 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.running {
+	if !s.running && !s.pendingLaunch {
 		return nil
 	}
 
 	pid := s.pid
 	if pid <= 0 {
-		pid, _ = readPostmasterPID(s.dataDir)
+		resolveCtx, resolveCancel := deriveBoundedContext(ctx, 3*time.Second)
+		resolvedPID, _ := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
+		resolveCancel()
+		if resolvedPID > 0 {
+			pid = resolvedPID
+			s.pid = resolvedPID
+		}
 	}
 
 	pgCtl := filepath.Join(s.binDir, "pg_ctl")
-
-	// 1. Attempt graceful fast stop bounded by ctx (or default 10s if unbounded ctx)
-	fastCtx, fastCancel := deriveBoundedContext(ctx, 10*time.Second)
-	defer fastCancel()
-
-	stopCmd := exec.CommandContext(fastCtx, pgCtl,
-		"-w",
-		"-D", s.dataDir,
-		"-m", "fast",
-		"stop",
-	)
 	var stopErrs []error
-	if runErr := stopCmd.Run(); runErr != nil {
-		// 2. Fall back to immediate stop bounded by 5s
-		immCtx, immCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer immCancel()
 
-		immCmd := exec.CommandContext(immCtx, pgCtl,
+	if pid > 0 {
+		// 1. Attempt graceful fast stop bounded by ctx (or default 10s if unbounded ctx)
+		fastCtx, fastCancel := deriveBoundedContext(ctx, 10*time.Second)
+		defer fastCancel()
+
+		stopCmd := exec.CommandContext(fastCtx, pgCtl,
 			"-w",
 			"-D", s.dataDir,
-			"-m", "immediate",
+			"-m", "fast",
 			"stop",
 		)
-		if immErr := immCmd.Run(); immErr != nil {
-			stopErrs = append(stopErrs, fmt.Errorf("immediate stop failed: %w", immErr))
-		}
-	}
+		if runErr := stopCmd.Run(); runErr != nil {
+			// 2. Fall back to immediate stop bounded by 5s
+			immCtx, immCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer immCancel()
 
-	// 3. Confirm owned-process exit
-	if pid > 0 {
+			immCmd := exec.CommandContext(immCtx, pgCtl,
+				"-w",
+				"-D", s.dataDir,
+				"-m", "immediate",
+				"stop",
+			)
+			if immErr := immCmd.Run(); immErr != nil {
+				stopErrs = append(stopErrs, fmt.Errorf("immediate stop failed: %w", immErr))
+			}
+		}
+
+		// 3. Confirm owned-process exit
 		if err := s.confirmExit(pid, 5*time.Second); err != nil {
 			stopErrs = append(stopErrs, fmt.Errorf("failed to confirm postmaster process %d exit: %w", pid, err))
-			// Process failed to exit! Propagate failure and do NOT clear running state or PID
+			// Process failed to exit! Propagate failure and retain running state, PID, and pending launch
+			s.running = true
+			s.pendingLaunch = true
 			return errors.Join(stopErrs...)
+		}
+	} else if s.pendingLaunch {
+		// No PID was resolved. Try immediate stop on the data dir just in case a postmaster was started
+		if s.binDir != "" {
+			immCtx, immCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer immCancel()
+			immCmd := exec.CommandContext(immCtx, pgCtl, "-w", "-D", s.dataDir, "-m", "immediate", "stop")
+			_ = immCmd.Run()
 		}
 	}
 
-	// 4. Process exit confirmed: clean up temporary socket if applicable and clear state
+	// 4. Process exit confirmed or child accounted for: clean up temporary socket if applicable and clear state
 	if s.tempSocket && s.socketDir != "" {
 		_ = os.RemoveAll(s.socketDir)
 	}
 
+	s.pendingLaunch = false
 	s.running = false
 	s.pid = 0
 	return nil
@@ -445,11 +528,18 @@ func (s *Supervisor) Close() error {
 	return s.Stop(context.Background())
 }
 
-// Running reports whether the supervisor is currently running.
+// Running reports whether the supervisor is currently running or has a pending launch.
 func (s *Supervisor) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.running
+	return s.running || s.pendingLaunch
+}
+
+// PendingLaunch reports whether a launch attempt is pending resolution or cleanup.
+func (s *Supervisor) PendingLaunch() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingLaunch
 }
 
 // PID returns the postmaster process ID, or 0 if not running.

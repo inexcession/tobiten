@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -351,5 +352,279 @@ func TestSupervisor_CleanupFailure(t *testing.T) {
 	}
 	if killErr := syscall.Kill(launchedPID, 0); !errors.Is(killErr, syscall.ESRCH) {
 		t.Fatalf("expected postmaster process %d to be dead (ESRCH), got: %v", launchedPID, killErr)
+	}
+}
+
+func TestSupervisor_CancelAfterForkBeforePIDCreation(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	dataDir := filepath.Join(tmpDir, "pgdata")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create binDir: %v", err)
+	}
+
+	writeExecutable := func(name, script string) {
+		p := filepath.Join(binDir, name)
+		if err := os.WriteFile(p, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write %s: %v", name, err)
+		}
+	}
+
+	writeExecutable("initdb", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"initdb (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
+	writeExecutable("postgres", "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-V\" ]; then echo \"postgres (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
+
+	pgCtlScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "pg_ctl (PostgreSQL) 18.6"
+  exit 0
+fi
+
+dataDir=""
+mode=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D) dataDir="$2"; shift 2 ;;
+    start) mode="start"; shift ;;
+    stop) mode="stop"; shift ;;
+    *) shift ;;
+  esac
+done
+
+if [ "$mode" = "start" ]; then
+  sh -c '
+    sleep 0.15
+    echo "$$" > "'"$dataDir"'/postmaster.pid"
+    while true; do sleep 1; done
+  ' >/dev/null 2>&1 </dev/null &
+  child_pid=$!
+  echo "$child_pid" > "$dataDir/.forked"
+  while true; do sleep 1; done
+fi
+
+if [ "$mode" = "stop" ]; then
+  if [ -f "$dataDir/postmaster.pid" ]; then
+    pid=$(head -n 1 "$dataDir/postmaster.pid")
+    if [ -n "$pid" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$dataDir/postmaster.pid"
+  fi
+  exit 0
+fi
+`
+	writeExecutable("pg_ctl", pgCtlScript)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating supervisor: %v", err)
+	}
+
+	forkedFile := filepath.Join(dataDir, ".forked")
+	pidFile := filepath.Join(dataDir, "postmaster.pid")
+
+	var recordedChildPID int
+	cancelTriggered := make(chan struct{})
+	go func() {
+		for i := 0; i < 400; i++ {
+			if data, err := os.ReadFile(forkedFile); err == nil && len(data) > 0 {
+				pidStr := strings.TrimSpace(string(data))
+				if p, parseErr := strconv.Atoi(pidStr); parseErr == nil && p > 0 {
+					recordedChildPID = p
+					// Verify postmaster.pid does NOT exist yet when we cancel
+					if _, statErr := os.Stat(pidFile); os.IsNotExist(statErr) {
+						cancel()
+						close(cancelTriggered)
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("timeout waiting for .forked file before postmaster.pid")
+	}()
+
+	startErr := s.Start(ctx)
+	if startErr == nil {
+		t.Fatal("expected Start to fail due to context cancellation, got nil")
+	}
+
+	select {
+	case <-cancelTriggered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for cancelTriggered")
+	}
+
+	if recordedChildPID <= 0 {
+		t.Fatal("expected child PID to be recorded")
+	}
+
+	// Verify that the child process was resolved and cleaned up (not discarded as an orphan)
+	if killErr := syscall.Kill(recordedChildPID, 0); !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("expected child process %d to be dead (ESRCH), got: %v", recordedChildPID, killErr)
+	}
+
+	if s.Running() {
+		t.Fatal("expected supervisor to not be Running() after cleanup")
+	}
+	if s.PID() != 0 {
+		t.Fatalf("expected PID() to be 0 after cleanup, got %d", s.PID())
+	}
+}
+
+func TestSupervisor_PendingLaunchRetainedAndResolvedByStop(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	dataDir := filepath.Join(tmpDir, "pgdata")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create binDir: %v", err)
+	}
+
+	writeExecutable := func(name, script string) {
+		p := filepath.Join(binDir, name)
+		if err := os.WriteFile(p, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write %s: %v", name, err)
+		}
+	}
+
+	writeExecutable("initdb", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"initdb (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
+	writeExecutable("postgres", "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-V\" ]; then echo \"postgres (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
+
+	pgCtlScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "pg_ctl (PostgreSQL) 18.6"
+  exit 0
+fi
+
+dataDir=""
+mode=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D) dataDir="$2"; shift 2 ;;
+    start) mode="start"; shift ;;
+    stop) mode="stop"; shift ;;
+    *) shift ;;
+  esac
+done
+
+if [ "$mode" = "start" ]; then
+  sh -c '
+    sleep 3
+    echo "$$" > "'"$dataDir"'/postmaster.pid"
+    while true; do sleep 1; done
+  ' >/dev/null 2>&1 </dev/null &
+  child_pid=$!
+  echo "$child_pid" > "$dataDir/.forked"
+  while true; do sleep 1; done
+fi
+
+if [ "$mode" = "stop" ]; then
+  if [ -f "$dataDir/postmaster.pid" ]; then
+    pid=$(head -n 1 "$dataDir/postmaster.pid")
+    if [ -n "$pid" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$dataDir/postmaster.pid"
+  fi
+  exit 0
+fi
+`
+	writeExecutable("pg_ctl", pgCtlScript)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Short resolution timeout so Start fails resolution before postmaster.pid appears at 350ms
+	s, err := New(Options{
+		BinDir:            binDir,
+		DataDir:           dataDir,
+		NoSync:            true,
+		isRoot:            func() bool { return false },
+		resolvePIDTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating supervisor: %v", err)
+	}
+
+	forkedFile := filepath.Join(dataDir, ".forked")
+	pidFile := filepath.Join(dataDir, "postmaster.pid")
+
+	var recordedChildPID int
+	cancelTriggered := make(chan struct{})
+	go func() {
+		for i := 0; i < 400; i++ {
+			if data, err := os.ReadFile(forkedFile); err == nil && len(data) > 0 {
+				pidStr := strings.TrimSpace(string(data))
+				if p, parseErr := strconv.Atoi(pidStr); parseErr == nil && p > 0 {
+					recordedChildPID = p
+					if _, statErr := os.Stat(pidFile); os.IsNotExist(statErr) {
+						cancel()
+						close(cancelTriggered)
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("timeout waiting for .forked file before postmaster.pid")
+	}()
+
+	startErr := s.Start(ctx)
+	if startErr == nil {
+		t.Fatal("expected Start to fail due to context cancellation, got nil")
+	}
+
+	select {
+	case <-cancelTriggered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for cancelTriggered")
+	}
+
+	// Verify error mentions pending launch not yet accounted for
+	if !strings.Contains(startErr.Error(), "pending postmaster launch not yet accounted for") {
+		t.Fatalf("expected error to mention unaccounted pending launch, got: %v", startErr)
+	}
+
+	// Verify pending launch is RETAINED and retryable
+	if !s.PendingLaunch() {
+		t.Fatal("expected PendingLaunch() to be true")
+	}
+	if !s.Running() {
+		t.Fatal("expected Running() to be true (retryable state)")
+	}
+
+	// Simulate child creating postmaster.pid
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(recordedChildPID)+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write pidFile: %v", err)
+	}
+
+	// Now call Stop() to resolve and clean up the retained pending launch
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+
+	if stopErr := s.Stop(stopCtx); stopErr != nil {
+		t.Fatalf("expected Stop() to succeed and account for pending launch, got: %v", stopErr)
+	}
+
+	if s.PendingLaunch() {
+		t.Fatal("expected PendingLaunch() to be false after Stop")
+	}
+	if s.Running() {
+		t.Fatal("expected Running() to be false after Stop")
+	}
+	if s.PID() != 0 {
+		t.Fatalf("expected PID() to be 0 after Stop, got %d", s.PID())
+	}
+
+	// Verify child process was killed
+	if killErr := syscall.Kill(recordedChildPID, 0); !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("expected child process %d to be dead (ESRCH), got: %v", recordedChildPID, killErr)
 	}
 }
