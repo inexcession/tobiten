@@ -892,6 +892,7 @@ func TestPrintUsage(t *testing.T) {
 		"--data-dir",
 		"--env-file",
 		"--extract-cache-max-mb",
+		"--help",
 		"--host",
 		"--intake-mode",
 		"--library-mode",
@@ -913,9 +914,12 @@ func TestPrintUsage(t *testing.T) {
 		}
 	}
 
-	// Single-letter alias -v must be presented with single dash
-	if !strings.Contains(out, "  -v\t") {
-		t.Errorf("PrintUsage output missing short alias -v")
+	// -v alias must be omitted from canonical help
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "-v\t") || strings.HasPrefix(trimmed, "-v ") || trimmed == "-v" {
+			t.Errorf("PrintUsage output contains omitted alias -v: %q", line)
+		}
 	}
 
 	// Secret keys and client API key must NOT have CLI flags (I-7)
@@ -937,5 +941,14 @@ func TestSingleDashAliasAccepted(t *testing.T) {
 	}
 	if cfg.Host != "127.0.0.1" {
 		t.Errorf("Host = %q, want 127.0.0.1", cfg.Host)
+	}
+
+	// -v alias returns ShowVersion
+	cfgV, err := Load([]string{"-v"}, WithEnviron(nil), WithoutEnvFile())
+	if err != nil {
+		t.Fatalf("Load() unexpected error for -v: %v", err)
+	}
+	if !cfgV.ShowVersion {
+		t.Errorf("ShowVersion = false, want true for -v alias")
 	}
 }

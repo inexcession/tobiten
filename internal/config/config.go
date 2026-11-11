@@ -343,7 +343,15 @@ func PrintUsage(w io.Writer) {
 }
 
 func printDefaults(w io.Writer, fs *flag.FlagSet) {
+	var printedHelp bool
 	fs.VisitAll(func(fl *flag.Flag) {
+		if fl.Name == "v" {
+			return // Omit short alias from canonical help (M1-T1.5)
+		}
+		if !printedHelp && fl.Name > "help" {
+			printedHelp = true
+			fmt.Fprint(w, "  --help\n    \tprint help and exit\n")
+		}
 		var b strings.Builder
 		prefix := "--"
 		if len(fl.Name) == 1 {
@@ -366,6 +374,9 @@ func printDefaults(w io.Writer, fs *flag.FlagSet) {
 		}
 		fmt.Fprint(w, b.String(), "\n")
 	})
+	if !printedHelp {
+		fmt.Fprint(w, "  --help\n    \tprint help and exit\n")
+	}
 }
 
 // Load loads, resolves, and validates configuration according to precedence:

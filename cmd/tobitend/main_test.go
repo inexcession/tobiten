@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,9 +105,16 @@ func TestRunHelp(t *testing.T) {
 				t.Errorf("run(%s) stderr = %q, want usage output", flag, out)
 			}
 			// Verify canonical double-dash options are presented (ADR-0014 §2, I-8)
-			for _, canonical := range []string{"--version", "--base-url", "--log-format", "--port", "--data-dir"} {
+			for _, canonical := range []string{"--help", "--version", "--base-url", "--log-format", "--port", "--data-dir"} {
 				if !bytes.Contains(buf.Bytes(), []byte(canonical)) {
 					t.Errorf("run(%s) usage missing canonical option %q", flag, canonical)
+				}
+			}
+			// -v alias must be omitted from canonical help
+			for _, line := range strings.Split(out, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "-v\t") || strings.HasPrefix(trimmed, "-v ") || trimmed == "-v" {
+					t.Errorf("run(%s) usage contains omitted alias -v: %q", flag, line)
 				}
 			}
 			// I-7: secrets and client API key must NOT have CLI flags
