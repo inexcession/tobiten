@@ -952,3 +952,63 @@ func TestSingleDashAliasAccepted(t *testing.T) {
 		t.Errorf("ShowVersion = false, want true for -v alias")
 	}
 }
+
+func TestDisabledModules(t *testing.T) {
+	t.Run("default has no disabled modules", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if !cfg.IsModuleEnabled("komga") {
+			t.Errorf("expected komga to be enabled by default")
+		}
+		if !cfg.IsModuleEnabled("opds") {
+			t.Errorf("expected opds to be enabled by default")
+		}
+	})
+
+	t.Run("WithDisabledModules disables specified modules", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithDisabledModules("komga", "TEST-MOD"))
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.IsModuleEnabled("komga") {
+			t.Errorf("expected komga to be disabled")
+		}
+		if cfg.IsModuleEnabled("KOMGA") {
+			t.Errorf("expected KOMGA (case-insensitive) to be disabled")
+		}
+		if cfg.IsModuleEnabled("test-mod") {
+			t.Errorf("expected test-mod to be disabled")
+		}
+		if !cfg.IsModuleEnabled("opds") {
+			t.Errorf("expected opds to remain enabled")
+		}
+	})
+
+	t.Run("DisableModule and EnableModule mutate list dynamically", func(t *testing.T) {
+		cfg := &Config{}
+		if !cfg.IsModuleEnabled("komga") {
+			t.Errorf("expected komga enabled initially")
+		}
+
+		cfg.DisableModule("komga")
+		if cfg.IsModuleEnabled("komga") {
+			t.Errorf("expected komga disabled after DisableModule")
+		}
+
+		// Idempotent disable
+		cfg.DisableModule("komga")
+		if len(cfg.DisabledModules) != 1 {
+			t.Errorf("len(DisabledModules) = %d, want 1", len(cfg.DisabledModules))
+		}
+
+		cfg.EnableModule("komga")
+		if !cfg.IsModuleEnabled("komga") {
+			t.Errorf("expected komga enabled after EnableModule")
+		}
+		if len(cfg.DisabledModules) != 0 {
+			t.Errorf("len(DisabledModules) = %d, want 0", len(cfg.DisabledModules))
+		}
+	})
+}

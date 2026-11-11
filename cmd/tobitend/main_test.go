@@ -444,3 +444,22 @@ func TestRunServer_GracefulShutdown(t *testing.T) {
 		t.Fatal("timed out waiting for server shutdown")
 	}
 }
+
+func TestBuildRegistry(t *testing.T) {
+	t.Run("nil config returns registry", func(t *testing.T) {
+		reg := BuildRegistry(nil)
+		if reg == nil {
+			t.Fatal("BuildRegistry(nil) returned nil")
+		}
+	})
+
+	t.Run("applies disabled modules from config", func(t *testing.T) {
+		cfg := &config.Config{
+			DisabledModules: []string{"test-mod"},
+		}
+		reg := BuildRegistry(cfg)
+		if reg == nil {
+			t.Fatal("BuildRegistry(cfg) returned nil")
+		}
+	})
+}

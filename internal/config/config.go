@@ -125,8 +125,51 @@ type Config struct {
 	// Operational flags
 	ShowVersion bool `json:"-"`
 
+	// DisabledModules contains names of modules disabled at runtime (ADR-0018 §1).
+	DisabledModules []string `json:"disabled_modules,omitempty"`
+
 	// sources tracks the origin of each setting (flag > env > env_file > default)
 	sources map[string]Source
+}
+
+// IsModuleEnabled returns true if the module with the given name is enabled.
+func (c *Config) IsModuleEnabled(name string) bool {
+	if c == nil {
+		return true
+	}
+	target := strings.ToLower(strings.TrimSpace(name))
+	for _, m := range c.DisabledModules {
+		if strings.ToLower(strings.TrimSpace(m)) == target {
+			return false
+		}
+	}
+	return true
+}
+
+// DisableModule adds a module name to the DisabledModules list.
+func (c *Config) DisableModule(name string) {
+	if !c.IsModuleEnabled(name) {
+		return
+	}
+	trimmed := strings.TrimSpace(name)
+	if trimmed != "" {
+		c.DisabledModules = append(c.DisabledModules, trimmed)
+	}
+}
+
+// EnableModule removes a module name from the DisabledModules list if present.
+func (c *Config) EnableModule(name string) {
+	target := strings.ToLower(strings.TrimSpace(name))
+	if target == "" {
+		return
+	}
+	filtered := make([]string, 0, len(c.DisabledModules))
+	for _, m := range c.DisabledModules {
+		if strings.ToLower(strings.TrimSpace(m)) != target {
+			filtered = append(filtered, m)
+		}
+	}
+	c.DisabledModules = filtered
 }
 
 // ThumbsCacheDir returns the directory for ephemeral preview thumbnails (ADR-0015).
@@ -243,12 +286,13 @@ func (c *Config) Validate() error {
 type Option func(*loadOptions)
 
 type loadOptions struct {
-	environ       []string
-	hasCustomEnv  bool
-	envFile       string
-	hasEnvFile    bool
-	envFileReader io.Reader
-	skipEnvFile   bool
+	environ         []string
+	hasCustomEnv    bool
+	envFile         string
+	hasEnvFile      bool
+	envFileReader   io.Reader
+	skipEnvFile     bool
+	disabledModules []string
 }
 
 // WithEnviron specifies a custom environment list (e.g. for testing).
@@ -278,6 +322,18 @@ func WithEnvFileReader(r io.Reader) Option {
 func WithoutEnvFile() Option {
 	return func(o *loadOptions) {
 		o.skipEnvFile = true
+	}
+}
+
+// WithDisabledModules specifies module names to disable when loading config (ADR-0018 §1).
+func WithDisabledModules(names ...string) Option {
+	return func(o *loadOptions) {
+		for _, name := range names {
+			trimmed := strings.TrimSpace(name)
+			if trimmed != "" {
+				o.disabledModules = append(o.disabledModules, trimmed)
+			}
+		}
 	}
 }
 
@@ -556,6 +612,11 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	cfg.IntakeMode = strings.ToLower(cfg.IntakeMode)
 	cfg.LogLevel = strings.ToLower(cfg.LogLevel)
 	cfg.LogFormat = strings.ToLower(cfg.LogFormat)
+
+	// Disabled modules
+	if len(lo.disabledModules) > 0 {
+		cfg.DisabledModules = append(cfg.DisabledModules, lo.disabledModules...)
+	}
 
 	// 5. Semantic Validation
 	if err := cfg.Validate(); err != nil {

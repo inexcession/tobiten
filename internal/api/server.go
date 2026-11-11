@@ -8,10 +8,12 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/module"
 )
 
 // DefaultShutdownTimeout is the maximum duration to wait for in-flight requests
@@ -22,7 +24,8 @@ const DefaultShutdownTimeout = 10 * time.Second
 type ServerOptions struct {
 	Config   *config.Config
 	Logger   *slog.Logger
-	Listener net.Listener // optional; if nil, binds Config.Host:Config.Port
+	Listener net.Listener    // optional; if nil, binds Config.Host:Config.Port
+	Registry module.Registry // optional; if nil, module.NewRegistry() is used
 }
 
 // Server represents the Tobiten HTTP server daemon.
@@ -33,6 +36,7 @@ type Server struct {
 	httpServer *http.Server
 	mux        *http.ServeMux
 	urlBuilder *URLBuilder
+	registry   module.Registry
 }
 
 // NewServer initializes a new Server with configured routes and middleware.
@@ -56,6 +60,12 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
+	reg := opts.Registry
+	if reg == nil {
+		reg = module.NewRegistry()
+	}
+	reg.ApplyConfig(cfg)
+
 	listener := opts.Listener
 	if listener == nil {
 		addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
@@ -69,7 +79,10 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	mux := http.NewServeMux()
 
 	// Register /healthz liveness endpoint (ADR-0006 §1 closed allowlist)
-	registerHealthz(mux)
+	registerHealthz(mux, ub)
+
+	// Mount module routes (ADR-0018 §1, ADR-0020 §6)
+	mountModuleRoutes(mux, reg, ub, logger)
 
 	// Wrap root router with global RequestLogger and URLBuilder middleware
 	handler := middleware.RequestLogger(logger)(URLBuilderMiddleware(ub)(mux))
@@ -88,12 +101,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		httpServer: httpServer,
 		mux:        mux,
 		urlBuilder: ub,
+		registry:   reg,
 	}, nil
 }
 
 // registerHealthz attaches the unauthenticated GET/HEAD /healthz endpoint.
 // It returns 200 OK indicating liveness only, with no version or details (ADR-0006 §1).
-func registerHealthz(mux *http.ServeMux) {
+func registerHealthz(mux *http.ServeMux, ub *URLBuilder) {
 	healthz := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -105,6 +119,58 @@ func registerHealthz(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("HEAD /healthz", healthz)
+
+	if ub != nil && ub.SubPath() != "" {
+		subHealthz := ub.Path("/healthz")
+		mux.HandleFunc("GET "+subHealthz, healthz)
+		mux.HandleFunc("HEAD "+subHealthz, healthz)
+	}
+}
+
+// mountModuleRoutes registers routes from enabled modules in the registry onto mux.
+// It ensures module routes agree with generated public URLs and sub-path reverse proxies (ADR-0020 §6).
+func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, logger *slog.Logger) {
+	if reg == nil {
+		return
+	}
+	for _, mount := range reg.Routes() {
+		prefix := "/" + strings.Trim(mount.Prefix, "/")
+		handler := mount.Handler
+		if handler == nil {
+			continue
+		}
+
+		moduleName := mount.ModuleName
+		guardedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !reg.IsEnabled(moduleName) {
+				http.NotFound(w, r)
+				return
+			}
+			handler.ServeHTTP(w, r)
+		})
+
+		logger.Debug("mounting module route",
+			slog.String("module", moduleName),
+			slog.String("prefix", prefix),
+		)
+
+		if prefix == "/" {
+			mux.Handle("/", guardedHandler)
+			if ub != nil && ub.SubPath() != "" {
+				mux.Handle(ub.SubPath()+"/", http.StripPrefix(ub.SubPath(), guardedHandler))
+			}
+			continue
+		}
+
+		mux.Handle(prefix, guardedHandler)
+		mux.Handle(prefix+"/", guardedHandler)
+
+		if ub != nil && ub.SubPath() != "" {
+			subPrefix := ub.Path(prefix)
+			mux.Handle(subPrefix, http.StripPrefix(ub.SubPath(), guardedHandler))
+			mux.Handle(subPrefix+"/", http.StripPrefix(ub.SubPath(), guardedHandler))
+		}
+	}
 }
 
 // Addr returns the network address the server is listening on.
@@ -148,6 +214,11 @@ func (s *Server) PublicURL(ref string) string {
 // Mux returns the underlying *http.ServeMux used by the server.
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
+}
+
+// Registry returns the module registry wired to this server.
+func (s *Server) Registry() module.Registry {
+	return s.registry
 }
 
 // Handler returns the root HTTP handler of the server (including middleware).

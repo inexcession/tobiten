@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/module"
 )
 
 func TestNewServer_Validation(t *testing.T) {
@@ -457,4 +458,220 @@ func TestServer_AbsoluteURLBuilder_ForwardedHeadersIgnored(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServer_ModuleRouteLifecycle(t *testing.T) {
+	// done_when: A test module registers a route that answers when enabled
+	// and is absent when disabled by config.
+
+	newTestModule := func() *module.SimpleModule {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("hello from greeter module"))
+		})
+		mod := module.NewSimpleModule("greeter-module")
+		mod.Mounts = []module.RouteMount{
+			{Prefix: "/greeter", Handler: handler},
+		}
+		return mod
+	}
+
+	t.Run("module route answers 200 when enabled", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080",
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// Verify module route answers 200 OK
+		resp, err := http.Get(baseURL + "/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /greeter/hello failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "hello from greeter module" {
+			t.Errorf("body = %q, want %q", string(body), "hello from greeter module")
+		}
+
+		// Bare prefix /greeter also answers 200 OK
+		respBare, err := http.Get(baseURL + "/greeter")
+		if err != nil {
+			t.Fatalf("GET /greeter failed: %v", err)
+		}
+		_ = respBare.Body.Close()
+		if respBare.StatusCode != http.StatusOK {
+			t.Errorf("bare prefix status = %d, want 200", respBare.StatusCode)
+		}
+
+		// Core healthz route still works
+		respHealth, err := http.Get(baseURL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		_ = respHealth.Body.Close()
+		if respHealth.StatusCode != http.StatusOK {
+			t.Errorf("healthz status = %d, want 200", respHealth.StatusCode)
+		}
+	})
+
+	t.Run("module route is absent (404) when disabled by config", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:            "127.0.0.1",
+			Port:            0,
+			BaseURL:         "http://localhost:8080",
+			DisabledModules: []string{"greeter-module"},
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// Verify module route is absent (404 Not Found)
+		resp, err := http.Get(baseURL + "/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /greeter/hello failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want 404 (route must be absent when disabled)", resp.StatusCode)
+		}
+
+		// Bare prefix /greeter also absent
+		respBare, err := http.Get(baseURL + "/greeter")
+		if err != nil {
+			t.Fatalf("GET /greeter failed: %v", err)
+		}
+		_ = respBare.Body.Close()
+		if respBare.StatusCode != http.StatusNotFound {
+			t.Errorf("bare prefix status = %d, want 404", respBare.StatusCode)
+		}
+
+		// Core healthz route still answers 200 OK
+		respHealth, err := http.Get(baseURL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		_ = respHealth.Body.Close()
+		if respHealth.StatusCode != http.StatusOK {
+			t.Errorf("healthz status = %d, want 200", respHealth.StatusCode)
+		}
+	})
+
+	t.Run("sub-path mount agreement and reverse proxy requests (ADR-0020 §6)", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080/tobiten",
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		// Verify public URL generated with subpath
+		wantPublicURL := "http://localhost:8080/tobiten/greeter/hello"
+		if got := srv.PublicURL("/greeter/hello"); got != wantPublicURL {
+			t.Errorf("PublicURL = %q, want %q", got, wantPublicURL)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// 1. Request via sub-path (as forwarded by plain reverse proxy)
+		respSub, err := http.Get(baseURL + "/tobiten/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /tobiten/greeter/hello failed: %v", err)
+		}
+		defer respSub.Body.Close()
+
+		if respSub.StatusCode != http.StatusOK {
+			t.Errorf("sub-path request status = %d, want 200", respSub.StatusCode)
+		}
+		bodySub, _ := io.ReadAll(respSub.Body)
+		if string(bodySub) != "hello from greeter module" {
+			t.Errorf("sub-path body = %q, want %q", string(bodySub), "hello from greeter module")
+		}
+
+		// 2. Direct un-prefixed request also succeeds
+		respDirect, err := http.Get(baseURL + "/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /greeter/hello failed: %v", err)
+		}
+		_ = respDirect.Body.Close()
+		if respDirect.StatusCode != http.StatusOK {
+			t.Errorf("direct request status = %d, want 200", respDirect.StatusCode)
+		}
+
+		// 3. Sub-path healthz request succeeds
+		respSubHealth, err := http.Get(baseURL + "/tobiten/healthz")
+		if err != nil {
+			t.Fatalf("GET /tobiten/healthz failed: %v", err)
+		}
+		_ = respSubHealth.Body.Close()
+		if respSubHealth.StatusCode != http.StatusOK {
+			t.Errorf("sub-path healthz status = %d, want 200", respSubHealth.StatusCode)
+		}
+	})
 }

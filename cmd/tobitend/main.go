@@ -13,6 +13,7 @@ import (
 	"github.com/inexcession/tobiten/internal/api"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/logging"
+	"github.com/inexcession/tobiten/internal/module"
 )
 
 // Version is the build version of tobitend.
@@ -41,10 +42,22 @@ func setupLogging(cfg *config.Config) error {
 	return nil
 }
 
+// BuildRegistry constructs the composition root module registry for tobitend.
+// Compiled-in modules are registered here (ADR-0018 §1).
+func BuildRegistry(cfg *config.Config) module.Registry {
+	reg := module.NewRegistry()
+	if cfg != nil {
+		reg.ApplyConfig(cfg)
+	}
+	return reg
+}
+
 var startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	reg := BuildRegistry(cfg)
 	srv, err := api.NewServer(api.ServerOptions{
-		Config: cfg,
-		Logger: logger,
+		Config:   cfg,
+		Logger:   logger,
+		Registry: reg,
 	})
 	if err != nil {
 		return err
