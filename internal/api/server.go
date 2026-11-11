@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/api/middleware"
+	"github.com/inexcession/tobiten/internal/api/openapi"
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/module"
 )
@@ -64,6 +67,10 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	reg := opts.Registry
 	if reg == nil {
 		reg = module.NewRegistry()
+		_ = reg.Register(NewSystemModule())
+		_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+	} else if reg.Module("system") == nil {
+		_ = reg.Register(NewSystemModule())
 	}
 	reg.ApplyConfig(cfg)
 
@@ -79,10 +86,8 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 	mux := http.NewServeMux()
 
-	// Register /healthz liveness endpoint (ADR-0006 §1 closed allowlist)
-	registerHealthz(mux, ub)
-
-	// Mount module routes (ADR-0018 §1, ADR-0020 §6)
+	// Mount module routes from registry (ADR-0018 §1, ADR-0020 §6).
+	// Core liveness (/healthz) and native REST (/api/v1) resolve through the registry.
 	mountModuleRoutes(mux, reg, ub, logger)
 
 	// Wrap root router with global RequestLogger and URLBuilder middleware
@@ -104,28 +109,6 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		urlBuilder: ub,
 		registry:   reg,
 	}, nil
-}
-
-// registerHealthz attaches the unauthenticated GET/HEAD /healthz endpoint.
-// It returns 200 OK indicating liveness only, with no version or details (ADR-0006 §1).
-func registerHealthz(mux *http.ServeMux, ub *URLBuilder) {
-	healthz := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.WriteHeader(http.StatusOK)
-		if r.Method != http.MethodHead {
-			_, _ = w.Write([]byte("ok\n"))
-		}
-	}
-
-	mux.HandleFunc("GET /healthz", healthz)
-	mux.HandleFunc("HEAD /healthz", healthz)
-
-	if ub != nil && ub.SubPath() != "" {
-		subHealthz := ub.Path("/healthz")
-		mux.HandleFunc("GET "+subHealthz, healthz)
-		mux.HandleFunc("HEAD "+subHealthz, healthz)
-	}
 }
 
 // stripSubPath wraps h to strip the base URL's sub-path from incoming requests.
@@ -172,12 +155,124 @@ func stripSubPath(ub *URLBuilder, h http.Handler) http.Handler {
 	})
 }
 
+type compositeHandler struct {
+	handlers []http.Handler
+}
+
+func (c *compositeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if len(c.handlers) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if len(c.handlers) == 1 {
+		c.handlers[0].ServeHTTP(w, r)
+		return
+	}
+
+	var first404 *fallbackRecorder
+
+	for i, h := range c.handlers {
+		if i == len(c.handlers)-1 {
+			rec := newFallbackRecorder(w)
+			h.ServeHTTP(rec, r)
+			if !rec.is404 {
+				rec.flush()
+				return
+			}
+			if first404 != nil {
+				first404.flush()
+			} else {
+				rec.flush()
+			}
+			return
+		}
+
+		rec := newFallbackRecorder(w)
+		h.ServeHTTP(rec, r)
+		if !rec.is404 {
+			rec.flush()
+			return
+		}
+		if first404 == nil {
+			first404 = rec
+		}
+	}
+}
+
+type fallbackRecorder struct {
+	underlying http.ResponseWriter
+	header     http.Header
+	buf        bytes.Buffer
+	statusCode int
+	is404      bool
+	written    bool
+}
+
+func newFallbackRecorder(w http.ResponseWriter) *fallbackRecorder {
+	return &fallbackRecorder{
+		underlying: w,
+		header:     make(http.Header),
+		statusCode: http.StatusOK,
+	}
+}
+
+func (r *fallbackRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *fallbackRecorder) WriteHeader(statusCode int) {
+	if r.written {
+		return
+	}
+	r.written = true
+	r.statusCode = statusCode
+	if statusCode == http.StatusNotFound {
+		r.is404 = true
+	}
+}
+
+func (r *fallbackRecorder) Write(b []byte) (int, error) {
+	if !r.written {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.buf.Write(b)
+}
+
+func (r *fallbackRecorder) flush() {
+	for k, vv := range r.header {
+		for _, v := range vv {
+			r.underlying.Header().Add(k, v)
+		}
+	}
+	r.underlying.WriteHeader(r.statusCode)
+	_, _ = r.underlying.Write(r.buf.Bytes())
+}
+
 // mountModuleRoutes registers routes from enabled modules in the registry onto mux.
-// It ensures module routes agree with generated public URLs and sub-path reverse proxies (ADR-0020 §6).
+// It ensures module routes agree with generated public URLs and sub-path reverse proxies (ADR-0020 §6),
+// and composes direct and BASE_URL-prefixed aliases without duplicate ServeMux pattern panics (ADR-0018 §1).
 func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, logger *slog.Logger) {
 	if reg == nil {
 		return
 	}
+
+	patternHandlers := make(map[string]*compositeHandler)
+
+	registerPattern := func(pattern string, h http.Handler, isDirect bool) {
+		if comp, exists := patternHandlers[pattern]; exists {
+			if isDirect {
+				// Direct module routes precede subpath aliases in fallback resolution order
+				comp.handlers = append([]http.Handler{h}, comp.handlers...)
+			} else {
+				comp.handlers = append(comp.handlers, h)
+			}
+		} else {
+			comp := &compositeHandler{handlers: []http.Handler{h}}
+			patternHandlers[pattern] = comp
+			mux.Handle(pattern, comp)
+		}
+	}
+
 	for _, mount := range reg.Routes() {
 		prefix := "/" + strings.Trim(mount.Prefix, "/")
 		handler := mount.Handler
@@ -200,24 +295,24 @@ func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, 
 		)
 
 		if prefix == "/" {
-			mux.Handle("/", guardedHandler)
+			registerPattern("/", guardedHandler, true)
 			if ub != nil && ub.SubPath() != "" {
 				subPath := ub.SubPath()
 				subPathHandler := stripSubPath(ub, guardedHandler)
-				mux.Handle(subPath, subPathHandler)
-				mux.Handle(subPath+"/", subPathHandler)
+				registerPattern(subPath, subPathHandler, false)
+				registerPattern(subPath+"/", subPathHandler, false)
 			}
 			continue
 		}
 
-		mux.Handle(prefix, guardedHandler)
-		mux.Handle(prefix+"/", guardedHandler)
+		registerPattern(prefix, guardedHandler, true)
+		registerPattern(prefix+"/", guardedHandler, true)
 
 		if ub != nil && ub.SubPath() != "" {
 			subPrefix := ub.Path(prefix)
 			subPrefixHandler := stripSubPath(ub, guardedHandler)
-			mux.Handle(subPrefix, subPrefixHandler)
-			mux.Handle(subPrefix+"/", subPrefixHandler)
+			registerPattern(subPrefix, subPrefixHandler, false)
+			registerPattern(subPrefix+"/", subPrefixHandler, false)
 		}
 	}
 }

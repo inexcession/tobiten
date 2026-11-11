@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/inexcession/tobiten/internal/api"
+	"github.com/inexcession/tobiten/internal/api/openapi"
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
@@ -45,7 +47,22 @@ func setupLogging(cfg *config.Config) error {
 // BuildRegistry constructs the composition root module registry for tobitend.
 // Compiled-in modules are registered here (ADR-0018 §1).
 func BuildRegistry(cfg *config.Config) module.Registry {
+	return BuildRegistryWithServices(cfg, app.NewStubServices())
+}
+
+// BuildRegistryWithServices constructs the composition root module registry
+// wired with the specified application services.
+func BuildRegistryWithServices(cfg *config.Config, services *app.Services) module.Registry {
 	reg := module.NewRegistry()
+	if services == nil {
+		services = app.NewStubServices()
+	}
+
+	// Register compiled-in modules
+	_ = reg.Register(api.NewSystemModule())
+	_ = reg.Register(openapi.NewModule(services))
+
+	// Apply configuration (e.g. disabled modules) after registering real modules
 	if cfg != nil {
 		reg.ApplyConfig(cfg)
 	}

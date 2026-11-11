@@ -446,20 +446,38 @@ func TestRunServer_GracefulShutdown(t *testing.T) {
 }
 
 func TestBuildRegistry(t *testing.T) {
-	t.Run("nil config returns registry", func(t *testing.T) {
+	t.Run("nil config returns registry with compiled-in modules", func(t *testing.T) {
 		reg := BuildRegistry(nil)
 		if reg == nil {
 			t.Fatal("BuildRegistry(nil) returned nil")
+		}
+		if reg.Module("system") == nil {
+			t.Errorf("expected 'system' module to be registered")
+		}
+		if reg.Module("openapi") == nil {
+			t.Errorf("expected 'openapi' module to be registered")
+		}
+		if !reg.IsEnabled("system") {
+			t.Errorf("expected 'system' module to be enabled by default")
+		}
+		if !reg.IsEnabled("openapi") {
+			t.Errorf("expected 'openapi' module to be enabled by default")
 		}
 	})
 
 	t.Run("applies disabled modules from config", func(t *testing.T) {
 		cfg := &config.Config{
-			DisabledModules: []string{"test-mod"},
+			DisabledModules: []string{"openapi"},
 		}
 		reg := BuildRegistry(cfg)
 		if reg == nil {
 			t.Fatal("BuildRegistry(cfg) returned nil")
+		}
+		if reg.IsEnabled("openapi") {
+			t.Errorf("expected 'openapi' module to be disabled by config")
+		}
+		if !reg.IsEnabled("system") {
+			t.Errorf("expected 'system' module to remain enabled")
 		}
 	})
 }

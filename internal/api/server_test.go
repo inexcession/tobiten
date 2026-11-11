@@ -988,3 +988,256 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_HealthzAndAuthThroughRegistry(t *testing.T) {
+	cfg := &config.Config{
+		Host:    "127.0.0.1",
+		Port:    0,
+		BaseURL: "http://localhost:8080",
+	}
+	srv, err := NewServer(ServerOptions{Config: cfg})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(ctx)
+	}()
+
+	baseURL := srv.URL()
+
+	t.Run("GET /healthz resolves through registry", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "ok\n" {
+			t.Errorf("body = %q, want 'ok\\n'", string(body))
+		}
+	})
+
+	t.Run("POST /healthz returns 405 Method Not Allowed", func(t *testing.T) {
+		resp, err := http.Post(baseURL+"/healthz", "text/plain", nil)
+		if err != nil {
+			t.Fatalf("POST /healthz failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405 Method Not Allowed", resp.StatusCode)
+		}
+	})
+
+	t.Run("GET /api/v1/auth/setup resolves through registry", func(t *testing.T) {
+		resp, err := http.Get(baseURL + "/api/v1/auth/setup")
+		if err != nil {
+			t.Fatalf("GET /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
+	t.Run("POST /api/v1/auth/setup creates admin and seals", func(t *testing.T) {
+		setupPayload := `{"setup_token":"token-123","username":"admin","password":"secretpassword"}`
+		resp, err := http.Post(baseURL+"/api/v1/auth/setup", "application/json", strings.NewReader(setupPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/setup failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 201 Created (body: %s)", resp.StatusCode, string(body))
+		}
+
+		// Subsequent setup attempt must fail with 403 Forbidden (sealed)
+		resp2, err := http.Post(baseURL+"/api/v1/auth/setup", "application/json", strings.NewReader(setupPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/setup 2nd attempt failed: %v", err)
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode != http.StatusForbidden {
+			t.Errorf("second setup attempt status = %d, want 403 Forbidden", resp2.StatusCode)
+		}
+	})
+
+	t.Run("POST /api/v1/auth/login succeeds with credentials", func(t *testing.T) {
+		loginPayload := `{"username":"admin","password":"secretpassword"}`
+		resp, err := http.Post(baseURL+"/api/v1/auth/login", "application/json", strings.NewReader(loginPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/login failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("status = %d, want 200 OK (body: %s)", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("POST /api/v1/auth/login fails on empty credentials", func(t *testing.T) {
+		loginPayload := `{"username":"","password":""}`
+		resp, err := http.Post(baseURL+"/api/v1/auth/login", "application/json", strings.NewReader(loginPayload))
+		if err != nil {
+			t.Fatalf("POST /api/v1/auth/login failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400 Bad Request", resp.StatusCode)
+		}
+	})
+}
+
+func TestServer_DisablingOpenAPIModule(t *testing.T) {
+	cfg := &config.Config{
+		Host:            "127.0.0.1",
+		Port:            0,
+		BaseURL:         "http://localhost:8080",
+		DisabledModules: []string{"openapi"},
+	}
+	srv, err := NewServer(ServerOptions{Config: cfg})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(ctx)
+	}()
+
+	baseURL := srv.URL()
+
+	// /healthz (system module) still works
+	respHealth, err := http.Get(baseURL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz failed: %v", err)
+	}
+	_ = respHealth.Body.Close()
+	if respHealth.StatusCode != http.StatusOK {
+		t.Errorf("healthz status = %d, want 200", respHealth.StatusCode)
+	}
+
+	// /api/v1/auth/login returns 404 (disabled module)
+	respLogin, err := http.Post(baseURL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"username":"admin","password":"pwd"}`))
+	if err != nil {
+		t.Fatalf("POST /api/v1/auth/login failed: %v", err)
+	}
+	_ = respLogin.Body.Close()
+	if respLogin.StatusCode != http.StatusNotFound {
+		t.Errorf("disabled openapi route status = %d, want 404", respLogin.StatusCode)
+	}
+}
+
+func TestServer_DuplicatePatternComposition(t *testing.T) {
+	// Tests the composition of root module (prefix: "/") and an API module (prefix: "/api")
+	// when BaseURL has sub-path "/api". Both modules attempt to claim pattern "/api" and "/api/".
+	// The server must compose without panicking, prioritizing direct handlers before subpath fallbacks.
+	reg := module.NewRegistry()
+
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("root module: " + r.URL.Path))
+	})
+	rootMod := module.NewSimpleModule("root-module")
+	rootMod.Mounts = []module.RouteMount{
+		{ModuleName: "root-module", Prefix: "/", Handler: rootHandler},
+	}
+	if err := reg.Register(rootMod); err != nil {
+		t.Fatalf("register rootMod failed: %v", err)
+	}
+
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("GET /api/specific", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("api module: specific endpoint"))
+	})
+	apiMod := module.NewSimpleModule("api-module")
+	apiMod.Mounts = []module.RouteMount{
+		{ModuleName: "api-module", Prefix: "/api", Handler: apiMux},
+	}
+	if err := reg.Register(apiMod); err != nil {
+		t.Fatalf("register apiMod failed: %v", err)
+	}
+
+	cfg := &config.Config{
+		Host:    "127.0.0.1",
+		Port:    0,
+		BaseURL: "http://localhost:8080/api",
+	}
+
+	// Must NOT panic on NewServer despite duplicate "/api" and "/api/" patterns
+	srv, err := NewServer(ServerOptions{
+		Config:   cfg,
+		Registry: reg,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(ctx)
+	}()
+
+	baseURL := srv.URL()
+
+	// 1. Direct request to API module's specific endpoint
+	respSpecific, err := http.Get(baseURL + "/api/specific")
+	if err != nil {
+		t.Fatalf("GET /api/specific failed: %v", err)
+	}
+	defer respSpecific.Body.Close()
+	if respSpecific.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", respSpecific.StatusCode)
+	}
+	bodySpecific, _ := io.ReadAll(respSpecific.Body)
+	if string(bodySpecific) != "api module: specific endpoint" {
+		t.Errorf("body = %q, want 'api module: specific endpoint'", string(bodySpecific))
+	}
+
+	// 2. Request to non-API route under /api falls back to root module
+	respFallback, err := http.Get(baseURL + "/api/app.js")
+	if err != nil {
+		t.Fatalf("GET /api/app.js failed: %v", err)
+	}
+	defer respFallback.Body.Close()
+	if respFallback.StatusCode != http.StatusOK {
+		t.Errorf("fallback status = %d, want 200", respFallback.StatusCode)
+	}
+	bodyFallback, _ := io.ReadAll(respFallback.Body)
+	if !strings.Contains(string(bodyFallback), "root module") {
+		t.Errorf("expected root module response, got %q", string(bodyFallback))
+	}
+
+	// 3. Direct request to root module works
+	respRoot, err := http.Get(baseURL + "/something-else")
+	if err != nil {
+		t.Fatalf("GET /something-else failed: %v", err)
+	}
+	_ = respRoot.Body.Close()
+	if respRoot.StatusCode != http.StatusOK {
+		t.Errorf("root status = %d, want 200", respRoot.StatusCode)
+	}
+}
