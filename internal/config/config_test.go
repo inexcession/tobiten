@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -344,7 +345,7 @@ func TestPrecedence_TableDriven(t *testing.T) {
 				t.Run("flag_overrides_all", func(t *testing.T) {
 					envFileContent := fmt.Sprintf("%s=%s\n", tc.envKey, tc.envFileVal)
 					envList := append([]string{fmt.Sprintf("%s=%s", tc.envKey, tc.envVal)}, tc.extraEnv...)
-					flagList := append([]string{fmt.Sprintf("-%s=%s", tc.flagName, tc.flagVal)}, tc.extraFlags...)
+					flagList := append([]string{fmt.Sprintf("--%s=%s", tc.flagName, tc.flagVal)}, tc.extraFlags...)
 
 					cfg, err := Load(flagList, WithEnviron(envList), WithEnvFileReader(strings.NewReader(envFileContent)))
 					if err != nil {
@@ -363,10 +364,12 @@ func TestPrecedence_TableDriven(t *testing.T) {
 			} else {
 				// I-7: Assert that secret keys cannot be passed via CLI flag
 				t.Run("no_cli_flag_allowed", func(t *testing.T) {
-					flagArg := fmt.Sprintf("-%s=secret", strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(tc.envKey, "TOBITEN_"), "_", "-")))
-					_, err := Load([]string{flagArg}, WithEnviron(nil), WithoutEnvFile())
-					if err == nil || !errors.Is(err, ErrInvalidFlag) {
-						t.Errorf("expected ErrInvalidFlag when passing %s, got %v", flagArg, err)
+					for _, prefix := range []string{"--", "-"} {
+						flagArg := fmt.Sprintf("%s%s=secret", prefix, strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(tc.envKey, "TOBITEN_"), "_", "-")))
+						_, err := Load([]string{flagArg}, WithEnviron(nil), WithoutEnvFile())
+						if err == nil || !errors.Is(err, ErrInvalidFlag) {
+							t.Errorf("expected ErrInvalidFlag when passing %s, got %v", flagArg, err)
+						}
 					}
 				})
 			}
@@ -557,7 +560,7 @@ func TestDataDirDerivedPaths(t *testing.T) {
 	})
 
 	t.Run("custom data directory derives all paths", func(t *testing.T) {
-		cfg, err := Load([]string{"-data-dir=/srv/tobiten"}, WithEnviron(nil), WithoutEnvFile())
+		cfg, err := Load([]string{"--data-dir=/srv/tobiten"}, WithEnviron(nil), WithoutEnvFile())
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
 		}
@@ -584,9 +587,9 @@ func TestDataDirDerivedPaths(t *testing.T) {
 
 	t.Run("explicit covers and cache dir override derived defaults", func(t *testing.T) {
 		cfg, err := Load([]string{
-			"-data-dir=/srv/tobiten",
-			"-covers-dir=/fast-nvme/covers",
-			"-cache-dir=/scratch/cache",
+			"--data-dir=/srv/tobiten",
+			"--covers-dir=/fast-nvme/covers",
+			"--cache-dir=/scratch/cache",
 		}, WithEnviron(nil), WithoutEnvFile())
 		if err != nil {
 			t.Fatalf("Load() error: %v", err)
@@ -653,7 +656,7 @@ func TestStorageModeValidation(t *testing.T) {
 	})
 
 	t.Run("local mode with empty database URL succeeds", func(t *testing.T) {
-		cfg, err := Load([]string{"-storage-mode=local"}, WithEnviron([]string{"TOBITEN_DATABASE_URL="}), WithoutEnvFile())
+		cfg, err := Load([]string{"--storage-mode=local"}, WithEnviron([]string{"TOBITEN_DATABASE_URL="}), WithoutEnvFile())
 		if err != nil {
 			t.Fatalf("Load() unexpected error: %v", err)
 		}
@@ -663,7 +666,7 @@ func TestStorageModeValidation(t *testing.T) {
 	})
 
 	t.Run("postgres mode with database URL succeeds", func(t *testing.T) {
-		cfg, err := Load([]string{"-storage-mode=postgres"}, WithEnviron([]string{
+		cfg, err := Load([]string{"--storage-mode=postgres"}, WithEnviron([]string{
 			"TOBITEN_DATABASE_URL=postgres://user:pass@localhost:5432/tobiten",
 		}), WithoutEnvFile())
 
@@ -678,7 +681,7 @@ func TestStorageModeValidation(t *testing.T) {
 	t.Run("invalid storage mode refuses startup", func(t *testing.T) {
 		invalidModes := []string{"sqlite", "mysql", "unknown"}
 		for _, m := range invalidModes {
-			_, err := Load([]string{"-storage-mode=" + m}, WithEnviron(nil), WithoutEnvFile())
+			_, err := Load([]string{"--storage-mode=" + m}, WithEnviron(nil), WithoutEnvFile())
 			if err == nil {
 				t.Fatalf("storage-mode=%q expected error, got nil", m)
 			}
@@ -696,7 +699,7 @@ func TestOtherValidation(t *testing.T) {
 	}
 
 	t.Run("invalid port numbers", func(t *testing.T) {
-		invalidPorts := []string{"-port=0", "-port=-1", "-port=65536"}
+		invalidPorts := []string{"--port=0", "--port=-1", "--port=65536"}
 		for _, p := range invalidPorts {
 			_, err := Load([]string{p}, WithEnviron(validPostgresEnv), WithoutEnvFile())
 			if err == nil || !errors.Is(err, ErrInvalidPort) {
@@ -706,28 +709,28 @@ func TestOtherValidation(t *testing.T) {
 	})
 
 	t.Run("invalid library mode", func(t *testing.T) {
-		_, err := Load([]string{"-library-mode=invalid"}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--library-mode=invalid"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil || !errors.Is(err, ErrInvalidLibraryMode) {
 			t.Errorf("expected ErrInvalidLibraryMode, got %v", err)
 		}
 	})
 
 	t.Run("invalid intake mode", func(t *testing.T) {
-		_, err := Load([]string{"-intake-mode=invalid"}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--intake-mode=invalid"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil || !errors.Is(err, ErrInvalidIntakeMode) {
 			t.Errorf("expected ErrInvalidIntakeMode, got %v", err)
 		}
 	})
 
 	t.Run("invalid log level", func(t *testing.T) {
-		_, err := Load([]string{"-log-level=verbose"}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--log-level=verbose"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil || !errors.Is(err, ErrInvalidLogLevel) {
 			t.Errorf("expected ErrInvalidLogLevel, got %v", err)
 		}
 	})
 
 	t.Run("invalid log format", func(t *testing.T) {
-		_, err := Load([]string{"-log-format=xml"}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--log-format=xml"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil || !errors.Is(err, ErrInvalidLogFormat) {
 			t.Errorf("expected ErrInvalidLogFormat, got %v", err)
 		}
@@ -744,7 +747,7 @@ func TestOtherValidation(t *testing.T) {
 			"https://user@books.example.com",  // user rejected
 		}
 		for _, u := range invalidURLs {
-			_, err := Load([]string{"-base-url=" + u}, WithEnviron(nil), WithoutEnvFile())
+			_, err := Load([]string{"--base-url=" + u}, WithEnviron(nil), WithoutEnvFile())
 			if err == nil || !errors.Is(err, ErrInvalidBaseURL) {
 				t.Errorf("expected ErrInvalidBaseURL for %q, got %v", u, err)
 			}
@@ -754,7 +757,7 @@ func TestOtherValidation(t *testing.T) {
 	t.Run("invalid base URL with credentials redacts password in error", func(t *testing.T) {
 		secretPass := "my_super_secret_password_987"
 		rawURL := fmt.Sprintf("http://user:%s@localhost:8080/books", secretPass)
-		_, err := Load([]string{"-base-url=" + rawURL}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--base-url=" + rawURL}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil {
 			t.Fatalf("expected error for base URL with credentials, got nil")
 		}
@@ -771,17 +774,17 @@ func TestOtherValidation(t *testing.T) {
 	})
 
 	t.Run("negative cache and worker budgets", func(t *testing.T) {
-		_, err := Load([]string{"-thumb-cache-max-mb=-1"}, WithEnviron(nil), WithoutEnvFile())
+		_, err := Load([]string{"--thumb-cache-max-mb=-1"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil {
 			t.Error("expected error for negative thumb-cache-max-mb")
 		}
 
-		_, err = Load([]string{"-extract-cache-max-mb=-1"}, WithEnviron(nil), WithoutEnvFile())
+		_, err = Load([]string{"--extract-cache-max-mb=-1"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil {
 			t.Error("expected error for negative extract-cache-max-mb")
 		}
 
-		_, err = Load([]string{"-scanner-workers=-1"}, WithEnviron(nil), WithoutEnvFile())
+		_, err = Load([]string{"--scanner-workers=-1"}, WithEnviron(nil), WithoutEnvFile())
 		if err == nil {
 			t.Error("expected error for negative scanner-workers")
 		}
@@ -868,5 +871,71 @@ func TestEnvFileDoubleQuotedUnescape(t *testing.T) {
 				t.Errorf("parseEnv(%s) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPrintUsage(t *testing.T) {
+	var buf bytes.Buffer
+	PrintUsage(&buf)
+	out := buf.String()
+
+	if !strings.Contains(out, "Usage of tobitend:\n") {
+		t.Errorf("PrintUsage output missing header: %q", out)
+	}
+
+	// Canonical double-dash long options must be presented (ADR-0014 §2, I-8)
+	expectedFlags := []string{
+		"--admin-user",
+		"--base-url",
+		"--cache-dir",
+		"--covers-dir",
+		"--data-dir",
+		"--env-file",
+		"--extract-cache-max-mb",
+		"--host",
+		"--intake-mode",
+		"--library-mode",
+		"--log-format",
+		"--log-level",
+		"--oidc-default-labels",
+		"--oidc-default-role",
+		"--pg-bin",
+		"--port",
+		"--scanner-workers",
+		"--storage-mode",
+		"--thumb-cache-max-mb",
+		"--trusted-proxies",
+		"--version",
+	}
+	for _, flg := range expectedFlags {
+		if !strings.Contains(out, flg) {
+			t.Errorf("PrintUsage output missing canonical long option %q", flg)
+		}
+	}
+
+	// Single-letter alias -v must be presented with single dash
+	if !strings.Contains(out, "  -v\t") {
+		t.Errorf("PrintUsage output missing short alias -v")
+	}
+
+	// Secret keys and client API key must NOT have CLI flags (I-7)
+	for _, forbidden := range []string{"admin-pass", "secret-key", "database-url", "api-key"} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("PrintUsage output contains forbidden flag %q", forbidden)
+		}
+	}
+}
+
+func TestSingleDashAliasAccepted(t *testing.T) {
+	// Existing parser aliases remain accepted (ADR-0014 §2, I-8)
+	cfg, err := Load([]string{"-port=9090", "-host=127.0.0.1"}, WithEnviron(nil), WithoutEnvFile())
+	if err != nil {
+		t.Fatalf("Load() unexpected error for single-dash flag alias: %v", err)
+	}
+	if cfg.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", cfg.Port)
+	}
+	if cfg.Host != "127.0.0.1" {
+		t.Errorf("Host = %q, want 127.0.0.1", cfg.Host)
 	}
 }

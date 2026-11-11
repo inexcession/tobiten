@@ -31,6 +31,11 @@ func TestRunVersion(t *testing.T) {
 		want string
 	}{
 		{
+			name: "flag --version",
+			args: []string{"--version"},
+			want: "tobitend 0.1.0-dev\n",
+		},
+		{
 			name: "flag -version",
 			args: []string{"-version"},
 			want: "tobitend 0.1.0-dev\n",
@@ -72,7 +77,7 @@ func TestRunVersion(t *testing.T) {
 }
 
 func TestRunHelp(t *testing.T) {
-	for _, flag := range []string{"-h", "-help"} {
+	for _, flag := range []string{"--help", "-help", "-h"} {
 		t.Run(flag, func(t *testing.T) {
 			r, w, err := os.Pipe()
 			if err != nil {
@@ -98,8 +103,14 @@ func TestRunHelp(t *testing.T) {
 			if !bytes.Contains(buf.Bytes(), []byte("Usage of tobitend:")) {
 				t.Errorf("run(%s) stderr = %q, want usage output", flag, out)
 			}
+			// Verify canonical double-dash options are presented (ADR-0014 §2, I-8)
+			for _, canonical := range []string{"--version", "--base-url", "--log-format", "--port", "--data-dir"} {
+				if !bytes.Contains(buf.Bytes(), []byte(canonical)) {
+					t.Errorf("run(%s) usage missing canonical option %q", flag, canonical)
+				}
+			}
 			// I-7: secrets and client API key must NOT have CLI flags
-			for _, forbidden := range []string{"-admin-pass", "-secret-key", "-database-url", "-api-key"} {
+			for _, forbidden := range []string{"admin-pass", "secret-key", "database-url", "api-key"} {
 				if bytes.Contains(buf.Bytes(), []byte(forbidden)) {
 					t.Errorf("run(%s) usage contains forbidden flag %q", flag, forbidden)
 				}
@@ -110,10 +121,15 @@ func TestRunHelp(t *testing.T) {
 
 func TestRunInvalidFlag(t *testing.T) {
 	invalidFlags := []string{
+		"--invalid-unknown-flag",
 		"-invalid-unknown-flag",
+		"--admin-pass=secret",
 		"-admin-pass=secret",
+		"--secret-key=secret",
 		"-secret-key=secret",
+		"--database-url=postgres://localhost/db",
 		"-database-url=postgres://localhost/db",
+		"--api-key=token",
 		"-api-key=token",
 	}
 	for _, flg := range invalidFlags {
@@ -138,7 +154,7 @@ func TestRunStorageModeRefusal(t *testing.T) {
 	}{
 		{
 			name:       "local mode with database URL refuses startup",
-			args:       []string{"-storage-mode=local"},
+			args:       []string{"--storage-mode=local"},
 			envKey:     "TOBITEN_DATABASE_URL",
 			envVal:     "postgres://user:super_secret_password@localhost:5432/db",
 			wantExit:   1,
@@ -147,7 +163,7 @@ func TestRunStorageModeRefusal(t *testing.T) {
 		},
 		{
 			name:       "postgres mode without database URL refuses startup",
-			args:       []string{"-storage-mode=postgres"},
+			args:       []string{"--storage-mode=postgres"},
 			envKey:     "TOBITEN_DATABASE_URL",
 			envVal:     "",
 			wantExit:   1,
@@ -207,7 +223,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		origStdout := os.Stdout
 		os.Stdout = w
 
-		exitCode := run([]string{"-log-format=table", "-log-level=debug"})
+		exitCode := run([]string{"--log-format=table", "--log-level=debug"})
 
 		_ = w.Close()
 		os.Stdout = origStdout
@@ -223,7 +239,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		logger := slog.Default()
 		// Debug level should be enabled
 		if !logger.Enabled(context.Background(), slog.LevelDebug) {
-			t.Errorf("expected LevelDebug to be enabled with -log-level=debug")
+			t.Errorf("expected LevelDebug to be enabled with --log-level=debug")
 		}
 	})
 
@@ -269,7 +285,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		origStderr := os.Stderr
 		os.Stderr = w
 
-		exitCode := run([]string{"-log-format=invalid_fmt"})
+		exitCode := run([]string{"--log-format=invalid_fmt"})
 
 		_ = w.Close()
 		os.Stderr = origStderr
@@ -279,7 +295,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		_ = r.Close()
 
 		if exitCode != 1 {
-			t.Errorf("run(-log-format=invalid_fmt) exit code = %d, want 1", exitCode)
+			t.Errorf("run(--log-format=invalid_fmt) exit code = %d, want 1", exitCode)
 		}
 		if !bytes.Contains(buf.Bytes(), []byte("unsupported log format")) {
 			t.Errorf("expected stderr to contain 'unsupported log format', got: %s", buf.String())
@@ -294,7 +310,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		origStderr := os.Stderr
 		os.Stderr = w
 
-		exitCode := run([]string{"-log-level=invalid_lvl"})
+		exitCode := run([]string{"--log-level=invalid_lvl"})
 
 		_ = w.Close()
 		os.Stderr = origStderr
@@ -304,7 +320,7 @@ func TestRunLoggingWiring(t *testing.T) {
 		_ = r.Close()
 
 		if exitCode != 1 {
-			t.Errorf("run(-log-level=invalid_lvl) exit code = %d, want 1", exitCode)
+			t.Errorf("run(--log-level=invalid_lvl) exit code = %d, want 1", exitCode)
 		}
 		if !bytes.Contains(buf.Bytes(), []byte("unsupported log level")) {
 			t.Errorf("expected stderr to contain 'unsupported log level', got: %s", buf.String())
@@ -324,7 +340,7 @@ func TestRunLoggingTableColorWiring(t *testing.T) {
 
 	t.Run("NO_COLOR disables color in table format", func(t *testing.T) {
 		t.Setenv("NO_COLOR", "1")
-		exitCode := run([]string{"-log-format=table"})
+		exitCode := run([]string{"--log-format=table"})
 		if exitCode != 0 {
 			t.Fatalf("run exit code = %d", exitCode)
 		}
@@ -339,7 +355,7 @@ func TestRunLoggingTableColorWiring(t *testing.T) {
 		origStdout := os.Stdout
 		os.Stdout = w
 
-		exitCode := run([]string{"-log-format=table"})
+		exitCode := run([]string{"--log-format=table"})
 
 		_ = w.Close()
 		os.Stdout = origStdout
@@ -366,7 +382,7 @@ func TestRunServer_GracefulShutdown(t *testing.T) {
 	defer cancel()
 
 	port := getFreePort(t)
-	args := []string{fmt.Sprintf("-port=%d", port)}
+	args := []string{fmt.Sprintf("--port=%d", port)}
 
 	origStartServer := startServer
 	defer func() { startServer = origStartServer }()

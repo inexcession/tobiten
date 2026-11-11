@@ -63,7 +63,8 @@ jobs:
       - name: Build binary
         run: make build
 
-      - name: Verify binary prints version
+      - name: Verify binary prints version and help
         run: |
-          ./bin/tobitend -version
+          ./bin/tobitend --version
           ./bin/tobitend -v
+          ./bin/tobitend --help

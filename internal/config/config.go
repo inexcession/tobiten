@@ -331,13 +331,41 @@ func registerFlags(fs *flag.FlagSet, fv *flagValues) {
 	fs.BoolVar(&fv.v, "v", false, "print version and exit")
 }
 
-// PrintUsage writes daemon command-line flag usage to the given writer.
+// PrintUsage writes daemon command-line flag usage with canonical double-dash options
+// to the given writer (ADR-0014 §2, I-8).
 func PrintUsage(w io.Writer) {
 	fs := flag.NewFlagSet("tobitend", flag.ContinueOnError)
 	fs.SetOutput(w)
 	var fv flagValues
 	registerFlags(fs, &fv)
-	fs.Usage()
+	fmt.Fprintf(w, "Usage of %s:\n", fs.Name())
+	printDefaults(w, fs)
+}
+
+func printDefaults(w io.Writer, fs *flag.FlagSet) {
+	fs.VisitAll(func(fl *flag.Flag) {
+		var b strings.Builder
+		prefix := "--"
+		if len(fl.Name) == 1 {
+			prefix = "-"
+		}
+		fmt.Fprintf(&b, "  %s%s", prefix, fl.Name)
+		name, usage := flag.UnquoteUsage(fl)
+		if len(name) > 0 {
+			b.WriteString(" ")
+			b.WriteString(name)
+		}
+		if b.Len() <= 4 {
+			b.WriteString("\t")
+		} else {
+			b.WriteString("\n    \t")
+		}
+		b.WriteString(strings.ReplaceAll(usage, "\n", "\n    \t"))
+		if fl.DefValue != "" && fl.DefValue != "0" && fl.DefValue != "false" {
+			fmt.Fprintf(&b, " (default %v)", fl.DefValue)
+		}
+		fmt.Fprint(w, b.String(), "\n")
+	})
 }
 
 // Load loads, resolves, and validates configuration according to precedence:
@@ -355,6 +383,10 @@ func Load(args []string, opts ...Option) (*Config, error) {
 	// 1. Parse CLI flags
 	fs := flag.NewFlagSet("tobitend", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage of %s:\n", fs.Name())
+		printDefaults(fs.Output(), fs)
+	}
 
 	var fv flagValues
 	registerFlags(fs, &fv)
