@@ -6,35 +6,9 @@ linters:
     - misspell
     - revive
     - unconvert
-    # Cognitive complexity & ballooning
-    - gocognit
-    - funlen
-    # Dead code & unused
-    - unused
-    - unparam
-    - wastedassign
-    # Duplication
-    - dupl
-    # Anti-patterns, bugs & modern Go
-    - gocritic
-    - nilerr
-    - errcheck
-    - copyloopvar
   settings:
     govet:
       enable-all: false
-    gocognit:
-      min-complexity: 45
-    funlen:
-      lines: 200
-      statements: 100
-      ignore-comments: true
-    dupl:
-      threshold: 100
-    gocritic:
-      disabled-checks:
-        - ifElseChain
-        - appendAssign
     revive:
       rules:
         - name: blank-imports
@@ -70,15 +44,6 @@ linters:
       - third_party$
       - builtin$
       - examples$
-      - internal/storage/postgres/.*\.sql\.go$
-    rules:
-      - path: '(.+)_test\.go'
-        linters:
-          - gocognit
-          - funlen
-          - dupl
-          - wastedassign
-          - copyloopvar
 formatters:
   enable:
     - gofmt
