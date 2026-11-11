@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +25,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/inexcession/tobiten/internal/storage/embedded"
 )
 
 var (
@@ -60,82 +61,19 @@ func setupSignalHandler() {
 	})
 }
 
-// findPgBinDir searches for PostgreSQL 18+ binaries.
-// Candidates checked in order:
-// 1. TOBITEN_PG_BIN environment variable
-// 2. MacPorts default: /opt/local/lib/postgresql18/bin
-// 3. Homebrew Apple Silicon: /opt/homebrew/opt/postgresql@18/bin
-// 4. Homebrew Intel: /usr/local/opt/postgresql@18/bin
-// 5. Debian/Ubuntu: /usr/lib/postgresql/18/bin
-// 6. PATH lookup for pg_ctl
+// findPgBinDir searches for PostgreSQL 18+ binaries by delegating to embedded.FindBinDirAtLeast.
 func findPgBinDir() (string, error) {
-	var candidates []string
-
-	if envBin := os.Getenv("TOBITEN_PG_BIN"); envBin != "" {
-		candidates = append(candidates, envBin)
-	}
-
-	candidates = append(candidates,
-		"/opt/local/lib/postgresql18/bin",
-		"/opt/homebrew/opt/postgresql@18/bin",
-		"/usr/local/opt/postgresql@18/bin",
-		"/usr/lib/postgresql/18/bin",
-	)
-
-	if pathBin, err := exec.LookPath("pg_ctl"); err == nil {
-		candidates = append(candidates, filepath.Dir(pathBin))
-	}
-
-	for _, dir := range candidates {
-		if isValidPg18BinDir(dir) {
-			return dir, nil
-		}
-	}
-
-	return "", errors.New("postgresql 18 binaries not found: set TOBITEN_PG_BIN, install postgresql 18 (e.g. via MacPorts in /opt/local/lib/postgresql18/bin), or provide TOBITEN_TEST_DATABASE_URL")
+	return embedded.FindBinDirAtLeast(18, os.Getenv("TOBITEN_PG_BIN"))
 }
 
 func isValidPg18BinDir(dir string) bool {
-	pgCtl := filepath.Join(dir, "pg_ctl")
-	initdb := filepath.Join(dir, "initdb")
-
-	if fi, err := os.Stat(pgCtl); err != nil || fi.IsDir() || (fi.Mode().Perm()&0111) == 0 {
-		return false
-	}
-	if fi, err := os.Stat(initdb); err != nil || fi.IsDir() || (fi.Mode().Perm()&0111) == 0 {
-		return false
-	}
-
-	// Verify major version is at least 18.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, pgCtl, "--version")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	major, err := parsePgMajorVersion(string(out))
-	if err != nil || major < 18 {
-		return false
-	}
-
-	return true
+	return embedded.IsValidBinDir(dir, func(major int) bool {
+		return major >= 18
+	})
 }
 
-var versionRegex = regexp.MustCompile(`(?i)(?:postgres(?:ql)?|pg_ctl|initdb)\s+(?:\([^\)]+\)\s+)?(\d+)(?:\.(\d+))?`)
-
 func parsePgMajorVersion(versionStr string) (int, error) {
-	matches := versionRegex.FindStringSubmatch(versionStr)
-	if len(matches) < 2 {
-		return 0, fmt.Errorf("unable to parse postgres version string: %q", versionStr)
-	}
-	major, err := strconv.Atoi(matches[1])
-	if err != nil {
-		return 0, fmt.Errorf("invalid major version number in %q: %w", versionStr, err)
-	}
-	return major, nil
+	return embedded.ParsePgMajorVersion(versionStr)
 }
 
 func getFreePort() (int, error) {
