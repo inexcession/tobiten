@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Sentinel errors returned by the supervisor.
@@ -54,6 +55,7 @@ type Supervisor struct {
 	binDir     string
 	dataDir    string
 	socketDir  string
+	logFile    string
 	port       int
 	pid        int
 	running    bool
@@ -61,9 +63,39 @@ type Supervisor struct {
 }
 
 // New creates a new embedded PostgreSQL supervisor with the given options.
+// All directory and file paths are resolved to absolute paths.
 func New(opts Options) (*Supervisor, error) {
 	if opts.DataDir == "" {
 		return nil, errors.New("data directory is required")
+	}
+
+	absDataDir, err := filepath.Abs(opts.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve absolute data directory: %w", err)
+	}
+
+	var absBinDir string
+	if opts.BinDir != "" {
+		absBinDir, err = filepath.Abs(opts.BinDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve absolute bin directory: %w", err)
+		}
+	}
+
+	var absSocketDir string
+	if opts.SocketDir != "" {
+		absSocketDir, err = filepath.Abs(opts.SocketDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve absolute socket directory: %w", err)
+		}
+	}
+
+	var absLogFile string
+	if opts.LogFile != "" {
+		absLogFile, err = filepath.Abs(opts.LogFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve absolute log file: %w", err)
+		}
 	}
 
 	port := opts.Port
@@ -72,10 +104,86 @@ func New(opts Options) (*Supervisor, error) {
 	}
 
 	return &Supervisor{
-		opts:    opts,
-		dataDir: filepath.Clean(opts.DataDir),
-		port:    port,
+		opts:      opts,
+		dataDir:   absDataDir,
+		binDir:    absBinDir,
+		socketDir: absSocketDir,
+		logFile:   absLogFile,
+		port:      port,
 	}, nil
+}
+
+func readPostmasterPID(dataDir string) (int, error) {
+	pidBytes, err := os.ReadFile(filepath.Join(dataDir, "postmaster.pid"))
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Split(string(pidBytes), "\n")
+	if len(lines) == 0 {
+		return 0, errors.New("empty postmaster.pid file")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid PID in postmaster.pid: %w", err)
+	}
+	return pid, nil
+}
+
+func confirmProcessExit(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	killed := false
+
+	for time.Now().Before(deadline) {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+
+		if !killed {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			killed = true
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+
+	return fmt.Errorf("process %d is still alive", pid)
+}
+
+func deriveBoundedContext(parent context.Context, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if _, ok := parent.Deadline(); ok {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, defaultTimeout)
+}
+
+func (s *Supervisor) cleanupFailedStart() {
+	pid, _ := readPostmasterPID(s.dataDir)
+	if s.binDir != "" {
+		pgCtl := filepath.Join(s.binDir, "pg_ctl")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stopCmd := exec.CommandContext(ctx, pgCtl, "-w", "-D", s.dataDir, "-m", "immediate", "stop")
+		_ = stopCmd.Run()
+	}
+
+	if pid > 0 {
+		_ = confirmProcessExit(pid, 3*time.Second)
+	}
+
+	if s.tempSocket && s.socketDir != "" {
+		_ = os.RemoveAll(s.socketDir)
+	}
+
+	s.running = false
+	s.pid = 0
 }
 
 // Start initializes the database cluster if necessary, writes the configuration,
@@ -98,49 +206,32 @@ func (s *Supervisor) Start(ctx context.Context) error {
 
 	// Maximum sun_path size for macOS is 104 bytes (Linux is 108).
 	const maxSunPath = 104
-	if s.opts.SocketDir != "" {
-		cleanSocketDir := filepath.Clean(s.opts.SocketDir)
-		sockPath := filepath.Join(cleanSocketDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
+	if s.socketDir != "" {
+		sockPath := filepath.Join(s.socketDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
 		if len(sockPath) >= maxSunPath {
 			return fmt.Errorf("%w: path %q is %d bytes (maximum is %d)", ErrSocketPathTooLong, sockPath, len(sockPath), maxSunPath-1)
 		}
-		s.socketDir = cleanSocketDir
 	}
 
-	binDir := s.opts.BinDir
+	// 1. Validate complete PostgreSQL 18 binary set (pg_ctl, initdb, postgres) before data mutation
+	binDir := s.binDir
 	if binDir == "" {
-		var err error
-		binDir, err = FindBinDir("")
+		discovered, err := FindBinDir("")
 		if err != nil {
 			return err
 		}
+		binDir = discovered
+	}
+	if err := ValidateBinDir(binDir, func(m int) bool { return m == PinnedMajor }); err != nil {
+		return fmt.Errorf("invalid postgresql binary set: %w", err)
 	}
 	s.binDir = binDir
 
+	// 2. Initialize cluster into clean data directory BEFORE creating nested socket directories
 	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	if s.opts.SocketDir == "" {
-		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
-		if len(sockPath) < maxSunPath {
-			s.socketDir = s.dataDir
-		} else {
-			h := sha256.Sum256([]byte(s.dataDir))
-			tmpSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
-			if err := os.MkdirAll(tmpSockDir, 0700); err != nil {
-				return fmt.Errorf("failed to create fallback socket directory: %w", err)
-			}
-			s.socketDir = tmpSockDir
-			s.tempSocket = true
-		}
-	}
-
-	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
-	}
-
-	// Check if cluster initialized (PG_VERSION exists)
 	pgVersionFile := filepath.Join(s.dataDir, "PG_VERSION")
 	if _, err := os.Stat(pgVersionFile); os.IsNotExist(err) {
 		initdbArgs := []string{
@@ -160,7 +251,24 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 
-	// Write postgresql.conf block
+	// 3. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
+	if s.socketDir == "" {
+		sockPath := filepath.Join(s.dataDir, fmt.Sprintf(".s.PGSQL.%d", s.port))
+		if len(sockPath) < maxSunPath {
+			s.socketDir = s.dataDir
+		} else {
+			h := sha256.Sum256([]byte(s.dataDir))
+			tmpSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
+			s.socketDir = tmpSockDir
+			s.tempSocket = true
+		}
+	}
+
+	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
+		return fmt.Errorf("failed to create socket directory: %w", err)
+	}
+
+	// 4. Write postgresql.conf block
 	confPath := filepath.Join(s.dataDir, "postgresql.conf")
 	settings := ConfigSettings{
 		ListenAddresses:       "''",
@@ -172,8 +280,8 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
 
-	// Start PostgreSQL via pg_ctl
-	logFile := s.opts.LogFile
+	// 5. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
+	logFile := s.logFile
 	if logFile == "" {
 		logFile = filepath.Join(s.dataDir, "postgresql.log")
 	}
@@ -184,18 +292,24 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		"-l", logFile,
 		"start",
 	)
-	out, err := startCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pg_ctl start failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	out, startErr := startCmd.CombinedOutput()
+	if startErr != nil {
+		s.cleanupFailedStart()
+		return fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
 	}
 
 	// Read postmaster.pid
-	pidBytes, err := os.ReadFile(filepath.Join(s.dataDir, "postmaster.pid"))
-	if err == nil {
-		lines := strings.Split(string(pidBytes), "\n")
-		if len(lines) > 0 {
-			s.pid, _ = strconv.Atoi(strings.TrimSpace(lines[0]))
-		}
+	pid, err := readPostmasterPID(s.dataDir)
+	if err != nil || pid <= 0 {
+		s.cleanupFailedStart()
+		return fmt.Errorf("server started but failed to read postmaster.pid: %w", err)
+	}
+	s.pid = pid
+
+	// Check if context was cancelled while waiting
+	if ctx.Err() != nil {
+		s.cleanupFailedStart()
+		return ctx.Err()
 	}
 
 	s.running = true
@@ -212,31 +326,46 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	// Attempt graceful fast stop first
-	stopCmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "pg_ctl"),
+	pid := s.pid
+	if pid <= 0 {
+		pid, _ = readPostmasterPID(s.dataDir)
+	}
+
+	pgCtl := filepath.Join(s.binDir, "pg_ctl")
+
+	// 1. Attempt graceful fast stop bounded by ctx (or default 10s if unbounded ctx)
+	fastCtx, fastCancel := deriveBoundedContext(ctx, 10*time.Second)
+	defer fastCancel()
+
+	stopCmd := exec.CommandContext(fastCtx, pgCtl,
 		"-w",
 		"-D", s.dataDir,
 		"-m", "fast",
 		"stop",
 	)
-	if err := stopCmd.Run(); err != nil {
-		// Fall back to immediate stop
-		stopImm := exec.Command(filepath.Join(s.binDir, "pg_ctl"),
+	if runErr := stopCmd.Run(); runErr != nil {
+		// 2. Fall back to immediate stop bounded by 5s
+		immCtx, immCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer immCancel()
+
+		immCmd := exec.CommandContext(immCtx, pgCtl,
 			"-w",
 			"-D", s.dataDir,
 			"-m", "immediate",
 			"stop",
 		)
-		_ = stopImm.Run()
+		_ = immCmd.Run()
 	}
 
-	// If postmaster is still running, kill it
-	if s.pid > 0 {
-		if err := syscall.Kill(s.pid, 0); err == nil {
-			_ = syscall.Kill(s.pid, syscall.SIGKILL)
+	// 3. Confirm owned-process exit
+	if pid > 0 {
+		if err := confirmProcessExit(pid, 5*time.Second); err != nil {
+			// Process failed to exit! Propagate failure and do NOT clear running state
+			return fmt.Errorf("failed to confirm postmaster process %d exit: %w", pid, err)
 		}
 	}
 
+	// 4. Process exit confirmed: clean up temporary socket if applicable and clear state
 	if s.tempSocket && s.socketDir != "" {
 		_ = os.RemoveAll(s.socketDir)
 	}
@@ -311,5 +440,5 @@ func (s *Supervisor) ConnString() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return fmt.Sprintf("host=%s port=%d user=postgres dbname=postgres sslmode=disable",
-		s.socketDir, s.port)
+		EscapeConnStringValue(s.socketDir), s.port)
 }

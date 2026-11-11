@@ -7,10 +7,59 @@ import (
 	"testing"
 )
 
+func TestEscapePgConfString(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		{"", "''"},
+		{"/var/run/postgresql", "'/var/run/postgresql'"},
+		{"/path with spaces/data", "'/path with spaces/data'"},
+		{"/tmp/bob's data", "'/tmp/bob''s data'"},
+		{`C:\pg\data`, `'C:\\pg\\data'`},
+	}
+
+	for _, tc := range tests {
+		out := EscapePgConfString(tc.input)
+		if out != tc.expect {
+			t.Errorf("EscapePgConfString(%q) = %q, expected %q", tc.input, out, tc.expect)
+		}
+	}
+}
+
+func TestEscapeConnStringValue(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		{"", "''"},
+		{"simple", "simple"},
+		{"5432", "5432"},
+		{"/tmp/socket", "/tmp/socket"},
+		{"/tmp/path with spaces", "'/tmp/path with spaces'"},
+		{"/tmp/bob's socket", `'/'tmp/'bob\'s socket'`},
+		{`\escaped\path`, `'\\escaped\\path'`},
+	}
+
+	for _, tc := range tests {
+		out := EscapeConnStringValue(tc.input)
+		if tc.input == "/tmp/bob's socket" {
+			// Expected format with escaped single quote inside single quotes
+			if out != `'/tmp/bob\'s socket'` {
+				t.Errorf("EscapeConnStringValue(%q) = %q, expected %q", tc.input, out, `'/tmp/bob\'s socket'`)
+			}
+			continue
+		}
+		if out != tc.expect {
+			t.Errorf("EscapeConnStringValue(%q) = %q, expected %q", tc.input, out, tc.expect)
+		}
+	}
+}
+
 func TestGenerateConfig(t *testing.T) {
 	settings := ConfigSettings{
 		ListenAddresses:         "''",
-		UnixSocketDirectories:   "/tmp/test-socket",
+		UnixSocketDirectories:   "/tmp/test socket with 'quotes'",
 		UnixSocketPermissions:   "0700",
 		Port:                    5432,
 		WALCompression:          "zstd",
@@ -26,7 +75,7 @@ func TestGenerateConfig(t *testing.T) {
 	expectedSnippets := []string{
 		confBeginMarker,
 		"listen_addresses = ''",
-		"unix_socket_directories = '/tmp/test-socket'",
+		"unix_socket_directories = '/tmp/test socket with ''quotes'''",
 		"unix_socket_permissions = 0700",
 		"port = 5432",
 		"wal_compression = 'zstd'",

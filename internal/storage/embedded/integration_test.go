@@ -3,7 +3,10 @@ package embedded
 import (
 	"context"
 	"errors"
+	"net"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,8 +42,9 @@ func TestSupervisor_Integration(t *testing.T) {
 	if !s.Running() {
 		t.Fatal("expected supervisor to be Running()")
 	}
-	if s.PID() <= 0 {
-		t.Fatalf("expected positive PID, got %d", s.PID())
+	savedPID := s.PID()
+	if savedPID <= 0 {
+		t.Fatalf("expected positive PID, got %d", savedPID)
 	}
 	if s.SocketDir() == "" {
 		t.Fatal("expected non-empty SocketDir")
@@ -114,9 +118,86 @@ func TestSupervisor_Integration(t *testing.T) {
 		t.Fatalf("expected PID() to be 0 after Stop, got %d", s.PID())
 	}
 
-	// Idempotent stop
+	// 4. External post-stop check: confirm owned process has truly exited
+	killErr := syscall.Kill(savedPID, 0)
+	if !errors.Is(killErr, syscall.ESRCH) {
+		t.Fatalf("expected process %d to be dead (ESRCH), got: %v", savedPID, killErr)
+	}
+
+	// 5. External post-stop check: confirm connection attempts fail
+	connCheckCtx, connCheckCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer connCheckCancel()
+	deadPool, poolErr := pgxpool.New(connCheckCtx, dbURL)
+	if poolErr == nil {
+		pingErr := deadPool.Ping(connCheckCtx)
+		deadPool.Close()
+		if pingErr == nil {
+			t.Fatal("expected connection to stopped PostgreSQL instance to fail, but ping succeeded")
+		}
+	}
+
+	// 6. Confirm UNIX socket is not accepting connections
+	sockPath := filepath.Join(s.SocketDir(), ".s.PGSQL.5432")
+	conn, dialErr := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		t.Fatalf("expected unix socket dial to fail after stop, but connection succeeded")
+	}
+
+	// 7. Idempotent stop check
 	if err := s.Stop(stopCtx); err != nil {
 		t.Fatalf("subsequent Stop call failed: %v", err)
+	}
+}
+
+func TestSupervisor_InitializeBeforeNestedSocketDir_Integration(t *testing.T) {
+	binDir, err := FindBinDir("")
+	if err != nil {
+		t.Skipf("skipping integration test: no PostgreSQL %d binaries found on host: %v", PinnedMajor, err)
+	}
+
+	tmpDir, err := os.MkdirTemp("/tmp", "tbt-nst-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir in /tmp: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+	dataDir := filepath.Join(tmpDir, "pgdata")
+	nestedSocketDir := filepath.Join(dataDir, "nested-sock")
+
+	s, err := New(Options{
+		BinDir:    binDir,
+		DataDir:   dataDir,
+		SocketDir: nestedSocketDir,
+		NoSync:    true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create supervisor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("failed to start supervisor with nested socket dir: %v", err)
+	}
+	defer func() {
+		_ = s.Stop(context.Background())
+	}()
+
+	pool, err := pgxpool.New(ctx, s.DatabaseURL())
+	if err != nil {
+		t.Fatalf("failed to connect to instance with nested socket dir: %v", err)
+	}
+	defer pool.Close()
+
+	var result int
+	if err := pool.QueryRow(ctx, "SELECT 100").Scan(&result); err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if result != 100 {
+		t.Fatalf("expected 100, got %d", result)
 	}
 }
 

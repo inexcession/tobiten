@@ -13,6 +13,47 @@ const (
 	confEndMarker   = "# --- END TOBITEN EMBEDDED CONFIGURATION ---"
 )
 
+// EscapePgConfString escapes and quotes a string value for inclusion in postgresql.conf.
+// Backslashes are escaped as \\ and single quotes are escaped as ”.
+func EscapePgConfString(val string) string {
+	escaped := strings.ReplaceAll(val, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `'`, `''`)
+	return "'" + escaped + "'"
+}
+
+// EscapeConnStringValue quotes and escapes a parameter value for a libpq/pgx key-value connection string.
+// If the value contains spaces, tabs, single quotes, or backslashes, it is enclosed in single quotes
+// with single quotes and backslashes escaped with a backslash.
+func EscapeConnStringValue(val string) string {
+	if val == "" {
+		return "''"
+	}
+	needsQuote := false
+	for _, r := range val {
+		if r == ' ' || r == '\t' || r == '\'' || r == '\\' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return val
+	}
+	var sb strings.Builder
+	sb.WriteByte('\'')
+	for _, r := range val {
+		switch r {
+		case '\'':
+			sb.WriteString(`\'`)
+		case '\\':
+			sb.WriteString(`\\`)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	sb.WriteByte('\'')
+	return sb.String()
+}
+
 // ConfigSettings contains PostgreSQL configuration parameters tuned for embedded execution.
 type ConfigSettings struct {
 	// ListenAddresses specifies TCP listening addresses (typically '' for UNIX-socket-only).
@@ -38,19 +79,15 @@ func GenerateConfig(settings ConfigSettings) string {
 	sb.WriteString("# Generated automatically by Tobiten. Do not edit manually.\n")
 
 	listen := settings.ListenAddresses
-	if listen == "" {
+	if listen == "" || listen == "''" {
 		listen = "''"
-	} else if !strings.HasPrefix(listen, "'") {
-		listen = fmt.Sprintf("'%s'", listen)
+	} else {
+		listen = EscapePgConfString(listen)
 	}
 	fmt.Fprintf(&sb, "listen_addresses = %s\n", listen)
 
 	if settings.UnixSocketDirectories != "" {
-		sockDir := settings.UnixSocketDirectories
-		if !strings.HasPrefix(sockDir, "'") {
-			sockDir = fmt.Sprintf("'%s'", sockDir)
-		}
-		fmt.Fprintf(&sb, "unix_socket_directories = %s\n", sockDir)
+		fmt.Fprintf(&sb, "unix_socket_directories = %s\n", EscapePgConfString(settings.UnixSocketDirectories))
 	}
 
 	if settings.UnixSocketPermissions != "" {
@@ -66,19 +103,11 @@ func GenerateConfig(settings ConfigSettings) string {
 	fmt.Fprintf(&sb, "port = %d\n", port)
 
 	if settings.WALCompression != "" {
-		wal := settings.WALCompression
-		if !strings.HasPrefix(wal, "'") {
-			wal = fmt.Sprintf("'%s'", wal)
-		}
-		fmt.Fprintf(&sb, "wal_compression = %s\n", wal)
+		fmt.Fprintf(&sb, "wal_compression = %s\n", EscapePgConfString(settings.WALCompression))
 	}
 
 	if settings.DefaultToastCompression != "" {
-		toast := settings.DefaultToastCompression
-		if !strings.HasPrefix(toast, "'") {
-			toast = fmt.Sprintf("'%s'", toast)
-		}
-		fmt.Fprintf(&sb, "default_toast_compression = %s\n", toast)
+		fmt.Fprintf(&sb, "default_toast_compression = %s\n", EscapePgConfString(settings.DefaultToastCompression))
 	}
 
 	if len(settings.ExtraSettings) > 0 {

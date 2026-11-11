@@ -1,6 +1,7 @@
 package embedded
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,42 +70,84 @@ func TestFindBinDirAtLeast(t *testing.T) {
 }
 
 func TestFindBinDir_NotFound(t *testing.T) {
-	// Search in an explicit non-existent directory and without matching candidate paths
 	tmpEmpty := t.TempDir()
 	_, err := FindBinDirMatching(tmpEmpty, func(major int) bool {
-		return major == 9999 // impossible major version
+		return major == 9999
 	})
 	if err == nil {
 		t.Fatal("expected error when no matching binaries exist, got nil")
 	}
 }
 
-func TestIsValidBinDir_InvalidDir(t *testing.T) {
+func createDummyBinary(t *testing.T, dir, name string, version string, executable bool) {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"%s (PostgreSQL) %s\"\nfi\nexit 0\n", name, version)
+	mode := os.FileMode(0644)
+	if executable {
+		mode = 0755
+	}
+	if err := os.WriteFile(p, []byte(script), mode); err != nil {
+		t.Fatalf("failed to create dummy binary %s: %v", name, err)
+	}
+}
+
+func TestValidateBinDir_CompleteSet(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Empty dir: no binaries
-	if IsValidBinDir(tmpDir, nil) {
-		t.Fatal("expected IsValidBinDir to return false for empty dir")
+	createDummyBinary(t, tmpDir, "pg_ctl", "18.6", true)
+	createDummyBinary(t, tmpDir, "initdb", "18.6", true)
+	createDummyBinary(t, tmpDir, "postgres", "18.6", true)
+
+	if err := ValidateBinDir(tmpDir, func(m int) bool { return m == 18 }); err != nil {
+		t.Fatalf("expected valid binary set to pass, got: %v", err)
+	}
+}
+
+func TestValidateBinDir_MissingBinary(t *testing.T) {
+	// Missing postgres
+	tmp1 := t.TempDir()
+	createDummyBinary(t, tmp1, "pg_ctl", "18.6", true)
+	createDummyBinary(t, tmp1, "initdb", "18.6", true)
+	if err := ValidateBinDir(tmp1, func(m int) bool { return m == 18 }); err == nil {
+		t.Fatal("expected error for missing postgres binary, got nil")
 	}
 
 	// Missing initdb
-	pgCtl := filepath.Join(tmpDir, "pg_ctl")
-	if err := os.WriteFile(pgCtl, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
-		t.Fatalf("failed to write dummy pg_ctl: %v", err)
-	}
-	if IsValidBinDir(tmpDir, nil) {
-		t.Fatal("expected IsValidBinDir to return false when initdb is missing")
+	tmp2 := t.TempDir()
+	createDummyBinary(t, tmp2, "pg_ctl", "18.6", true)
+	createDummyBinary(t, tmp2, "postgres", "18.6", true)
+	if err := ValidateBinDir(tmp2, func(m int) bool { return m == 18 }); err == nil {
+		t.Fatal("expected error for missing initdb binary, got nil")
 	}
 
-	// Non-executable pg_ctl
-	initdb := filepath.Join(tmpDir, "initdb")
-	if err := os.WriteFile(initdb, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
-		t.Fatalf("failed to write dummy initdb: %v", err)
+	// Missing pg_ctl
+	tmp3 := t.TempDir()
+	createDummyBinary(t, tmp3, "initdb", "18.6", true)
+	createDummyBinary(t, tmp3, "postgres", "18.6", true)
+	if err := ValidateBinDir(tmp3, func(m int) bool { return m == 18 }); err == nil {
+		t.Fatal("expected error for missing pg_ctl binary, got nil")
 	}
-	if err := os.Chmod(pgCtl, 0644); err != nil {
-		t.Fatalf("failed to chmod pg_ctl: %v", err)
+}
+
+func TestValidateBinDir_NonExecutable(t *testing.T) {
+	tmpDir := t.TempDir()
+	createDummyBinary(t, tmpDir, "pg_ctl", "18.6", false) // non-executable
+	createDummyBinary(t, tmpDir, "initdb", "18.6", true)
+	createDummyBinary(t, tmpDir, "postgres", "18.6", true)
+
+	if err := ValidateBinDir(tmpDir, func(m int) bool { return m == 18 }); err == nil {
+		t.Fatal("expected error for non-executable pg_ctl, got nil")
 	}
-	if IsValidBinDir(tmpDir, nil) {
-		t.Fatal("expected IsValidBinDir to return false when pg_ctl is not executable")
+}
+
+func TestValidateBinDir_MismatchedVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	createDummyBinary(t, tmpDir, "pg_ctl", "17.2", true) // major 17
+	createDummyBinary(t, tmpDir, "initdb", "17.2", true)
+	createDummyBinary(t, tmpDir, "postgres", "17.2", true)
+
+	if err := ValidateBinDir(tmpDir, func(m int) bool { return m == 18 }); err == nil {
+		t.Fatal("expected error for major version 17 when 18 required, got nil")
 	}
 }

@@ -3,6 +3,7 @@ package embedded
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,9 @@ import (
 
 // PinnedMajor is the exact PostgreSQL major version required by Tobiten for embedded mode (ADR-0001 §4).
 const PinnedMajor = 18
+
+// RequiredBinaries are the PostgreSQL binaries required for embedded supervisor execution (ADR-0001).
+var RequiredBinaries = []string{"pg_ctl", "initdb", "postgres"}
 
 var versionRegex = regexp.MustCompile(`(?i)(?:postgres(?:ql)?|pg_ctl|initdb)\s+(?:\([^\)]+\)\s+)?(\d+)(?:\.(\d+))?`)
 
@@ -31,38 +35,54 @@ func ParsePgMajorVersion(versionStr string) (int, error) {
 	return major, nil
 }
 
-// IsValidBinDir checks whether dir contains executable pg_ctl and initdb binaries,
-// and whether pg_ctl --version satisfies the match predicate.
+// ValidateBinDir verifies that dir contains the complete set of required PostgreSQL binaries
+// (pg_ctl, initdb, postgres), that each binary is an executable regular file,
+// and that each binary's major version satisfies the match predicate.
+func ValidateBinDir(dir string, match func(major int) bool) error {
+	if dir == "" {
+		return errors.New("binary directory path is empty")
+	}
+
+	for _, name := range RequiredBinaries {
+		binPath := filepath.Join(dir, name)
+		fi, err := os.Stat(binPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("missing required postgresql binary %q in %s", name, dir)
+			}
+			return fmt.Errorf("cannot stat binary %q in %s: %w", name, dir, err)
+		}
+		if fi.IsDir() {
+			return fmt.Errorf("binary %q in %s is a directory", name, dir)
+		}
+		if (fi.Mode().Perm() & 0111) == 0 {
+			return fmt.Errorf("binary %q in %s is not executable", name, dir)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		cmd := exec.CommandContext(ctx, binPath, "--version")
+		out, err := cmd.Output()
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to run %s --version: %w", name, err)
+		}
+
+		major, err := ParsePgMajorVersion(string(out))
+		if err != nil {
+			return fmt.Errorf("failed to parse version for %s: %w", name, err)
+		}
+
+		if match != nil && !match(major) {
+			return fmt.Errorf("binary %q in %s has major version %d, which does not satisfy version requirements", name, dir, major)
+		}
+	}
+
+	return nil
+}
+
+// IsValidBinDir reports whether ValidateBinDir returns nil.
 func IsValidBinDir(dir string, match func(major int) bool) bool {
-	pgCtl := filepath.Join(dir, "pg_ctl")
-	initdb := filepath.Join(dir, "initdb")
-
-	if fi, err := os.Stat(pgCtl); err != nil || fi.IsDir() || (fi.Mode().Perm()&0111) == 0 {
-		return false
-	}
-	if fi, err := os.Stat(initdb); err != nil || fi.IsDir() || (fi.Mode().Perm()&0111) == 0 {
-		return false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, pgCtl, "--version")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	major, err := ParsePgMajorVersion(string(out))
-	if err != nil {
-		return false
-	}
-
-	if match != nil && !match(major) {
-		return false
-	}
-
-	return true
+	return ValidateBinDir(dir, match) == nil
 }
 
 func candidateDirs(major int) []string {
@@ -98,11 +118,19 @@ func FindBinDirAtLeast(minMajor int, explicitBinDir string) (string, error) {
 
 // FindBinDirMatching discovers PostgreSQL binaries using a custom version validation predicate.
 func FindBinDirMatching(explicitBinDir string, match func(major int) bool) (string, error) {
-	var candidates []string
-
 	if explicitBinDir != "" {
-		candidates = append(candidates, explicitBinDir)
-	} else if envBin := os.Getenv("TOBITEN_PG_BIN"); envBin != "" {
+		clean, err := filepath.Abs(explicitBinDir)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve absolute path for %q: %w", explicitBinDir, err)
+		}
+		if err := ValidateBinDir(clean, match); err != nil {
+			return "", fmt.Errorf("explicit binary directory %q is invalid: %w", explicitBinDir, err)
+		}
+		return clean, nil
+	}
+
+	var candidates []string
+	if envBin := os.Getenv("TOBITEN_PG_BIN"); envBin != "" {
 		candidates = append(candidates, envBin)
 	}
 
@@ -114,13 +142,16 @@ func FindBinDirMatching(explicitBinDir string, match func(major int) bool) (stri
 
 	seen := make(map[string]bool)
 	for _, dir := range candidates {
-		clean := filepath.Clean(dir)
+		clean, err := filepath.Abs(dir)
+		if err != nil {
+			clean = filepath.Clean(dir)
+		}
 		if seen[clean] {
 			continue
 		}
 		seen[clean] = true
 
-		if IsValidBinDir(clean, match) {
+		if err := ValidateBinDir(clean, match); err == nil {
 			return clean, nil
 		}
 	}
