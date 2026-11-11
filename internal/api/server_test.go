@@ -312,3 +312,149 @@ func TestServer_CustomListener(t *testing.T) {
 		t.Errorf("srv.Addr() = %q, want %q", srv.Addr(), ln.Addr().String())
 	}
 }
+
+func TestServer_AbsoluteURLBuilder_ForwardedHeadersIgnored(t *testing.T) {
+	testCases := []struct {
+		name         string
+		configured   string
+		expectedRoot string
+	}{
+		{
+			name:         "root base http",
+			configured:   "http://localhost:8080",
+			expectedRoot: "http://localhost:8080",
+		},
+		{
+			name:         "sub-path base https",
+			configured:   "https://books.example.com/comics",
+			expectedRoot: "https://books.example.com/comics",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Host:    "127.0.0.1",
+				Port:    0,
+				BaseURL: tc.configured,
+			}
+			srv, err := NewServer(ServerOptions{Config: cfg})
+			if err != nil {
+				t.Fatalf("NewServer failed: %v", err)
+			}
+
+			// Verify Server methods
+			if srv.BaseURL() != tc.expectedRoot {
+				t.Errorf("srv.BaseURL() = %q, want %q", srv.BaseURL(), tc.expectedRoot)
+			}
+			if srv.URLBuilder().BaseURL() != tc.expectedRoot {
+				t.Errorf("srv.URLBuilder().BaseURL() = %q, want %q", srv.URLBuilder().BaseURL(), tc.expectedRoot)
+			}
+
+			// Verify PublicURL builds on BaseURL, never on listener address srv.URL()
+			setupPublic := srv.PublicURL("/api/v1/auth/setup")
+			expectedSetup := tc.expectedRoot + "/api/v1/auth/setup"
+			if setupPublic != expectedSetup {
+				t.Errorf("srv.PublicURL() = %q, want %q", setupPublic, expectedSetup)
+			}
+			if strings.HasPrefix(setupPublic, srv.URL()) {
+				t.Errorf("srv.PublicURL() must not use local listener address srv.URL() (%q)", srv.URL())
+			}
+
+			// Register a test route that exercises link generation in request context
+			type linkPayload struct {
+				SetupURL  string `json:"setup_url"`
+				OPDSURL   string `json:"opds_url"`
+				SeriesURL string `json:"series_url"`
+			}
+
+			srv.Mux().HandleFunc("GET /test/links", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				payload := linkPayload{
+					SetupURL:  srv.PublicURL("/api/v1/auth/setup"),
+					OPDSURL:   URLFromRequest(r, "/komga/opds/v1.2/catalog"),
+					SeriesURL: URLBuilderFromRequest(r).URL("/komga/api/v1/series?page=0&size=20"),
+				}
+				_ = json.NewEncoder(w).Encode(payload)
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				serverDone <- srv.Run(ctx)
+			}()
+
+			// Send HTTP request to live server listener with aggressive forwarded headers
+			req, err := http.NewRequest(http.MethodGet, srv.URL()+"/test/links", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest failed: %v", err)
+			}
+			req.Host = "internal-docker-host:8080"
+			req.Header.Set("X-Forwarded-Host", "attacker.evil.com")
+			req.Header.Set("X-Forwarded-Proto", "https")
+			req.Header.Set("X-Forwarded-For", "203.0.113.195, 70.41.3.18")
+			req.Header.Set("X-Forwarded-Port", "9999")
+			req.Header.Set("X-Forwarded-Prefix", "/spoofed-prefix")
+			req.Header.Set("Forwarded", "for=192.0.2.60;proto=https;by=203.0.113.43;host=forwarded.example.org")
+
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("HTTP request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+
+			var payload linkPayload
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				t.Fatalf("decoding response failed: %v", err)
+			}
+
+			// Validate all links match configured BaseURL exactly
+			wantSetup := tc.expectedRoot + "/api/v1/auth/setup"
+			wantOPDS := tc.expectedRoot + "/komga/opds/v1.2/catalog"
+			wantSeries := tc.expectedRoot + "/komga/api/v1/series?page=0&size=20"
+
+			if payload.SetupURL != wantSetup {
+				t.Errorf("SetupURL = %q, want %q (forwarded headers were consulted!)", payload.SetupURL, wantSetup)
+			}
+			if payload.OPDSURL != wantOPDS {
+				t.Errorf("OPDSURL = %q, want %q (forwarded headers were consulted!)", payload.OPDSURL, wantOPDS)
+			}
+			if payload.SeriesURL != wantSeries {
+				t.Errorf("SeriesURL = %q, want %q (forwarded headers were consulted!)", payload.SeriesURL, wantSeries)
+			}
+
+			// Verify hostile header values are completely absent from response
+			for _, forbidden := range []string{
+				"attacker.evil.com",
+				"internal-docker-host",
+				"spoofed-prefix",
+				"forwarded.example.org",
+				"9999",
+			} {
+				if strings.Contains(payload.SetupURL, forbidden) ||
+					strings.Contains(payload.OPDSURL, forbidden) ||
+					strings.Contains(payload.SeriesURL, forbidden) {
+					t.Errorf("response leaked forwarded/proxy header value %q", forbidden)
+				}
+			}
+
+			cancel()
+			select {
+			case err := <-serverDone:
+				if err != nil {
+					t.Fatalf("srv.Run failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server failed to shutdown within timeout")
+			}
+		})
+	}
+}

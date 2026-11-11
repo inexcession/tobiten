@@ -32,6 +32,7 @@ type Server struct {
 	listener   net.Listener
 	httpServer *http.Server
 	mux        *http.ServeMux
+	urlBuilder *URLBuilder
 }
 
 // NewServer initializes a new Server with configured routes and middleware.
@@ -44,6 +45,15 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = config.DefaultBaseURL
+	}
+	ub, err := NewURLBuilder(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
 	listener := opts.Listener
@@ -61,8 +71,8 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	// Register /healthz liveness endpoint (ADR-0006 §1 closed allowlist)
 	registerHealthz(mux)
 
-	// Wrap root router with global RequestLogger middleware
-	handler := middleware.RequestLogger(logger)(mux)
+	// Wrap root router with global RequestLogger and URLBuilder middleware
+	handler := middleware.RequestLogger(logger)(URLBuilderMiddleware(ub)(mux))
 
 	httpServer := &http.Server{
 		Addr:              listener.Addr().String(),
@@ -77,6 +87,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		listener:   listener,
 		httpServer: httpServer,
 		mux:        mux,
+		urlBuilder: ub,
 	}, nil
 }
 
@@ -104,7 +115,8 @@ func (s *Server) Addr() string {
 	return s.httpServer.Addr
 }
 
-// URL returns the local HTTP base URL to communicate with this server.
+// URL returns the listener-derived local HTTP base URL to communicate with this server in tests.
+// Do not use this or Server.Addr() to build public links; use PublicURL() or URLBuilder() instead (ADR-0014 §2, ADR-0020 §6).
 func (s *Server) URL() string {
 	addr := s.Addr()
 	host, port, err := net.SplitHostPort(addr)
@@ -115,6 +127,22 @@ func (s *Server) URL() string {
 		return fmt.Sprintf("http://%s:%s", host, port)
 	}
 	return "http://" + addr
+}
+
+// URLBuilder returns the URLBuilder configured for this server.
+func (s *Server) URLBuilder() *URLBuilder {
+	return s.urlBuilder
+}
+
+// BaseURL returns the configured public base URL without trailing slashes.
+func (s *Server) BaseURL() string {
+	return s.urlBuilder.BaseURL()
+}
+
+// PublicURL builds an absolute public URL using the server's configured TOBITEN_BASE_URL.
+// It never consults the listener address, server port, or forwarded headers (ADR-0014 §2, ADR-0020 §6).
+func (s *Server) PublicURL(ref string) string {
+	return s.urlBuilder.URL(ref)
 }
 
 // Mux returns the underlying *http.ServeMux used by the server.
