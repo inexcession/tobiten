@@ -119,6 +119,17 @@ func (ub *URLBuilder) SubPath() string {
 	return ub.subPath
 }
 
+// SubPathDecoded returns the unescaped path component of the base URL sub-path, or empty string if root.
+// For example, for "https://example.com/my%20base", it returns "/my base".
+// For "https://example.com/a%2Fb", it returns "/a/b".
+// For "http://localhost:8080", it returns "".
+func (ub *URLBuilder) SubPathDecoded() string {
+	if ub == nil || ub.base == nil {
+		return ""
+	}
+	return ub.base.Path
+}
+
 // Path returns the path with the base URL's sub-path prepended.
 // Useful for constructing cookie paths or internal mount routes that must preserve sub-paths.
 // When base URL sub-path and application route share a prefix (e.g. /komga or /api), both are preserved.

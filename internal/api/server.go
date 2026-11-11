@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -127,6 +128,50 @@ func registerHealthz(mux *http.ServeMux, ub *URLBuilder) {
 	}
 }
 
+// stripSubPath wraps h to strip the base URL's sub-path from incoming requests.
+// It consistently strips the decoded Path and escaped RawPath so encoded bases
+// (such as %20 and %2F) do not cause 404s (ADR-0020 §6).
+func stripSubPath(ub *URLBuilder, h http.Handler) http.Handler {
+	if ub == nil || ub.SubPath() == "" {
+		return h
+	}
+
+	decodedSubPath := ub.SubPathDecoded()
+	escapedSubPath := ub.SubPath()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, decodedSubPath)
+		if len(p) >= len(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+
+		var rp string
+		if r.URL.RawPath != "" {
+			rp = strings.TrimPrefix(r.URL.RawPath, escapedSubPath)
+			if len(rp) >= len(r.URL.RawPath) {
+				http.NotFound(w, r)
+				return
+			}
+		}
+
+		if p == "" {
+			p = "/"
+		}
+		if r.URL.RawPath != "" && rp == "" {
+			rp = "/"
+		}
+
+		r2 := new(http.Request)
+		*r2 = *r
+		r2.URL = new(url.URL)
+		*r2.URL = *r.URL
+		r2.URL.Path = p
+		r2.URL.RawPath = rp
+		h.ServeHTTP(w, r2)
+	})
+}
+
 // mountModuleRoutes registers routes from enabled modules in the registry onto mux.
 // It ensures module routes agree with generated public URLs and sub-path reverse proxies (ADR-0020 §6).
 func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, logger *slog.Logger) {
@@ -157,7 +202,10 @@ func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, 
 		if prefix == "/" {
 			mux.Handle("/", guardedHandler)
 			if ub != nil && ub.SubPath() != "" {
-				mux.Handle(ub.SubPath()+"/", http.StripPrefix(ub.SubPath(), guardedHandler))
+				subPath := ub.SubPath()
+				subPathHandler := stripSubPath(ub, guardedHandler)
+				mux.Handle(subPath, subPathHandler)
+				mux.Handle(subPath+"/", subPathHandler)
 			}
 			continue
 		}
@@ -167,8 +215,9 @@ func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, 
 
 		if ub != nil && ub.SubPath() != "" {
 			subPrefix := ub.Path(prefix)
-			mux.Handle(subPrefix, http.StripPrefix(ub.SubPath(), guardedHandler))
-			mux.Handle(subPrefix+"/", http.StripPrefix(ub.SubPath(), guardedHandler))
+			subPrefixHandler := stripSubPath(ub, guardedHandler)
+			mux.Handle(subPrefix, subPrefixHandler)
+			mux.Handle(subPrefix+"/", subPrefixHandler)
 		}
 	}
 }

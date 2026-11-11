@@ -674,4 +674,317 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			t.Errorf("sub-path healthz status = %d, want 200", respSubHealth.StatusCode)
 		}
 	})
+
+	newRootModule := func() *module.SimpleModule {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("hello from root module at " + r.URL.Path))
+		})
+		mod := module.NewSimpleModule("root-module")
+		mod.Mounts = []module.RouteMount{
+			{Prefix: "/", Handler: handler},
+		}
+		return mod
+	}
+
+	t.Run("encoded %20 base URL regression with root and prefixed mounts", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register(greeter) error: %v", err)
+		}
+		if err := reg.Register(newRootModule()); err != nil {
+			t.Fatalf("Register(root) error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080/my%20base",
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// 1. Prefixed module route under %20 base
+		for _, target := range []string{
+			"/my%20base/greeter",
+			"/my%20base/greeter/",
+			"/my%20base/greeter/hello",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+
+		// 2. Direct un-prefixed route
+		respDirect, err := http.Get(baseURL + "/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /greeter/hello failed: %v", err)
+		}
+		_ = respDirect.Body.Close()
+		if respDirect.StatusCode != http.StatusOK {
+			t.Errorf("GET /greeter/hello status = %d, want 200", respDirect.StatusCode)
+		}
+
+		// 3. Root module route under %20 base (both bare and with sub-paths)
+		for _, target := range []string{
+			"/my%20base",
+			"/my%20base/",
+			"/my%20base/root-item",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+
+		// 4. Healthz under %20 base and at root
+		for _, target := range []string{"/my%20base/healthz", "/healthz"} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+	})
+
+	t.Run("encoded %20 base URL with config-disabled modules", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register(greeter) error: %v", err)
+		}
+		if err := reg.Register(newRootModule()); err != nil {
+			t.Fatalf("Register(root) error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:            "127.0.0.1",
+			Port:            0,
+			BaseURL:         "http://localhost:8080/my%20base",
+			DisabledModules: []string{"greeter-module", "root-module"},
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// Disabled routes must return 404
+		for _, target := range []string{
+			"/my%20base/greeter",
+			"/my%20base/greeter/hello",
+			"/greeter/hello",
+			"/my%20base/root-item",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("GET %s status = %d, want 404 for disabled module", target, resp.StatusCode)
+			}
+		}
+
+		// Core healthz must still answer 200 OK
+		for _, target := range []string{"/my%20base/healthz", "/healthz"} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+	})
+
+	t.Run("encoded %2F base URL regression with root and prefixed mounts", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register(greeter) error: %v", err)
+		}
+		if err := reg.Register(newRootModule()); err != nil {
+			t.Fatalf("Register(root) error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080/a%2Fb",
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// 1. Prefixed module route under %2F base
+		for _, target := range []string{
+			"/a%2Fb/greeter",
+			"/a%2Fb/greeter/",
+			"/a%2Fb/greeter/hello",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+
+		// 2. Direct un-prefixed route
+		respDirect, err := http.Get(baseURL + "/greeter/hello")
+		if err != nil {
+			t.Fatalf("GET /greeter/hello failed: %v", err)
+		}
+		_ = respDirect.Body.Close()
+		if respDirect.StatusCode != http.StatusOK {
+			t.Errorf("GET /greeter/hello status = %d, want 200", respDirect.StatusCode)
+		}
+
+		// 3. Root module route under %2F base
+		for _, target := range []string{
+			"/a%2Fb",
+			"/a%2Fb/",
+			"/a%2Fb/root-item",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+
+		// 4. Healthz under %2F base and at root
+		for _, target := range []string{"/a%2Fb/healthz", "/healthz"} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+	})
+
+	t.Run("encoded %2F base URL with config-disabled modules", func(t *testing.T) {
+		reg := module.NewRegistry()
+		if err := reg.Register(newTestModule()); err != nil {
+			t.Fatalf("Register(greeter) error: %v", err)
+		}
+		if err := reg.Register(newRootModule()); err != nil {
+			t.Fatalf("Register(root) error: %v", err)
+		}
+
+		cfg := &config.Config{
+			Host:            "127.0.0.1",
+			Port:            0,
+			BaseURL:         "http://localhost:8080/a%2Fb",
+			DisabledModules: []string{"greeter-module", "root-module"},
+		}
+		srv, err := NewServer(ServerOptions{
+			Config:   cfg,
+			Registry: reg,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+
+		// Disabled routes must return 404
+		for _, target := range []string{
+			"/a%2Fb/greeter",
+			"/a%2Fb/greeter/hello",
+			"/greeter/hello",
+			"/a%2Fb/root-item",
+		} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("GET %s status = %d, want 404 for disabled module", target, resp.StatusCode)
+			}
+		}
+
+		// Core healthz must still answer 200 OK
+		for _, target := range []string{"/a%2Fb/healthz", "/healthz"} {
+			resp, err := http.Get(baseURL + target)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", target, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET %s status = %d, want 200", target, resp.StatusCode)
+			}
+		}
+	})
 }
