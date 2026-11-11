@@ -52,11 +52,9 @@ func NewURLBuilder(rawBaseURL string) (*URLBuilder, error) {
 		return nil, fmt.Errorf("%w: %q (base URL must not contain query parameters, fragment, or user credentials)", config.ErrInvalidBaseURL, displayURL)
 	}
 
-	// Normalize sub-path: remove trailing slashes.
+	// Normalize sub-path: remove trailing slashes while preserving URL escaping.
 	cleanPath := strings.TrimRight(parsed.Path, "/")
 	cleanRawPath := strings.TrimRight(parsed.RawPath, "/")
-
-	baseURLStr := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, cleanPath)
 
 	canonicalURL := &url.URL{
 		Scheme:  parsed.Scheme,
@@ -67,8 +65,8 @@ func NewURLBuilder(rawBaseURL string) (*URLBuilder, error) {
 
 	return &URLBuilder{
 		base:       canonicalURL,
-		rawBaseURL: baseURLStr,
-		subPath:    cleanPath,
+		rawBaseURL: canonicalURL.String(),
+		subPath:    canonicalURL.EscapedPath(),
 	}, nil
 }
 
@@ -103,28 +101,20 @@ func (ub *URLBuilder) SubPath() string {
 
 // Path returns the path with the base URL's sub-path prepended.
 // Useful for constructing cookie paths or internal mount routes that must preserve sub-paths.
+// When base URL sub-path and application route share a prefix (e.g. /komga or /api), both are preserved.
 func (ub *URLBuilder) Path(ref string) string {
 	if ref == "" {
 		return ub.subPath
 	}
-	// If ref already starts with subPath, avoid duplicating it.
-	if ub.subPath != "" {
-		if ref == ub.subPath {
-			return ub.subPath
+	if ref == "/" {
+		if ub.subPath == "" {
+			return "/"
 		}
-		if strings.HasPrefix(ref, ub.subPath+"/") {
-			return ref
-		}
+		return ub.subPath + "/"
 	}
 	cleanRef := strings.TrimLeft(ref, "/")
 	if ub.subPath == "" {
-		if strings.HasPrefix(ref, "/") {
-			return "/" + cleanRef
-		}
-		return cleanRef
-	}
-	if ref == "/" {
-		return ub.subPath + "/"
+		return "/" + cleanRef
 	}
 	return ub.subPath + "/" + cleanRef
 }
@@ -151,58 +141,40 @@ func (ub *URLBuilder) Parse(ref string) (*url.URL, error) {
 	refPath := parsed.Path
 	refRawPath := parsed.RawPath
 
-	// If ref already starts with subPath, strip it so joining does not duplicate it.
-	if ub.subPath != "" {
-		if refPath == ub.subPath {
-			refPath = ""
-		} else if strings.HasPrefix(refPath, ub.subPath+"/") {
-			refPath = strings.TrimPrefix(refPath, ub.subPath)
-		}
-		if refRawPath != "" {
-			subRaw := ub.base.RawPath
-			if subRaw == "" {
-				subRaw = ub.subPath
-			}
-			if refRawPath == subRaw {
-				refRawPath = ""
-			} else if strings.HasPrefix(refRawPath, subRaw+"/") {
-				refRawPath = strings.TrimPrefix(refRawPath, subRaw)
-			}
-		}
-	}
-
 	var joinedPath, joinedRawPath string
 
 	switch refPath {
 	case "":
-		joinedPath = ub.subPath
+		joinedPath = ub.base.Path
 		joinedRawPath = ub.base.RawPath
 	case "/":
-		if ub.subPath == "" {
+		if ub.base.Path == "" {
 			joinedPath = "/"
 			joinedRawPath = "/"
 		} else {
-			joinedPath = ub.subPath + "/"
+			joinedPath = ub.base.Path + "/"
 			if ub.base.RawPath != "" {
 				joinedRawPath = ub.base.RawPath + "/"
+			} else if ub.base.EscapedPath() != "" {
+				joinedRawPath = ub.base.EscapedPath() + "/"
 			}
 		}
 	default:
 		cleanRef := strings.TrimLeft(refPath, "/")
-		if ub.subPath == "" {
+		if ub.base.Path == "" {
 			joinedPath = "/" + cleanRef
 		} else {
-			joinedPath = ub.subPath + "/" + cleanRef
+			joinedPath = ub.base.Path + "/" + cleanRef
 		}
 
-		if refRawPath != "" || ub.base.RawPath != "" {
+		if refRawPath != "" || ub.base.RawPath != "" || ub.base.EscapedPath() != ub.base.Path {
 			rRaw := refRawPath
 			if rRaw == "" {
-				rRaw = refPath
+				rRaw = parsed.EscapedPath()
 			}
 			bRaw := ub.base.RawPath
 			if bRaw == "" {
-				bRaw = ub.subPath
+				bRaw = ub.base.EscapedPath()
 			}
 			cleanRawRef := strings.TrimLeft(rRaw, "/")
 			if bRaw == "" {

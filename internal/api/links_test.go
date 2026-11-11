@@ -214,8 +214,8 @@ func TestURLBuilder_SubPathBase(t *testing.T) {
 	if got := ub.Path("/"); got != "/tobiten/" {
 		t.Errorf("Path(/) = %q, want /tobiten/", got)
 	}
-	if got := ub.Path("/tobiten/komga"); got != "/tobiten/komga" {
-		t.Errorf("Path(/tobiten/komga) = %q, want /tobiten/komga", got)
+	if got := ub.Path("/tobiten/komga"); got != "/tobiten/tobiten/komga" {
+		t.Errorf("Path(/tobiten/komga) = %q, want /tobiten/tobiten/komga", got)
 	}
 
 	tests := []struct {
@@ -232,11 +232,6 @@ func TestURLBuilder_SubPathBase(t *testing.T) {
 		{ref: "/komga/api/v1/series?page=0&size=20", want: "https://example.com/tobiten/komga/api/v1/series?page=0&size=20"},
 		{ref: "/docs#header", want: "https://example.com/tobiten/docs#header"},
 		{ref: "/books/1/file/Chapter%201.cbz", want: "https://example.com/tobiten/books/1/file/Chapter%201.cbz"},
-		// Idempotency: reference already starts with configured sub-path
-		{ref: "/tobiten/api/v1/auth/setup", want: "https://example.com/tobiten/api/v1/auth/setup"},
-		{ref: "/tobiten/komga", want: "https://example.com/tobiten/komga"},
-		{ref: "/tobiten", want: "https://example.com/tobiten"},
-		{ref: "/tobiten/", want: "https://example.com/tobiten/"},
 	}
 
 	for _, tt := range tests {
@@ -446,4 +441,158 @@ func TestURLBuilder_ContextAndMiddleware(t *testing.T) {
 			t.Errorf("capturedLink = %q, want %q", capturedLink, want)
 		}
 	})
+}
+
+func TestURLBuilder_PrefixMatching_PreservesBoth(t *testing.T) {
+	t.Run("base url /komga with /komga routes preserves both", func(t *testing.T) {
+		ub := MustNewURLBuilder("https://example.com/komga")
+
+		cases := []struct {
+			ref      string
+			wantURL  string
+			wantPath string
+		}{
+			{
+				ref:      "/komga",
+				wantURL:  "https://example.com/komga/komga",
+				wantPath: "/komga/komga",
+			},
+			{
+				ref:      "/komga/",
+				wantURL:  "https://example.com/komga/komga/",
+				wantPath: "/komga/komga/",
+			},
+			{
+				ref:      "/komga/opds/v1.2/catalog",
+				wantURL:  "https://example.com/komga/komga/opds/v1.2/catalog",
+				wantPath: "/komga/komga/opds/v1.2/catalog",
+			},
+			{
+				ref:      "/komga/api/v1/series",
+				wantURL:  "https://example.com/komga/komga/api/v1/series",
+				wantPath: "/komga/komga/api/v1/series",
+			},
+			{
+				ref:      "/api/v1/auth/setup",
+				wantURL:  "https://example.com/komga/api/v1/auth/setup",
+				wantPath: "/komga/api/v1/auth/setup",
+			},
+		}
+
+		for _, tc := range cases {
+			if got := ub.URL(tc.ref); got != tc.wantURL {
+				t.Errorf("URL(%q) = %q, want %q", tc.ref, got, tc.wantURL)
+			}
+			if got := ub.Path(tc.ref); got != tc.wantPath {
+				t.Errorf("Path(%q) = %q, want %q", tc.ref, got, tc.wantPath)
+			}
+		}
+	})
+
+	t.Run("base url /api with /api routes preserves both", func(t *testing.T) {
+		ub := MustNewURLBuilder("https://example.com/api")
+
+		cases := []struct {
+			ref      string
+			wantURL  string
+			wantPath string
+		}{
+			{
+				ref:      "/api",
+				wantURL:  "https://example.com/api/api",
+				wantPath: "/api/api",
+			},
+			{
+				ref:      "/api/",
+				wantURL:  "https://example.com/api/api/",
+				wantPath: "/api/api/",
+			},
+			{
+				ref:      "/api/v1/auth/setup",
+				wantURL:  "https://example.com/api/api/v1/auth/setup",
+				wantPath: "/api/api/v1/auth/setup",
+			},
+			{
+				ref:      "/komga/opds/v1.2/catalog",
+				wantURL:  "https://example.com/api/komga/opds/v1.2/catalog",
+				wantPath: "/api/komga/opds/v1.2/catalog",
+			},
+		}
+
+		for _, tc := range cases {
+			if got := ub.URL(tc.ref); got != tc.wantURL {
+				t.Errorf("URL(%q) = %q, want %q", tc.ref, got, tc.wantURL)
+			}
+			if got := ub.Path(tc.ref); got != tc.wantPath {
+				t.Errorf("Path(%q) = %q, want %q", tc.ref, got, tc.wantPath)
+			}
+		}
+	})
+}
+
+func TestURLBuilder_URLEscapingIntact(t *testing.T) {
+	testCases := []struct {
+		name        string
+		rawBase     string
+		wantBaseURL string
+		wantSubPath string
+		ref         string
+		wantURL     string
+		wantPath    string
+	}{
+		{
+			name:        "space escaped as %20",
+			rawBase:     "https://example.com/sub%20path",
+			wantBaseURL: "https://example.com/sub%20path",
+			wantSubPath: "/sub%20path",
+			ref:         "/komga",
+			wantURL:     "https://example.com/sub%20path/komga",
+			wantPath:    "/sub%20path/komga",
+		},
+		{
+			name:        "question mark escaped as %3F",
+			rawBase:     "https://example.com/foo%3Fbar",
+			wantBaseURL: "https://example.com/foo%3Fbar",
+			wantSubPath: "/foo%3Fbar",
+			ref:         "/komga",
+			wantURL:     "https://example.com/foo%3Fbar/komga",
+			wantPath:    "/foo%3Fbar/komga",
+		},
+		{
+			name:        "hash escaped as %23",
+			rawBase:     "https://example.com/baz%23qux",
+			wantBaseURL: "https://example.com/baz%23qux",
+			wantSubPath: "/baz%23qux",
+			ref:         "/komga",
+			wantURL:     "https://example.com/baz%23qux/komga",
+			wantPath:    "/baz%23qux/komga",
+		},
+		{
+			name:        "combined %20, %3F, %23 with trailing slash normalized",
+			rawBase:     "https://example.com/sub%20path/foo%3Fbar/baz%23qux/",
+			wantBaseURL: "https://example.com/sub%20path/foo%3Fbar/baz%23qux",
+			wantSubPath: "/sub%20path/foo%3Fbar/baz%23qux",
+			ref:         "/komga/opds/v1.2/catalog",
+			wantURL:     "https://example.com/sub%20path/foo%3Fbar/baz%23qux/komga/opds/v1.2/catalog",
+			wantPath:    "/sub%20path/foo%3Fbar/baz%23qux/komga/opds/v1.2/catalog",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ub := MustNewURLBuilder(tc.rawBase)
+			if got := ub.BaseURL(); got != tc.wantBaseURL {
+				t.Errorf("BaseURL() = %q, want %q", got, tc.wantBaseURL)
+			}
+			if got := ub.SubPath(); got != tc.wantSubPath {
+				t.Errorf("SubPath() = %q, want %q", got, tc.wantSubPath)
+			}
+			if got := ub.URL(tc.ref); got != tc.wantURL {
+				t.Errorf("URL(%q) = %q, want %q", tc.ref, got, tc.wantURL)
+			}
+			if got := ub.Path(tc.ref); got != tc.wantPath {
+				t.Errorf("Path(%q) = %q, want %q", tc.ref, got, tc.wantPath)
+			}
+		})
+	}
 }
