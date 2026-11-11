@@ -52,9 +52,29 @@ func NewURLBuilder(rawBaseURL string) (*URLBuilder, error) {
 		return nil, fmt.Errorf("%w: %q (base URL must not contain query parameters, fragment, or user credentials)", config.ErrInvalidBaseURL, displayURL)
 	}
 
-	// Normalize sub-path: remove trailing slashes while preserving URL escaping.
-	cleanPath := strings.TrimRight(parsed.Path, "/")
-	cleanRawPath := strings.TrimRight(parsed.RawPath, "/")
+	// Normalize sub-path: remove literal trailing slashes on the escaped base path,
+	// keeping Path and RawPath consistent so percent-encoded slashes (%2F) stay encoded.
+	escapedPath := parsed.EscapedPath()
+	cleanPath := parsed.Path
+	cleanRawPath := parsed.RawPath
+
+	if strings.HasSuffix(escapedPath, "/") {
+		if escapedPath == "/" {
+			cleanPath = ""
+			cleanRawPath = ""
+		} else {
+			trimmedEscaped := strings.TrimRight(escapedPath, "/")
+			numTrailingSlashes := len(escapedPath) - len(trimmedEscaped)
+			for i := 0; i < numTrailingSlashes; i++ {
+				cleanPath = strings.TrimSuffix(cleanPath, "/")
+			}
+			if cleanRawPath != "" {
+				for i := 0; i < numTrailingSlashes; i++ {
+					cleanRawPath = strings.TrimSuffix(cleanRawPath, "/")
+				}
+			}
+		}
+	}
 
 	canonicalURL := &url.URL{
 		Scheme:  parsed.Scheme,

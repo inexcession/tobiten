@@ -576,6 +576,24 @@ func TestURLBuilder_URLEscapingIntact(t *testing.T) {
 			wantURL:     "https://example.com/sub%20path/foo%3Fbar/baz%23qux/komga/opds/v1.2/catalog",
 			wantPath:    "/sub%20path/foo%3Fbar/baz%23qux/komga/opds/v1.2/catalog",
 		},
+		{
+			name:        "base ending with %2F keeps encoding",
+			rawBase:     "https://example.com/books%2F",
+			wantBaseURL: "https://example.com/books%2F",
+			wantSubPath: "/books%2F",
+			ref:         "/komga",
+			wantURL:     "https://example.com/books%2F/komga",
+			wantPath:    "/books%2F/komga",
+		},
+		{
+			name:        "base ending with %2F/ normalizes literal trailing slash and keeps %2F",
+			rawBase:     "https://example.com/books%2F/",
+			wantBaseURL: "https://example.com/books%2F",
+			wantSubPath: "/books%2F",
+			ref:         "/komga",
+			wantURL:     "https://example.com/books%2F/komga",
+			wantPath:    "/books%2F/komga",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -592,6 +610,77 @@ func TestURLBuilder_URLEscapingIntact(t *testing.T) {
 			}
 			if got := ub.Path(tc.ref); got != tc.wantPath {
 				t.Errorf("Path(%q) = %q, want %q", tc.ref, got, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestURLBuilder_Percent2F_Regressions(t *testing.T) {
+	bases := []struct {
+		name    string
+		rawBase string
+	}{
+		{
+			name:    "ending in %2F",
+			rawBase: "https://example.com/books%2F",
+		},
+		{
+			name:    "ending in %2F/",
+			rawBase: "https://example.com/books%2F/",
+		},
+		{
+			name:    "ending in %2F/// multiple trailing slashes",
+			rawBase: "https://example.com/books%2F///",
+		},
+	}
+
+	for _, b := range bases {
+		t.Run(b.name, func(t *testing.T) {
+			ub := MustNewURLBuilder(b.rawBase)
+
+			if got := ub.BaseURL(); got != "https://example.com/books%2F" {
+				t.Errorf("BaseURL() = %q, want https://example.com/books%%2F", got)
+			}
+			if got := ub.SubPath(); got != "/books%2F" {
+				t.Errorf("SubPath() = %q, want /books%%2F", got)
+			}
+
+			// URL() checks
+			urlCases := []struct {
+				ref  string
+				want string
+			}{
+				{ref: "", want: "https://example.com/books%2F"},
+				{ref: "/", want: "https://example.com/books%2F/"},
+				{ref: "/komga", want: "https://example.com/books%2F/komga"},
+				{ref: "komga", want: "https://example.com/books%2F/komga"},
+				{ref: "/komga/", want: "https://example.com/books%2F/komga/"},
+				{ref: "/komga/opds/v1.2/catalog", want: "https://example.com/books%2F/komga/opds/v1.2/catalog"},
+				{ref: "/api/v1/auth/setup", want: "https://example.com/books%2F/api/v1/auth/setup"},
+			}
+			for _, c := range urlCases {
+				if got := ub.URL(c.ref); got != c.want {
+					t.Errorf("URL(%q) = %q, want %q", c.ref, got, c.want)
+				}
+			}
+
+			// Path() checks
+			pathCases := []struct {
+				ref  string
+				want string
+			}{
+				{ref: "", want: "/books%2F"},
+				{ref: "/", want: "/books%2F/"},
+				{ref: "/komga", want: "/books%2F/komga"},
+				{ref: "komga", want: "/books%2F/komga"},
+				{ref: "/komga/", want: "/books%2F/komga/"},
+				{ref: "/komga/opds/v1.2/catalog", want: "/books%2F/komga/opds/v1.2/catalog"},
+				{ref: "/api/v1/auth/setup", want: "/books%2F/api/v1/auth/setup"},
+			}
+			for _, c := range pathCases {
+				if got := ub.Path(c.ref); got != c.want {
+					t.Errorf("Path(%q) = %q, want %q", c.ref, got, c.want)
+				}
 			}
 		})
 	}
