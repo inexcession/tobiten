@@ -502,17 +502,24 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 			s.pendingLaunch = true
 			return errors.Join(stopErrs...)
 		}
-	} else if s.pendingLaunch {
-		// No PID was resolved. Try immediate stop on the data dir just in case a postmaster was started
+	} else {
+		// Unresolved PID: attempt immediate stop on dataDir just in case
 		if s.binDir != "" {
-			immCtx, immCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			immCtx, immCancel := deriveBoundedContext(ctx, 3*time.Second)
 			defer immCancel()
 			immCmd := exec.CommandContext(immCtx, pgCtl, "-w", "-D", s.dataDir, "-m", "immediate", "stop")
-			_ = immCmd.Run()
+			if immErr := immCmd.Run(); immErr != nil {
+				stopErrs = append(stopErrs, fmt.Errorf("immediate stop failed: %w", immErr))
+			}
 		}
+		stopErrs = append(stopErrs, errors.New("postmaster PID unresolved: child launch remains pending"))
+		// Unresolved PID / failed cleanup: retain pending state, running state, and socket
+		s.running = true
+		s.pendingLaunch = true
+		return errors.Join(stopErrs...)
 	}
 
-	// 4. Process exit confirmed or child accounted for: clean up temporary socket if applicable and clear state
+	// 4. Process exit confirmed: child is accounted for! Clean up temporary socket if applicable and clear state
 	if s.tempSocket && s.socketDir != "" {
 		_ = os.RemoveAll(s.socketDir)
 	}
