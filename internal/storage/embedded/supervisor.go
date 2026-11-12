@@ -73,27 +73,31 @@ type Options struct {
 
 // Supervisor manages the lifecycle of an embedded PostgreSQL subprocess on a UNIX domain socket.
 type Supervisor struct {
-	mu                sync.Mutex
-	opts              Options
-	binDir            string
-	dataDir           string
-	socketDir         string
-	logFile           string
-	port              int
-	pid               int
-	running           bool
-	pendingLaunch     bool
-	tempSocket        bool
-	logger            *slog.Logger
-	isNetworkFS       bool
-	fsType            string
-	fsProbe           func(path string) (fsType string, isNetwork bool, err error)
-	compressionCaps   CompressionCapabilities
-	compressionErr    error
-	compressionProbe  func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
-	probeTimeout      time.Duration
-	confirmExit       func(pid int, timeout time.Duration) error
-	resolvePIDTimeout time.Duration
+	mu                           sync.Mutex
+	opts                         Options
+	binDir                       string
+	dataDir                      string
+	socketDir                    string
+	logFile                      string
+	port                         int
+	pid                          int
+	running                      bool
+	pendingLaunch                bool
+	tempSocket                   bool
+	logger                       *slog.Logger
+	isNetworkFS                  bool
+	fsType                       string
+	fsProbe                      func(path string) (fsType string, isNetwork bool, err error)
+	compressionCaps              CompressionCapabilities
+	compressionErr               error
+	compressionProbe             func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
+	probeTimeout                 time.Duration
+	confirmExit                  func(pid int, timeout time.Duration) error
+	resolvePIDTimeout            time.Duration
+	dataLock                     *fileLock
+	socketLock                   *fileLock
+	socketDirPreExisted          bool
+	socketHadPreExistingContents bool
 }
 
 // New creates a new embedded PostgreSQL supervisor with the given options.
@@ -283,9 +287,12 @@ func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 		return errors.Join(stopErrs...)
 	}
 
-	if s.tempSocket && s.socketDir != "" {
-		_ = os.RemoveAll(s.socketDir)
+	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
+		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+			_ = os.RemoveAll(s.socketDir)
+		}
 	}
+	s.releaseLocks()
 
 	s.pendingLaunch = false
 	s.running = false
@@ -349,7 +356,31 @@ func (s *Supervisor) setupSocketDir() error {
 		}
 	}
 
+	if s.tempSocket {
+		sockLockPath := SocketDirLockPath(s.socketDir)
+		sockLock, err := acquireFileLock(sockLockPath, ErrSocketDirLocked, s.socketDir)
+		if err != nil {
+			return err
+		}
+		s.socketLock = sockLock
+
+		entries, readErr := os.ReadDir(s.socketDir)
+		if readErr == nil {
+			s.socketDirPreExisted = true
+			if len(entries) > 0 {
+				s.socketHadPreExistingContents = true
+			}
+		} else if os.IsNotExist(readErr) {
+			s.socketDirPreExisted = false
+			s.socketHadPreExistingContents = false
+		}
+	}
+
 	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
+		if s.socketLock != nil {
+			_ = s.socketLock.Unlock()
+			s.socketLock = nil
+		}
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 	return nil
@@ -382,19 +413,30 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 
+	// 0. Acquire exclusive lifetime ownership of the data directory before any inspection, mutation, or launch (ADR-0001 §3).
+	lockPath := DataDirLockPath(s.dataDir)
+	dataLock, err := acquireFileLock(lockPath, ErrDataDirLocked, s.dataDir)
+	if err != nil {
+		return err
+	}
+	s.dataLock = dataLock
+
 	// 1. Validate complete PostgreSQL 18 binary set (pg_ctl, initdb, postgres) before data mutation
 	if err := s.validateBinaries(); err != nil {
+		s.cleanupStartupFailure()
 		return err
 	}
 
 	// 2. Check for pre-existing running server before mutating data or configuration
 	prePID, _ := readPostmasterPID(s.dataDir)
 	if prePID > 0 && syscall.Kill(prePID, 0) == nil {
+		s.cleanupStartupFailure()
 		return fmt.Errorf("embedded postgresql cannot start: another server (PID %d) is already running in %s", prePID, s.dataDir)
 	}
 
 	// 3. Inspect existing cluster version before mutating configuration or starting PostgreSQL (ADR-0001 §4)
 	if err := ValidateClusterVersion(s.dataDir); err != nil {
+		s.cleanupStartupFailure()
 		return err
 	}
 
@@ -403,11 +445,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 
 	// 5. Initialize cluster into clean data directory BEFORE creating nested socket directories
 	if err := s.ensureClusterInitialized(ctx); err != nil {
+		s.cleanupStartupFailure()
 		return err
 	}
 
 	// 6. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
 	if err := s.setupSocketDir(); err != nil {
+		s.cleanupStartupFailure()
 		return err
 	}
 
@@ -421,11 +465,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.applyCompressionSettings(ctx, &settings)
 	if err := WriteConfigFile(confPath, settings); err != nil {
+		s.cleanupStartupFailure()
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
 
 	// 8. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
 	if err := ctx.Err(); err != nil {
+		s.cleanupStartupFailure()
 		return err
 	}
 
@@ -586,14 +632,73 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	}
 
 	// 4. Process exit confirmed: child is accounted for! Clean up temporary socket if applicable and clear state
-	if s.tempSocket && s.socketDir != "" {
-		_ = os.RemoveAll(s.socketDir)
+	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
+		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+			_ = os.RemoveAll(s.socketDir)
+		}
 	}
+	s.releaseLocks()
 
 	s.pendingLaunch = false
 	s.running = false
 	s.pid = 0
 	return nil
+}
+
+func (s *Supervisor) cleanupStartupFailure() {
+	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
+		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+			_ = os.RemoveAll(s.socketDir)
+		}
+	}
+	s.releaseLocks()
+}
+
+func (s *Supervisor) releaseLocks() {
+	if s.socketLock != nil {
+		_ = s.socketLock.Unlock()
+		s.socketLock = nil
+	}
+	if s.dataLock != nil {
+		_ = s.dataLock.Unlock()
+		s.dataLock = nil
+	}
+	if s.opts.SocketDir == "" && s.tempSocket {
+		s.socketDir = ""
+		s.tempSocket = false
+		s.socketDirPreExisted = false
+		s.socketHadPreExistingContents = false
+	}
+}
+
+// DataLockPath returns the path of the lock file used for data-directory ownership.
+func (s *Supervisor) DataLockPath() string {
+	return DataDirLockPath(s.dataDir)
+}
+
+// SocketLockPath returns the path of the lock file used for temporary socket-directory ownership,
+// or empty string if no separate socket lock is used.
+func (s *Supervisor) SocketLockPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.socketDir == "" || s.socketDir == s.dataDir || !s.tempSocket {
+		return ""
+	}
+	return SocketDirLockPath(s.socketDir)
+}
+
+// DataDirLocked reports whether this supervisor currently holds the data-directory lock.
+func (s *Supervisor) DataDirLocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dataLock != nil
+}
+
+// SocketDirLocked reports whether this supervisor currently holds the socket-directory lock.
+func (s *Supervisor) SocketDirLocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.socketLock != nil
 }
 
 // Close stops the supervisor, satisfying io.Closer.
