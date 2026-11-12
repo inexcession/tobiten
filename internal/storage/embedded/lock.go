@@ -22,16 +22,20 @@ func canonicalizePath(path string) (string, error) {
 	if path == "" {
 		path = "."
 	}
+
+	resolved := "/"
+	var remaining []string
+
 	if !filepath.IsAbs(path) {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return "", fmt.Errorf("failed to get current working directory: %w", err)
 		}
-		path = filepath.Join(cwd, path)
+		remaining = append(splitPathComponents(cwd), splitPathComponents(path)...)
+	} else {
+		remaining = splitPathComponents(path)
 	}
 
-	resolved := "/"
-	remaining := splitPathComponents(path)
 	symlinks := 0
 
 	for len(remaining) > 0 {
