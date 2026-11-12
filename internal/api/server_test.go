@@ -15,8 +15,19 @@ import (
 	"github.com/inexcession/tobiten/internal/api/openapi"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/module"
 )
+
+type passthroughAuth struct{}
+
+func (passthroughAuth) Name() string { return "test-passthrough" }
+
+func (passthroughAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	return module.AuthSuccess(&domain.Principal{
+		User: domain.User{ID: "test-user-id", Username: "testuser"},
+	}), nil
+}
 
 func TestNewServer_Validation(t *testing.T) {
 	_, err := NewServer(ServerOptions{Config: nil})
@@ -117,7 +128,10 @@ func TestServer_GracefulShutdown_InFlightRequestsComplete(t *testing.T) {
 		Host: "127.0.0.1",
 		Port: 0,
 	}
-	srv, err := NewServer(ServerOptions{Config: cfg})
+	srv, err := NewServer(ServerOptions{
+		Config:         cfg,
+		Authenticators: []module.Authenticator{passthroughAuth{}},
+	})
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -342,7 +356,10 @@ func TestServer_AbsoluteURLBuilder_ForwardedHeadersIgnored(t *testing.T) {
 				Port:    0,
 				BaseURL: tc.configured,
 			}
-			srv, err := NewServer(ServerOptions{Config: cfg})
+			srv, err := NewServer(ServerOptions{
+				Config:         cfg,
+				Authenticators: []module.Authenticator{passthroughAuth{}},
+			})
 			if err != nil {
 				t.Fatalf("NewServer failed: %v", err)
 			}
@@ -476,6 +493,7 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 		mod.Mounts = []module.RouteMount{
 			{Prefix: "/greeter", Handler: handler},
 		}
+		mod.Auths = []module.Authenticator{passthroughAuth{}}
 		return mod
 	}
 
@@ -491,8 +509,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			BaseURL: "http://localhost:8080",
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -557,8 +576,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			DisabledModules: []string{"greeter-module"},
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -618,8 +638,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			BaseURL: "http://localhost:8080/tobiten",
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -705,8 +726,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			BaseURL: "http://localhost:8080/my%20base",
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -793,8 +815,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			DisabledModules: []string{"greeter-module", "root-module"},
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -855,8 +878,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			BaseURL: "http://localhost:8080/a%2Fb",
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -943,8 +967,9 @@ func TestServer_ModuleRouteLifecycle(t *testing.T) {
 			DisabledModules: []string{"greeter-module", "root-module"},
 		}
 		srv, err := NewServer(ServerOptions{
-			Config:   cfg,
-			Registry: reg,
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{passthroughAuth{}},
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -1295,8 +1320,9 @@ func TestServer_DuplicatePatternComposition(t *testing.T) {
 
 	// Must NOT panic on NewServer despite duplicate "/api" and "/api/" patterns
 	srv, err := NewServer(ServerOptions{
-		Config:   cfg,
-		Registry: reg,
+		Config:         cfg,
+		Registry:       reg,
+		Authenticators: []module.Authenticator{passthroughAuth{}},
 	})
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)

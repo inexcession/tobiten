@@ -32,6 +32,10 @@ func (m *SystemModule) RouteMounts() []module.RouteMount {
 // It returns 200 OK indicating liveness only, with no version or details (ADR-0006 §1).
 func HealthzHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusMethodNotAllowed)

@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -608,6 +609,56 @@ func TestValidationFunctions(t *testing.T) {
 		r.Permissions = []domain.Permission{domain.PermissionLibraryRead}
 		if err := r.Validate(); err != nil {
 			t.Errorf("expected valid role, got %v", err)
+		}
+	})
+}
+
+func TestPrincipal_Context(t *testing.T) {
+	t.Run("nil context returns false", func(t *testing.T) {
+		var nilCtx context.Context
+		p, ok := domain.PrincipalFromContext(nilCtx)
+		if ok || p != nil {
+			t.Errorf("expected ok=false and p=nil on nil context, got ok=%v, p=%v", ok, p)
+		}
+	})
+
+	t.Run("context without principal returns false", func(t *testing.T) {
+		p, ok := domain.PrincipalFromContext(context.Background())
+		if ok || p != nil {
+			t.Errorf("expected ok=false and p=nil on empty context, got ok=%v, p=%v", ok, p)
+		}
+	})
+
+	t.Run("MustPrincipalFromContext panics on missing principal", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic on missing principal in context")
+			}
+		}()
+		domain.MustPrincipalFromContext(context.Background())
+	})
+
+	t.Run("round-trip attaches and extracts principal", func(t *testing.T) {
+		expected := domain.NewPrincipal(
+			domain.User{ID: "usr_1", Username: "alice"},
+			domain.BuiltInRoles()[:1],
+			domain.CredentialKindPassword,
+			"cred_1",
+			nil,
+		)
+		ctx := domain.ContextWithPrincipal(context.Background(), expected)
+
+		p, ok := domain.PrincipalFromContext(ctx)
+		if !ok || p == nil {
+			t.Fatalf("expected ok=true, got ok=%v", ok)
+		}
+		if p.User.ID != expected.User.ID || p.User.Username != expected.User.Username {
+			t.Errorf("got user %+v, want %+v", p.User, expected.User)
+		}
+
+		mustP := domain.MustPrincipalFromContext(ctx)
+		if mustP.User.ID != expected.User.ID {
+			t.Errorf("MustPrincipalFromContext got ID %q, want %q", mustP.User.ID, expected.User.ID)
 		}
 	})
 }

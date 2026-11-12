@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"time"
@@ -428,4 +429,31 @@ func (p *Principal) HasAnyPermission(perms ...Permission) bool {
 		}
 	}
 	return false
+}
+
+type principalContextKeyType struct{}
+
+var principalContextKey = principalContextKeyType{}
+
+// ContextWithPrincipal returns a new context with the given Principal attached.
+func ContextWithPrincipal(ctx context.Context, principal *Principal) context.Context {
+	return context.WithValue(ctx, principalContextKey, principal)
+}
+
+// PrincipalFromContext extracts the Principal from the context, if present.
+func PrincipalFromContext(ctx context.Context) (*Principal, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	p, ok := ctx.Value(principalContextKey).(*Principal)
+	return p, ok && p != nil
+}
+
+// MustPrincipalFromContext extracts the Principal from the context or panics if absent.
+func MustPrincipalFromContext(ctx context.Context) *Principal {
+	p, ok := PrincipalFromContext(ctx)
+	if !ok || p == nil {
+		panic("principal missing from context in authenticated handler")
+	}
+	return p
 }

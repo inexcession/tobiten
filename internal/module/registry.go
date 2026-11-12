@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/domain"
 )
 
 // Migration ranges for core and modules (ADR-0018 §2).
@@ -77,9 +78,30 @@ type AuthenticatorProvider interface {
 	Authenticators() []Authenticator
 }
 
-// Authenticator represents a declared pluggable authentication mechanism.
+// Authenticator represents a declared pluggable authentication mechanism (ADR-0018 S1).
 type Authenticator interface {
 	Name() string
+	Authenticate(r *http.Request) (AuthResult, error)
+}
+
+// AuthResult represents the outcome of an Authenticator invocation.
+type AuthResult struct {
+	// Handled indicates whether the authenticator recognized matching credentials
+	// on the incoming request. If false, the chain continues to the next authenticator.
+	Handled bool
+
+	// Principal is the resolved identity and authorization context when authentication succeeds.
+	Principal *domain.Principal
+}
+
+// AuthPass returns an AuthResult indicating the authenticator did not recognize matching credentials.
+func AuthPass() AuthResult {
+	return AuthResult{Handled: false}
+}
+
+// AuthSuccess returns an AuthResult with the resolved Principal.
+func AuthSuccess(p *domain.Principal) AuthResult {
+	return AuthResult{Handled: true, Principal: p}
 }
 
 // JobKindProvider indicates a module provides background job kinds (ADR-0017, ADR-0018).
@@ -476,6 +498,10 @@ func (s *SimpleModule) EventSubscribers() []EventSubscriber {
 type NamedAuthenticator string
 
 func (n NamedAuthenticator) Name() string { return string(n) }
+
+func (n NamedAuthenticator) Authenticate(r *http.Request) (AuthResult, error) {
+	return AuthPass(), nil
+}
 
 // NamedJobKind is a simple string-backed JobKind descriptor.
 type NamedJobKind string

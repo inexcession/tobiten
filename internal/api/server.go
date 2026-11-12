@@ -25,10 +25,11 @@ const DefaultShutdownTimeout = 10 * time.Second
 
 // ServerOptions configures the Tobiten HTTP server.
 type ServerOptions struct {
-	Config   *config.Config
-	Logger   *slog.Logger
-	Listener net.Listener    // optional; if nil, binds Config.Host:Config.Port
-	Registry module.Registry // optional; if nil, module.NewRegistry() is used
+	Config         *config.Config
+	Logger         *slog.Logger
+	Listener       net.Listener           // optional; if nil, binds Config.Host:Config.Port
+	Registry       module.Registry        // optional; if nil, module.NewRegistry() is used
+	Authenticators []module.Authenticator // optional; test-injected authenticators
 }
 
 // Server represents the Tobiten HTTP server daemon.
@@ -89,8 +90,18 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	// Core liveness (/healthz) and native REST (/api/v1) resolve through the registry.
 	mountModuleRoutes(mux, reg, ub, logger)
 
-	// Wrap root router with global RequestLogger and URLBuilder middleware
-	handler := middleware.RequestLogger(logger)(URLBuilderMiddleware(ub)(mux))
+	// Wrap root router with global RequestLogger, URLBuilder, and Auth middleware (ADR-0006 §1, ADR-0018 S1)
+	authOpts := middleware.AuthOptions{
+		Registry:        reg,
+		Authenticators:  opts.Authenticators,
+		SubPathResolver: ub,
+		Logger:          logger,
+	}
+	handler := middleware.RequestLogger(logger)(
+		URLBuilderMiddleware(ub)(
+			middleware.Auth(authOpts)(mux),
+		),
+	)
 
 	httpServer := &http.Server{
 		Addr:              listener.Addr().String(),
