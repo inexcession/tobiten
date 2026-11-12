@@ -80,6 +80,8 @@ var startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Log
 	return srv.Run(ctx)
 }
 
+var startDaemon = runDaemon
+
 func runContext(ctx context.Context, args []string) int {
 	cfg, err := config.Load(args)
 	if err != nil {
@@ -100,19 +102,11 @@ func runContext(ctx context.Context, args []string) int {
 		return 0
 	}
 
-	if err := setupLogging(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "tobitend: failed to initialize logger: %v\n", err)
-		return 1
-	}
-
 	if ctx.Err() != nil {
 		return 0
 	}
-
-	slog.Info("starting server daemon", slog.String("version", Version))
-
-	if err := startServer(ctx, cfg, slog.Default()); err != nil {
-		slog.Error("server error", logging.Err(err))
+	if err := startDaemon(ctx, cfg, startServer); err != nil {
+		fmt.Fprintf(os.Stderr, "tobitend: %v\n", err)
 		return 1
 	}
 

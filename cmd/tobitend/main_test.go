@@ -216,6 +216,7 @@ func TestRunStorageModeRefusal(t *testing.T) {
 }
 
 func TestRunLoggingWiring(t *testing.T) {
+	bypassStorageForHTTPTest(t)
 	origLogger := slog.Default()
 	defer slog.SetDefault(origLogger)
 
@@ -339,6 +340,7 @@ func TestRunLoggingWiring(t *testing.T) {
 }
 
 func TestRunLoggingTableColorWiring(t *testing.T) {
+	bypassStorageForHTTPTest(t)
 	origLogger := slog.Default()
 	defer slog.SetDefault(origLogger)
 
@@ -388,6 +390,7 @@ func getFreePort(t *testing.T) int {
 }
 
 func TestRunServer_GracefulShutdown(t *testing.T) {
+	bypassStorageForHTTPTest(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -529,4 +532,17 @@ func TestBuildRegistry(t *testing.T) {
 			t.Errorf("expected 'system' module to remain enabled")
 		}
 	})
+}
+
+// These tests isolate CLI logging/HTTP behavior; startup_test covers real storage.
+func bypassStorageForHTTPTest(t *testing.T) {
+	t.Helper()
+	original := startDaemon
+	t.Cleanup(func() { startDaemon = original })
+	startDaemon = func(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger) error) error {
+		if err := setupLogging(cfg); err != nil {
+			return err
+		}
+		return serve(ctx, cfg, slog.Default())
+	}
 }

@@ -462,3 +462,16 @@ func (r *UserRepository) ListUserRoles(ctx context.Context, userID string) ([]do
 	}
 	return res, nil
 }
+
+// WithBootstrapTx serializes first-user provisioning against other user writes.
+// The table lock is held through commit, including the empty-user check, credential,
+// and role creation. A failure rolls all three records back.
+func (r *UserRepository) WithBootstrapTx(ctx context.Context, fn func(storage.UserRepository) error) error {
+	return r.WithTx(ctx, func(repo storage.UserRepository) error {
+		txRepo := repo.(*UserRepository)
+		if _, err := txRepo.db.Exec(ctx, "LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"); err != nil {
+			return fmt.Errorf("locking first-user provisioning: %w", err)
+		}
+		return fn(repo)
+	})
+}
