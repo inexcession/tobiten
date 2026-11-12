@@ -54,6 +54,9 @@ type Options struct {
 	// fsProbe overrides filesystem detection (for testing network filesystem warnings).
 	fsProbe func(path string) (fsType string, isNetwork bool, err error)
 
+	// compressionProbe overrides compression capability detection (for testing compression tuning and warnings).
+	compressionProbe func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
+
 	// postLaunchHook is an optional hook executed immediately after postmaster is launched,
 	// before readiness/state finalization. Used for testing post-launch failures/cancellations.
 	postLaunchHook func(s *Supervisor, pid int) error
@@ -82,6 +85,8 @@ type Supervisor struct {
 	isNetworkFS       bool
 	fsType            string
 	fsProbe           func(path string) (fsType string, isNetwork bool, err error)
+	compressionCaps   CompressionCapabilities
+	compressionProbe  func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
 	confirmExit       func(pid int, timeout time.Duration) error
 	resolvePIDTimeout time.Duration
 }
@@ -151,6 +156,7 @@ func New(opts Options) (*Supervisor, error) {
 		port:              port,
 		logger:            logger,
 		fsProbe:           opts.fsProbe,
+		compressionProbe:  opts.compressionProbe,
 		confirmExit:       confirmFn,
 		resolvePIDTimeout: resolveTimeout,
 	}, nil
@@ -394,7 +400,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return err
 	}
 
-	// 7. Write postgresql.conf block
+	// 7. Write postgresql.conf block with probed compression settings (ADR-0001 §2)
 	confPath := filepath.Join(s.dataDir, "postgresql.conf")
 	settings := ConfigSettings{
 		ListenAddresses:       "''",
@@ -402,6 +408,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		UnixSocketPermissions: "0700",
 		Port:                  s.port,
 	}
+	s.applyCompressionSettings(ctx, &settings)
 	if err := WriteConfigFile(confPath, settings); err != nil {
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
@@ -721,4 +728,69 @@ func defaultFSProbe(path string) (string, bool, error) {
 		return "", false, err
 	}
 	return info.Type, info.IsNetwork, nil
+}
+
+// CompressionCapabilities returns the detected compression capabilities of the PostgreSQL binary.
+func (s *Supervisor) CompressionCapabilities() CompressionCapabilities {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compressionCaps
+}
+
+// CheckCompression inspects the PostgreSQL binary's compression capabilities and updates cached state.
+func (s *Supervisor) CheckCompression(ctx context.Context) (CompressionCapabilities, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	probe := s.compressionProbe
+	if probe == nil {
+		probe = defaultCompressionProbe
+	}
+
+	caps, err := probe(ctx, s.binDir, s.dataDir)
+	if err != nil {
+		return CompressionCapabilities{}, err
+	}
+	s.compressionCaps = caps
+	return caps, nil
+}
+
+func (s *Supervisor) applyCompressionSettings(ctx context.Context, settings *ConfigSettings) {
+	probe := s.compressionProbe
+	if probe == nil {
+		probe = defaultCompressionProbe
+	}
+
+	caps, err := probe(ctx, s.binDir, s.dataDir)
+	if err != nil {
+		s.logger.Warn("failed to probe postgresql compression capabilities; omitting compression tuning and using server defaults",
+			slog.Any("error", err),
+		)
+		s.compressionCaps = CompressionCapabilities{}
+		return
+	}
+
+	s.compressionCaps = caps
+
+	if caps.HasZstdWAL {
+		settings.WALCompression = "zstd"
+	} else {
+		s.logger.Warn("local postgresql build lacks zstd WAL compression support; omitting wal_compression tuning and using server default",
+			slog.String("setting", "wal_compression"),
+			slog.String("unsupported_method", "zstd"),
+		)
+	}
+
+	if caps.HasLZ4Toast {
+		settings.DefaultToastCompression = "lz4"
+	} else {
+		s.logger.Warn("local postgresql build lacks lz4 TOAST compression support; omitting default_toast_compression tuning and using server default",
+			slog.String("setting", "default_toast_compression"),
+			slog.String("unsupported_method", "lz4"),
+		)
+	}
+}
+
+func defaultCompressionProbe(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error) {
+	return ProbeCompression(ctx, binDir, dataDir)
 }
