@@ -41,7 +41,10 @@ func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value str
 	if timeout <= 0 {
 		timeout = DefaultProbeTimeout
 	}
-	cmdCtx, cancel := deriveBoundedContext(ctx, timeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, postgresBin,
@@ -65,15 +68,15 @@ func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value str
 		return false, fmt.Errorf("unexpected output probing %s: %q", setting, stdout.String())
 	}
 
-	// 1. Check for command context timeout or caller context cancellation
+	// 1. Check for caller context cancellation/earlier deadline vs probe timeout
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if cmdCtx.Err() != nil {
 		if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
 			return false, fmt.Errorf("probe of %s timed out: %w", setting, cmdCtx.Err())
 		}
 		return false, cmdCtx.Err()
-	}
-	if ctx.Err() != nil {
-		return false, ctx.Err()
 	}
 
 	// 2. Check if this is a genuine parameter rejection by PostgreSQL (unsupported setting)

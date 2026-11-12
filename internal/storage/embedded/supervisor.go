@@ -218,7 +218,7 @@ func deriveBoundedContext(parent context.Context, defaultTimeout time.Duration) 
 	if parent == nil {
 		parent = context.Background()
 	}
-	if _, ok := parent.Deadline(); ok {
+	if defaultTimeout <= 0 {
 		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, defaultTimeout)
