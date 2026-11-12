@@ -46,3 +46,12 @@ type UserRepository interface {
 	RemoveUserRole(ctx context.Context, userID, roleID string) error
 	ListUserRoles(ctx context.Context, userID string) ([]domain.Role, error)
 }
+
+// SettingsRepository defines the persistence interface for the system_settings table (ADR-0014 §2).
+type SettingsRepository interface {
+	GetSetting(ctx context.Context, key string) (*domain.SystemSetting, error)
+	SetSetting(ctx context.Context, setting *domain.SystemSetting) error
+	DeleteSetting(ctx context.Context, key string) error
+	ListSettings(ctx context.Context) ([]domain.SystemSetting, error)
+	GetSettingsMap(ctx context.Context) (map[string]string, error)
+}

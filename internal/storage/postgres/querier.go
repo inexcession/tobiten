@@ -14,24 +14,28 @@ type Querier interface {
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) error
 	DeleteCredential(ctx context.Context, id string) (int64, error)
+	DeleteSystemSetting(ctx context.Context, key string) error
 	DeleteUser(ctx context.Context, id string) (int64, error)
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
+	GetSystemSetting(ctx context.Context, key string) (SystemSetting, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	ListAllRolePermissions(ctx context.Context) ([]RolePermission, error)
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
 	ListRoles(ctx context.Context) ([]Role, error)
+	ListSystemSettings(ctx context.Context) ([]SystemSetting, error)
 	ListUserRoles(ctx context.Context, userID string) ([]ListUserRolesRow, error)
 	ListUsers(ctx context.Context) ([]User, error)
 	RemoveUserRole(ctx context.Context, arg RemoveUserRoleParams) (int64, error)
 	RevokeCredential(ctx context.Context, arg RevokeCredentialParams) (int64, error)
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
+	UpsertSystemSetting(ctx context.Context, arg UpsertSystemSettingParams) (SystemSetting, error)
 }
 
 var _ Querier = (*Queries)(nil)

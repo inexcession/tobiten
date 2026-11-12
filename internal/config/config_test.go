@@ -1012,3 +1012,435 @@ func TestDisabledModules(t *testing.T) {
 		}
 	})
 }
+
+// TestSystemSettings_Precedence tests the slice acceptance criterion (M1-T1.4, ADR-0014 §2):
+// "A setting stored in system_settings is read when no flag/env sets it, env still wins,
+// and the effective config reports env_locked for pinned keys."
+func TestSystemSettings_Precedence(t *testing.T) {
+	t.Run("system_settings_read_when_no_flag_or_env_sets_it", func(t *testing.T) {
+		settings := map[string]string{
+			"server.port":       "9090",
+			"log.level":         "debug",
+			"scanner.workers":   "4",
+			"library.mode":      "managed",
+			"oidc.default_role": "Reader",
+		}
+
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		if cfg.Port != 9090 {
+			t.Errorf("Port = %d, want 9090 from system_settings", cfg.Port)
+		}
+		if cfg.LogLevel != "debug" {
+			t.Errorf("LogLevel = %q, want 'debug' from system_settings", cfg.LogLevel)
+		}
+		if cfg.ScannerWorkers != 4 {
+			t.Errorf("ScannerWorkers = %d, want 4 from system_settings", cfg.ScannerWorkers)
+		}
+		if cfg.LibraryMode != "managed" {
+			t.Errorf("LibraryMode = %q, want 'managed' from system_settings", cfg.LibraryMode)
+		}
+		if cfg.OIDCDefaultRole != "Reader" {
+			t.Errorf("OIDCDefaultRole = %q, want 'Reader' from system_settings", cfg.OIDCDefaultRole)
+		}
+
+		// Provenance and lock status: system_settings values are NOT env_locked
+		for _, key := range []string{"TOBITEN_PORT", "TOBITEN_LOG_LEVEL", "TOBITEN_SCANNER_WORKERS", "TOBITEN_LIBRARY_MODE", "TOBITEN_OIDC_DEFAULT_ROLE"} {
+			if src := cfg.SourceOf(key); src != SourceSystemSettings {
+				t.Errorf("%s SourceOf() = %v, want %v", key, src, SourceSystemSettings)
+			}
+			if cfg.IsEnvLocked(key) {
+				t.Errorf("%s IsEnvLocked() = true, want false for system_settings", key)
+			}
+		}
+
+		// EffectiveConfig reporting
+		eff := cfg.EffectiveConfig()
+		for _, key := range []string{"TOBITEN_PORT", "TOBITEN_LOG_LEVEL", "TOBITEN_SCANNER_WORKERS", "TOBITEN_LIBRARY_MODE", "TOBITEN_OIDC_DEFAULT_ROLE"} {
+			s, ok := eff.Settings[key]
+			if !ok {
+				t.Errorf("EffectiveConfig missing setting %q", key)
+				continue
+			}
+			if s.EnvLocked {
+				t.Errorf("%s in EffectiveConfig has EnvLocked = true, want false", key)
+			}
+			if s.Source != SourceSystemSettings {
+				t.Errorf("%s in EffectiveConfig has Source = %v, want %v", key, s.Source, SourceSystemSettings)
+			}
+		}
+	})
+
+	t.Run("env_still_wins_over_system_settings", func(t *testing.T) {
+		settings := map[string]string{
+			"server.port":     "9090",
+			"log.level":       "debug",
+			"scanner.workers": "4",
+		}
+		env := []string{
+			"TOBITEN_PORT=8088",
+			"TOBITEN_LOG_LEVEL=warn",
+		}
+
+		cfg, err := Load(nil, WithEnviron(env), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		// Env overrides system_settings
+		if cfg.Port != 8088 {
+			t.Errorf("Port = %d, want 8088 from env (env still wins)", cfg.Port)
+		}
+		if cfg.LogLevel != "warn" {
+			t.Errorf("LogLevel = %q, want 'warn' from env (env still wins)", cfg.LogLevel)
+		}
+		// Unset in env still falls back to system_settings
+		if cfg.ScannerWorkers != 4 {
+			t.Errorf("ScannerWorkers = %d, want 4 from system_settings", cfg.ScannerWorkers)
+		}
+
+		// Env-pinned keys must report env_locked = true
+		if !cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = false, want true for env-pinned key")
+		}
+		if !cfg.IsEnvLocked("TOBITEN_LOG_LEVEL") {
+			t.Errorf("IsEnvLocked(TOBITEN_LOG_LEVEL) = false, want true for env-pinned key")
+		}
+		if cfg.SourceOf("TOBITEN_PORT") != SourceEnv {
+			t.Errorf("SourceOf(TOBITEN_PORT) = %v, want %v", cfg.SourceOf("TOBITEN_PORT"), SourceEnv)
+		}
+		if cfg.SourceOf("TOBITEN_LOG_LEVEL") != SourceEnv {
+			t.Errorf("SourceOf(TOBITEN_LOG_LEVEL) = %v, want %v", cfg.SourceOf("TOBITEN_LOG_LEVEL"), SourceEnv)
+		}
+
+		// system_settings key remains unlocked
+		if cfg.IsEnvLocked("TOBITEN_SCANNER_WORKERS") {
+			t.Errorf("IsEnvLocked(TOBITEN_SCANNER_WORKERS) = true, want false")
+		}
+		if cfg.SourceOf("TOBITEN_SCANNER_WORKERS") != SourceSystemSettings {
+			t.Errorf("SourceOf(TOBITEN_SCANNER_WORKERS) = %v, want %v", cfg.SourceOf("TOBITEN_SCANNER_WORKERS"), SourceSystemSettings)
+		}
+
+		// Verify via EffectiveConfig
+		eff := cfg.EffectiveConfig()
+		if !eff.Settings["TOBITEN_PORT"].EnvLocked {
+			t.Errorf("EffectiveConfig TOBITEN_PORT EnvLocked = false, want true")
+		}
+		if !eff.Settings["TOBITEN_LOG_LEVEL"].EnvLocked {
+			t.Errorf("EffectiveConfig TOBITEN_LOG_LEVEL EnvLocked = false, want true")
+		}
+		if eff.Settings["TOBITEN_SCANNER_WORKERS"].EnvLocked {
+			t.Errorf("EffectiveConfig TOBITEN_SCANNER_WORKERS EnvLocked = true, want false")
+		}
+	})
+
+	t.Run("flag_still_wins_over_system_settings_and_env", func(t *testing.T) {
+		settings := map[string]string{
+			"server.port": "9090",
+		}
+		env := []string{
+			"TOBITEN_PORT=8088",
+		}
+		flags := []string{
+			"--port=7070",
+		}
+
+		cfg, err := Load(flags, WithEnviron(env), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		if cfg.Port != 7070 {
+			t.Errorf("Port = %d, want 7070 from flag (flag overrides all)", cfg.Port)
+		}
+		if cfg.SourceOf("TOBITEN_PORT") != SourceFlag {
+			t.Errorf("SourceOf(TOBITEN_PORT) = %v, want %v", cfg.SourceOf("TOBITEN_PORT"), SourceFlag)
+		}
+		if !cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = false, want true for flag")
+		}
+	})
+
+	t.Run("env_file_still_wins_over_system_settings", func(t *testing.T) {
+		settings := map[string]string{
+			"server.port": "9090",
+		}
+		envFile := "TOBITEN_PORT=8085\n"
+
+		cfg, err := Load(nil, WithEnviron(nil), WithEnvFileReader(strings.NewReader(envFile)), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		if cfg.Port != 8085 {
+			t.Errorf("Port = %d, want 8085 from .env file", cfg.Port)
+		}
+		if cfg.SourceOf("TOBITEN_PORT") != SourceEnvFile {
+			t.Errorf("SourceOf(TOBITEN_PORT) = %v, want %v", cfg.SourceOf("TOBITEN_PORT"), SourceEnvFile)
+		}
+		if !cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = false, want true for env_file")
+		}
+	})
+
+	t.Run("blank_env_falls_through_to_system_settings", func(t *testing.T) {
+		// I-6: blank environment variable is treated as absent and falls through to system_settings
+		settings := map[string]string{
+			"server.port": "9090",
+			"log.level":   "debug",
+		}
+		env := []string{
+			"TOBITEN_PORT=",
+			"TOBITEN_LOG_LEVEL=   ",
+		}
+
+		cfg, err := Load(nil, WithEnviron(env), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		if cfg.Port != 9090 {
+			t.Errorf("Port = %d, want 9090 from system_settings when env is blank", cfg.Port)
+		}
+		if cfg.LogLevel != "debug" {
+			t.Errorf("LogLevel = %q, want 'debug' from system_settings when env is blank", cfg.LogLevel)
+		}
+		if cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = true, want false when env was blank")
+		}
+		if cfg.IsEnvLocked("TOBITEN_LOG_LEVEL") {
+			t.Errorf("IsEnvLocked(TOBITEN_LOG_LEVEL) = true, want false when env was blank")
+		}
+	})
+
+	t.Run("blank_system_settings_falls_through_to_default", func(t *testing.T) {
+		settings := map[string]string{
+			"server.port": "   ",
+			"log.level":   "",
+		}
+
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+
+		if cfg.Port != DefaultPort {
+			t.Errorf("Port = %d, want default %d when system_settings is blank", cfg.Port, DefaultPort)
+		}
+		if cfg.LogLevel != DefaultLogLevel {
+			t.Errorf("LogLevel = %q, want default %q when system_settings is blank", cfg.LogLevel, DefaultLogLevel)
+		}
+		if cfg.SourceOf("TOBITEN_PORT") != SourceDefault {
+			t.Errorf("SourceOf(TOBITEN_PORT) = %v, want %v", cfg.SourceOf("TOBITEN_PORT"), SourceDefault)
+		}
+		if cfg.IsEnvLocked("TOBITEN_PORT") {
+			t.Errorf("IsEnvLocked(TOBITEN_PORT) = true, want false for default")
+		}
+	})
+}
+
+func TestSystemSettings_KeyAliases(t *testing.T) {
+	tests := []struct {
+		name       string
+		settings   map[string]string
+		checkField func(*testing.T, *Config)
+	}{
+		{
+			name:     "oidc.default_role_id alias",
+			settings: map[string]string{"oidc.default_role_id": "019318a0-0000-7000-8000-000000000003"},
+			checkField: func(t *testing.T, c *Config) {
+				if c.OIDCDefaultRole != "019318a0-0000-7000-8000-000000000003" {
+					t.Errorf("OIDCDefaultRole = %q, want role id", c.OIDCDefaultRole)
+				}
+				if c.SourceOf("TOBITEN_OIDC_DEFAULT_ROLE") != SourceSystemSettings {
+					t.Errorf("SourceOf = %v, want %v", c.SourceOf("TOBITEN_OIDC_DEFAULT_ROLE"), SourceSystemSettings)
+				}
+			},
+		},
+		{
+			name:     "oidc.default_labels alias",
+			settings: map[string]string{"oidc.default_labels": "restricted,family"},
+			checkField: func(t *testing.T, c *Config) {
+				if c.OIDCDefaultLabels != "restricted,family" {
+					t.Errorf("OIDCDefaultLabels = %q, want 'restricted,family'", c.OIDCDefaultLabels)
+				}
+			},
+		},
+		{
+			name:     "server.base_url alias",
+			settings: map[string]string{"server.base_url": "https://books.example.com/tobiten"},
+			checkField: func(t *testing.T, c *Config) {
+				if c.BaseURL != "https://books.example.com/tobiten" {
+					t.Errorf("BaseURL = %q, want 'https://books.example.com/tobiten'", c.BaseURL)
+				}
+			},
+		},
+		{
+			name:     "cache.thumb_max_mb alias",
+			settings: map[string]string{"cache.thumb_max_mb": "1024"},
+			checkField: func(t *testing.T, c *Config) {
+				if c.ThumbCacheMaxMB != 1024 {
+					t.Errorf("ThumbCacheMaxMB = %d, want 1024", c.ThumbCacheMaxMB)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithSystemSettings(tt.settings))
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+			tt.checkField(t, cfg)
+		})
+	}
+}
+
+func TestSystemSettings_WithSystemSettingsJSON(t *testing.T) {
+	rawJSON := map[string][]byte{
+		"server.port":           []byte(`9090`),
+		"log.level":             []byte(`"debug"`),
+		"oidc.default_labels":   []byte(`["label-1", "label-2"]`),
+		"events.retention_days": []byte(`14`),
+	}
+
+	cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithSystemSettingsJSON(rawJSON))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if cfg.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", cfg.Port)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want 'debug'", cfg.LogLevel)
+	}
+	if cfg.OIDCDefaultLabels != "label-1,label-2" {
+		t.Errorf("OIDCDefaultLabels = %q, want 'label-1,label-2'", cfg.OIDCDefaultLabels)
+	}
+
+	// Unmapped setting accessible via SystemSetting
+	val, ok := cfg.SystemSetting("events.retention_days")
+	if !ok || val != "14" {
+		t.Errorf("SystemSetting(events.retention_days) = %q, %v; want '14', true", val, ok)
+	}
+}
+
+func TestSystemSettings_ApplySystemSettings(t *testing.T) {
+	env := []string{
+		"TOBITEN_PORT=8080",
+	}
+	cfg, err := Load(nil, WithEnviron(env), WithoutEnvFile())
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	// Initial state
+	if !cfg.IsEnvLocked("TOBITEN_PORT") {
+		t.Errorf("expected TOBITEN_PORT to be env-locked")
+	}
+	if cfg.IsEnvLocked("TOBITEN_LOG_LEVEL") {
+		t.Errorf("expected TOBITEN_LOG_LEVEL not to be env-locked")
+	}
+
+	// Apply settings: port is locked, log.level is not
+	err = cfg.ApplySystemSettings(map[string]string{
+		"server.port": "9090",
+		"log.level":   "debug",
+	})
+	if err != nil {
+		t.Fatalf("ApplySystemSettings failed: %v", err)
+	}
+
+	// Port should remain 8080 ("env still wins")
+	if cfg.Port != 8080 {
+		t.Errorf("Port = %d, want 8080 (env-locked key must not be modified)", cfg.Port)
+	}
+	// LogLevel should be updated to debug
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want 'debug' from applied system_settings", cfg.LogLevel)
+	}
+	if cfg.SourceOf("TOBITEN_LOG_LEVEL") != SourceSystemSettings {
+		t.Errorf("SourceOf(TOBITEN_LOG_LEVEL) = %v, want %v", cfg.SourceOf("TOBITEN_LOG_LEVEL"), SourceSystemSettings)
+	}
+	if cfg.IsEnvLocked("TOBITEN_LOG_LEVEL") {
+		t.Errorf("IsEnvLocked(TOBITEN_LOG_LEVEL) = true, want false")
+	}
+
+	// Apply invalid setting: port out of range must fail validation and keep cfg intact
+	err = cfg.ApplySystemSettings(map[string]string{
+		"log.level": "invalid_level",
+	})
+	if err == nil {
+		t.Errorf("expected error applying invalid log level, got nil")
+	}
+	// Previous valid LogLevel must still be debug
+	if cfg.LogLevel != "debug" {
+		t.Errorf("LogLevel corrupted after failed ApplySystemSettings: got %q, want 'debug'", cfg.LogLevel)
+	}
+}
+
+func TestEffectiveConfig_Reporting(t *testing.T) {
+	flags := []string{"--host=127.0.0.1"}
+	env := []string{"TOBITEN_PORT=9090"}
+	settings := map[string]string{
+		"log.level":             "warn",
+		"events.retention_days": "7",
+	}
+
+	cfg, err := Load(flags, WithEnviron(env), WithoutEnvFile(), WithSystemSettings(settings))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	eff := cfg.EffectiveConfig()
+
+	// 1. Flag setting: host
+	hostSetting := eff.Settings["TOBITEN_HOST"]
+	if !hostSetting.EnvLocked || hostSetting.Source != SourceFlag || hostSetting.Value != "127.0.0.1" {
+		t.Errorf("hostSetting = %+v, want Source=flag, EnvLocked=true, Value=127.0.0.1", hostSetting)
+	}
+
+	// 2. Env setting: port
+	portSetting := eff.Settings["TOBITEN_PORT"]
+	if !portSetting.EnvLocked || portSetting.Source != SourceEnv || portSetting.Value != 9090 {
+		t.Errorf("portSetting = %+v, want Source=env, EnvLocked=true, Value=9090", portSetting)
+	}
+
+	// 3. SystemSettings setting: log.level
+	logSetting := eff.Settings["TOBITEN_LOG_LEVEL"]
+	if logSetting.EnvLocked || logSetting.Source != SourceSystemSettings || logSetting.Value != "warn" {
+		t.Errorf("logSetting = %+v, want Source=system_settings, EnvLocked=false, Value=warn", logSetting)
+	}
+
+	// 4. Default setting: library.mode
+	libSetting := eff.Settings["TOBITEN_LIBRARY_MODE"]
+	if libSetting.EnvLocked || libSetting.Source != SourceDefault || libSetting.Value != "virtual" {
+		t.Errorf("libSetting = %+v, want Source=default, EnvLocked=false, Value=virtual", libSetting)
+	}
+
+	// 5. Unmapped setting: events.retention_days
+	unmappedSetting := eff.Settings["events.retention_days"]
+	if unmappedSetting.EnvLocked || unmappedSetting.Source != SourceSystemSettings || unmappedSetting.Value != "7" {
+		t.Errorf("unmappedSetting = %+v, want Source=system_settings, EnvLocked=false, Value=7", unmappedSetting)
+	}
+
+	// 6. Secret setting: admin pass
+	passSetting := eff.Settings["TOBITEN_ADMIN_PASS"]
+	if !passSetting.IsSecret {
+		t.Errorf("passSetting.IsSecret = false, want true")
+	}
+	if passSetting.Value != "" {
+		t.Errorf("unset passSetting.Value = %q, want empty string", passSetting.Value)
+	}
+
+	// 7. Setting helper lookup by alias
+	s, ok := cfg.Setting("port")
+	if !ok || s.Key != "TOBITEN_PORT" || !s.EnvLocked {
+		t.Errorf("Setting('port') = %+v, %v; want TOBITEN_PORT locked", s, ok)
+	}
+}
