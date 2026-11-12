@@ -625,6 +625,16 @@ func (c *Config) rebaseDefaultPaths(orig *Config) {
 	}
 }
 
+// SetResolvedDataDir freezes the canonical root before any derived path is opened.
+// Configuration provenance and independent cover/cache overrides are preserved.
+func (c *Config) SetResolvedDataDir(root string) {
+	c.DataDir = root
+	c.PostgresDir = filepath.Join(root, "postgres")
+	c.BackupsDir = filepath.Join(root, "backups")
+	c.SecretKeyPath = filepath.Join(root, "secret.key")
+	c.rebaseDefaultPaths(c)
+}
+
 // Validate checks configuration invariants and storage-mode conflict rules.
 func (c *Config) Validate() error {
 	// Storage mode conflict validation (ADR-0001 §3, ROADMAP M1-AC2, M1-T1, I-6/I-7)

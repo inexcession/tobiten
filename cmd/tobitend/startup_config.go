@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/inexcession/tobiten/internal/config"
@@ -15,34 +14,10 @@ type storageIdentity struct {
 	binaries [3]string
 }
 
-// canonicalPath also resolves symlinked ancestors when the final path is not yet created.
-func canonicalPath(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err == nil {
-		return resolved, nil
-	}
-	if !os.IsNotExist(err) {
-		return "", err
-	}
-	parent := filepath.Dir(absolute)
-	if parent == absolute {
-		return "", err
-	}
-	resolvedParent, err := canonicalPath(parent)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(resolvedParent, filepath.Base(absolute)), nil
-}
-
 func identifyStorage(cfg *config.Config) (storageIdentity, error) {
 	identity := storageIdentity{mode: cfg.StorageMode}
 	var err error
-	identity.dataDir, err = canonicalPath(cfg.DataDir)
+	identity.dataDir, err = embedded.CanonicalPath(cfg.DataDir)
 	if err != nil {
 		return identity, fmt.Errorf("resolving data directory: %w", err)
 	}
@@ -73,6 +48,7 @@ func applyStartupSettings(cfg *config.Config, settings map[string]string, frozen
 	if identity != frozen {
 		return fmt.Errorf("persisted storage identity conflicts with the opened instance: configure TOBITEN_DATA_DIR, TOBITEN_STORAGE_MODE, and TOBITEN_PG_BIN via bootstrap flags/environment/.env and restart")
 	}
+	candidate.SetResolvedDataDir(identity.dataDir)
 	*cfg = candidate
 	return nil
 }

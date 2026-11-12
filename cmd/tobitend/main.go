@@ -25,6 +25,16 @@ func versionString() string {
 	return fmt.Sprintf("tobitend %s", Version)
 }
 
+// bootstrapLogger uses canonical JSON and service metadata before stored logging
+// settings can be read. Its defaults are constants validated by the logging package.
+func bootstrapLogger() *slog.Logger {
+	logger, err := logging.New(logging.Options{})
+	if err != nil {
+		panic(err)
+	}
+	return logger
+}
+
 func setupLogging(cfg *config.Config) error {
 	noColor := true
 	if cfg.LogFormat == logging.FormatTable {
@@ -105,8 +115,9 @@ func runContext(ctx context.Context, args []string) int {
 	if ctx.Err() != nil {
 		return 0
 	}
+	slog.SetDefault(bootstrapLogger())
 	if err := startDaemon(ctx, cfg, startServer); err != nil {
-		fmt.Fprintf(os.Stderr, "tobitend: %v\n", err)
+		slog.Error("server error", logging.Err(err))
 		return 1
 	}
 

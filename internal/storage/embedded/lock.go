@@ -15,6 +15,12 @@ var (
 	ErrSocketDirLocked = errors.New("embedded postgresql socket directory is locked by another process")
 )
 
+// CanonicalPath resolves existing symlinks, including links to not-yet-created
+// targets, without cleaning away filesystem-dependent symlink/.. traversal.
+func CanonicalPath(path string) (string, error) {
+	return canonicalizePath(path)
+}
+
 // canonicalizePath returns the canonical absolute path with all symlinks resolved,
 // preserving filesystem symlink and ".." semantics even if intermediate leaf
 // components or target directories do not exist yet.
