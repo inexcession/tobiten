@@ -3,7 +3,9 @@ package openapi
 import (
 	"net/http"
 
+	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
+	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/module"
 )
 
@@ -43,9 +45,22 @@ func (m *Module) buildRouter() http.Handler {
 	mux := http.NewServeMux()
 
 	// Auth routes (closed unauthenticated allowlist, ADR-0006 §1, ADR-0014 §1).
-	// Only POST is allowlisted; GET/HEAD are not allowlisted and return 405 Method Not Allowed.
+	// Only POST is allowlisted; other methods return 405 Method Not Allowed.
 	mux.HandleFunc("POST /api/v1/auth/login", m.handleLogin)
 	mux.HandleFunc("POST /api/v1/auth/setup", m.handleSetup)
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqPath := r.URL.Path
+		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+
+		p, ok := domain.PrincipalFromContext(r.Context())
+		if !ok || p == nil {
+			middleware.WriteUnauthorized(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }

@@ -291,6 +291,9 @@ func mountModuleRoutes(mux *http.ServeMux, reg module.Registry, ub *URLBuilder, 
 		}
 
 		moduleName := mount.ModuleName
+		if moduleName != "system" && moduleName != "openapi" {
+			handler = middleware.RequirePrincipal(handler)
+		}
 		guardedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !reg.IsEnabled(moduleName) {
 				http.NotFound(w, r)

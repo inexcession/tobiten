@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -45,27 +46,28 @@ var closedAllowlist = []allowlistTarget{
 	},
 }
 
-func matchAllowlistTarget(reqPath, subDecoded, subEscaped string) (allowlistTarget, bool) {
-	for _, target := range closedAllowlist {
-		if reqPath == target.path {
-			return target, true
-		}
-		if subDecoded != "" && reqPath == subDecoded+target.path {
-			return target, true
-		}
-		if subEscaped != "" && subEscaped != subDecoded && reqPath == subEscaped+target.path {
-			return target, true
-		}
+// WriteUnauthorized writes a standard 401 Unauthorized response with WWW-Authenticate: Basic
+// and never an empty 200 (ADR-0006 §1, KOMGA-ADAPTER §8).
+func WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="tobiten"`)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}` + "\n"))
 	}
-	return allowlistTarget{}, false
 }
 
-func matchRequestAllowlist(r *http.Request, subDecoded, subEscaped string) (allowlistTarget, bool) {
-	target, matched := matchAllowlistTarget(r.URL.Path, subDecoded, subEscaped)
-	if !matched && r.URL.RawPath != "" {
-		target, matched = matchAllowlistTarget(r.URL.RawPath, subDecoded, subEscaped)
-	}
-	return target, matched
+// RequirePrincipal wraps an http.Handler to ensure a verified domain.Principal exists in context.
+// Unauthenticated requests receive 401 Unauthorized with WWW-Authenticate: Basic and never an empty 200.
+func RequirePrincipal(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, ok := domain.PrincipalFromContext(r.Context())
+		if !ok || p == nil {
+			WriteUnauthorized(w, r)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 func isMethodAllowed(method string, allowed []string) bool {
@@ -86,13 +88,34 @@ func writeMethodNotAllowed(w http.ResponseWriter, r *http.Request, allowedMethod
 	}
 }
 
-func writeUnauthorized(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("WWW-Authenticate", `Basic realm="tobiten"`)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusUnauthorized)
-	if r.Method != http.MethodHead {
-		_, _ = w.Write([]byte(`{"error":"unauthorized"}` + "\n"))
+func matchAllowlistTarget(reqPath, subDecoded, subEscaped string, allowDecoded bool) (allowlistTarget, bool) {
+	for _, target := range closedAllowlist {
+		if reqPath == target.path {
+			return target, true
+		}
+		if subEscaped != "" && reqPath == subEscaped+target.path {
+			return target, true
+		}
+		if allowDecoded && subDecoded != "" && reqPath == subDecoded+target.path {
+			return target, true
+		}
 	}
+	return allowlistTarget{}, false
+}
+
+func matchRequestAllowlist(r *http.Request, subDecoded, subEscaped string) (allowlistTarget, bool) {
+	hasEncodedSlash := strings.Contains(strings.ToUpper(subEscaped), "%2F")
+
+	if r.URL.RawPath != "" {
+		if target, matched := matchAllowlistTarget(r.URL.RawPath, subDecoded, subEscaped, false); matched {
+			return target, true
+		}
+		if hasEncodedSlash {
+			return allowlistTarget{}, false
+		}
+	}
+
+	return matchAllowlistTarget(r.URL.Path, subDecoded, subEscaped, !hasEncodedSlash)
 }
 
 func collectAuthenticators(opts AuthOptions) []module.Authenticator {
@@ -104,20 +127,20 @@ func collectAuthenticators(opts AuthOptions) []module.Authenticator {
 	return auths
 }
 
-func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.Principal, bool) {
+func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.Principal, bool, error) {
 	for _, a := range auths {
 		res, err := a.Authenticate(r)
 		if err != nil {
-			return nil, false
+			return nil, false, err
 		}
 		if res.Handled {
 			if res.Principal != nil {
-				return res.Principal, true
+				return res.Principal, true, nil
 			}
-			return nil, false
+			return nil, false, errors.New("handled without principal")
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 // Auth returns HTTP middleware that enforces Tobiten's mandatory authentication contract
@@ -136,6 +159,18 @@ func Auth(opts AuthOptions) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auths := collectAuthenticators(opts)
+			principal, ok, err := authenticateChain(r, auths)
+			if err != nil {
+				WriteUnauthorized(w, r)
+				return
+			}
+			if ok && principal != nil {
+				ctx := domain.ContextWithPrincipal(r.Context(), principal)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
 			target, matched := matchRequestAllowlist(r, subDecoded, subEscaped)
 			if matched {
 				if isMethodAllowed(r.Method, target.allowedMethods) {
@@ -146,15 +181,7 @@ func Auth(opts AuthOptions) func(http.Handler) http.Handler {
 				return
 			}
 
-			auths := collectAuthenticators(opts)
-			principal, ok := authenticateChain(r, auths)
-			if ok && principal != nil {
-				ctx := domain.ContextWithPrincipal(r.Context(), principal)
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
-
-			writeUnauthorized(w, r)
+			WriteUnauthorized(w, r)
 		})
 	}
 }

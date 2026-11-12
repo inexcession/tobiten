@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -562,6 +563,293 @@ func TestM1AC5_InjectedAuthenticator_DenialAndVerifiedPrincipal(t *testing.T) {
 		}
 		if len(payload.Permissions) == 0 {
 			t.Errorf("expected permissions, got none")
+		}
+	})
+}
+
+func TestM1AC5_RoutingSecurityRegressions_ExemptionsBoundToPublicHandlers(t *testing.T) {
+	testPrincipal := domain.NewPrincipal(
+		domain.User{ID: "usr_sentinel", Username: "sentinel"},
+		domain.BuiltInRoles()[:1],
+		domain.CredentialKindPassword,
+		"cred_sentinel",
+		nil,
+	)
+	authenticator := &tokenAuth{
+		token:     "sentinel-token",
+		principal: testPrincipal,
+	}
+
+	t.Run("collision: Base /comics with protected mount /comics/healthz", func(t *testing.T) {
+		reg := module.NewRegistry()
+		_ = reg.Register(api.NewSystemModule())
+
+		// Protected module mounted directly at /comics/healthz
+		protectedMarker := "PROTECTED_SENTINEL_COMICS_HEALTHZ"
+		protectedMod := module.NewSimpleModule("protected-comics")
+		protectedMod.Mounts = []module.RouteMount{
+			{
+				ModuleName: "protected-comics",
+				Prefix:     "/comics/healthz",
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(protectedMarker))
+				}),
+			},
+		}
+		_ = reg.Register(protectedMod)
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080/comics",
+		}
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{authenticator},
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		handler := srv.Handler()
+
+		// 1. Unauthenticated GET /comics/healthz MUST return 401 and NEVER execute the protected marker
+		reqUnauth := httptest.NewRequest(http.MethodGet, "/comics/healthz", nil)
+		recUnauth := httptest.NewRecorder()
+		handler.ServeHTTP(recUnauth, reqUnauth)
+
+		if recUnauth.Code != http.StatusUnauthorized {
+			t.Errorf("unauthenticated GET /comics/healthz status = %d, want 401 Unauthorized", recUnauth.Code)
+		}
+		if strings.Contains(recUnauth.Body.String(), protectedMarker) {
+			t.Fatalf("SECURITY VIOLATION: unauthenticated GET /comics/healthz executed protected handler: %s", recUnauth.Body.String())
+		}
+		if auth := recUnauth.Header().Get("WWW-Authenticate"); !strings.HasPrefix(auth, "Basic") {
+			t.Errorf("WWW-Authenticate = %q, want Basic", auth)
+		}
+
+		// 2. Authenticated GET /comics/healthz executes the direct protected handler (direct precedence preserved)
+		reqAuth := httptest.NewRequest(http.MethodGet, "/comics/healthz", nil)
+		reqAuth.Header.Set("X-Auth-Token", "sentinel-token")
+		recAuth := httptest.NewRecorder()
+		handler.ServeHTTP(recAuth, reqAuth)
+
+		if recAuth.Code != http.StatusOK {
+			t.Errorf("authenticated GET /comics/healthz status = %d, want 200", recAuth.Code)
+		}
+		if recAuth.Body.String() != protectedMarker {
+			t.Errorf("authenticated GET /comics/healthz body = %q, want %q", recAuth.Body.String(), protectedMarker)
+		}
+
+		// 3. Positive control: genuine direct /healthz returns 200 ok
+		reqHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		recHealth := httptest.NewRecorder()
+		handler.ServeHTTP(recHealth, reqHealth)
+
+		if recHealth.Code != http.StatusOK {
+			t.Errorf("genuine GET /healthz status = %d, want 200", recHealth.Code)
+		}
+		if recHealth.Body.String() != "ok\n" {
+			t.Errorf("genuine GET /healthz body = %q, want 'ok\\n'", recHealth.Body.String())
+		}
+	})
+
+	t.Run("encoded base: Base /a%2Fb with protected root mount /", func(t *testing.T) {
+		reg := module.NewRegistry()
+		_ = reg.Register(api.NewSystemModule())
+
+		protectedMarker := "PROTECTED_SENTINEL_ROOT"
+		rootMod := module.NewSimpleModule("protected-root")
+		rootMod.Mounts = []module.RouteMount{
+			{
+				ModuleName: "protected-root",
+				Prefix:     "/",
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(protectedMarker))
+				}),
+			},
+		}
+		_ = reg.Register(rootMod)
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080/a%2Fb",
+		}
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:         cfg,
+			Registry:       reg,
+			Authenticators: []module.Authenticator{authenticator},
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		handler := srv.Handler()
+
+		// 1. Unauthenticated decoded spelling GET /a/b/healthz MUST return 401 and NEVER execute protected root
+		reqDecoded := httptest.NewRequest(http.MethodGet, "/a/b/healthz", nil)
+		recDecoded := httptest.NewRecorder()
+		handler.ServeHTTP(recDecoded, reqDecoded)
+
+		if recDecoded.Code != http.StatusUnauthorized {
+			t.Errorf("unauthenticated decoded GET /a/b/healthz status = %d, want 401", recDecoded.Code)
+		}
+		if strings.Contains(recDecoded.Body.String(), protectedMarker) {
+			t.Fatalf("SECURITY VIOLATION: decoded /a/b/healthz executed protected handler: %s", recDecoded.Body.String())
+		}
+
+		// 2. Authenticated decoded spelling GET /a/b/healthz hits root handler with valid Principal
+		reqDecodedAuth := httptest.NewRequest(http.MethodGet, "/a/b/healthz", nil)
+		reqDecodedAuth.Header.Set("X-Auth-Token", "sentinel-token")
+		recDecodedAuth := httptest.NewRecorder()
+		handler.ServeHTTP(recDecodedAuth, reqDecodedAuth)
+
+		if recDecodedAuth.Code != http.StatusOK {
+			t.Errorf("authenticated decoded GET /a/b/healthz status = %d, want 200", recDecodedAuth.Code)
+		}
+		if recDecodedAuth.Body.String() != protectedMarker {
+			t.Errorf("authenticated decoded body = %q, want %q", recDecodedAuth.Body.String(), protectedMarker)
+		}
+
+		// 3. Unauthenticated double-encoded spelling GET /a%252Fb/healthz MUST return 401 and NEVER execute protected root
+		reqDouble := httptest.NewRequest(http.MethodGet, "/a%252Fb/healthz", nil)
+		recDouble := httptest.NewRecorder()
+		handler.ServeHTTP(recDouble, reqDouble)
+
+		if recDouble.Code != http.StatusUnauthorized {
+			t.Errorf("unauthenticated double-encoded GET /a%%252Fb/healthz status = %d, want 401", recDouble.Code)
+		}
+		if strings.Contains(recDouble.Body.String(), protectedMarker) {
+			t.Fatalf("SECURITY VIOLATION: double-encoded executed protected handler: %s", recDouble.Body.String())
+		}
+
+		// 4. Authenticated double-encoded spelling GET /a%252Fb/healthz hits root handler with valid Principal
+		reqDoubleAuth := httptest.NewRequest(http.MethodGet, "/a%252Fb/healthz", nil)
+		reqDoubleAuth.Header.Set("X-Auth-Token", "sentinel-token")
+		recDoubleAuth := httptest.NewRecorder()
+		handler.ServeHTTP(recDoubleAuth, reqDoubleAuth)
+
+		if recDoubleAuth.Code != http.StatusOK {
+			t.Errorf("authenticated double-encoded status = %d, want 200", recDoubleAuth.Code)
+		}
+		if recDoubleAuth.Body.String() != protectedMarker {
+			t.Errorf("authenticated double-encoded body = %q, want %q", recDoubleAuth.Body.String(), protectedMarker)
+		}
+
+		// 5. Positive controls: genuine escaped subpath alias /a%2Fb/healthz returns 200 ok
+		reqEscaped := httptest.NewRequest(http.MethodGet, "/a%2Fb/healthz", nil)
+		recEscaped := httptest.NewRecorder()
+		handler.ServeHTTP(recEscaped, reqEscaped)
+
+		if recEscaped.Code != http.StatusOK {
+			t.Errorf("genuine escaped GET /a%%2Fb/healthz status = %d, want 200 (body: %s)", recEscaped.Code, recEscaped.Body.String())
+		}
+		if recEscaped.Body.String() != "ok\n" {
+			t.Errorf("genuine escaped body = %q, want 'ok\\n'", recEscaped.Body.String())
+		}
+
+		// 6. Direct /healthz returns 200 ok
+		reqDirect := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		recDirect := httptest.NewRecorder()
+		handler.ServeHTTP(recDirect, reqDirect)
+
+		if recDirect.Code != http.StatusOK {
+			t.Errorf("genuine direct GET /healthz status = %d, want 200", recDirect.Code)
+		}
+		if recDirect.Body.String() != "ok\n" {
+			t.Errorf("genuine direct body = %q, want 'ok\\n'", recDirect.Body.String())
+		}
+	})
+
+	t.Run("absent or disabled public module: protected root mount /", func(t *testing.T) {
+		// Case A: No OpenAPI module registered at all
+		regNoOpenAPI := module.NewRegistry()
+		_ = regNoOpenAPI.Register(api.NewSystemModule())
+
+		protectedMarker := "PROTECTED_SENTINEL_ROOT"
+		rootMod := module.NewSimpleModule("protected-root")
+		rootMod.Mounts = []module.RouteMount{
+			{
+				ModuleName: "protected-root",
+				Prefix:     "/",
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(protectedMarker))
+				}),
+			},
+		}
+		_ = regNoOpenAPI.Register(rootMod)
+
+		cfg := &config.Config{
+			Host:    "127.0.0.1",
+			Port:    0,
+			BaseURL: "http://localhost:8080",
+		}
+		srvNoOpenAPI, err := api.NewServer(api.ServerOptions{
+			Config:         cfg,
+			Registry:       regNoOpenAPI,
+			Authenticators: []module.Authenticator{authenticator},
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		handlerNoOpenAPI := srvNoOpenAPI.Handler()
+
+		// 1. Unauthenticated POST /api/v1/auth/login with no OpenAPI module MUST NOT execute protected root
+		for _, endpoint := range []string{"/api/v1/auth/login", "/api/v1/auth/setup"} {
+			reqUnauth := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(`{}`))
+			recUnauth := httptest.NewRecorder()
+			handlerNoOpenAPI.ServeHTTP(recUnauth, reqUnauth)
+
+			if recUnauth.Code != http.StatusUnauthorized {
+				t.Errorf("unauthenticated POST %s (no OpenAPI) status = %d, want 401", endpoint, recUnauth.Code)
+			}
+			if strings.Contains(recUnauth.Body.String(), protectedMarker) {
+				t.Fatalf("SECURITY VIOLATION: POST %s executed protected root handler: %s", endpoint, recUnauth.Body.String())
+			}
+		}
+
+		// 2. Authenticated POST /api/v1/auth/login executes fallback root handler
+		reqAuth := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
+		reqAuth.Header.Set("X-Auth-Token", "sentinel-token")
+		recAuth := httptest.NewRecorder()
+		handlerNoOpenAPI.ServeHTTP(recAuth, reqAuth)
+
+		if recAuth.Code != http.StatusOK {
+			t.Errorf("authenticated POST /api/v1/auth/login (no OpenAPI) status = %d, want 200", recAuth.Code)
+		}
+		if recAuth.Body.String() != protectedMarker {
+			t.Errorf("authenticated POST body = %q, want %q", recAuth.Body.String(), protectedMarker)
+		}
+
+		// Case B: OpenAPI module enabled: unauthenticated POST reaches login handler, NOT root
+		regWithOpenAPI := module.NewRegistry()
+		_ = regWithOpenAPI.Register(api.NewSystemModule())
+		_ = regWithOpenAPI.Register(openapi.NewModule(app.NewStubServices()))
+		_ = regWithOpenAPI.Register(rootMod)
+
+		srvWithOpenAPI, err := api.NewServer(api.ServerOptions{
+			Config:         cfg,
+			Registry:       regWithOpenAPI,
+			Authenticators: []module.Authenticator{authenticator},
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		handlerWithOpenAPI := srvWithOpenAPI.Handler()
+
+		reqLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"password"}`))
+		recLogin := httptest.NewRecorder()
+		handlerWithOpenAPI.ServeHTTP(recLogin, reqLogin)
+
+		// Reached OpenAPI login handler (returns 200 login response, NOT root protected marker)
+		if strings.Contains(recLogin.Body.String(), protectedMarker) {
+			t.Fatalf("SECURITY VIOLATION: POST /api/v1/auth/login reached root instead of OpenAPI: %s", recLogin.Body.String())
+		}
+		if recLogin.Code != http.StatusOK {
+			t.Errorf("login status = %d, want 200 (body: %s)", recLogin.Code, recLogin.Body.String())
 		}
 	})
 }
