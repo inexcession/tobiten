@@ -27,6 +27,20 @@ const (
 
 	// HashSchemeArgon2id is the credential hash scheme string stored in credentials.hash_scheme (ADR-0006 §3, ADR-0018 S1).
 	HashSchemeArgon2id = "argon2id"
+
+	// Bounded limits for Argon2id parameters to prevent DoS attacks.
+	MinMemory         uint32 = 8          // 8 KiB (RFC 9106 requires >= 8*p KiB)
+	MaxMemory         uint32 = 256 * 1024 // 256 MiB (65536 KiB default)
+	MinIterations     uint32 = 1
+	MaxIterations     uint32 = 10 // default is 3
+	MinParallelism    uint8  = 1
+	MaxParallelism    uint8  = 16 // default is 4
+	MinSaltLength     uint32 = 8  // bytes (default is 16)
+	MaxSaltLength     uint32 = 64 // bytes
+	MinKeyLength      uint32 = 16 // bytes (default is 32)
+	MaxKeyLength      uint32 = 64 // bytes
+	MinEncodedHashLen        = 30
+	MaxEncodedHashLen        = 512
 )
 
 // Argon2idParams holds the cost parameters for Argon2id password hashing (RFC 9106).
@@ -73,15 +87,31 @@ func HashPassword(password string) (string, error) {
 }
 
 // HashPasswordWithParams hashes a plaintext password using Argon2id with custom parameters.
+// If params.Version is 0, it normalizes to argon2.Version (19).
+// Unsupported versions (e.g. 16) are rejected before hashing.
 func HashPasswordWithParams(password string, params Argon2idParams) (string, error) {
-	if params.SaltLength == 0 {
-		return "", errors.New("salt length must be greater than 0")
+	if params.Version == 0 {
+		params.Version = argon2.Version
 	}
-	if params.KeyLength == 0 {
-		return "", errors.New("key length must be greater than 0")
+	if params.Version != argon2.Version {
+		return "", fmt.Errorf("%w: unsupported generation version %d (only %d is supported)", ErrIncompatibleVersion, params.Version, argon2.Version)
 	}
-	if params.Memory == 0 || params.Iterations == 0 || params.Parallelism == 0 {
-		return "", errors.New("memory, iterations, and parallelism must be greater than 0")
+
+	if params.Parallelism < MinParallelism || params.Parallelism > MaxParallelism {
+		return "", fmt.Errorf("%w: parallelism %d out of bounds [%d, %d]", ErrInvalidHashFormat, params.Parallelism, MinParallelism, MaxParallelism)
+	}
+	minMem := 8 * uint32(params.Parallelism)
+	if params.Memory < minMem || params.Memory > MaxMemory {
+		return "", fmt.Errorf("%w: memory %d out of bounds [%d, %d]", ErrInvalidHashFormat, params.Memory, minMem, MaxMemory)
+	}
+	if params.Iterations < MinIterations || params.Iterations > MaxIterations {
+		return "", fmt.Errorf("%w: iterations %d out of bounds [%d, %d]", ErrInvalidHashFormat, params.Iterations, MinIterations, MaxIterations)
+	}
+	if params.SaltLength < MinSaltLength || params.SaltLength > MaxSaltLength {
+		return "", fmt.Errorf("%w: salt length %d out of bounds [%d, %d]", ErrInvalidHashFormat, params.SaltLength, MinSaltLength, MaxSaltLength)
+	}
+	if params.KeyLength < MinKeyLength || params.KeyLength > MaxKeyLength {
+		return "", fmt.Errorf("%w: key length %d out of bounds [%d, %d]", ErrInvalidHashFormat, params.KeyLength, MinKeyLength, MaxKeyLength)
 	}
 
 	salt := make([]byte, params.SaltLength)
@@ -94,14 +124,9 @@ func HashPasswordWithParams(password string, params Argon2idParams) (string, err
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Key := base64.RawStdEncoding.EncodeToString(key)
 
-	version := params.Version
-	if version == 0 {
-		version = argon2.Version
-	}
-
 	encoded := fmt.Sprintf("$%s$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		AlgorithmArgon2id,
-		version,
+		params.Version,
 		params.Memory,
 		params.Iterations,
 		params.Parallelism,
@@ -113,10 +138,14 @@ func HashPasswordWithParams(password string, params Argon2idParams) (string, err
 }
 
 // ParseArgon2idHash decomposes a PHC-formatted Argon2id string into its parameters, salt, and key.
-// The expected format is:
+// It applies strict, bounded validation before decoding base64 or allocating KDF buffers:
 //
 //	$argon2id$v=19$m=65536,t=3,p=4$<salt>$<key>
 func ParseArgon2idHash(encodedHash string) (*Argon2idParams, []byte, []byte, error) {
+	if len(encodedHash) < MinEncodedHashLen || len(encodedHash) > MaxEncodedHashLen {
+		return nil, nil, nil, ErrInvalidHashFormat
+	}
+
 	parts := strings.Split(encodedHash, "$")
 	// Expected parts: ["", "argon2id", "v=19", "m=65536,t=3,p=4", "<salt>", "<key>"]
 	if len(parts) != 6 || parts[0] != "" {
@@ -127,61 +156,24 @@ func ParseArgon2idHash(encodedHash string) (*Argon2idParams, []byte, []byte, err
 		return nil, nil, nil, fmt.Errorf("%w: %q", ErrUnsupportedAlgorithm, parts[1])
 	}
 
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: %v", ErrInvalidHashFormat, err)
-	}
-	if version != argon2.Version {
-		return nil, nil, nil, fmt.Errorf("%w: got %d, want %d", ErrIncompatibleVersion, version, argon2.Version)
+	version, err := parseVersion(parts[2])
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	var (
-		memory      uint32
-		iterations  uint32
-		parallelism uint8
-		hasM, hasT  bool
-		hasP        bool
-	)
-
-	for _, param := range strings.Split(parts[3], ",") {
-		kv := strings.SplitN(param, "=", 2)
-		if len(kv) != 2 {
-			return nil, nil, nil, ErrInvalidHashFormat
-		}
-		val, err := strconv.ParseUint(kv[1], 10, 32)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%w: invalid parameter %s: %v", ErrInvalidHashFormat, kv[0], err)
-		}
-		switch kv[0] {
-		case "m":
-			memory = uint32(val)
-			hasM = true
-		case "t":
-			iterations = uint32(val)
-			hasT = true
-		case "p":
-			if val == 0 || val > 255 {
-				return nil, nil, nil, fmt.Errorf("%w: parallelism out of uint8 range: %d", ErrInvalidHashFormat, val)
-			}
-			parallelism = uint8(val)
-			hasP = true
-		default:
-			return nil, nil, nil, fmt.Errorf("%w: unknown cost parameter %q", ErrInvalidHashFormat, kv[0])
-		}
+	memory, iterations, parallelism, err := parseCostParams(parts[3])
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	if !hasM || !hasT || !hasP || memory == 0 || iterations == 0 || parallelism == 0 {
-		return nil, nil, nil, ErrInvalidHashFormat
+	salt, err := parseComponent(parts[4], int(MinSaltLength), int(MaxSaltLength), "salt")
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	salt, err := decodeBase64(parts[4])
-	if err != nil || len(salt) == 0 {
-		return nil, nil, nil, fmt.Errorf("%w: invalid salt base64: %v", ErrInvalidHashFormat, err)
-	}
-
-	key, err := decodeBase64(parts[5])
-	if err != nil || len(key) == 0 {
-		return nil, nil, nil, fmt.Errorf("%w: invalid key base64: %v", ErrInvalidHashFormat, err)
+	key, err := parseComponent(parts[5], int(MinKeyLength), int(MaxKeyLength), "key")
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	params := &Argon2idParams{
@@ -194,6 +186,119 @@ func ParseArgon2idHash(encodedHash string) (*Argon2idParams, []byte, []byte, err
 	}
 
 	return params, salt, key, nil
+}
+
+func parseVersion(s string) (int, error) {
+	if !strings.HasPrefix(s, "v=") {
+		return 0, ErrInvalidHashFormat
+	}
+	verStr := strings.TrimPrefix(s, "v=")
+	if verStr == "" {
+		return 0, ErrInvalidHashFormat
+	}
+	for _, r := range verStr {
+		if r < '0' || r > '9' {
+			return 0, ErrInvalidHashFormat
+		}
+	}
+	version, err := strconv.ParseUint(verStr, 10, 32)
+	if err != nil {
+		return 0, ErrInvalidHashFormat
+	}
+	if version != uint64(argon2.Version) {
+		return 0, fmt.Errorf("%w: got %d, want %d", ErrIncompatibleVersion, version, argon2.Version)
+	}
+	return int(version), nil
+}
+
+func parseCostParams(s string) (uint32, uint32, uint8, error) {
+	tuples := strings.Split(s, ",")
+	if len(tuples) != 3 {
+		return 0, 0, 0, ErrInvalidHashFormat
+	}
+
+	var (
+		memory      uint32
+		iterations  uint32
+		parallelism uint8
+		hasM, hasT  bool
+		hasP        bool
+	)
+
+	for _, tuple := range tuples {
+		kv := strings.Split(tuple, "=")
+		if len(kv) != 2 || kv[0] == "" || kv[1] == "" {
+			return 0, 0, 0, ErrInvalidHashFormat
+		}
+		for _, r := range kv[1] {
+			if r < '0' || r > '9' {
+				return 0, 0, 0, ErrInvalidHashFormat
+			}
+		}
+		val, parseErr := strconv.ParseUint(kv[1], 10, 32)
+		if parseErr != nil {
+			return 0, 0, 0, fmt.Errorf("%w: invalid parameter %s: %v", ErrInvalidHashFormat, kv[0], parseErr)
+		}
+
+		switch kv[0] {
+		case "m":
+			if hasM {
+				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter m", ErrInvalidHashFormat)
+			}
+			if val > uint64(MaxMemory) {
+				return 0, 0, 0, fmt.Errorf("%w: memory %d exceeds maximum %d", ErrInvalidHashFormat, val, MaxMemory)
+			}
+			memory = uint32(val)
+			hasM = true
+		case "t":
+			if hasT {
+				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter t", ErrInvalidHashFormat)
+			}
+			if val < uint64(MinIterations) || val > uint64(MaxIterations) {
+				return 0, 0, 0, fmt.Errorf("%w: iterations %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinIterations, MaxIterations)
+			}
+			iterations = uint32(val)
+			hasT = true
+		case "p":
+			if hasP {
+				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter p", ErrInvalidHashFormat)
+			}
+			if val < uint64(MinParallelism) || val > uint64(MaxParallelism) {
+				return 0, 0, 0, fmt.Errorf("%w: parallelism %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinParallelism, MaxParallelism)
+			}
+			parallelism = uint8(val)
+			hasP = true
+		default:
+			return 0, 0, 0, fmt.Errorf("%w: unknown cost parameter %q", ErrInvalidHashFormat, kv[0])
+		}
+	}
+
+	if !hasM || !hasT || !hasP {
+		return 0, 0, 0, ErrInvalidHashFormat
+	}
+
+	if memory < 8*uint32(parallelism) {
+		return 0, 0, 0, fmt.Errorf("%w: memory %d below minimum %d for parallelism %d", ErrInvalidHashFormat, memory, 8*parallelism, parallelism)
+	}
+
+	return memory, iterations, parallelism, nil
+}
+
+func parseComponent(s string, minRaw, maxRaw int, name string) ([]byte, error) {
+	minB64 := minBase64Len(minRaw)
+	maxB64 := maxBase64Len(maxRaw)
+	if len(s) < minB64 || len(s) > maxB64 {
+		return nil, fmt.Errorf("%w: %s length out of bounds", ErrInvalidHashFormat, name)
+	}
+
+	b, err := decodeBase64(s)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid %s base64: %v", ErrInvalidHashFormat, name, err)
+	}
+	if len(b) < minRaw || len(b) > maxRaw {
+		return nil, fmt.Errorf("%w: %s bytes out of bounds", ErrInvalidHashFormat, name)
+	}
+	return b, nil
 }
 
 // VerifyPassword verifies whether the plaintext password matches the encoded Argon2id hash.
@@ -235,10 +340,30 @@ func ComparePassword(password, encodedHash string) error {
 
 // NeedsRehash reports whether the encoded hash was created with parameters different
 // from targetParams (or DefaultArgon2idParams if targetParams is omitted).
+// Target parameters are normalized: Version=0 defaults to argon2.Version,
+// and SaltLength=0 or KeyLength=0 default to DefaultArgon2idParams.
 func NeedsRehash(encodedHash string, targetParams ...Argon2idParams) bool {
 	target := DefaultArgon2idParams
 	if len(targetParams) > 0 {
 		target = targetParams[0]
+		if target.Version == 0 {
+			target.Version = argon2.Version
+		}
+		if target.SaltLength == 0 {
+			target.SaltLength = DefaultArgon2idParams.SaltLength
+		}
+		if target.KeyLength == 0 {
+			target.KeyLength = DefaultArgon2idParams.KeyLength
+		}
+		if target.Memory == 0 {
+			target.Memory = DefaultArgon2idParams.Memory
+		}
+		if target.Iterations == 0 {
+			target.Iterations = DefaultArgon2idParams.Iterations
+		}
+		if target.Parallelism == 0 {
+			target.Parallelism = DefaultArgon2idParams.Parallelism
+		}
 	}
 
 	params, _, _, err := ParseArgon2idHash(encodedHash)
@@ -249,6 +374,7 @@ func NeedsRehash(encodedHash string, targetParams ...Argon2idParams) bool {
 	return params.Memory != target.Memory ||
 		params.Iterations != target.Iterations ||
 		params.Parallelism != target.Parallelism ||
+		params.SaltLength != target.SaltLength ||
 		params.KeyLength != target.KeyLength ||
 		params.Version != target.Version
 }
@@ -261,4 +387,12 @@ func decodeBase64(s string) ([]byte, error) {
 		return b, nil
 	}
 	return base64.StdEncoding.DecodeString(s)
+}
+
+func minBase64Len(rawBytes int) int {
+	return (rawBytes*8 + 5) / 6
+}
+
+func maxBase64Len(rawBytes int) int {
+	return ((rawBytes + 2) / 3) * 4
 }

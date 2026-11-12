@@ -209,13 +209,38 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 			wantErr: ErrUnsupportedAlgorithm,
 		},
 		{
-			name:    "incompatible version",
+			name:    "incompatible version 16",
 			hash:    "$argon2id$v=16$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
 			wantErr: ErrIncompatibleVersion,
 		},
 		{
-			name:    "invalid version string",
-			hash:    "$argon2id$v=xyz$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			name:    "incompatible version 20",
+			hash:    "$argon2id$v=20$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrIncompatibleVersion,
+		},
+		{
+			name:    "trailing version junk",
+			hash:    "$argon2id$v=19junk$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "version with hyphen suffix",
+			hash:    "$argon2id$v=19-rc1$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "version with decimal junk",
+			hash:    "$argon2id$v=19.0$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "empty version value",
+			hash:    "$argon2id$v=$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "missing version prefix",
+			hash:    "$argon2id$19$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
@@ -234,8 +259,58 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
-			name:    "zero memory",
-			hash:    "$argon2id$v=19$m=0,t=3,p=4$" + validSalt + "$" + validKey,
+			name:    "duplicate memory parameter",
+			hash:    "$argon2id$v=19$m=65536,m=1024,t=3$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "duplicate iterations parameter",
+			hash:    "$argon2id$v=19$m=65536,t=3,t=2$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "duplicate parallelism parameter",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4,p=2$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple empty element",
+			hash:    "$argon2id$v=19$m=65536,,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple missing key",
+			hash:    "$argon2id$v=19$=65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple missing value",
+			hash:    "$argon2id$v=19$m=,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple multiple equals",
+			hash:    "$argon2id$v=19$m=65536=1,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple non-digit value",
+			hash:    "$argon2id$v=19$m=65536kb,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "invalid tuple signed value",
+			hash:    "$argon2id$v=19$m=+65536,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "memory below RFC 9106 minimum 8*p",
+			hash:    "$argon2id$v=19$m=16,t=3,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "excessive memory",
+			hash:    "$argon2id$v=19$m=1048576,t=3,p=4$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
@@ -244,18 +319,38 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
+			name:    "excessive iterations",
+			hash:    "$argon2id$v=19$m=65536,t=100,p=4$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
 			name:    "zero parallelism",
 			hash:    "$argon2id$v=19$m=65536,t=3,p=0$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
-			name:    "parallelism overflow",
+			name:    "excessive parallelism",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=32$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "parallelism overflow uint8",
 			hash:    "$argon2id$v=19$m=65536,t=3,p=256$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
 			name:    "unknown cost parameter",
 			hash:    "$argon2id$v=19$m=65536,t=3,p=4,unknown=1$" + validSalt + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "salt too short (<8 bytes)",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + base64.RawStdEncoding.EncodeToString([]byte("short")) + "$" + validKey,
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "salt too long (>64 bytes)",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + base64.RawStdEncoding.EncodeToString(make([]byte, 65)) + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
@@ -269,6 +364,16 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
+			name:    "key too short (<16 bytes)",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + validSalt + "$" + base64.RawStdEncoding.EncodeToString([]byte("tooshortkey")),
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "key too long (>64 bytes)",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + validSalt + "$" + base64.RawStdEncoding.EncodeToString(make([]byte, 65)),
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
 			name:    "invalid key base64",
 			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + validSalt + "$not-valid-base64!",
 			wantErr: ErrInvalidHashFormat,
@@ -276,6 +381,11 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 		{
 			name:    "empty key",
 			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + validSalt + "$",
+			wantErr: ErrInvalidHashFormat,
+		},
+		{
+			name:    "excessive total string length",
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4$" + validSalt + "$" + strings.Repeat("a", 600),
 			wantErr: ErrInvalidHashFormat,
 		},
 	}
@@ -305,6 +415,79 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 	}
 }
 
+func TestArgon2id_FastRejectionWithoutExpensiveWork(t *testing.T) {
+	validSalt := base64.RawStdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	validKey := base64.RawStdEncoding.EncodeToString(make([]byte, 32))
+
+	// An attacker hash with excessive costs (e.g. t=1000000) or invalid tuples.
+	excessiveHashes := []string{
+		"$argon2id$v=19$m=65536,t=1000,p=4$" + validSalt + "$" + validKey,
+		"$argon2id$v=19$m=1048576,t=3,p=4$" + validSalt + "$" + validKey,
+		"$argon2id$v=19$m=65536,m=65536,t=3$" + validSalt + "$" + validKey,
+		"$argon2id$v=19junk$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+	}
+
+	for _, hash := range excessiveHashes {
+		start := time.Now()
+		match, err := VerifyPassword("password", hash)
+		elapsed := time.Since(start)
+
+		if match {
+			t.Errorf("expected match=false, got true")
+		}
+		if err == nil {
+			t.Errorf("expected error, got nil")
+		}
+
+		// Rejection must be fast (<10ms) without executing expensive KDF work.
+		if elapsed > 10*time.Millisecond {
+			t.Errorf("rejection took too long (%v > 10ms); expensive work was executed for %q", elapsed, hash)
+		}
+	}
+}
+
+func TestArgon2id_VersionNormalizationAndRejection(t *testing.T) {
+	// 1. Version=0 must be normalized to argon2.Version (19) and successfully generate a valid hash.
+	paramsWithZeroVersion := Argon2idParams{
+		Version:     0,
+		Memory:      1024,
+		Iterations:  1,
+		Parallelism: 1,
+		SaltLength:  16,
+		KeyLength:   32,
+	}
+	hash, err := HashPasswordWithParams("test-pass", paramsWithZeroVersion)
+	if err != nil {
+		t.Fatalf("expected Version=0 to normalize to argon2.Version, got error: %v", err)
+	}
+	if !strings.HasPrefix(hash, "$argon2id$v=19$") {
+		t.Errorf("expected generated hash to have v=19, got: %s", hash)
+	}
+
+	// Verify the hash with normalized version verifies cleanly.
+	match, err := VerifyPassword("test-pass", hash)
+	if err != nil || !match {
+		t.Fatalf("VerifyPassword failed on hash generated with Version=0: match=%v, err=%v", match, err)
+	}
+
+	// 2. Unsupported generation version (e.g. 16) must be rejected before hashing.
+	paramsWithV16 := Argon2idParams{
+		Version:     16,
+		Memory:      1024,
+		Iterations:  1,
+		Parallelism: 1,
+		SaltLength:  16,
+		KeyLength:   32,
+	}
+	_, err = HashPasswordWithParams("test-pass", paramsWithV16)
+	if err == nil {
+		t.Fatal("expected HashPasswordWithParams to reject Version=16, got nil error")
+	}
+	if !errors.Is(err, ErrIncompatibleVersion) {
+		t.Errorf("expected ErrIncompatibleVersion, got: %v", err)
+	}
+}
+
 func TestArgon2id_NeedsRehash(t *testing.T) {
 	// A freshly hashed password with default parameters should not need rehash.
 	encoded, err := HashPassword("test-password")
@@ -314,6 +497,38 @@ func TestArgon2id_NeedsRehash(t *testing.T) {
 
 	if NeedsRehash(encoded) {
 		t.Errorf("expected NeedsRehash=false for default params, got true")
+	}
+
+	// Passing targetParams with Version=0 must normalize to 19 and NOT falsely report stale.
+	targetWithZeroVersion := Argon2idParams{
+		Memory:      64 * 1024,
+		Iterations:  3,
+		Parallelism: 4,
+		SaltLength:  16,
+		KeyLength:   32,
+		Version:     0, // Uninitialized / default zero value
+	}
+	if NeedsRehash(encoded, targetWithZeroVersion) {
+		t.Errorf("expected NeedsRehash=false when targetParams has Version=0, got true")
+	}
+
+	// A hash with a short salt (e.g. 8 bytes) must be detected as needing rehash against target SaltLength 16.
+	shortSaltParams := Argon2idParams{
+		Memory:      1024,
+		Iterations:  1,
+		Parallelism: 1,
+		SaltLength:  8, // Short salt
+		KeyLength:   32,
+		Version:     argon2.Version,
+	}
+	shortSaltHash, err := HashPasswordWithParams("test-password", shortSaltParams)
+	if err != nil {
+		t.Fatalf("HashPasswordWithParams failed: %v", err)
+	}
+
+	// NeedsRehash against default params (SaltLength=16) must return true (short salt caught!).
+	if !NeedsRehash(shortSaltHash) {
+		t.Errorf("expected NeedsRehash=true for hash with short salt (8B) against default target (16B), got false")
 	}
 
 	// A hash with lower cost parameters should need rehash.
@@ -396,21 +611,51 @@ func TestArgon2id_PaddedBase64Acceptance(t *testing.T) {
 }
 
 func TestArgon2id_HashPasswordWithParams_Validation(t *testing.T) {
-	// Zero salt length
-	_, err := HashPasswordWithParams("pw", Argon2idParams{SaltLength: 0, KeyLength: 32, Memory: 1024, Iterations: 1, Parallelism: 1})
+	// Salt length too short
+	_, err := HashPasswordWithParams("pw", Argon2idParams{SaltLength: 4, KeyLength: 32, Memory: 1024, Iterations: 1, Parallelism: 1})
 	if err == nil {
-		t.Error("expected error for zero salt length, got nil")
+		t.Error("expected error for salt length < MinSaltLength, got nil")
 	}
 
-	// Zero key length
-	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 0, Memory: 1024, Iterations: 1, Parallelism: 1})
+	// Salt length too long
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 128, KeyLength: 32, Memory: 1024, Iterations: 1, Parallelism: 1})
 	if err == nil {
-		t.Error("expected error for zero key length, got nil")
+		t.Error("expected error for salt length > MaxSaltLength, got nil")
 	}
 
-	// Zero memory
-	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 32, Memory: 0, Iterations: 1, Parallelism: 1})
+	// Key length too short
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 8, Memory: 1024, Iterations: 1, Parallelism: 1})
 	if err == nil {
-		t.Error("expected error for zero memory, got nil")
+		t.Error("expected error for key length < MinKeyLength, got nil")
+	}
+
+	// Key length too long
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 128, Memory: 1024, Iterations: 1, Parallelism: 1})
+	if err == nil {
+		t.Error("expected error for key length > MaxKeyLength, got nil")
+	}
+
+	// Memory below 8*p
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 32, Memory: 4, Iterations: 1, Parallelism: 1})
+	if err == nil {
+		t.Error("expected error for memory < 8*p, got nil")
+	}
+
+	// Memory above MaxMemory
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 32, Memory: 1048576, Iterations: 1, Parallelism: 1})
+	if err == nil {
+		t.Error("expected error for memory > MaxMemory, got nil")
+	}
+
+	// Iterations above MaxIterations
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 32, Memory: 1024, Iterations: 20, Parallelism: 1})
+	if err == nil {
+		t.Error("expected error for iterations > MaxIterations, got nil")
+	}
+
+	// Parallelism above MaxParallelism
+	_, err = HashPasswordWithParams("pw", Argon2idParams{SaltLength: 16, KeyLength: 32, Memory: 1024, Iterations: 1, Parallelism: 32})
+	if err == nil {
+		t.Error("expected error for parallelism > MaxParallelism, got nil")
 	}
 }
