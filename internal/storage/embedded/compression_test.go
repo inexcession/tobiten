@@ -41,11 +41,12 @@ func setupTestSupervisorWithProbe(t *testing.T, probe func(ctx context.Context, 
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	s, err := New(Options{
-		BinDir:           binDir,
-		DataDir:          dataDir,
-		Logger:           logger,
-		isRoot:           func() bool { return false },
-		compressionProbe: probe,
+		BinDir:            binDir,
+		DataDir:           dataDir,
+		Logger:            logger,
+		isRoot:            func() bool { return false },
+		resolvePIDTimeout: 10 * time.Millisecond,
+		compressionProbe:  probe,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error creating supervisor: %v", err)
@@ -258,10 +259,14 @@ func TestSupervisor_CompressionSettings_StaleConfigDoesNotHideSupportedCodec(t *
 		t.Fatalf("failed to write PG_VERSION: %v", err)
 	}
 
-	// Write stale unsupported settings into dataDir/postgresql.conf and postgresql.auto.conf
-	staleConf := `# Stale configuration from earlier run or user edit
+	// Write stale unsupported settings into existing cluster files (postgresql.conf and postgresql.auto.conf).
+	// Stale settings inside the prior Tobiten block simulate an earlier run where codecs were configured,
+	// while postgresql.auto.conf simulates runtime alter system or external edits.
+	staleConf := `# Existing cluster configuration with stale Tobiten block
+# --- BEGIN TOBITEN EMBEDDED CONFIGURATION ---
 wal_compression = 'invalid_stale_algo'
 default_toast_compression = 'stale_broken'
+# --- END TOBITEN EMBEDDED CONFIGURATION ---
 `
 	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte(staleConf), 0600); err != nil {
 		t.Fatalf("failed to write stale postgresql.conf: %v", err)
@@ -274,10 +279,11 @@ default_toast_compression = 'stale_broken'
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	s, err := New(Options{
-		BinDir:  binDir,
-		DataDir: dataDir,
-		Logger:  logger,
-		isRoot:  func() bool { return false },
+		BinDir:            binDir,
+		DataDir:           dataDir,
+		Logger:            logger,
+		isRoot:            func() bool { return false },
+		resolvePIDTimeout: 10 * time.Millisecond,
 		// compressionProbe left unset to exercise ProbeCompression directly!
 	})
 	if err != nil {
@@ -293,6 +299,20 @@ default_toast_compression = 'stale_broken'
 		t.Fatalf("failed to read postgresql.conf: %v", err)
 	}
 	confContent := string(confBytes)
+
+	// Verify the Tobiten configuration block specifically
+	startIdx := strings.Index(confContent, confBeginMarker)
+	endIdx := strings.Index(confContent, confEndMarker)
+	if startIdx == -1 || endIdx == -1 || endIdx < startIdx {
+		t.Fatalf("expected tobiten config block in postgresql.conf, got:\n%s", confContent)
+	}
+	tobitenBlock := confContent[startIdx:endIdx]
+	if !strings.Contains(tobitenBlock, "default_toast_compression = 'lz4'") {
+		t.Fatalf("expected tobiten block to contain default_toast_compression = 'lz4', got:\n%s", tobitenBlock)
+	}
+	if strings.Contains(tobitenBlock, "wal_compression") {
+		t.Fatalf("expected tobiten block to omit unsupported wal_compression, got:\n%s", tobitenBlock)
+	}
 
 	if !strings.Contains(confContent, "default_toast_compression = 'lz4'") {
 		t.Fatalf("expected postgresql.conf to contain default_toast_compression = 'lz4', got:\n%s", confContent)
