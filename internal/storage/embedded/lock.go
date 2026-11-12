@@ -16,81 +16,96 @@ var (
 )
 
 // canonicalizePath returns the canonical absolute path with all symlinks resolved,
-// even if the target file/directory or intermediate leaf components do not exist yet.
+// preserving filesystem symlink and ".." semantics even if intermediate leaf
+// components or target directories do not exist yet.
 func canonicalizePath(path string) (string, error) {
-	return canonicalizePathDepth(path, 0)
+	if path == "" {
+		path = "."
+	}
+	if !filepath.IsAbs(path) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		path = filepath.Join(cwd, path)
+	}
+
+	resolved := "/"
+	remaining := splitPathComponents(path)
+	symlinks := 0
+
+	for len(remaining) > 0 {
+		name := remaining[0]
+		remaining = remaining[1:]
+
+		if name == "" || name == "." {
+			continue
+		}
+
+		if name == ".." {
+			if resolved == "/" {
+				continue
+			}
+			// Refuse '..' traversal through a component that does not exist on disk,
+			// preserving filesystem semantics where non-existent paths cannot resolve '..'.
+			if fi, err := os.Lstat(resolved); err != nil {
+				return "", fmt.Errorf("cannot resolve '..' through non-existent path %q: %w", resolved, err)
+			} else if !fi.IsDir() {
+				return "", fmt.Errorf("cannot resolve '..' through non-directory %q", resolved)
+			}
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+
+		candidate := filepath.Join(resolved, name)
+		fi, err := os.Lstat(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Target does not exist on disk.
+				// Append candidate and continue. Subsequent '..' will be safely refused.
+				resolved = candidate
+				continue
+			}
+			return "", fmt.Errorf("failed to stat %q: %w", candidate, err)
+		}
+
+		if fi.Mode()&os.ModeSymlink != 0 {
+			symlinks++
+			if symlinks > 64 {
+				return "", fmt.Errorf("too many levels of symbolic links: %q", candidate)
+			}
+			target, err := os.Readlink(candidate)
+			if err != nil {
+				return "", fmt.Errorf("failed to readlink %q: %w", candidate, err)
+			}
+
+			targetComps := splitPathComponents(target)
+			if filepath.IsAbs(target) {
+				resolved = "/"
+				remaining = append(targetComps, remaining...)
+			} else {
+				// Relative to the directory containing the symlink, which is 'resolved'
+				remaining = append(targetComps, remaining...)
+			}
+			continue
+		}
+
+		resolved = candidate
+	}
+
+	return filepath.Clean(resolved), nil
 }
 
-func canonicalizePathDepth(path string, depth int) (string, error) {
-	if depth > 64 {
-		return "", fmt.Errorf("too many levels of symbolic links: %q", path)
-	}
-
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve absolute path for %q: %w", path, err)
-	}
-	abs = filepath.Clean(abs)
-
-	// If the path itself exists and can be fully evaluated, do so.
-	if realPath, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(realPath), nil
-	}
-
-	// If abs exists as a symlink pointing to a non-existent target (broken or not-yet-created leaf):
-	if fi, err := os.Lstat(abs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(abs)
-		if err == nil {
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(abs), target)
-			}
-			return canonicalizePathDepth(target, depth+1)
+func splitPathComponents(p string) []string {
+	p = filepath.ToSlash(p)
+	parts := strings.Split(p, "/")
+	var res []string
+	for _, part := range parts {
+		if part != "" && part != "." {
+			res = append(res, part)
 		}
 	}
-
-	// If the path does not exist, find the lowest existing ancestor,
-	// resolve symlinks on it, and re-append the remaining components.
-	curr := abs
-	var trailing []string
-	for {
-		parent := filepath.Dir(curr)
-		if parent == curr {
-			break
-		}
-		trailing = append([]string{filepath.Base(curr)}, trailing...)
-		curr = parent
-
-		if fi, err := os.Lstat(curr); err == nil {
-			if fi.Mode()&os.ModeSymlink != 0 {
-				target, err := os.Readlink(curr)
-				if err == nil {
-					if !filepath.IsAbs(target) {
-						target = filepath.Join(filepath.Dir(curr), target)
-					}
-					resolvedParent, err := canonicalizePathDepth(target, depth+1)
-					if err == nil {
-						curr = resolvedParent
-						break
-					}
-				}
-			}
-			if resolved, err := filepath.EvalSymlinks(curr); err == nil {
-				curr = resolved
-				break
-			}
-		}
-	}
-
-	result := curr
-	for _, seg := range trailing {
-		result = filepath.Join(result, seg)
-	}
-	result = filepath.Clean(result)
-
-	if result != abs {
-		return canonicalizePathDepth(result, depth+1)
-	}
-	return result, nil
+	return res
 }
 
 // DataDirLockPath returns the lock file path corresponding to a data directory.

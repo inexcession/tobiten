@@ -179,6 +179,63 @@ func TestLock_DataDirLockPath_SymlinkAliases(t *testing.T) {
 	if lockTarget != lockLeaf {
 		t.Fatalf("expected identical lock path for not-yet-created leaf target: target=%q, leaf=%q", lockTarget, lockLeaf)
 	}
+
+	// 4. Symlink with intermediate symlink followed by '..' and not-yet-created target:
+	// alias -> parent/link/../future where parent/link -> other/subdir
+	parent := filepath.Join(tmpDir, "parent")
+	other := filepath.Join(tmpDir, "other")
+	subdir := filepath.Join(other, "subdir")
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		t.Fatalf("failed to create parent: %v", err)
+	}
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(subdir, link); err != nil {
+		t.Fatalf("failed to create link symlink: %v", err)
+	}
+	alias := filepath.Join(tmpDir, "alias_symlink_dotdot")
+	symlinkTarget := filepath.Join(parent, "link") + "/../future"
+	if err := os.Symlink(symlinkTarget, alias); err != nil {
+		t.Fatalf("failed to create alias symlink: %v", err)
+	}
+
+	// Before target exists: must resolve to other/future, NOT parent/future
+	canonBefore, err := canonicalizePath(alias)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed before creation: %v", err)
+	}
+	expectedTarget := filepath.Join(other, "future")
+	expectedCanon, err := canonicalizePath(expectedTarget)
+	if err != nil {
+		t.Fatalf("canonicalizePath(expectedTarget) failed: %v", err)
+	}
+	if canonBefore != expectedCanon {
+		t.Fatalf("expected canonical path before creation to be %q, got: %q", expectedCanon, canonBefore)
+	}
+	if lockAlias, lockTargetSym := DataDirLockPath(alias), DataDirLockPath(expectedTarget); lockAlias != lockTargetSym {
+		t.Fatalf("expected identical lock path before creation: alias=%q, target=%q", lockAlias, lockTargetSym)
+	}
+
+	// Now create target directory and prove identity remains stable and matches EvalSymlinks
+	if err := os.MkdirAll(expectedTarget, 0700); err != nil {
+		t.Fatalf("failed to create target: %v", err)
+	}
+	canonAfter, err := canonicalizePath(alias)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed after creation: %v", err)
+	}
+	if canonAfter != canonBefore {
+		t.Fatalf("identity changed after target creation: before=%q, after=%q", canonBefore, canonAfter)
+	}
+	evalSymlinks, err := filepath.EvalSymlinks(alias)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks failed: %v", err)
+	}
+	if canonAfter != filepath.Clean(evalSymlinks) {
+		t.Fatalf("expected canonAfter %q to match filepath.EvalSymlinks %q", canonAfter, evalSymlinks)
+	}
 }
 
 func TestLock_SocketDirLockPath(t *testing.T) {
@@ -465,23 +522,51 @@ func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMuta
 
 	writeFakeBinaries(t, binDir)
 
+	canonicalDir, err := canonicalizePath(realDir)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed: %v", err)
+	}
+	hangFile := filepath.Join(canonicalDir, ".hang_pgctl")
+	releaseFile := filepath.Join(canonicalDir, ".release")
+	if err := os.WriteFile(hangFile, []byte("1\n"), 0644); err != nil {
+		t.Fatalf("failed to write hang file: %v", err)
+	}
+
 	s1, err := New(Options{
-		BinDir:  binDir,
-		DataDir: aliasDir,
-		NoSync:  true,
-		isRoot:  func() bool { return false },
+		BinDir:            binDir,
+		DataDir:           aliasDir,
+		NoSync:            true,
+		isRoot:            func() bool { return false },
+		resolvePIDTimeout: 50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("failed to create s1: %v", err)
 	}
 
+	t.Cleanup(func() {
+		_ = os.WriteFile(releaseFile, []byte("release\n"), 0644)
+		_ = s1.Stop(context.Background())
+	})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := s1.Start(ctx); err != nil {
-		t.Fatalf("s1.Start failed: %v", err)
+	// s1.Start begins launch and acquires data lock, but hangs before PID publication
+	startErr := s1.Start(ctx)
+	if startErr == nil {
+		t.Fatal("expected s1.Start to fail with resolution timeout before PID publication, got nil")
 	}
-	defer func() { _ = s1.Stop(context.Background()) }()
+
+	// Verify that postmaster.pid DOES NOT EXIST yet!
+	pidFile := filepath.Join(canonicalDir, "postmaster.pid")
+	if _, statErr := os.Stat(pidFile); !os.IsNotExist(statErr) {
+		t.Fatalf("expected postmaster.pid to NOT exist before PID publication, stat: %v", statErr)
+	}
+
+	// Verify that s1 holds the data directory lock
+	if !s1.DataDirLocked() {
+		t.Fatal("expected s1 to hold data-directory lock before PID publication")
+	}
 
 	// Record postgresql.conf content created by s1
 	confPath := filepath.Join(s1.DataDir(), "postgresql.conf")
@@ -490,7 +575,7 @@ func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMuta
 		t.Fatalf("failed to read postgresql.conf: %v", err)
 	}
 
-	// 1. Second subprocess using realDir (the alias target) MUST be excluded
+	// 1. Second subprocess using realDir (the alias target) MUST be excluded while PID is NOT published
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
@@ -503,6 +588,11 @@ func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMuta
 	}
 	if !strings.Contains(string(out), "embedded postgresql data directory is locked by another process") {
 		t.Fatalf("expected clear lock error in subprocess output, got:\n%s", string(out))
+	}
+
+	// Verify postmaster.pid STILL does not exist
+	if _, statErr := os.Stat(pidFile); !os.IsNotExist(statErr) {
+		t.Fatalf("expected postmaster.pid to STILL not exist after rejected attempt, stat: %v", statErr)
 	}
 
 	// 2. Assert that postgresql.conf was NOT mutated by the rejected subprocess
@@ -524,10 +614,15 @@ func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMuta
 		t.Fatalf("expected LockDataDir(aliasDir) to fail with ErrDataDirLocked, got: %v", err)
 	}
 
-	// 4. Stop s1
+	// 4. Release s1 hang and stop s1
+	if err := os.WriteFile(releaseFile, []byte("release\n"), 0644); err != nil {
+		t.Fatalf("failed to write release file: %v", err)
+	}
 	if err := s1.Stop(context.Background()); err != nil {
 		t.Fatalf("s1.Stop failed: %v", err)
 	}
+	_ = os.Remove(hangFile)
+	_ = os.Remove(releaseFile)
 
 	// 5. Now second process on realDir succeeds
 	cmd2 := exec.Command(os.Args[0])
@@ -539,6 +634,128 @@ func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMuta
 	out2, err2 := cmd2.CombinedOutput()
 	if err2 != nil {
 		t.Fatalf("expected second process to succeed after s1 stopped: %v (output: %s)", err2, string(out2))
+	}
+}
+
+func TestSupervisor_MissingTarget_SymlinkDotDot_StableIdentityAndExclusionWithoutPID(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	writeFakeBinaries(t, binDir)
+
+	parent := filepath.Join(tmpDir, "parent")
+	other := filepath.Join(tmpDir, "other")
+	subdir := filepath.Join(other, "subdir")
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		t.Fatalf("failed to create parent: %v", err)
+	}
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(subdir, link); err != nil {
+		t.Fatalf("failed to create link symlink: %v", err)
+	}
+
+	// alias -> parent/link/../future where other/future does NOT exist yet!
+	alias := filepath.Join(tmpDir, "alias")
+	target := filepath.Join(parent, "link") + "/../future"
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatalf("failed to create alias symlink: %v", err)
+	}
+
+	expectedTarget := filepath.Join(other, "future")
+	expectedCanon, err := canonicalizePath(expectedTarget)
+	if err != nil {
+		t.Fatalf("canonicalizePath(expectedTarget) failed: %v", err)
+	}
+
+	// 1. Prove intended canonical path while target is absent
+	canonBefore, err := canonicalizePath(alias)
+	if err != nil {
+		t.Fatalf("canonicalizePath(alias) failed: %v", err)
+	}
+	if canonBefore != expectedCanon {
+		t.Fatalf("expected canonical path before target creation %q, got: %q", expectedCanon, canonBefore)
+	}
+	lockAlias := DataDirLockPath(alias)
+	lockTarget := DataDirLockPath(expectedTarget)
+	if lockAlias != lockTarget {
+		t.Fatalf("expected identical lock path for alias and intended target: alias=%q, target=%q", lockAlias, lockTarget)
+	}
+
+	// Prove target directory and postmaster.pid do not exist
+	if _, err := os.Stat(canonBefore); !os.IsNotExist(err) {
+		t.Fatalf("expected target directory %q to not exist yet", canonBefore)
+	}
+	pidPath := filepath.Join(canonBefore, "postmaster.pid")
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("expected postmaster.pid %q to not exist", pidPath)
+	}
+
+	// 2. Process 1 acquires maintenance lock via alias while target is absent (no PID file)
+	unlock, err := LockDataDir(alias)
+	if err != nil {
+		t.Fatalf("LockDataDir(alias) failed: %v", err)
+	}
+	defer func() { _ = unlock() }()
+
+	// 3. Second process attempts to supervise intended target and must be excluded without a PID file
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+expectedTarget,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected second process on missing-target to be excluded, output: %s", string(out))
+	}
+	if !strings.Contains(string(out), "embedded postgresql data directory is locked by another process") {
+		t.Fatalf("expected clear lock error in subprocess output, got:\n%s", string(out))
+	}
+
+	// Assert no PID file was published and no config was created
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("postmaster.pid was created by rejected process!")
+	}
+	confPath := filepath.Join(canonBefore, "postgresql.conf")
+	if _, err := os.Stat(confPath); !os.IsNotExist(err) {
+		t.Fatal("postgresql.conf was created by rejected attempt!")
+	}
+
+	// 4. Release maintenance lock, create target directory, and prove stable identity before/after creation
+	if err := unlock(); err != nil {
+		t.Fatalf("failed to unlock: %v", err)
+	}
+	if err := os.MkdirAll(expectedTarget, 0700); err != nil {
+		t.Fatalf("failed to create target directory: %v", err)
+	}
+
+	canonAfter, err := canonicalizePath(alias)
+	if err != nil {
+		t.Fatalf("canonicalizePath(alias) after creation failed: %v", err)
+	}
+	if canonAfter != canonBefore {
+		t.Fatalf("identity changed after target creation: before=%q, after=%q", canonBefore, canonAfter)
+	}
+	evalAfter, err := filepath.EvalSymlinks(alias)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks failed: %v", err)
+	}
+	if canonAfter != filepath.Clean(evalAfter) {
+		t.Fatalf("expected canonAfter %q to match filepath.EvalSymlinks %q", canonAfter, evalAfter)
+	}
+
+	// 5. Second process can now supervise intended target successfully
+	cmd2 := exec.Command(os.Args[0])
+	cmd2.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+expectedTarget,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+	)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		t.Fatalf("expected second process to succeed after target creation and unlock, got: %v (output: %s)", err2, string(out2))
 	}
 }
 
