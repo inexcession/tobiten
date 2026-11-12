@@ -212,13 +212,17 @@ func (c *Config) SourceOf(envKey string) Source {
 	if c == nil || c.sources == nil {
 		return SourceDefault
 	}
-	if src, ok := c.sources[envKey]; ok {
+	trimmed := strings.TrimSpace(envKey)
+	if src, ok := c.sources[trimmed]; ok {
 		return src
 	}
-	if canonical := canonicalEnvKey(envKey); canonical != "" {
+	if canonical := canonicalEnvKey(trimmed); canonical != "" {
 		if src, ok := c.sources[canonical]; ok {
 			return src
 		}
+	}
+	if src, ok := c.sources[envKey]; ok {
+		return src
 	}
 	return SourceDefault
 }
@@ -342,13 +346,17 @@ func (c *Config) Setting(key string) (EffectiveSetting, bool) {
 		return EffectiveSetting{}, false
 	}
 	eff := c.EffectiveSettings()
-	if s, ok := eff[key]; ok {
-		return s, true
-	}
-	if canonical := canonicalEnvKey(key); canonical != "" {
+	trimmed := strings.TrimSpace(key)
+	if canonical := canonicalEnvKey(trimmed); canonical != "" {
 		if s, ok := eff[canonical]; ok {
 			return s, true
 		}
+	}
+	if s, ok := eff[trimmed]; ok {
+		return s, true
+	}
+	if s, ok := eff[key]; ok {
+		return s, true
 	}
 	return EffectiveSetting{}, false
 }
@@ -370,8 +378,17 @@ func (c *Config) SystemSetting(key string) (string, bool) {
 	if c == nil || c.rawSystemSettings == nil {
 		return "", false
 	}
-	val, ok := c.rawSystemSettings[key]
-	return val, ok
+	if val, ok := c.rawSystemSettings[key]; ok {
+		return val, true
+	}
+	trimmed := strings.TrimSpace(key)
+	if val, ok := c.rawSystemSettings[trimmed]; ok {
+		return val, true
+	}
+	if canonical := canonicalEnvKey(trimmed); canonical != "" {
+		return lookupSystemSetting(c.rawSystemSettings, canonical)
+	}
+	return "", false
 }
 
 // ApplySystemSettings applies settings from system_settings to an existing Config.
@@ -573,6 +590,8 @@ func (c *Config) ApplySystemSettings(settings map[string]string) error {
 		clone.sources[entry.envKey] = SourceSystemSettings
 	}
 
+	clone.rebaseDefaultPaths(c)
+
 	for k := range settings {
 		canonical := canonicalEnvKey(k)
 		if canonical == "" && !c.IsEnvLocked(k) {
@@ -591,6 +610,19 @@ func (c *Config) ApplySystemSettings(settings map[string]string) error {
 // ApplySystemSettingsJSON unmarshals raw JSONB settings and applies them.
 func (c *Config) ApplySystemSettingsJSON(raw map[string][]byte) error {
 	return c.ApplySystemSettings(ParseSystemSettingsJSON(raw))
+}
+
+// rebaseDefaultPaths rebases default-derived cover and cache directories when DataDir changes,
+// while preserving explicit flag/env/.env/DB overrides and their provenance (ADR-0014 §2).
+func (c *Config) rebaseDefaultPaths(orig *Config) {
+	if !orig.IsEnvLocked("TOBITEN_COVERS_DIR") && c.sources["TOBITEN_COVERS_DIR"] == SourceDefault {
+		c.CoversDir = filepath.Join(c.DataDir, "covers")
+		c.sources["TOBITEN_COVERS_DIR"] = SourceDefault
+	}
+	if !orig.IsEnvLocked("TOBITEN_CACHE_DIR") && c.sources["TOBITEN_CACHE_DIR"] == SourceDefault {
+		c.CacheDir = filepath.Join(c.DataDir, "cache")
+		c.sources["TOBITEN_CACHE_DIR"] = SourceDefault
+	}
 }
 
 // Validate checks configuration invariants and storage-mode conflict rules.
@@ -1179,12 +1211,39 @@ var envKeyAliases = map[string][]string{
 	"TOBITEN_INTAKE_MODE":          {"intake.mode", "intake_mode"},
 }
 
+// envKeyAcceptedAliases maps each canonical TOBITEN_* environment variable key
+// to its complete ordered list of accepted alias spellings.
+var envKeyAcceptedAliases = func() map[string][]string {
+	m := make(map[string][]string, len(envKeyAliases))
+	for envKey, aliases := range envKeyAliases {
+		seen := make(map[string]bool)
+		var list []string
+		add := func(s string) {
+			norm := strings.ToLower(strings.TrimSpace(s))
+			if norm != "" && !seen[norm] {
+				seen[norm] = true
+				list = append(list, norm)
+			}
+		}
+		add(envKey)
+		for _, a := range aliases {
+			add(a)
+		}
+		snake := strings.ToLower(strings.TrimPrefix(envKey, "TOBITEN_"))
+		add(snake)
+		dotted := strings.ReplaceAll(snake, "_", ".")
+		add(dotted)
+		m[envKey] = list
+	}
+	return m
+}()
+
+// aliasToEnvKey maps every accepted alias (in lowercase) back to its canonical TOBITEN_* key.
 var aliasToEnvKey = func() map[string]string {
 	m := make(map[string]string)
-	for envKey, aliases := range envKeyAliases {
-		m[strings.ToLower(envKey)] = envKey
+	for envKey, aliases := range envKeyAcceptedAliases {
 		for _, alias := range aliases {
-			m[strings.ToLower(alias)] = envKey
+			m[alias] = envKey
 		}
 	}
 	return m
@@ -1195,8 +1254,9 @@ func canonicalEnvKey(key string) string {
 	if envKey, ok := aliasToEnvKey[k]; ok {
 		return envKey
 	}
-	if strings.HasPrefix(strings.ToUpper(key), "TOBITEN_") {
-		return strings.ToUpper(key)
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if strings.HasPrefix(upper, "TOBITEN_") {
+		return upper
 	}
 	return ""
 }
@@ -1211,35 +1271,12 @@ func lookupSystemSetting(systemSettings map[string]string, envKey string) (strin
 			return trimmed, true
 		}
 	}
-	if val, ok := systemSettings[strings.ToLower(envKey)]; ok {
-		trimmed := strings.TrimSpace(val)
-		if trimmed != "" {
-			return trimmed, true
-		}
-	}
-	if aliases, ok := envKeyAliases[envKey]; ok {
-		for _, alias := range aliases {
-			if val, ok := systemSettings[alias]; ok {
-				trimmed := strings.TrimSpace(val)
-				if trimmed != "" {
-					return trimmed, true
-				}
+	for _, alias := range envKeyAcceptedAliases[envKey] {
+		if val, ok := systemSettings[alias]; ok {
+			trimmed := strings.TrimSpace(val)
+			if trimmed != "" {
+				return trimmed, true
 			}
-		}
-	}
-	trimmedPrefix := strings.TrimPrefix(envKey, "TOBITEN_")
-	snake := strings.ToLower(trimmedPrefix)
-	if val, ok := systemSettings[snake]; ok {
-		trimmed := strings.TrimSpace(val)
-		if trimmed != "" {
-			return trimmed, true
-		}
-	}
-	dotted := strings.ReplaceAll(snake, "_", ".")
-	if val, ok := systemSettings[dotted]; ok {
-		trimmed := strings.TrimSpace(val)
-		if trimmed != "" {
-			return trimmed, true
 		}
 	}
 	return "", false

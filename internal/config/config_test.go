@@ -1444,3 +1444,423 @@ func TestEffectiveConfig_Reporting(t *testing.T) {
 		t.Errorf("Setting('port') = %+v, %v; want TOBITEN_PORT locked", s, ok)
 	}
 }
+
+func TestSystemSettings_PathRebasing(t *testing.T) {
+	t.Run("default_paths_rebased_when_data_dir_applied", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		if cfg.DataDir != "./data" || cfg.CoversDir != "data/covers" || cfg.CacheDir != "data/cache" {
+			t.Fatalf("unexpected defaults: data=%q, covers=%q, cache=%q", cfg.DataDir, cfg.CoversDir, cfg.CacheDir)
+		}
+
+		err = cfg.ApplySystemSettings(map[string]string{
+			"storage.data_dir": "/srv/tobiten",
+		})
+		if err != nil {
+			t.Fatalf("ApplySystemSettings failed: %v", err)
+		}
+
+		if cfg.DataDir != "/srv/tobiten" {
+			t.Errorf("DataDir = %q, want /srv/tobiten", cfg.DataDir)
+		}
+		wantCovers := filepath.Join("/srv/tobiten", "covers")
+		if cfg.CoversDir != wantCovers {
+			t.Errorf("CoversDir = %q, want %q", cfg.CoversDir, wantCovers)
+		}
+		wantCache := filepath.Join("/srv/tobiten", "cache")
+		if cfg.CacheDir != wantCache {
+			t.Errorf("CacheDir = %q, want %q", cfg.CacheDir, wantCache)
+		}
+		if cfg.SourceOf("TOBITEN_COVERS_DIR") != SourceDefault {
+			t.Errorf("SourceOf(TOBITEN_COVERS_DIR) = %v, want SourceDefault", cfg.SourceOf("TOBITEN_COVERS_DIR"))
+		}
+		if cfg.SourceOf("TOBITEN_CACHE_DIR") != SourceDefault {
+			t.Errorf("SourceOf(TOBITEN_CACHE_DIR) = %v, want SourceDefault", cfg.SourceOf("TOBITEN_CACHE_DIR"))
+		}
+	})
+
+	t.Run("explicit_covers_dir_override_preserved", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		err = cfg.ApplySystemSettings(map[string]string{
+			"storage.data_dir":   "/srv/tobiten",
+			"storage.covers_dir": "/mnt/fast/covers",
+		})
+		if err != nil {
+			t.Fatalf("ApplySystemSettings failed: %v", err)
+		}
+
+		if cfg.DataDir != "/srv/tobiten" {
+			t.Errorf("DataDir = %q, want /srv/tobiten", cfg.DataDir)
+		}
+		if cfg.CoversDir != "/mnt/fast/covers" {
+			t.Errorf("CoversDir = %q, want /mnt/fast/covers", cfg.CoversDir)
+		}
+		if cfg.SourceOf("TOBITEN_COVERS_DIR") != SourceSystemSettings {
+			t.Errorf("SourceOf(TOBITEN_COVERS_DIR) = %v, want SourceSystemSettings", cfg.SourceOf("TOBITEN_COVERS_DIR"))
+		}
+		wantCache := filepath.Join("/srv/tobiten", "cache")
+		if cfg.CacheDir != wantCache {
+			t.Errorf("CacheDir = %q, want %q", cfg.CacheDir, wantCache)
+		}
+		if cfg.SourceOf("TOBITEN_CACHE_DIR") != SourceDefault {
+			t.Errorf("SourceOf(TOBITEN_CACHE_DIR) = %v, want SourceDefault", cfg.SourceOf("TOBITEN_CACHE_DIR"))
+		}
+	})
+
+	t.Run("env_locked_covers_dir_never_rebased", func(t *testing.T) {
+		env := []string{"TOBITEN_COVERS_DIR=/env/covers"}
+		cfg, err := Load(nil, WithEnviron(env), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		err = cfg.ApplySystemSettings(map[string]string{
+			"storage.data_dir":   "/srv/tobiten",
+			"storage.covers_dir": "/db/covers",
+		})
+		if err != nil {
+			t.Fatalf("ApplySystemSettings failed: %v", err)
+		}
+
+		if cfg.CoversDir != "/env/covers" {
+			t.Errorf("CoversDir = %q, want /env/covers (env-locked value must not be overridden or rebased)", cfg.CoversDir)
+		}
+		if cfg.SourceOf("TOBITEN_COVERS_DIR") != SourceEnv {
+			t.Errorf("SourceOf(TOBITEN_COVERS_DIR) = %v, want SourceEnv", cfg.SourceOf("TOBITEN_COVERS_DIR"))
+		}
+		if !cfg.IsEnvLocked("TOBITEN_COVERS_DIR") {
+			t.Errorf("IsEnvLocked(TOBITEN_COVERS_DIR) = false, want true")
+		}
+		wantCache := filepath.Join("/srv/tobiten", "cache")
+		if cfg.CacheDir != wantCache {
+			t.Errorf("CacheDir = %q, want %q", cfg.CacheDir, wantCache)
+		}
+	})
+
+	t.Run("independent_covers_and_cache_overrides_without_data_dir_change", func(t *testing.T) {
+		cfg, err := Load(nil, WithEnviron(nil), WithoutEnvFile())
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		err = cfg.ApplySystemSettings(map[string]string{
+			"storage.covers_dir": "/custom/covers",
+			"storage.cache_dir":  "/custom/cache",
+		})
+		if err != nil {
+			t.Fatalf("ApplySystemSettings failed: %v", err)
+		}
+
+		if cfg.DataDir != "./data" {
+			t.Errorf("DataDir = %q, want ./data", cfg.DataDir)
+		}
+		if cfg.CoversDir != "/custom/covers" {
+			t.Errorf("CoversDir = %q, want /custom/covers", cfg.CoversDir)
+		}
+		if cfg.CacheDir != "/custom/cache" {
+			t.Errorf("CacheDir = %q, want /custom/cache", cfg.CacheDir)
+		}
+		if cfg.SourceOf("TOBITEN_COVERS_DIR") != SourceSystemSettings {
+			t.Errorf("SourceOf(TOBITEN_COVERS_DIR) = %v, want SourceSystemSettings", cfg.SourceOf("TOBITEN_COVERS_DIR"))
+		}
+		if cfg.SourceOf("TOBITEN_CACHE_DIR") != SourceSystemSettings {
+			t.Errorf("SourceOf(TOBITEN_CACHE_DIR) = %v, want SourceSystemSettings", cfg.SourceOf("TOBITEN_CACHE_DIR"))
+		}
+	})
+}
+
+func TestSystemSettings_LoadApplyEquivalence(t *testing.T) {
+	cases := []struct {
+		name     string
+		flags    []string
+		environ  []string
+		settings map[string]string
+	}{
+		{
+			name: "custom_data_dir_only",
+			settings: map[string]string{
+				"storage.data_dir": "/srv/tobiten",
+			},
+		},
+		{
+			name: "data_dir_with_explicit_covers_dir",
+			settings: map[string]string{
+				"storage.data_dir":   "/srv/tobiten",
+				"storage.covers_dir": "/fast/covers",
+			},
+		},
+		{
+			name: "data_dir_with_explicit_cache_dir",
+			settings: map[string]string{
+				"storage.data_dir":  "/srv/tobiten",
+				"storage.cache_dir": "/fast/cache",
+			},
+		},
+		{
+			name: "data_dir_and_both_explicit_overrides",
+			settings: map[string]string{
+				"storage.data_dir":   "/srv/tobiten",
+				"storage.covers_dir": "/fast/covers",
+				"storage.cache_dir":  "/fast/cache",
+			},
+		},
+		{
+			name:    "env_locked_data_dir_with_db_data_dir",
+			environ: []string{"TOBITEN_DATA_DIR=/env/data"},
+			settings: map[string]string{
+				"storage.data_dir": "/db/data",
+			},
+		},
+		{
+			name:    "env_locked_covers_dir_with_db_data_dir",
+			environ: []string{"TOBITEN_COVERS_DIR=/env/covers"},
+			settings: map[string]string{
+				"storage.data_dir":   "/db/data",
+				"storage.covers_dir": "/db/covers",
+			},
+		},
+		{
+			name:  "flags_and_env_with_multiple_settings",
+			flags: []string{"--host=127.0.0.1", "--port=9000"},
+			environ: []string{
+				"TOBITEN_LOG_LEVEL=warn",
+				"TOBITEN_DATA_DIR=/env/root",
+			},
+			settings: map[string]string{
+				"server.host":       "0.0.0.0",
+				"server.port":       "8080",
+				"log.level":         "debug",
+				"storage.data_dir":  "/db/root",
+				"scanner.workers":   "6",
+				"oidc.default_role": "Editor",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgLoaded, err := Load(tc.flags, WithEnviron(tc.environ), WithoutEnvFile(), WithSystemSettings(tc.settings))
+			if err != nil {
+				t.Fatalf("Load(WithSystemSettings) failed: %v", err)
+			}
+
+			cfgApplied, err := Load(tc.flags, WithEnviron(tc.environ), WithoutEnvFile())
+			if err != nil {
+				t.Fatalf("Load(base) failed: %v", err)
+			}
+			if err := cfgApplied.ApplySystemSettings(tc.settings); err != nil {
+				t.Fatalf("ApplySystemSettings failed: %v", err)
+			}
+
+			if cfgLoaded.Host != cfgApplied.Host {
+				t.Errorf("Host mismatch: loaded=%q, applied=%q", cfgLoaded.Host, cfgApplied.Host)
+			}
+			if cfgLoaded.Port != cfgApplied.Port {
+				t.Errorf("Port mismatch: loaded=%d, applied=%d", cfgLoaded.Port, cfgApplied.Port)
+			}
+			if cfgLoaded.BaseURL != cfgApplied.BaseURL {
+				t.Errorf("BaseURL mismatch: loaded=%q, applied=%q", cfgLoaded.BaseURL, cfgApplied.BaseURL)
+			}
+			if cfgLoaded.DataDir != cfgApplied.DataDir {
+				t.Errorf("DataDir mismatch: loaded=%q, applied=%q", cfgLoaded.DataDir, cfgApplied.DataDir)
+			}
+			if cfgLoaded.CoversDir != cfgApplied.CoversDir {
+				t.Errorf("CoversDir mismatch: loaded=%q, applied=%q", cfgLoaded.CoversDir, cfgApplied.CoversDir)
+			}
+			if cfgLoaded.CacheDir != cfgApplied.CacheDir {
+				t.Errorf("CacheDir mismatch: loaded=%q, applied=%q", cfgLoaded.CacheDir, cfgApplied.CacheDir)
+			}
+			if cfgLoaded.PostgresDir != cfgApplied.PostgresDir {
+				t.Errorf("PostgresDir mismatch: loaded=%q, applied=%q", cfgLoaded.PostgresDir, cfgApplied.PostgresDir)
+			}
+			if cfgLoaded.BackupsDir != cfgApplied.BackupsDir {
+				t.Errorf("BackupsDir mismatch: loaded=%q, applied=%q", cfgLoaded.BackupsDir, cfgApplied.BackupsDir)
+			}
+			if cfgLoaded.SecretKeyPath != cfgApplied.SecretKeyPath {
+				t.Errorf("SecretKeyPath mismatch: loaded=%q, applied=%q", cfgLoaded.SecretKeyPath, cfgApplied.SecretKeyPath)
+			}
+			if cfgLoaded.LogLevel != cfgApplied.LogLevel {
+				t.Errorf("LogLevel mismatch: loaded=%q, applied=%q", cfgLoaded.LogLevel, cfgApplied.LogLevel)
+			}
+			if cfgLoaded.ScannerWorkers != cfgApplied.ScannerWorkers {
+				t.Errorf("ScannerWorkers mismatch: loaded=%d, applied=%d", cfgLoaded.ScannerWorkers, cfgApplied.ScannerWorkers)
+			}
+			if cfgLoaded.OIDCDefaultRole != cfgApplied.OIDCDefaultRole {
+				t.Errorf("OIDCDefaultRole mismatch: loaded=%q, applied=%q", cfgLoaded.OIDCDefaultRole, cfgApplied.OIDCDefaultRole)
+			}
+
+			effLoaded := cfgLoaded.EffectiveSettings()
+			effApplied := cfgApplied.EffectiveSettings()
+			if len(effLoaded) != len(effApplied) {
+				t.Fatalf("EffectiveSettings len mismatch: loaded=%d, applied=%d", len(effLoaded), len(effApplied))
+			}
+			for k, sLoaded := range effLoaded {
+				sApplied, ok := effApplied[k]
+				if !ok {
+					t.Errorf("key %q present in loaded but missing in applied", k)
+					continue
+				}
+				if sLoaded.Key != sApplied.Key || sLoaded.Value != sApplied.Value || sLoaded.Source != sApplied.Source || sLoaded.EnvLocked != sApplied.EnvLocked {
+					t.Errorf("EffectiveSetting mismatch for %q: loaded=%+v, applied=%+v", k, sLoaded, sApplied)
+				}
+			}
+		})
+	}
+}
+
+func TestSystemSettings_AcceptedAliases_ResolutionAndReporting(t *testing.T) {
+	t.Run("data.dir_reproduction_env_pinned_vs_db_override", func(t *testing.T) {
+		env := []string{"TOBITEN_DATA_DIR=/env/root"}
+		settings := map[string]string{"data.dir": "/db/root"}
+
+		cfg, err := Load(nil, WithEnviron(env), WithoutEnvFile(), WithSystemSettings(settings))
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		if cfg.DataDir != "/env/root" {
+			t.Errorf("DataDir = %q, want /env/root", cfg.DataDir)
+		}
+		if cfg.SourceOf("data.dir") != SourceEnv {
+			t.Errorf("SourceOf(data.dir) = %v, want SourceEnv", cfg.SourceOf("data.dir"))
+		}
+		if !cfg.IsEnvLocked("data.dir") {
+			t.Errorf("IsEnvLocked(data.dir) = false, want true")
+		}
+
+		s, ok := cfg.Setting("data.dir")
+		if !ok {
+			t.Fatalf("Setting(data.dir) not found")
+		}
+		if s.Key != "TOBITEN_DATA_DIR" {
+			t.Errorf("Setting(data.dir).Key = %q, want TOBITEN_DATA_DIR", s.Key)
+		}
+		if s.Value != "/env/root" {
+			t.Errorf("Setting(data.dir).Value = %v, want /env/root", s.Value)
+		}
+		if s.Source != SourceEnv {
+			t.Errorf("Setting(data.dir).Source = %v, want SourceEnv", s.Source)
+		}
+		if !s.EnvLocked {
+			t.Errorf("Setting(data.dir).EnvLocked = false, want true")
+		}
+
+		eff := cfg.EffectiveSettings()
+		if dup, exists := eff["data.dir"]; exists {
+			t.Errorf("EffectiveSettings contained unexpected duplicate entry for accepted alias 'data.dir': %+v", dup)
+		}
+	})
+
+	t.Run("all_daemon_keys_accepted_aliases_pinned_and_unpinned", func(t *testing.T) {
+		type aliasTestCase struct {
+			envKey     string
+			dbVal      string
+			envVal     string
+			extraEnv   []string
+			wantDBVal  any
+			wantEnvVal any
+			isSecret   bool
+		}
+
+		testCases := []aliasTestCase{
+			{envKey: "TOBITEN_HOST", dbVal: "10.0.0.1", envVal: "10.0.0.2", wantDBVal: "10.0.0.1", wantEnvVal: "10.0.0.2"},
+			{envKey: "TOBITEN_PORT", dbVal: "9090", envVal: "9091", wantDBVal: 9090, wantEnvVal: 9091},
+			{envKey: "TOBITEN_BASE_URL", dbVal: "http://db.example.com", envVal: "http://env.example.com", wantDBVal: "http://db.example.com", wantEnvVal: "http://env.example.com"},
+			{envKey: "TOBITEN_DATA_DIR", dbVal: "/db/data", envVal: "/env/data", wantDBVal: "/db/data", wantEnvVal: "/env/data"},
+			{envKey: "TOBITEN_COVERS_DIR", dbVal: "/db/covers", envVal: "/env/covers", wantDBVal: "/db/covers", wantEnvVal: "/env/covers"},
+			{envKey: "TOBITEN_CACHE_DIR", dbVal: "/db/cache", envVal: "/env/cache", wantDBVal: "/db/cache", wantEnvVal: "/env/cache"},
+			{envKey: "TOBITEN_THUMB_CACHE_MAX_MB", dbVal: "1024", envVal: "2048", wantDBVal: 1024, wantEnvVal: 2048},
+			{envKey: "TOBITEN_EXTRACT_CACHE_MAX_MB", dbVal: "512", envVal: "1024", wantDBVal: 512, wantEnvVal: 1024},
+			{envKey: "TOBITEN_ADMIN_USER", dbVal: "db_admin", envVal: "env_admin", wantDBVal: "db_admin", wantEnvVal: "env_admin"},
+			{envKey: "TOBITEN_ADMIN_PASS", dbVal: "db_pass", envVal: "env_pass", wantDBVal: "", wantEnvVal: "[REDACTED]", isSecret: true},
+			{envKey: "TOBITEN_SECRET_KEY", dbVal: "db_secret_32bytes_long_secret_k", envVal: "env_secret_32bytes_long_secret_k", wantDBVal: "", wantEnvVal: "[REDACTED]", isSecret: true},
+			{envKey: "TOBITEN_TRUSTED_PROXIES", dbVal: "10.0.0.0/8", envVal: "172.16.0.0/12", wantDBVal: "10.0.0.0/8", wantEnvVal: "172.16.0.0/12"},
+			{envKey: "TOBITEN_OIDC_DEFAULT_ROLE", dbVal: "Reader", envVal: "Editor", wantDBVal: "Reader", wantEnvVal: "Editor"},
+			{envKey: "TOBITEN_OIDC_DEFAULT_LABELS", dbVal: "lbl1,lbl2", envVal: "lbl3,lbl4", wantDBVal: "lbl1,lbl2", wantEnvVal: "lbl3,lbl4"},
+			{envKey: "TOBITEN_LOG_LEVEL", dbVal: "debug", envVal: "warn", wantDBVal: "debug", wantEnvVal: "warn"},
+			{envKey: "TOBITEN_LOG_FORMAT", dbVal: "json", envVal: "text", wantDBVal: "json", wantEnvVal: "text"},
+			{envKey: "TOBITEN_STORAGE_MODE", dbVal: "local", envVal: "local", wantDBVal: "local", wantEnvVal: "local"},
+			{envKey: "TOBITEN_DATABASE_URL", dbVal: "postgres://u:p@localhost:5432/db", envVal: "postgres://u:p@localhost:5432/env_db", extraEnv: []string{"TOBITEN_STORAGE_MODE=postgres"}, wantDBVal: "", wantEnvVal: "[REDACTED]", isSecret: true},
+			{envKey: "TOBITEN_PG_BIN", dbVal: "/db/pg/bin", envVal: "/env/pg/bin", wantDBVal: "/db/pg/bin", wantEnvVal: "/env/pg/bin"},
+			{envKey: "TOBITEN_LIBRARY_MODE", dbVal: "managed", envVal: "virtual", wantDBVal: "managed", wantEnvVal: "virtual"},
+			{envKey: "TOBITEN_SCANNER_WORKERS", dbVal: "3", envVal: "6", wantDBVal: 3, wantEnvVal: 6},
+			{envKey: "TOBITEN_INTAKE_MODE", dbVal: "copy", envVal: "move", wantDBVal: "copy", wantEnvVal: "move"},
+		}
+
+		for _, tc := range testCases {
+			aliases := envKeyAcceptedAliases[tc.envKey]
+			for _, alias := range aliases {
+				// 1. Unpinned: DB setting provided under this alias
+				settingsUnpinned := map[string]string{alias: tc.dbVal}
+				cfgUnpinned, err := Load(nil, WithEnviron(nil), WithoutEnvFile(), WithSystemSettings(settingsUnpinned))
+				if err != nil {
+					t.Fatalf("[%s:%s] unpinned Load failed: %v", tc.envKey, alias, err)
+				}
+				sUnpinned, ok := cfgUnpinned.Setting(alias)
+				if !ok {
+					t.Fatalf("[%s:%s] Setting(%q) not found", tc.envKey, alias, alias)
+				}
+				if sUnpinned.Key != tc.envKey {
+					t.Errorf("[%s:%s] Key = %q, want %q", tc.envKey, alias, sUnpinned.Key, tc.envKey)
+				}
+				if sUnpinned.Value != tc.wantDBVal {
+					t.Errorf("[%s:%s] Value = %v, want %v", tc.envKey, alias, sUnpinned.Value, tc.wantDBVal)
+				}
+				expectedUnpinnedSource := SourceSystemSettings
+				if tc.isSecret {
+					expectedUnpinnedSource = SourceDefault
+				}
+				if sUnpinned.Source != expectedUnpinnedSource {
+					t.Errorf("[%s:%s] Source = %v, want %v", tc.envKey, alias, sUnpinned.Source, expectedUnpinnedSource)
+				}
+				if sUnpinned.EnvLocked {
+					t.Errorf("[%s:%s] EnvLocked = true, want false", tc.envKey, alias)
+				}
+				if cfgUnpinned.IsEnvLocked(alias) {
+					t.Errorf("[%s:%s] IsEnvLocked(%q) = true, want false", tc.envKey, alias, alias)
+				}
+				effUnpinned := cfgUnpinned.EffectiveSettings()
+				if _, exists := effUnpinned[alias]; exists && alias != strings.ToLower(tc.envKey) && alias != tc.envKey {
+					t.Errorf("[%s:%s] alias leaked into EffectiveSettings as unmapped key", tc.envKey, alias)
+				}
+
+				// 2. Pinned: Env variable set for envKey, DB setting under alias
+				envPinned := append([]string{tc.envKey + "=" + tc.envVal}, tc.extraEnv...)
+				cfgPinned, err := Load(nil, WithEnviron(envPinned), WithoutEnvFile(), WithSystemSettings(settingsUnpinned))
+				if err != nil {
+					t.Fatalf("[%s:%s] pinned Load failed: %v", tc.envKey, alias, err)
+				}
+				sPinned, ok := cfgPinned.Setting(alias)
+				if !ok {
+					t.Fatalf("[%s:%s] Setting(%q) pinned not found", tc.envKey, alias, alias)
+				}
+				if sPinned.Key != tc.envKey {
+					t.Errorf("[%s:%s] Key = %q, want %q", tc.envKey, alias, sPinned.Key, tc.envKey)
+				}
+				if sPinned.Value != tc.wantEnvVal {
+					t.Errorf("[%s:%s] pinned Value = %v, want %v", tc.envKey, alias, sPinned.Value, tc.wantEnvVal)
+				}
+				if sPinned.Source != SourceEnv {
+					t.Errorf("[%s:%s] pinned Source = %v, want SourceEnv", tc.envKey, alias, sPinned.Source)
+				}
+				if !sPinned.EnvLocked {
+					t.Errorf("[%s:%s] pinned EnvLocked = false, want true", tc.envKey, alias)
+				}
+				if !cfgPinned.IsEnvLocked(alias) {
+					t.Errorf("[%s:%s] pinned IsEnvLocked(%q) = false, want true", tc.envKey, alias, alias)
+				}
+				effPinned := cfgPinned.EffectiveSettings()
+				if _, exists := effPinned[alias]; exists && alias != strings.ToLower(tc.envKey) && alias != tc.envKey {
+					t.Errorf("[%s:%s] pinned alias leaked into EffectiveSettings as unmapped key", tc.envKey, alias)
+				}
+			}
+		}
+	})
+}
