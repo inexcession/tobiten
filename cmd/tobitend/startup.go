@@ -43,6 +43,8 @@ func (d *daemonStorage) close() error {
 }
 
 func openDaemonStorage(ctx context.Context, cfg *config.Config) (_ *daemonStorage, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	frozen, err := identifyStorage(cfg)
 	if err != nil {
 		return nil, err
