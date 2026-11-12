@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 )
@@ -182,7 +183,7 @@ func TestRunDaemonRetriesFailedCleanupBeforeReturning(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(original) })
 	slog.SetDefault(bootstrapLogger())
 	called := false
-	err := runDaemon(t.Context(), cfg, func(context.Context, *config.Config, *slog.Logger) error { called = true; return nil })
+	err := runDaemon(t.Context(), cfg, func(context.Context, *config.Config, *slog.Logger, *app.Services) error { called = true; return nil })
 	if err == nil || called {
 		t.Fatalf("startup result err=%v served=%t", err, called)
 	}
@@ -195,7 +196,7 @@ func TestRunDaemonRetriesShutdownUntilExitConfirmed(t *testing.T) {
 	cfg, local := cleanupFixture(t, false)
 	original := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(original) })
-	err := runDaemon(t.Context(), cfg, func(context.Context, *config.Config, *slog.Logger) error { return nil })
+	err := runDaemon(t.Context(), cfg, func(context.Context, *config.Config, *slog.Logger, *app.Services) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

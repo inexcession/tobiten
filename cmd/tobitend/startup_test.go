@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/auth"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
@@ -58,7 +59,7 @@ func TestDaemonEnvironmentAdminProvisioning(t *testing.T) {
 	t.Setenv("TOBITEN_ADMIN_PASS", "initial-password")
 	var firstID, firstHash string
 	calls := 0
-	startServer = func(ctx context.Context, cfg *config.Config, _ *slog.Logger) error {
+	startServer = func(ctx context.Context, cfg *config.Config, _ *slog.Logger, _ *app.Services) error {
 		calls++
 		if cfg.AdminPass != "" {
 			t.Error("bootstrap password retained in serving config")
@@ -119,7 +120,7 @@ func TestStartupSettingsBeforeProvisioningAndServing(t *testing.T) {
 	}
 	original := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(original) })
-	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(ctx context.Context, cfg *config.Config, logger *slog.Logger, _ *app.Services) error {
 		if cfg.BaseURL != "https://books.example.test/sub" || !logger.Enabled(ctx, slog.LevelDebug) || cfg.LogFormat != "text" {
 			t.Error("stored settings not resolved before serving/logging")
 		}
@@ -138,7 +139,7 @@ func TestStartupIdentityConflictNoAdminAndCleanup(t *testing.T) {
 	migrateStartupDB(t, db)
 	putSetting(t, db, "storage.data_dir", t.TempDir())
 	called := false
-	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger) error { called = true; return nil })
+	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error { called = true; return nil })
 	if err == nil || !strings.Contains(err.Error(), "restart") {
 		t.Fatalf("expected actionable conflict: %v", err)
 	}
@@ -200,7 +201,7 @@ func TestRunDaemonOwnershipLossStopsServing(t *testing.T) {
 	db := testdb.New(t)
 	original := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(original) })
-	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(ctx context.Context, _ *config.Config, _ *slog.Logger) error {
+	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(ctx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
 		// Identify the dedicated owner by its granted advisory lock, not the application pool.
 		if _, err := db.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND granted AND classid=$1::oid AND objid=$2::oid", daemonLockID>>32, daemonLockID&0xffffffff); err != nil {
 			t.Fatal(err)
@@ -230,7 +231,7 @@ func TestLocalDaemonProvisioningAndRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = runDaemon(t.Context(), cfg, func(ctx context.Context, cfg *config.Config, _ *slog.Logger) error {
+		err = runDaemon(t.Context(), cfg, func(ctx context.Context, cfg *config.Config, _ *slog.Logger, _ *app.Services) error {
 			// postmaster.pid records the actual socket directory, including long-path fallback.
 			pid, err := os.ReadFile(filepath.Join(dataDir, "postgres", "postmaster.pid"))
 			if err != nil {
@@ -286,7 +287,7 @@ func TestLocalStartupConflictCleansUp(t *testing.T) {
 	if err := d.close(); err != nil {
 		t.Fatal(err)
 	}
-	err = runDaemon(t.Context(), load(), func(context.Context, *config.Config, *slog.Logger) error {
+	err = runDaemon(t.Context(), load(), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
 		t.Fatal("served on identity conflict")
 		return nil
 	})

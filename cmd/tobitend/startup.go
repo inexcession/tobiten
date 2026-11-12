@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/api"
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/logging"
@@ -144,7 +146,7 @@ func (d *daemonStorage) open(ctx context.Context, cfg *config.Config) (err error
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
 // connection is monitored independently; loss cancels application operations.
-func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger) error) (err error) {
+func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger, *app.Services) error) (err error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	d, err := openDaemonStorage(ctx, cfg)
@@ -167,8 +169,18 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		return err
 	}
 	cfg.AdminPass = ""
+	ub, err := api.NewURLBuilder(cfg.BaseURL)
+	if err != nil {
+		return err
+	}
+	setup, err := bootstrap.NewSetup(ctx, postgres.NewUserRepository(d.pool), slog.Default(), ub.URL("/api/v1/auth/setup"))
+	if err != nil {
+		return err
+	}
+	defer setup.Close()
+	services := &app.Services{Setup: setup}
 	slog.Info("starting server daemon", slog.String("version", Version))
-	err = serve(ctx, cfg, slog.Default())
+	err = serve(ctx, cfg, slog.Default(), services)
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
 		return errors.Join(err, cause)
 	}

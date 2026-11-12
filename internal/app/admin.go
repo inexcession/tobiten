@@ -46,10 +46,15 @@ type JobInfo struct {
 	Error       *string    `json:"error,omitempty"`
 }
 
-// AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
-type AdminService interface {
+// SetupService implements the unauthenticated first-run bootstrap only.
+type SetupService interface {
 	IsSetupSealed(ctx context.Context) (bool, error)
 	SetupInitialAdmin(ctx context.Context, req SetupAdminRequest) (*domain.User, error)
+}
+
+// AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
+type AdminService interface {
+	SetupService
 	AuthenticateUser(ctx context.Context, username, password string) (*domain.Principal, error)
 	ListUsers(ctx context.Context, principal *domain.Principal) ([]domain.User, error)
 	GetUser(ctx context.Context, principal *domain.Principal, id string) (*domain.User, error)

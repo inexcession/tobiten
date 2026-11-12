@@ -221,7 +221,7 @@ func TestRunLoggingWiring(t *testing.T) {
 	defer slog.SetDefault(origLogger)
 
 	origStartServer := startServer
-	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, _ *app.Services) error {
 		return nil
 	}
 	defer func() { startServer = origStartServer }()
@@ -345,7 +345,7 @@ func TestRunLoggingTableColorWiring(t *testing.T) {
 	defer slog.SetDefault(origLogger)
 
 	origStartServer := startServer
-	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, _ *app.Services) error {
 		return nil
 	}
 	defer func() { startServer = origStartServer }()
@@ -403,7 +403,7 @@ func TestRunServer_GracefulShutdown(t *testing.T) {
 	started := make(chan struct{})
 	var srvURL string
 
-	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, _ *app.Services) error {
 		srv, err := api.NewServer(api.ServerOptions{
 			Config: cfg,
 			Logger: logger,
@@ -539,10 +539,10 @@ func bypassStorageForHTTPTest(t *testing.T) {
 	t.Helper()
 	original := startDaemon
 	t.Cleanup(func() { startDaemon = original })
-	startDaemon = func(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger) error) error {
+	startDaemon = func(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger, *app.Services) error) error {
 		if err := setupLogging(cfg); err != nil {
 			return err
 		}
-		return serve(ctx, cfg, slog.Default())
+		return serve(ctx, cfg, slog.Default(), nil)
 	}
 }

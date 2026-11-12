@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 )
@@ -78,7 +79,7 @@ func TestLifecycleErrorsUseConfiguredStructuredLogging(t *testing.T) {
 	t.Cleanup(func() { startDaemon = original })
 	for _, format := range []string{"json", "text", "table"} {
 		t.Run(format, func(t *testing.T) {
-			startDaemon = func(_ context.Context, cfg *config.Config, _ func(context.Context, *config.Config, *slog.Logger) error) error {
+			startDaemon = func(_ context.Context, cfg *config.Config, _ func(context.Context, *config.Config, *slog.Logger, *app.Services) error) error {
 				if err := setupLogging(cfg); err != nil {
 					return err
 				}

@@ -34,31 +34,38 @@ func ProvisionAdmin(ctx context.Context, repo Repository, username, password str
 		if strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
 			return errors.New("first-run provisioning requires both TOBITEN_ADMIN_USER and TOBITEN_ADMIN_PASS")
 		}
-		userID, err := domain.NewID()
-		if err != nil {
-			return fmt.Errorf("generating user ID: %w", err)
-		}
-		credentialID, err := domain.NewID()
-		if err != nil {
-			return fmt.Errorf("generating credential ID: %w", err)
-		}
-		scheme := auth.HashSchemeArgon2id
-		hash, err := auth.HashPassword(password)
-		if err != nil {
-			return fmt.Errorf("hashing bootstrap password: %w", err)
-		}
-		if err := tx.CreateUser(ctx, &domain.User{ID: userID, Username: username}); err != nil {
-			return fmt.Errorf("creating initial user: %w", err)
-		}
-		if err := tx.CreateCredential(ctx, &domain.Credential{
-			ID: credentialID, UserID: userID, Kind: domain.CredentialKindPassword,
-			SecretHash: &hash, HashScheme: &scheme,
-		}); err != nil {
-			return fmt.Errorf("creating initial password credential: %w", err)
-		}
-		if err := tx.AssignUserRole(ctx, userID, domain.RoleAdminID); err != nil {
-			return fmt.Errorf("assigning initial Admin role: %w", err)
-		}
-		return nil
+		_, err = createAdmin(ctx, tx, username, password)
+		return err
 	})
+}
+
+// createAdmin is shared by environment and interactive provisioning within the same lock.
+func createAdmin(ctx context.Context, tx storage.UserRepository, username, password string) (*domain.User, error) {
+	userID, err := domain.NewID()
+	if err != nil {
+		return nil, fmt.Errorf("generating user ID: %w", err)
+	}
+	credentialID, err := domain.NewID()
+	if err != nil {
+		return nil, fmt.Errorf("generating credential ID: %w", err)
+	}
+	scheme := auth.HashSchemeArgon2id
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return nil, fmt.Errorf("hashing bootstrap password: %w", err)
+	}
+	user := &domain.User{ID: userID, Username: username}
+	if err := tx.CreateUser(ctx, user); err != nil {
+		return nil, fmt.Errorf("creating initial user: %w", err)
+	}
+	if err := tx.CreateCredential(ctx, &domain.Credential{
+		ID: credentialID, UserID: userID, Kind: domain.CredentialKindPassword,
+		SecretHash: &hash, HashScheme: &scheme,
+	}); err != nil {
+		return nil, fmt.Errorf("creating initial password credential: %w", err)
+	}
+	if err := tx.AssignUserRole(ctx, userID, domain.RoleAdminID); err != nil {
+		return nil, fmt.Errorf("assigning initial Admin role: %w", err)
+	}
+	return user, nil
 }

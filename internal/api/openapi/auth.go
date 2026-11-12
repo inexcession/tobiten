@@ -91,13 +91,14 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if m.services == nil || m.services.Admin == nil {
+	service := m.setupService()
+	if service == nil {
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
 
 	// Check if setup is already sealed (permanent seal: users > 0, ADR-0014 §1)
-	sealed, err := m.services.Admin.IsSetupSealed(r.Context())
+	sealed, err := service.IsSetupSealed(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to check setup status")
 		return
@@ -119,7 +120,7 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := m.services.Admin.SetupInitialAdmin(r.Context(), req)
+	user, err := service.SetupInitialAdmin(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, app.ErrSetupSealed) {
 			writeError(w, http.StatusForbidden, "first-run setup is permanently sealed")
@@ -129,7 +130,11 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid setup parameters")
 			return
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		if errors.Is(err, app.ErrUnauthorized) {
+			writeError(w, http.StatusUnauthorized, "invalid setup token")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "setup failed")
 		return
 	}
 
@@ -140,4 +145,16 @@ func (m *Module) handleSetup(w http.ResponseWriter, r *http.Request) {
 		},
 		Message: "initial admin created",
 	})
+}
+
+// Existing AdminService implementations include setup; composition can wire bootstrap
+// independently while account authentication and management remain unavailable.
+func (m *Module) setupService() app.SetupService {
+	if m.services == nil {
+		return nil
+	}
+	if m.services.Setup != nil {
+		return m.services.Setup
+	}
+	return m.services.Admin
 }

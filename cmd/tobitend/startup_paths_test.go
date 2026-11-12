@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 	"github.com/jackc/pgx/v5"
@@ -66,7 +67,7 @@ func TestStorageRootAliasesProvisionActualPGDATA(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				err = runDaemon(t.Context(), cfg, func(ctx context.Context, cfg *config.Config, _ *slog.Logger) error {
+				err = runDaemon(t.Context(), cfg, func(ctx context.Context, cfg *config.Config, _ *slog.Logger, _ *app.Services) error {
 					conn, err := pgx.Connect(ctx, supervisor.DatabaseURL())
 					if err != nil {
 						t.Fatal(err)

@@ -56,7 +56,7 @@ func setupLogging(cfg *config.Config) error {
 
 // BuildRegistry constructs the composition root module registry for tobitend.
 // Compiled-in modules are registered here (ADR-0018 §1).
-// Defaults fail closed with nil services until real PostgreSQL application services are wired.
+// Defaults fail closed with nil services; the daemon supplies its owned application services.
 func BuildRegistry(cfg *config.Config) module.Registry {
 	return BuildRegistryWithServices(cfg, nil)
 }
@@ -77,8 +77,8 @@ func BuildRegistryWithServices(cfg *config.Config, services *app.Services) modul
 	return reg
 }
 
-var startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
-	reg := BuildRegistry(cfg)
+var startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
+	reg := BuildRegistryWithServices(cfg, services)
 	srv, err := api.NewServer(api.ServerOptions{
 		Config:   cfg,
 		Logger:   logger,
