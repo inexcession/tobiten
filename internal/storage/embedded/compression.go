@@ -1,6 +1,7 @@
 package embedded
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,40 +20,58 @@ type CompressionCapabilities struct {
 	HasLZ4Toast bool
 }
 
-func probeSetting(ctx context.Context, postgresBin, dataDir, setting, value string) (bool, error) {
+func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value string) (bool, error) {
 	cmdCtx, cancel := deriveBoundedContext(ctx, 3*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, postgresBin,
-		"-D", dataDir,
+		"-D", probeDir,
+		"--config-file=/dev/null",
 		"-c", fmt.Sprintf("%s=%s", setting, value),
 		"-C", setting,
 	)
 
-	out, err := cmd.Output()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
 	if err == nil {
-		if strings.TrimSpace(string(out)) == value {
+		if strings.TrimSpace(stdout.String()) == value {
 			return true, nil
 		}
-		return false, nil
+		return false, fmt.Errorf("unexpected output probing %s: %q", setting, stdout.String())
 	}
 
+	// 1. Check for command context timeout or caller context cancellation
+	if cmdCtx.Err() != nil {
+		if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
+			return false, fmt.Errorf("probe of %s timed out: %w", setting, cmdCtx.Err())
+		}
+		return false, cmdCtx.Err()
+	}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
 
+	// 2. Check if this is a genuine parameter rejection by PostgreSQL (unsupported setting)
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		// PostgreSQL evaluated the parameter and rejected it (unsupported method).
-		return false, nil
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		errStr := stderr.String()
+		if strings.Contains(errStr, "invalid value for parameter") && strings.Contains(errStr, setting) {
+			return false, nil
+		}
 	}
 
-	return false, fmt.Errorf("failed to run postgres -C %s: %w", setting, err)
+	// 3. Any other failure is an unrelated command failure (crash, syntax error, missing library)
+	return false, fmt.Errorf("failed to probe %s: %w (stderr: %s)", setting, err, strings.TrimSpace(stderr.String()))
 }
 
 // ProbeCompression detects whether the PostgreSQL binary set supports zstd WAL compression
 // and lz4 TOAST compression (ADR-0001 §2).
-func ProbeCompression(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error) {
+// Probes run against an isolated temporary directory with zero configuration, ensuring that
+// stale or invalid settings in existing cluster files never contaminate capability detection.
+func ProbeCompression(ctx context.Context, binDir, _ string) (CompressionCapabilities, error) {
 	if binDir == "" {
 		discovered, err := FindBinDir("")
 		if err != nil {
@@ -68,38 +87,30 @@ func ProbeCompression(ctx context.Context, binDir, dataDir string) (CompressionC
 		return CompressionCapabilities{}, fmt.Errorf("postgres binary in %s is not executable", binDir)
 	}
 
-	targetDir := dataDir
-	var cleanUpTemp bool
-	if targetDir == "" || !clusterVersionFileExists(targetDir) {
-		tmpDir, err := os.MkdirTemp("", "tobiten-pg-probe-*")
-		if err != nil {
-			return CompressionCapabilities{}, fmt.Errorf("failed to create temporary probe directory: %w", err)
-		}
-		targetDir = tmpDir
-		cleanUpTemp = true
-		defer func() {
-			if cleanUpTemp {
-				_ = os.RemoveAll(tmpDir)
-			}
-		}()
+	// Always use a clean, isolated temporary directory for capability probing
+	tmpDir, err := os.MkdirTemp("", "tobiten-pg-probe-*")
+	if err != nil {
+		return CompressionCapabilities{}, fmt.Errorf("failed to create temporary probe directory: %w", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
 
-		// Write minimal configuration and version file required for postgres -C
-		pgVersionPath := filepath.Join(targetDir, "PG_VERSION")
-		if err := os.WriteFile(pgVersionPath, []byte(fmt.Sprintf("%d\n", PinnedMajor)), 0600); err != nil {
-			return CompressionCapabilities{}, fmt.Errorf("failed to write probe PG_VERSION: %w", err)
-		}
-		confPath := filepath.Join(targetDir, "postgresql.conf")
-		if err := os.WriteFile(confPath, []byte(""), 0600); err != nil {
-			return CompressionCapabilities{}, fmt.Errorf("failed to write probe postgresql.conf: %w", err)
-		}
+	pgVersionPath := filepath.Join(tmpDir, "PG_VERSION")
+	if err := os.WriteFile(pgVersionPath, []byte(fmt.Sprintf("%d\n", PinnedMajor)), 0600); err != nil {
+		return CompressionCapabilities{}, fmt.Errorf("failed to write probe PG_VERSION: %w", err)
+	}
+	confPath := filepath.Join(tmpDir, "postgresql.conf")
+	if err := os.WriteFile(confPath, []byte(""), 0600); err != nil {
+		return CompressionCapabilities{}, fmt.Errorf("failed to write probe postgresql.conf: %w", err)
 	}
 
-	hasZstd, err := probeSetting(ctx, postgresBin, targetDir, "wal_compression", "zstd")
+	hasZstd, err := probeSetting(ctx, postgresBin, tmpDir, "wal_compression", "zstd")
 	if err != nil {
 		return CompressionCapabilities{}, err
 	}
 
-	hasLZ4, err := probeSetting(ctx, postgresBin, targetDir, "default_toast_compression", "lz4")
+	hasLZ4, err := probeSetting(ctx, postgresBin, tmpDir, "default_toast_compression", "lz4")
 	if err != nil {
 		return CompressionCapabilities{}, err
 	}
@@ -108,9 +119,4 @@ func ProbeCompression(ctx context.Context, binDir, dataDir string) (CompressionC
 		HasZstdWAL:  hasZstd,
 		HasLZ4Toast: hasLZ4,
 	}, nil
-}
-
-func clusterVersionFileExists(dataDir string) bool {
-	fi, err := os.Stat(filepath.Join(dataDir, "PG_VERSION"))
-	return err == nil && !fi.IsDir()
 }

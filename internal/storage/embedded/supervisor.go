@@ -86,6 +86,7 @@ type Supervisor struct {
 	fsType            string
 	fsProbe           func(path string) (fsType string, isNetwork bool, err error)
 	compressionCaps   CompressionCapabilities
+	compressionErr    error
 	compressionProbe  func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
 	confirmExit       func(pid int, timeout time.Duration) error
 	resolvePIDTimeout time.Duration
@@ -737,6 +738,13 @@ func (s *Supervisor) CompressionCapabilities() CompressionCapabilities {
 	return s.compressionCaps
 }
 
+// CompressionError returns any error encountered during compression capability probing.
+func (s *Supervisor) CompressionError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compressionErr
+}
+
 // CheckCompression inspects the PostgreSQL binary's compression capabilities and updates cached state.
 func (s *Supervisor) CheckCompression(ctx context.Context) (CompressionCapabilities, error) {
 	s.mu.Lock()
@@ -748,7 +756,9 @@ func (s *Supervisor) CheckCompression(ctx context.Context) (CompressionCapabilit
 	}
 
 	caps, err := probe(ctx, s.binDir, s.dataDir)
+	s.compressionErr = err
 	if err != nil {
+		s.compressionCaps = CompressionCapabilities{}
 		return CompressionCapabilities{}, err
 	}
 	s.compressionCaps = caps
@@ -762,6 +772,7 @@ func (s *Supervisor) applyCompressionSettings(ctx context.Context, settings *Con
 	}
 
 	caps, err := probe(ctx, s.binDir, s.dataDir)
+	s.compressionErr = err
 	if err != nil {
 		s.logger.Warn("failed to probe postgresql compression capabilities; omitting compression tuning and using server defaults",
 			slog.Any("error", err),
