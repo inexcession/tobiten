@@ -24,11 +24,21 @@ func init() {
 func runSubprocessSupervisor() {
 	dataDir := os.Getenv("TOBITEN_TEST_SUBPROCESS_DATADIR")
 	binDir := os.Getenv("TOBITEN_TEST_SUBPROCESS_BINDIR")
+	socketDir := os.Getenv("TOBITEN_TEST_SUBPROCESS_SOCKETDIR")
+	portStr := os.Getenv("TOBITEN_TEST_SUBPROCESS_PORT")
+	port := 5432
+	if portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			port = p
+		}
+	}
 	s, err := New(Options{
-		DataDir: dataDir,
-		BinDir:  binDir,
-		NoSync:  true,
-		isRoot:  func() bool { return false },
+		DataDir:   dataDir,
+		BinDir:    binDir,
+		SocketDir: socketDir,
+		Port:      port,
+		NoSync:    true,
+		isRoot:    func() bool { return false },
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "new error: %v\n", err)
@@ -81,53 +91,100 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$mode" = "start" ]; then
-  sh -c '
-    echo "$$" > "'"$dataDir"'/postmaster.pid"
+  if [ -f "$dataDir/.hang_pgctl" ]; then
+    sh -c '
+      echo "$$" > "'"$dataDir"'/postmaster.pid.tmp"
+      while [ ! -f "'"$dataDir"'/.release" ]; do
+        sleep 0.01
+      done
+      mv "'"$dataDir"'/postmaster.pid.tmp" "'"$dataDir"'/postmaster.pid"
+      while true; do sleep 1; done
+    ' >/dev/null 2>&1 </dev/null &
+    child_pid=$!
+    echo "$child_pid" > "$dataDir/.forked"
     while true; do sleep 1; done
-  ' >/dev/null 2>&1 </dev/null &
-  child_pid=$!
-  echo "$child_pid" > "$dataDir/.forked"
-  exit 0
+  else
+    sh -c '
+      echo "$$" > "'"$dataDir"'/postmaster.pid"
+      while true; do sleep 1; done
+    ' >/dev/null 2>&1 </dev/null &
+    child_pid=$!
+    echo "$child_pid" > "$dataDir/.forked"
+    exit 0
+  fi
 fi
 
 if [ "$mode" = "stop" ]; then
-  if [ -f "$dataDir/postmaster.pid" ]; then
-    pid=$(head -n 1 "$dataDir/postmaster.pid")
-    if [ -n "$pid" ]; then
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$dataDir/postmaster.pid"
+  if [ ! -f "$dataDir/postmaster.pid" ]; then
+    echo "pg_ctl: PID absent" >&2
+    exit 1
   fi
+  pid=$(head -n 1 "$dataDir/postmaster.pid")
+  if [ -n "$pid" ]; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$dataDir/postmaster.pid"
   exit 0
 fi
 `
 	writeExecutable("pg_ctl", pgCtlScript)
 }
 
-func TestLock_DataDirLockPath(t *testing.T) {
-	cases := []struct {
-		input    string
-		expected string
-	}{
-		{"/data/postgres", "/data/postgres.lock"},
-		{"/data/postgres/", "/data/postgres.lock"},
-		{"postgres", "postgres.lock"},
-		{"./data/postgres", "data/postgres.lock"},
+func TestLock_DataDirLockPath_SymlinkAliases(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Existing directory symlink
+	realDir := filepath.Join(tmpDir, "real_cluster")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("failed to create realDir: %v", err)
+	}
+	aliasDir := filepath.Join(tmpDir, "alias_cluster")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
 	}
 
-	for _, c := range cases {
-		got := DataDirLockPath(c.input)
-		if got != c.expected {
-			t.Errorf("DataDirLockPath(%q) = %q, expected %q", c.input, got, c.expected)
-		}
+	lockReal := DataDirLockPath(realDir)
+	lockAlias := DataDirLockPath(aliasDir)
+	if lockReal != lockAlias {
+		t.Fatalf("expected identical lock path for alias: real=%q, alias=%q", lockReal, lockAlias)
+	}
+
+	// 2. Symlinked ancestor of not-yet-created cluster
+	ancestorReal := filepath.Join(tmpDir, "ancestor_real")
+	if err := os.MkdirAll(ancestorReal, 0700); err != nil {
+		t.Fatalf("failed to create ancestorReal: %v", err)
+	}
+	ancestorLink := filepath.Join(tmpDir, "ancestor_link")
+	if err := os.Symlink(ancestorReal, ancestorLink); err != nil {
+		t.Fatalf("failed to create ancestor symlink: %v", err)
+	}
+
+	newClusterViaReal := filepath.Join(ancestorReal, "nested", "pgdata")
+	newClusterViaLink := filepath.Join(ancestorLink, "nested", "pgdata")
+
+	lockViaReal := DataDirLockPath(newClusterViaReal)
+	lockViaLink := DataDirLockPath(newClusterViaLink)
+	if lockViaReal != lockViaLink {
+		t.Fatalf("expected identical lock path for ancestor symlink: real=%q, link=%q", lockViaReal, lockViaLink)
+	}
+
+	// 3. Broken/not-yet-created leaf symlink
+	nonExistentTarget := filepath.Join(tmpDir, "future_real_cluster")
+	brokenLeaf := filepath.Join(tmpDir, "broken_leaf_symlink")
+	if err := os.Symlink(nonExistentTarget, brokenLeaf); err != nil {
+		t.Fatalf("failed to create leaf symlink: %v", err)
+	}
+	lockTarget := DataDirLockPath(nonExistentTarget)
+	lockLeaf := DataDirLockPath(brokenLeaf)
+	if lockTarget != lockLeaf {
+		t.Fatalf("expected identical lock path for not-yet-created leaf target: target=%q, leaf=%q", lockTarget, lockLeaf)
 	}
 }
 
 func TestLock_SocketDirLockPath(t *testing.T) {
 	got := SocketDirLockPath("/tmp/tbt-1234")
-	expected := "/tmp/tbt-1234.lock"
-	if got != expected {
-		t.Fatalf("SocketDirLockPath = %q, expected %q", got, expected)
+	if !strings.HasSuffix(got, ".lock") {
+		t.Fatalf("SocketDirLockPath = %q, expected suffix .lock", got)
 	}
 }
 
@@ -209,17 +266,34 @@ func TestLock_StaleLockFileFromDeadProcess(t *testing.T) {
 
 func TestLock_LockDataDirPublicAPI(t *testing.T) {
 	tmpDir := t.TempDir()
-	dataDir := filepath.Join(tmpDir, "pgdata")
-
-	unlock, err := LockDataDir(dataDir)
-	if err != nil {
-		t.Fatalf("expected LockDataDir to succeed: %v", err)
+	realDir := filepath.Join(tmpDir, "real_cluster")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("failed to create realDir: %v", err)
+	}
+	aliasDir := filepath.Join(tmpDir, "alias_cluster")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
 	}
 
-	// Second call must fail
-	_, err = LockDataDir(dataDir)
+	// Lock via alias
+	unlock, err := LockDataDir(aliasDir)
+	if err != nil {
+		t.Fatalf("expected LockDataDir(alias) to succeed: %v", err)
+	}
+
+	// Second call via realDir MUST fail with ErrDataDirLocked
+	_, err = LockDataDir(realDir)
 	if err == nil {
-		t.Fatal("expected second LockDataDir to fail, got nil")
+		t.Fatal("expected second LockDataDir(real) to fail, got nil")
+	}
+	if !errors.Is(err, ErrDataDirLocked) {
+		t.Fatalf("expected ErrDataDirLocked, got: %v", err)
+	}
+
+	// Second call via aliasDir MUST also fail
+	_, err = LockDataDir(aliasDir)
+	if err == nil {
+		t.Fatal("expected LockDataDir(alias) to fail while held, got nil")
 	}
 	if !errors.Is(err, ErrDataDirLocked) {
 		t.Fatalf("expected ErrDataDirLocked, got: %v", err)
@@ -230,10 +304,10 @@ func TestLock_LockDataDirPublicAPI(t *testing.T) {
 		t.Fatalf("unlock failed: %v", err)
 	}
 
-	// Now third call succeeds
-	unlock2, err := LockDataDir(dataDir)
+	// Now call via realDir succeeds
+	unlock2, err := LockDataDir(realDir)
 	if err != nil {
-		t.Fatalf("expected third LockDataDir to succeed after unlock: %v", err)
+		t.Fatalf("expected LockDataDir(real) to succeed after unlock: %v", err)
 	}
 	_ = unlock2()
 }
@@ -377,6 +451,97 @@ func TestSupervisor_CrossProcessExclusion(t *testing.T) {
 	}
 }
 
+func TestSupervisor_CrossProcessAliasExclusion_BeforePIDPublication_NoConfigMutation(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	realDir := filepath.Join(tmpDir, "real_pgdata")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("failed to create realDir: %v", err)
+	}
+	aliasDir := filepath.Join(tmpDir, "alias_pgdata")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	writeFakeBinaries(t, binDir)
+
+	s1, err := New(Options{
+		BinDir:  binDir,
+		DataDir: aliasDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create s1: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s1.Start(ctx); err != nil {
+		t.Fatalf("s1.Start failed: %v", err)
+	}
+	defer func() { _ = s1.Stop(context.Background()) }()
+
+	// Record postgresql.conf content created by s1
+	confPath := filepath.Join(s1.DataDir(), "postgresql.conf")
+	initialConf, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("failed to read postgresql.conf: %v", err)
+	}
+
+	// 1. Second subprocess using realDir (the alias target) MUST be excluded
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+realDir,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected second process to be excluded via alias, output: %s", string(out))
+	}
+	if !strings.Contains(string(out), "embedded postgresql data directory is locked by another process") {
+		t.Fatalf("expected clear lock error in subprocess output, got:\n%s", string(out))
+	}
+
+	// 2. Assert that postgresql.conf was NOT mutated by the rejected subprocess
+	afterConf, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("failed to re-read postgresql.conf: %v", err)
+	}
+	if string(initialConf) != string(afterConf) {
+		t.Fatal("postgresql.conf was mutated by rejected subprocess attempt!")
+	}
+
+	// 3. Assert public LockDataDir API also excludes via alias
+	_, err = LockDataDir(realDir)
+	if !errors.Is(err, ErrDataDirLocked) {
+		t.Fatalf("expected LockDataDir(realDir) to fail with ErrDataDirLocked, got: %v", err)
+	}
+	_, err = LockDataDir(aliasDir)
+	if !errors.Is(err, ErrDataDirLocked) {
+		t.Fatalf("expected LockDataDir(aliasDir) to fail with ErrDataDirLocked, got: %v", err)
+	}
+
+	// 4. Stop s1
+	if err := s1.Stop(context.Background()); err != nil {
+		t.Fatalf("s1.Stop failed: %v", err)
+	}
+
+	// 5. Now second process on realDir succeeds
+	cmd2 := exec.Command(os.Args[0])
+	cmd2.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+realDir,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+	)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		t.Fatalf("expected second process to succeed after s1 stopped: %v (output: %s)", err2, string(out2))
+	}
+}
+
 func TestSupervisor_TempSocketDir_LockAndNamespaceSafety(t *testing.T) {
 	tmpDir := t.TempDir()
 	binDir := filepath.Join(tmpDir, "bin")
@@ -448,9 +613,15 @@ func TestSupervisor_TempSocketDir_PreExistingContentsPreserved(t *testing.T) {
 	}
 
 	// Compute deterministic temp socket dir
-	absLongData, _ := filepath.Abs(longDataDir)
-	h := sha256.Sum256([]byte(absLongData))
-	deterministicSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
+	canonicalLongData, err := canonicalizePath(longDataDir)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed: %v", err)
+	}
+	h := sha256.Sum256([]byte(canonicalLongData))
+	deterministicSockDir, err := canonicalizePath(filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4])))
+	if err != nil {
+		t.Fatalf("canonicalizePath temp sock failed: %v", err)
+	}
 
 	// Pre-create the directory with a foreign file
 	if err := os.MkdirAll(deterministicSockDir, 0700); err != nil {
@@ -500,10 +671,283 @@ func TestSupervisor_TempSocketDir_PreExistingContentsPreserved(t *testing.T) {
 	}
 }
 
+func TestSupervisor_SocketDir_InspectionErrorFailsSafelyAndPreserves(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	writeFakeBinaries(t, binDir)
+
+	longDataDir := filepath.Join(tmpDir, strings.Repeat("unreadable_sock_", 6), "pgdata")
+	if err := os.MkdirAll(longDataDir, 0700); err != nil {
+		t.Fatalf("failed to create longDataDir: %v", err)
+	}
+
+	canonicalLongData, err := canonicalizePath(longDataDir)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed: %v", err)
+	}
+	h := sha256.Sum256([]byte(canonicalLongData))
+	deterministicSockDir, err := canonicalizePath(filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4])))
+	if err != nil {
+		t.Fatalf("canonicalizePath temp sock failed: %v", err)
+	}
+
+	// Pre-create the directory with mode 0300 (write/exec only, no read permission -> ReadDir returns EACCES)
+	if err := os.MkdirAll(deterministicSockDir, 0700); err != nil {
+		t.Fatalf("failed to create deterministicSockDir: %v", err)
+	}
+	if err := os.Chmod(deterministicSockDir, 0300); err != nil {
+		t.Fatalf("failed to chmod 0300: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(deterministicSockDir, 0700)
+		_ = os.RemoveAll(deterministicSockDir)
+		_ = os.Remove(SocketDirLockPath(deterministicSockDir))
+	}()
+
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: longDataDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create supervisor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Start MUST fail safely on inspection error
+	startErr := s.Start(ctx)
+	if startErr == nil {
+		_ = s.Stop(context.Background())
+		t.Fatal("expected Start to fail safely on unreadable socket directory, got nil")
+	}
+	if !strings.Contains(startErr.Error(), "failed to inspect existing socket directory") {
+		t.Fatalf("expected inspection error, got: %v", startErr)
+	}
+
+	// Pre-existing directory MUST NOT have been removed by startup failure cleanup!
+	if _, statErr := os.Stat(deterministicSockDir); os.IsNotExist(statErr) {
+		t.Fatalf("pre-existing unreadable socket directory %s was removed by cleanup!", deterministicSockDir)
+	}
+}
+
+func TestSupervisor_SocketDir_PreExistingEmptyDirectoryPreservedOnStop(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	writeFakeBinaries(t, binDir)
+
+	longDataDir := filepath.Join(tmpDir, strings.Repeat("empty_pre_exist_", 6), "pgdata")
+	if err := os.MkdirAll(longDataDir, 0700); err != nil {
+		t.Fatalf("failed to create longDataDir: %v", err)
+	}
+
+	canonicalLongData, err := canonicalizePath(longDataDir)
+	if err != nil {
+		t.Fatalf("canonicalizePath failed: %v", err)
+	}
+	h := sha256.Sum256([]byte(canonicalLongData))
+	deterministicSockDir, err := canonicalizePath(filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4])))
+	if err != nil {
+		t.Fatalf("canonicalizePath temp sock failed: %v", err)
+	}
+
+	// Pre-create empty directory
+	if err := os.MkdirAll(deterministicSockDir, 0700); err != nil {
+		t.Fatalf("failed to create deterministicSockDir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(deterministicSockDir)
+		_ = os.Remove(SocketDirLockPath(deterministicSockDir))
+	}()
+
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: longDataDir,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create supervisor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("s.Start failed: %v", err)
+	}
+
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("s.Stop failed: %v", err)
+	}
+
+	// Empty pre-existing directory was NOT created by this startup; it MUST NOT be removed!
+	if _, statErr := os.Stat(deterministicSockDir); os.IsNotExist(statErr) {
+		t.Fatalf("pre-existing empty socket directory was removed on Stop!")
+	}
+}
+
+func TestSupervisor_ExplicitSocketDir_ParticipatesInNamespaceLocking(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	writeFakeBinaries(t, binDir)
+
+	dataDirA := filepath.Join(tmpDir, strings.Repeat("data_a_long_path_", 6), "pgdata")
+	dataDirB := filepath.Join(tmpDir, "data_b")
+	if err := os.MkdirAll(dataDirA, 0700); err != nil {
+		t.Fatalf("failed to create dataDirA: %v", err)
+	}
+	if err := os.MkdirAll(dataDirB, 0700); err != nil {
+		t.Fatalf("failed to create dataDirB: %v", err)
+	}
+
+	// Supervisor A uses fallback socket directory
+	sA, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDirA,
+		Port:    5432,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create sA: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := sA.Start(ctx); err != nil {
+		t.Fatalf("sA.Start failed: %v", err)
+	}
+	defer func() { _ = sA.Stop(context.Background()) }()
+
+	sockDirA := sA.SocketDir()
+	if sockDirA == "" {
+		t.Fatal("expected non-empty socketDir for sA")
+	}
+
+	// Supervisor B has different dataDir, different port (5433), but explicit SocketDir pointing at sA's socketDir
+	sB, err := New(Options{
+		BinDir:    binDir,
+		DataDir:   dataDirB,
+		SocketDir: sockDirA,
+		Port:      5433,
+		NoSync:    true,
+		isRoot:    func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create sB: %v", err)
+	}
+
+	err = sB.Start(ctx)
+	if err == nil {
+		_ = sB.Stop(context.Background())
+		t.Fatal("expected sB.Start to fail due to socket namespace collision, got nil")
+	}
+	if !errors.Is(err, ErrSocketDirLocked) {
+		t.Fatalf("expected ErrSocketDirLocked, got: %v", err)
+	}
+
+	// Stop sA
+	if err := sA.Stop(context.Background()); err != nil {
+		t.Fatalf("sA.Stop failed: %v", err)
+	}
+
+	// Now sB can start with its explicit SocketDir
+	if err := sB.Start(ctx); err != nil {
+		t.Fatalf("expected sB.Start to succeed after sA stopped: %v", err)
+	}
+	if !sB.SocketDirLocked() {
+		t.Fatal("expected sB to hold socket lock")
+	}
+	if err := sB.Stop(context.Background()); err != nil {
+		t.Fatalf("sB.Stop failed: %v", err)
+	}
+}
+
+func TestSupervisor_CrossProcess_ExplicitSocketDirContention(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	writeFakeBinaries(t, binDir)
+
+	dataDirA := filepath.Join(tmpDir, strings.Repeat("long_cluster_a_", 6), "pgdata")
+	dataDirB := filepath.Join(tmpDir, "cluster_b")
+	if err := os.MkdirAll(dataDirA, 0700); err != nil {
+		t.Fatalf("failed to create dataDirA: %v", err)
+	}
+	if err := os.MkdirAll(dataDirB, 0700); err != nil {
+		t.Fatalf("failed to create dataDirB: %v", err)
+	}
+
+	sA, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDirA,
+		Port:    5432,
+		NoSync:  true,
+		isRoot:  func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("failed to create sA: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := sA.Start(ctx); err != nil {
+		t.Fatalf("sA.Start failed: %v", err)
+	}
+	defer func() { _ = sA.Stop(context.Background()) }()
+
+	sockDirA := sA.SocketDir()
+
+	// Spawn subprocess with different dataDir and port, but explicit SocketDir = sockDirA
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+dataDirB,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+		"TOBITEN_TEST_SUBPROCESS_SOCKETDIR="+sockDirA,
+		"TOBITEN_TEST_SUBPROCESS_PORT=5433",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected second process to be excluded by socket lock, output: %s", string(out))
+	}
+	if !strings.Contains(string(out), "embedded postgresql socket directory is locked by another process") {
+		t.Fatalf("expected ErrSocketDirLocked in output, got:\n%s", string(out))
+	}
+
+	// Stop sA
+	if err := sA.Stop(context.Background()); err != nil {
+		t.Fatalf("sA.Stop failed: %v", err)
+	}
+
+	// Subprocess B can now succeed
+	cmd2 := exec.Command(os.Args[0])
+	cmd2.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+dataDirB,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+		"TOBITEN_TEST_SUBPROCESS_SOCKETDIR="+sockDirA,
+		"TOBITEN_TEST_SUBPROCESS_PORT=5433",
+	)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		t.Fatalf("expected subprocess B to succeed after sA stopped: %v (output: %s)", err2, string(out2))
+	}
+}
+
 func TestSupervisor_FailedStopRetainsLock_ExcludesSecondProcess(t *testing.T) {
 	tmpDir := t.TempDir()
 	binDir := filepath.Join(tmpDir, "bin")
-	dataDir := filepath.Join(tmpDir, "pgdata")
+	// Long data path forces fallback temporary socket directory
+	dataDir := filepath.Join(tmpDir, strings.Repeat("long_stop_retain_", 6), "pgdata")
+	otherDataDir := filepath.Join(tmpDir, "other_data")
+	if err := os.MkdirAll(otherDataDir, 0700); err != nil {
+		t.Fatalf("failed to create otherDataDir: %v", err)
+	}
 	writeFakeBinaries(t, binDir)
 
 	confirmCount := 0
@@ -539,15 +983,18 @@ func TestSupervisor_FailedStopRetainsLock_ExcludesSecondProcess(t *testing.T) {
 		t.Fatal("expected first Stop to fail, got nil")
 	}
 
-	// Ownership must be RETAINED!
+	// BOTH DataDirLock AND SocketDirLock MUST be RETAINED!
 	if !s.DataDirLocked() {
 		t.Fatal("expected DataDirLock to be retained after failed Stop")
+	}
+	if !s.SocketDirLocked() {
+		t.Fatal("expected SocketDirLock to be retained after failed Stop")
 	}
 	if !s.Running() {
 		t.Fatal("expected Running() to be true (retryable state) after failed Stop")
 	}
 
-	// Second process attempting to supervise MUST be excluded
+	// 1. Second process attempting to supervise dataDir MUST be excluded
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
@@ -562,6 +1009,23 @@ func TestSupervisor_FailedStopRetainsLock_ExcludesSecondProcess(t *testing.T) {
 		t.Fatalf("expected clear lock error in subprocess output, got:\n%s", string(out))
 	}
 
+	// 2. Third process attempting to use the retained socket directory with different dataDir and port MUST also be excluded
+	cmdSocket := exec.Command(os.Args[0])
+	cmdSocket.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+otherDataDir,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+		"TOBITEN_TEST_SUBPROCESS_SOCKETDIR="+s.SocketDir(),
+		"TOBITEN_TEST_SUBPROCESS_PORT=5433",
+	)
+	outSocket, errSocket := cmdSocket.CombinedOutput()
+	if errSocket == nil {
+		t.Fatalf("expected process targeting retained socket dir to be excluded, output: %s", string(outSocket))
+	}
+	if !strings.Contains(string(outSocket), "embedded postgresql socket directory is locked by another process") {
+		t.Fatalf("expected ErrSocketDirLocked in output, got:\n%s", string(outSocket))
+	}
+
 	// Retry Stop: this time confirmExit succeeds
 	retryErr := s.Stop(context.Background())
 	if retryErr != nil {
@@ -571,8 +1035,11 @@ func TestSupervisor_FailedStopRetainsLock_ExcludesSecondProcess(t *testing.T) {
 	if s.DataDirLocked() {
 		t.Fatal("expected DataDirLock to be released after successful retry Stop")
 	}
+	if s.SocketDirLocked() {
+		t.Fatal("expected SocketDirLock to be released after successful retry Stop")
+	}
 
-	// Second process can now succeed
+	// Second process on dataDir can now succeed
 	cmd2 := exec.Command(os.Args[0])
 	cmd2.Env = append(os.Environ(),
 		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
@@ -621,77 +1088,13 @@ func TestSupervisor_StartupErrorBeforeLaunchReleasesLock(t *testing.T) {
 func TestSupervisor_PendingLaunchRetainsLock_ExcludesSecondProcess(t *testing.T) {
 	tmpDir := t.TempDir()
 	binDir := filepath.Join(tmpDir, "bin")
-	dataDir := filepath.Join(tmpDir, "pgdata")
-	if err := os.MkdirAll(binDir, 0755); err != nil {
-		t.Fatalf("failed to create binDir: %v", err)
+	// Use long data path so fallback temporary socket is active
+	dataDir := filepath.Join(tmpDir, strings.Repeat("long_pending_launch_", 6), "pgdata")
+	otherDataDir := filepath.Join(tmpDir, "other_pending_data")
+	if err := os.MkdirAll(otherDataDir, 0700); err != nil {
+		t.Fatalf("failed to create otherDataDir: %v", err)
 	}
-
-	writeExecutable := func(name, script string) {
-		p := filepath.Join(binDir, name)
-		if err := os.WriteFile(p, []byte(script), 0755); err != nil {
-			t.Fatalf("failed to write %s: %v", name, err)
-		}
-	}
-
-	writeExecutable("initdb", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"initdb (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
-	writeExecutable("postgres", "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-V\" ]; then echo \"postgres (PostgreSQL) 18.6\"; exit 0; fi\nexit 0\n")
-
-	// pg_ctl script where child holds until .release is written
-	pgCtlScript := `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "pg_ctl (PostgreSQL) 18.6"
-  exit 0
-fi
-
-dataDir=""
-mode=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -D) dataDir="$2"; shift 2 ;;
-    start) mode="start"; shift ;;
-    stop) mode="stop"; shift ;;
-    *) shift ;;
-  esac
-done
-
-if [ "$mode" = "start" ]; then
-  if [ -f "$dataDir/.hang_pgctl" ]; then
-    sh -c '
-      echo "$$" > "'"$dataDir"'/postmaster.pid.tmp"
-      while [ ! -f "'"$dataDir"'/.release" ]; do
-        sleep 0.01
-      done
-      mv "'"$dataDir"'/postmaster.pid.tmp" "'"$dataDir"'/postmaster.pid"
-      while true; do sleep 1; done
-    ' >/dev/null 2>&1 </dev/null &
-    child_pid=$!
-    echo "$child_pid" > "$dataDir/.forked"
-    while true; do sleep 1; done
-  else
-    sh -c '
-      echo "$$" > "'"$dataDir"'/postmaster.pid"
-      while true; do sleep 1; done
-    ' >/dev/null 2>&1 </dev/null &
-    child_pid=$!
-    echo "$child_pid" > "$dataDir/.forked"
-    exit 0
-  fi
-fi
-
-if [ "$mode" = "stop" ]; then
-  if [ ! -f "$dataDir/postmaster.pid" ]; then
-    echo "pg_ctl: PID absent" >&2
-    exit 1
-  fi
-  pid=$(head -n 1 "$dataDir/postmaster.pid")
-  if [ -n "$pid" ]; then
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-  rm -f "$dataDir/postmaster.pid"
-  exit 0
-fi
-`
-	writeExecutable("pg_ctl", pgCtlScript)
+	writeFakeBinaries(t, binDir)
 
 	startCtx, cancelStart := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelStart()
@@ -707,12 +1110,13 @@ fi
 		t.Fatalf("failed to create supervisor: %v", err)
 	}
 
-	forkedFile := filepath.Join(dataDir, ".forked")
-	pidFile := filepath.Join(dataDir, "postmaster.pid")
-	releaseFile := filepath.Join(dataDir, ".release")
-	hangFile := filepath.Join(dataDir, ".hang_pgctl")
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		t.Fatalf("failed to create dataDir: %v", err)
+	canonicalDataDir := s.DataDir()
+	forkedFile := filepath.Join(canonicalDataDir, ".forked")
+	pidFile := filepath.Join(canonicalDataDir, "postmaster.pid")
+	releaseFile := filepath.Join(canonicalDataDir, ".release")
+	hangFile := filepath.Join(canonicalDataDir, ".hang_pgctl")
+	if err := os.MkdirAll(canonicalDataDir, 0700); err != nil {
+		t.Fatalf("failed to create canonicalDataDir: %v", err)
 	}
 	if err := os.WriteFile(hangFile, []byte("1\n"), 0644); err != nil {
 		t.Fatalf("failed to write hang file: %v", err)
@@ -746,15 +1150,18 @@ fi
 		t.Fatal("expected Start to fail due to context cancellation, got nil")
 	}
 
-	// Verify pending launch and data lock are RETAINED
+	// Verify pending launch, data lock, and socket lock are RETAINED
 	if !s.PendingLaunch() {
 		t.Fatal("expected PendingLaunch() to be true")
 	}
 	if !s.DataDirLocked() {
 		t.Fatal("expected DataDirLocked() to be true while pending launch")
 	}
+	if !s.SocketDirLocked() {
+		t.Fatal("expected SocketDirLocked() to be true while pending launch")
+	}
 
-	// Subprocess attempting to supervise must be excluded
+	// 1. Subprocess attempting to supervise dataDir must be excluded
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(),
 		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
@@ -767,6 +1174,23 @@ fi
 	}
 	if !strings.Contains(string(out), "embedded postgresql data directory is locked by another process") {
 		t.Fatalf("expected clear lock error in subprocess output, got:\n%s", string(out))
+	}
+
+	// 2. Subprocess attempting to use socketDir with different dataDir and port must be excluded
+	cmdSocket := exec.Command(os.Args[0])
+	cmdSocket.Env = append(os.Environ(),
+		"TOBITEN_TEST_SUBPROCESS_SUPERVISE=1",
+		"TOBITEN_TEST_SUBPROCESS_DATADIR="+otherDataDir,
+		"TOBITEN_TEST_SUBPROCESS_BINDIR="+binDir,
+		"TOBITEN_TEST_SUBPROCESS_SOCKETDIR="+s.SocketDir(),
+		"TOBITEN_TEST_SUBPROCESS_PORT=5433",
+	)
+	outSocket, errSocket := cmdSocket.CombinedOutput()
+	if errSocket == nil {
+		t.Fatalf("expected process targeting retained socket dir to be excluded during pending launch, output: %s", string(outSocket))
+	}
+	if !strings.Contains(string(outSocket), "embedded postgresql socket directory is locked by another process") {
+		t.Fatalf("expected ErrSocketDirLocked in output, got:\n%s", string(outSocket))
 	}
 
 	// Release child and wait for PID file
@@ -789,6 +1213,9 @@ fi
 
 	if s.DataDirLocked() {
 		t.Fatal("expected DataDirLocked() to be false after successful Stop")
+	}
+	if s.SocketDirLocked() {
+		t.Fatal("expected SocketDirLocked() to be false after successful Stop")
 	}
 
 	_ = os.Remove(hangFile)

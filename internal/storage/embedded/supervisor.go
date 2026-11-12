@@ -96,20 +96,20 @@ type Supervisor struct {
 	resolvePIDTimeout            time.Duration
 	dataLock                     *fileLock
 	socketLock                   *fileLock
-	socketDirPreExisted          bool
+	createdSocketDir             bool
 	socketHadPreExistingContents bool
 }
 
 // New creates a new embedded PostgreSQL supervisor with the given options.
-// All directory and file paths are resolved to absolute paths.
+// All directory and file paths are resolved to absolute canonical paths.
 func New(opts Options) (*Supervisor, error) {
 	if opts.DataDir == "" {
 		return nil, errors.New("data directory is required")
 	}
 
-	absDataDir, err := filepath.Abs(opts.DataDir)
+	absDataDir, err := canonicalizePath(opts.DataDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve absolute data directory: %w", err)
+		return nil, fmt.Errorf("failed to resolve canonical data directory: %w", err)
 	}
 
 	var absBinDir string
@@ -288,7 +288,7 @@ func (s *Supervisor) cleanupLaunchedPostmaster(pid int) error {
 	}
 
 	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
-		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+		if s.createdSocketDir && !s.socketHadPreExistingContents {
 			_ = os.RemoveAll(s.socketDir)
 		}
 	}
@@ -350,13 +350,21 @@ func (s *Supervisor) setupSocketDir() error {
 			s.socketDir = s.dataDir
 		} else {
 			h := sha256.Sum256([]byte(s.dataDir))
-			tmpSockDir := filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
-			s.socketDir = tmpSockDir
+			s.socketDir = filepath.Join(os.TempDir(), fmt.Sprintf("tbt-%x", h[:4]))
 			s.tempSocket = true
 		}
 	}
 
-	if s.tempSocket {
+	canonicalSock, err := canonicalizePath(s.socketDir)
+	if err != nil {
+		canonicalSock = filepath.Clean(s.socketDir)
+	}
+	canonicalData, err := canonicalizePath(s.dataDir)
+	if err != nil {
+		canonicalData = filepath.Clean(s.dataDir)
+	}
+
+	if canonicalSock != canonicalData {
 		sockLockPath := SocketDirLockPath(s.socketDir)
 		sockLock, err := acquireFileLock(sockLockPath, ErrSocketDirLocked, s.socketDir)
 		if err != nil {
@@ -364,24 +372,36 @@ func (s *Supervisor) setupSocketDir() error {
 		}
 		s.socketLock = sockLock
 
-		entries, readErr := os.ReadDir(s.socketDir)
-		if readErr == nil {
-			s.socketDirPreExisted = true
+		fi, statErr := os.Stat(s.socketDir)
+		if statErr == nil {
+			// Directory exists. It was NOT created by this startup.
+			s.createdSocketDir = false
+			if !fi.IsDir() {
+				return fmt.Errorf("socket path %q exists and is not a directory", s.socketDir)
+			}
+			entries, readErr := os.ReadDir(s.socketDir)
+			if readErr != nil {
+				// Failed inspection (e.g. EACCES on mode 0300). Fail safely!
+				return fmt.Errorf("failed to inspect existing socket directory %q: %w", s.socketDir, readErr)
+			}
 			if len(entries) > 0 {
 				s.socketHadPreExistingContents = true
 			}
-		} else if os.IsNotExist(readErr) {
-			s.socketDirPreExisted = false
+		} else if os.IsNotExist(statErr) {
+			// Directory does not exist yet. Create it now.
+			if err := os.MkdirAll(s.socketDir, 0700); err != nil {
+				return fmt.Errorf("failed to create socket directory %q: %w", s.socketDir, err)
+			}
+			s.createdSocketDir = true
 			s.socketHadPreExistingContents = false
+		} else {
+			// Unexpected stat error. Fail safely!
+			return fmt.Errorf("failed to stat socket directory %q: %w", s.socketDir, statErr)
 		}
-	}
-
-	if err := os.MkdirAll(s.socketDir, 0700); err != nil {
-		if s.socketLock != nil {
-			_ = s.socketLock.Unlock()
-			s.socketLock = nil
+	} else {
+		if err := os.MkdirAll(s.socketDir, 0700); err != nil {
+			return fmt.Errorf("failed to create socket directory %q: %w", s.socketDir, err)
 		}
-		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 	return nil
 }
@@ -633,7 +653,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 
 	// 4. Process exit confirmed: child is accounted for! Clean up temporary socket if applicable and clear state
 	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
-		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+		if s.createdSocketDir && !s.socketHadPreExistingContents {
 			_ = os.RemoveAll(s.socketDir)
 		}
 	}
@@ -647,7 +667,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 
 func (s *Supervisor) cleanupStartupFailure() {
 	if s.tempSocket && s.socketDir != "" && s.socketLock != nil {
-		if !s.socketDirPreExisted && !s.socketHadPreExistingContents {
+		if s.createdSocketDir && !s.socketHadPreExistingContents {
 			_ = os.RemoveAll(s.socketDir)
 		}
 	}
@@ -666,7 +686,7 @@ func (s *Supervisor) releaseLocks() {
 	if s.opts.SocketDir == "" && s.tempSocket {
 		s.socketDir = ""
 		s.tempSocket = false
-		s.socketDirPreExisted = false
+		s.createdSocketDir = false
 		s.socketHadPreExistingContents = false
 	}
 }
@@ -676,12 +696,17 @@ func (s *Supervisor) DataLockPath() string {
 	return DataDirLockPath(s.dataDir)
 }
 
-// SocketLockPath returns the path of the lock file used for temporary socket-directory ownership,
-// or empty string if no separate socket lock is used.
+// SocketLockPath returns the path of the lock file used for socket-directory ownership,
+// or empty string if no separate socket lock is used (i.e. when socketDir == dataDir).
 func (s *Supervisor) SocketLockPath() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.socketDir == "" || s.socketDir == s.dataDir || !s.tempSocket {
+	if s.socketDir == "" {
+		return ""
+	}
+	canonicalSock, _ := canonicalizePath(s.socketDir)
+	canonicalData, _ := canonicalizePath(s.dataDir)
+	if canonicalSock == canonicalData {
 		return ""
 	}
 	return SocketDirLockPath(s.socketDir)

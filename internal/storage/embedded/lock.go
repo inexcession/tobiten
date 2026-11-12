@@ -15,18 +15,102 @@ var (
 	ErrSocketDirLocked = errors.New("embedded postgresql socket directory is locked by another process")
 )
 
+// canonicalizePath returns the canonical absolute path with all symlinks resolved,
+// even if the target file/directory or intermediate leaf components do not exist yet.
+func canonicalizePath(path string) (string, error) {
+	return canonicalizePathDepth(path, 0)
+}
+
+func canonicalizePathDepth(path string, depth int) (string, error) {
+	if depth > 64 {
+		return "", fmt.Errorf("too many levels of symbolic links: %q", path)
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path for %q: %w", path, err)
+	}
+	abs = filepath.Clean(abs)
+
+	// If the path itself exists and can be fully evaluated, do so.
+	if realPath, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(realPath), nil
+	}
+
+	// If abs exists as a symlink pointing to a non-existent target (broken or not-yet-created leaf):
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(abs)
+		if err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(abs), target)
+			}
+			return canonicalizePathDepth(target, depth+1)
+		}
+	}
+
+	// If the path does not exist, find the lowest existing ancestor,
+	// resolve symlinks on it, and re-append the remaining components.
+	curr := abs
+	var trailing []string
+	for {
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		trailing = append([]string{filepath.Base(curr)}, trailing...)
+		curr = parent
+
+		if fi, err := os.Lstat(curr); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				target, err := os.Readlink(curr)
+				if err == nil {
+					if !filepath.IsAbs(target) {
+						target = filepath.Join(filepath.Dir(curr), target)
+					}
+					resolvedParent, err := canonicalizePathDepth(target, depth+1)
+					if err == nil {
+						curr = resolvedParent
+						break
+					}
+				}
+			}
+			if resolved, err := filepath.EvalSymlinks(curr); err == nil {
+				curr = resolved
+				break
+			}
+		}
+	}
+
+	result := curr
+	for _, seg := range trailing {
+		result = filepath.Join(result, seg)
+	}
+	result = filepath.Clean(result)
+
+	if result != abs {
+		return canonicalizePathDepth(result, depth+1)
+	}
+	return result, nil
+}
+
 // DataDirLockPath returns the lock file path corresponding to a data directory.
-// The lock file is placed in the parent directory alongside the data directory,
+// The lock file is placed in the parent directory alongside the canonical data directory,
 // preserving initdb's requirement that the data directory itself be empty.
 func DataDirLockPath(dataDir string) string {
-	clean := filepath.Clean(dataDir)
-	return clean + ".lock"
+	canonical, err := canonicalizePath(dataDir)
+	if err != nil {
+		canonical = filepath.Clean(dataDir)
+	}
+	return canonical + ".lock"
 }
 
 // SocketDirLockPath returns the lock file path for a socket directory.
 func SocketDirLockPath(socketDir string) string {
-	clean := filepath.Clean(socketDir)
-	return clean + ".lock"
+	canonical, err := canonicalizePath(socketDir)
+	if err != nil {
+		canonical = filepath.Clean(socketDir)
+	}
+	return canonical + ".lock"
 }
 
 // fileLock represents an advisory cross-process file lock held via syscall.Flock.
@@ -85,10 +169,15 @@ func (l *fileLock) Unlock() error {
 }
 
 // LockDataDir acquires exclusive ownership of the PostgreSQL data directory.
-// It returns an unlock function or ErrDataDirLocked if another process holds it.
+// It resolves symlinks to use the canonical cluster identity, and returns an unlock
+// function or ErrDataDirLocked if another process holds it.
 func LockDataDir(dataDir string) (func() error, error) {
-	lockPath := DataDirLockPath(dataDir)
-	lock, err := acquireFileLock(lockPath, ErrDataDirLocked, dataDir)
+	canonical, err := canonicalizePath(dataDir)
+	if err != nil {
+		canonical = filepath.Clean(dataDir)
+	}
+	lockPath := canonical + ".lock"
+	lock, err := acquireFileLock(lockPath, ErrDataDirLocked, canonical)
 	if err != nil {
 		return nil, err
 	}
