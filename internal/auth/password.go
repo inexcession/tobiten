@@ -43,6 +43,10 @@ const (
 	MaxEncodedHashLen        = 512
 )
 
+// argon2idKDF points to the Argon2id key derivation function, defaulting to argon2.IDKey.
+// It can be replaced in unit tests to deterministically verify that invalid inputs never trigger key derivation.
+var argon2idKDF = argon2.IDKey
+
 // Argon2idParams holds the cost parameters for Argon2id password hashing (RFC 9106).
 type Argon2idParams struct {
 	// Memory is the memory cost parameter in KiB (e.g. 65536 for 64 MiB).
@@ -119,7 +123,7 @@ func HashPasswordWithParams(password string, params Argon2idParams) (string, err
 		return "", fmt.Errorf("failed to generate random salt: %w", err)
 	}
 
-	key := argon2.IDKey([]byte(password), salt, params.Iterations, params.Memory, params.Parallelism, params.KeyLength)
+	key := argon2idKDF([]byte(password), salt, params.Iterations, params.Memory, params.Parallelism, params.KeyLength)
 
 	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64Key := base64.RawStdEncoding.EncodeToString(key)
@@ -310,7 +314,7 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 		return false, err
 	}
 
-	derivedKey := argon2.IDKey(
+	derivedKey := argon2idKDF(
 		[]byte(password),
 		salt,
 		params.Iterations,

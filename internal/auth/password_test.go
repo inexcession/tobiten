@@ -260,12 +260,12 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 		},
 		{
 			name:    "duplicate memory parameter",
-			hash:    "$argon2id$v=19$m=65536,m=1024,t=3$" + validSalt + "$" + validKey,
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4,m=1024$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
 			name:    "duplicate iterations parameter",
-			hash:    "$argon2id$v=19$m=65536,t=3,t=2$" + validSalt + "$" + validKey,
+			hash:    "$argon2id$v=19$m=65536,t=3,p=4,t=2$" + validSalt + "$" + validKey,
 			wantErr: ErrInvalidHashFormat,
 		},
 		{
@@ -415,34 +415,87 @@ func TestArgon2id_Verification_MalformedAndErrors(t *testing.T) {
 	}
 }
 
-func TestArgon2id_FastRejectionWithoutExpensiveWork(t *testing.T) {
+func TestArgon2id_InvalidInputsNeverReachKDF(t *testing.T) {
+	var kdfCalled bool
+	originalKDF := argon2idKDF
+	argon2idKDF = func(password, salt []byte, time, memory uint32, threads uint8, keyLen uint32) []byte {
+		kdfCalled = true
+		t.Fatalf("argon2idKDF was unexpectedly invoked with time=%d, memory=%d on invalid input", time, memory)
+		return nil
+	}
+	defer func() { argon2idKDF = originalKDF }()
+
 	validSalt := base64.RawStdEncoding.EncodeToString([]byte("0123456789abcdef"))
 	validKey := base64.RawStdEncoding.EncodeToString(make([]byte, 32))
 
-	// An attacker hash with excessive costs (e.g. t=1000000) or invalid tuples.
-	excessiveHashes := []string{
-		"$argon2id$v=19$m=65536,t=1000,p=4$" + validSalt + "$" + validKey,
-		"$argon2id$v=19$m=1048576,t=3,p=4$" + validSalt + "$" + validKey,
-		"$argon2id$v=19$m=65536,m=65536,t=3$" + validSalt + "$" + validKey,
-		"$argon2id$v=19junk$m=65536,t=3,p=4$" + validSalt + "$" + validKey,
+	// Excessive costs, duplicate parameters, invalid tuples, and malformed inputs.
+	invalidHashes := []struct {
+		name string
+		hash string
+	}{
+		{"excessive iterations", "$argon2id$v=19$m=65536,t=1000,p=4$" + validSalt + "$" + validKey},
+		{"excessive memory", "$argon2id$v=19$m=1048576,t=3,p=4$" + validSalt + "$" + validKey},
+		{"duplicate m parameter", "$argon2id$v=19$m=65536,t=3,p=4,m=1024$" + validSalt + "$" + validKey},
+		{"duplicate t parameter", "$argon2id$v=19$m=65536,t=3,p=4,t=2$" + validSalt + "$" + validKey},
+		{"duplicate p parameter", "$argon2id$v=19$m=65536,t=3,p=4,p=2$" + validSalt + "$" + validKey},
+		{"trailing version junk", "$argon2id$v=19junk$m=65536,t=3,p=4$" + validSalt + "$" + validKey},
+		{"unsupported algorithm", "$bcrypt$v=19$m=65536,t=3,p=4$" + validSalt + "$" + validKey},
+		{"salt too short", "$argon2id$v=19$m=65536,t=3,p=4$" + base64.RawStdEncoding.EncodeToString([]byte("short")) + "$" + validKey},
+		{"excessive parallelism", "$argon2id$v=19$m=65536,t=3,p=32$" + validSalt + "$" + validKey},
+		{"invalid tuple syntax", "$argon2id$v=19$m=65536=1,t=3,p=4$" + validSalt + "$" + validKey},
 	}
 
-	for _, hash := range excessiveHashes {
-		start := time.Now()
-		match, err := VerifyPassword("password", hash)
-		elapsed := time.Since(start)
+	for _, tc := range invalidHashes {
+		t.Run(tc.name, func(t *testing.T) {
+			kdfCalled = false
+			match, err := VerifyPassword("password", tc.hash)
+			if match {
+				t.Errorf("expected match=false, got true")
+			}
+			if err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if kdfCalled {
+				t.Errorf("KDF spy was invoked on invalid input %s", tc.name)
+			}
+		})
+	}
+}
 
-		if match {
-			t.Errorf("expected match=false, got true")
-		}
-		if err == nil {
-			t.Errorf("expected error, got nil")
-		}
+func TestArgon2id_InvalidGenerationParamsNeverReachKDF(t *testing.T) {
+	var kdfCalled bool
+	originalKDF := argon2idKDF
+	argon2idKDF = func(password, salt []byte, time, memory uint32, threads uint8, keyLen uint32) []byte {
+		kdfCalled = true
+		t.Fatalf("argon2idKDF was unexpectedly invoked during invalid generation")
+		return nil
+	}
+	defer func() { argon2idKDF = originalKDF }()
 
-		// Rejection must be fast (<10ms) without executing expensive KDF work.
-		if elapsed > 10*time.Millisecond {
-			t.Errorf("rejection took too long (%v > 10ms); expensive work was executed for %q", elapsed, hash)
-		}
+	invalidParams := []struct {
+		name   string
+		params Argon2idParams
+	}{
+		{"version 16", Argon2idParams{Version: 16, Memory: 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}},
+		{"excessive memory", Argon2idParams{Memory: 1048576, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}},
+		{"excessive iterations", Argon2idParams{Memory: 1024, Iterations: 20, Parallelism: 1, SaltLength: 16, KeyLength: 32}},
+		{"excessive parallelism", Argon2idParams{Memory: 1024, Iterations: 1, Parallelism: 32, SaltLength: 16, KeyLength: 32}},
+		{"memory below 8*p", Argon2idParams{Memory: 4, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}},
+		{"salt too short", Argon2idParams{Memory: 1024, Iterations: 1, Parallelism: 1, SaltLength: 4, KeyLength: 32}},
+		{"key too short", Argon2idParams{Memory: 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 8}},
+	}
+
+	for _, tc := range invalidParams {
+		t.Run(tc.name, func(t *testing.T) {
+			kdfCalled = false
+			_, err := HashPasswordWithParams("pass", tc.params)
+			if err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if kdfCalled {
+				t.Errorf("KDF spy was invoked on invalid generation params %s", tc.name)
+			}
+		})
 	}
 }
 
@@ -512,23 +565,53 @@ func TestArgon2id_NeedsRehash(t *testing.T) {
 		t.Errorf("expected NeedsRehash=false when targetParams has Version=0, got true")
 	}
 
-	// A hash with a short salt (e.g. 8 bytes) must be detected as needing rehash against target SaltLength 16.
-	shortSaltParams := Argon2idParams{
+	// Isolate salt length regression: use identical cost/version parameters between
+	// hash and target, varying ONLY salt length, with an unchanged-target negative control.
+	baseTarget := Argon2idParams{
 		Memory:      1024,
 		Iterations:  1,
 		Parallelism: 1,
-		SaltLength:  8, // Short salt
+		SaltLength:  16,
 		KeyLength:   32,
 		Version:     argon2.Version,
 	}
+	normalHash, err := HashPasswordWithParams("test-password", baseTarget)
+	if err != nil {
+		t.Fatalf("HashPasswordWithParams failed: %v", err)
+	}
+
+	// Negative control: hash generated with baseTarget does NOT need rehash against baseTarget.
+	if NeedsRehash(normalHash, baseTarget) {
+		t.Errorf("expected NeedsRehash=false when hash matches baseTarget, got true")
+	}
+
+	// Positive test: identical in every field EXCEPT SaltLength=8.
+	shortSaltParams := baseTarget
+	shortSaltParams.SaltLength = 8
 	shortSaltHash, err := HashPasswordWithParams("test-password", shortSaltParams)
 	if err != nil {
 		t.Fatalf("HashPasswordWithParams failed: %v", err)
 	}
 
-	// NeedsRehash against default params (SaltLength=16) must return true (short salt caught!).
-	if !NeedsRehash(shortSaltHash) {
-		t.Errorf("expected NeedsRehash=true for hash with short salt (8B) against default target (16B), got false")
+	// Against baseTarget (where SaltLength is 16), shortSaltHash MUST need rehash purely due to salt length.
+	if !NeedsRehash(shortSaltHash, baseTarget) {
+		t.Errorf("expected NeedsRehash=true for shortSaltHash (8B salt) against target (16B salt), got false")
+	}
+
+	// Negative control: against shortSaltParams itself (where SaltLength is 8), it does NOT need rehash.
+	if NeedsRehash(shortSaltHash, shortSaltParams) {
+		t.Errorf("expected NeedsRehash=false when target SaltLength matches (8B), got true")
+	}
+
+	// Also verify against DefaultArgon2idParams: short salt (8B) with identical production parameters.
+	shortSaltProdParams := DefaultArgon2idParams
+	shortSaltProdParams.SaltLength = 8
+	shortSaltProdHash, err := HashPasswordWithParams("test-password", shortSaltProdParams)
+	if err != nil {
+		t.Fatalf("HashPasswordWithParams failed: %v", err)
+	}
+	if !NeedsRehash(shortSaltProdHash) {
+		t.Errorf("expected NeedsRehash=true when only SaltLength differs from DefaultArgon2idParams, got false")
 	}
 
 	// A hash with lower cost parameters should need rehash.
