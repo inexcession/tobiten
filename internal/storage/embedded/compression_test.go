@@ -65,9 +65,7 @@ func TestSupervisor_CompressionSettings_FullConfig(t *testing.T) {
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
 	// Pre-cancelled context executes up through configuration write (step 7) and returns at step 8
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	// 1. Verify postgresql.conf contains full compression configuration
@@ -111,9 +109,7 @@ func TestSupervisor_CompressionSettings_WarnedFallbackConfig(t *testing.T) {
 
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	// 1. Verify postgresql.conf omits both compression settings
@@ -163,9 +159,7 @@ func TestSupervisor_CompressionSettings_PartialZstdOnly(t *testing.T) {
 
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	confBytes, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
@@ -208,9 +202,7 @@ func TestSupervisor_CompressionSettings_PartialLZ4Only(t *testing.T) {
 
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	confBytes, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
@@ -246,16 +238,27 @@ func TestSupervisor_CompressionSettings_PartialLZ4Only(t *testing.T) {
 func TestSupervisor_CompressionSettings_StaleConfigDoesNotHideSupportedCodec(t *testing.T) {
 	// Regression: Stale unsupported settings in existing cluster files (postgresql.conf / postgresql.auto.conf)
 	// must not cause capability detection to fail and hide supported codecs.
-	mockProbe := func(_ context.Context, _, _ string) (CompressionCapabilities, error) {
-		return CompressionCapabilities{
-			HasZstdWAL:  false,
-			HasLZ4Toast: true,
-		}, nil
+	// This exercises ProbeCompression directly (compressionProbe: nil) so that the supervisor evaluates
+	// capabilities through isolated execution and writes the effective configuration.
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bins")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create binDir: %v", err)
+	}
+	createDummyBinary(t, binDir, "pg_ctl", "18.6", true)
+	createDummyBinary(t, binDir, "initdb", "18.6", true)
+	// Partial binary support: zstd WAL unsupported, lz4 TOAST supported
+	createDummyPostgresWithCompression(t, binDir, false, true)
+
+	dataDir := filepath.Join(tmpDir, "pgdata")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		t.Fatalf("failed to create dataDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "PG_VERSION"), []byte("18\n"), 0600); err != nil {
+		t.Fatalf("failed to write PG_VERSION: %v", err)
 	}
 
-	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
-
-	// Write stale unsupported settings in dataDir/postgresql.conf and postgresql.auto.conf
+	// Write stale unsupported settings into dataDir/postgresql.conf and postgresql.auto.conf
 	staleConf := `# Stale configuration from earlier run or user edit
 wal_compression = 'invalid_stale_algo'
 default_toast_compression = 'stale_broken'
@@ -267,12 +270,24 @@ default_toast_compression = 'stale_broken'
 		t.Fatalf("failed to write stale postgresql.auto.conf: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
+	s, err := New(Options{
+		BinDir:  binDir,
+		DataDir: dataDir,
+		Logger:  logger,
+		isRoot:  func() bool { return false },
+		// compressionProbe left unset to exercise ProbeCompression directly!
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating supervisor: %v", err)
+	}
+
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
-	// 1. Verify that the supported codec (lz4) was emitted despite stale config
+	// 1. Verify that the supported codec (lz4) was emitted in the effective configuration despite stale cluster files
 	confBytes, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
 	if err != nil {
 		t.Fatalf("failed to read postgresql.conf: %v", err)
@@ -282,8 +297,8 @@ default_toast_compression = 'stale_broken'
 	if !strings.Contains(confContent, "default_toast_compression = 'lz4'") {
 		t.Fatalf("expected postgresql.conf to contain default_toast_compression = 'lz4', got:\n%s", confContent)
 	}
-	if strings.Contains(confContent, "wal_compression = 'zstd'") {
-		t.Fatalf("expected postgresql.conf to omit unsupported wal_compression=zstd, got:\n%s", confContent)
+	if strings.Contains(confContent, "wal_compression") {
+		t.Fatalf("expected postgresql.conf to omit unsupported wal_compression, got:\n%s", confContent)
 	}
 
 	// 2. Verify capabilities and diagnostics are preserved
@@ -316,9 +331,7 @@ func TestSupervisor_CompressionSettings_ProbeErrorFallback(t *testing.T) {
 
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	confBytes, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
@@ -355,9 +368,7 @@ func TestSupervisor_CompressionSettings_TimeoutDiagnostic(t *testing.T) {
 
 	s, dataDir, logBuf := setupTestSupervisorWithProbe(t, mockProbe)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
+	ctx := context.Background()
 	_ = s.Start(ctx)
 
 	confBytes, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
@@ -514,36 +525,99 @@ func TestProbeCompression_IsolatedFromDataDir(t *testing.T) {
 	}
 }
 
-func TestProbeCompression_Timeout(t *testing.T) {
+func TestProbeCompression_InternalDeadline_LiveParent(t *testing.T) {
+	// Regression: verify that ProbeCompression enforces its internal timeout when given a live parent context,
+	// and that child process termination and fixture cleanup are prompt and bounded (< 1s, never 10s).
 	tmpDir := t.TempDir()
 	binDir := filepath.Join(tmpDir, "bins")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("failed to create binDir: %v", err)
 	}
 
-	// Create dummy binary that sleeps for 10 seconds
+	// Use exec sleep so signals kill the process immediately without leaving child sh/sleep processes running
 	p := filepath.Join(binDir, "postgres")
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "postgres (PostgreSQL) 18.6"
   exit 0
 fi
-sleep 10
-exit 0
+exec sleep 2
 `
 	if err := os.WriteFile(p, []byte(script), 0755); err != nil {
 		t.Fatalf("failed to create sleeping postgres binary: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	start := time.Now()
+	// Live parent context without a parent deadline: exercises ProbeCompression's internal deadline
+	liveParentCtx := context.Background()
+	_, err := ProbeCompressionWithTimeout(liveParentCtx, binDir, "", 100*time.Millisecond)
+	elapsed := time.Since(start)
 
-	_, err := ProbeCompression(ctx, binDir, "")
 	if err == nil {
-		t.Fatal("expected timeout error from ProbeCompression, got nil")
+		t.Fatal("expected timeout error from ProbeCompressionWithTimeout, got nil")
 	}
 	if !strings.Contains(err.Error(), "timed out") && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected timeout/deadline exceeded error, got: %v", err)
+		t.Fatalf("expected timeout error wrapping DeadlineExceeded, got: %v", err)
+	}
+	// Verify execution was bounded by the internal timeout (< 1 second, never the 10s trap)
+	if elapsed > 1*time.Second {
+		t.Fatalf("expected prompt bounded cancellation, but execution took %v", elapsed)
+	}
+}
+
+func TestProbeSetting_StabilizedLocaleDoesNotHideCodec(t *testing.T) {
+	// Regression: Translated PostgreSQL error messages (e.g. German, French, Japanese)
+	// must not hide supported codecs or cause false probe errors.
+	// stabilizedLocaleEnv ensures LC_ALL=C is passed to postgres -C.
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bins")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create binDir: %v", err)
+	}
+
+	// Dummy postgres script that checks LC_ALL:
+	// If LC_ALL is "C", emits standard English rejection.
+	// If LC_ALL is localized (de_DE), emits translated German rejection.
+	p := filepath.Join(binDir, "postgres")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "postgres (PostgreSQL) 18.6"
+  exit 0
+fi
+
+for arg in "$@"; do
+  if [ "$arg" = "wal_compression=zstd" ]; then
+    if [ "$LC_ALL" = "C" ]; then
+      echo 'FATAL:  invalid value for parameter "wal_compression": "zstd"' >&2
+    else
+      echo 'FATAL:  ungueltiger Wert fuer Parameter "wal_compression": "zstd"' >&2
+    fi
+    exit 1
+  fi
+  if [ "$arg" = "default_toast_compression=lz4" ]; then
+    echo "lz4"
+    exit 0
+  fi
+done
+exit 0
+`
+	if err := os.WriteFile(p, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to create dummy localized postgres binary: %v", err)
+	}
+
+	// Simulate host system configured with German locale
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	t.Setenv("LANG", "de_DE.UTF-8")
+
+	caps, err := ProbeCompression(context.Background(), binDir, "")
+	if err != nil {
+		t.Fatalf("ProbeCompression failed under localized host environment: %v", err)
+	}
+	if caps.HasZstdWAL {
+		t.Fatalf("expected HasZstdWAL == false, got true")
+	}
+	if !caps.HasLZ4Toast {
+		t.Fatalf("expected HasLZ4Toast == true, got false")
 	}
 }
 

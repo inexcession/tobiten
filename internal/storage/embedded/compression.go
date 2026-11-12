@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// DefaultProbeTimeout is the default bounded timeout for probing compression capabilities.
+const DefaultProbeTimeout = 3 * time.Second
+
 // CompressionCapabilities describes the compression algorithms supported by a PostgreSQL build (ADR-0001 §2).
 type CompressionCapabilities struct {
 	// HasZstdWAL indicates whether the PostgreSQL build supports wal_compression = 'zstd'.
@@ -20,8 +23,25 @@ type CompressionCapabilities struct {
 	HasLZ4Toast bool
 }
 
-func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value string) (bool, error) {
-	cmdCtx, cancel := deriveBoundedContext(ctx, 3*time.Second)
+// stabilizedLocaleEnv returns the process environment with LC_* and LANG variables overridden to C
+// to ensure PostgreSQL parameter rejection messages are emitted in standard untranslated English.
+func stabilizedLocaleEnv() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env)+3)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LC_") || strings.HasPrefix(kv, "LANG=") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	return append(filtered, "LC_ALL=C", "LC_MESSAGES=C", "LANG=C")
+}
+
+func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value string, timeout time.Duration) (bool, error) {
+	if timeout <= 0 {
+		timeout = DefaultProbeTimeout
+	}
+	cmdCtx, cancel := deriveBoundedContext(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, postgresBin,
@@ -30,6 +50,8 @@ func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value str
 		"-c", fmt.Sprintf("%s=%s", setting, value),
 		"-C", setting,
 	)
+	cmd.Env = stabilizedLocaleEnv()
+	cmd.WaitDelay = 500 * time.Millisecond
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -71,7 +93,12 @@ func probeSetting(ctx context.Context, postgresBin, probeDir, setting, value str
 // and lz4 TOAST compression (ADR-0001 §2).
 // Probes run against an isolated temporary directory with zero configuration, ensuring that
 // stale or invalid settings in existing cluster files never contaminate capability detection.
-func ProbeCompression(ctx context.Context, binDir, _ string) (CompressionCapabilities, error) {
+func ProbeCompression(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error) {
+	return ProbeCompressionWithTimeout(ctx, binDir, dataDir, DefaultProbeTimeout)
+}
+
+// ProbeCompressionWithTimeout detects compression capabilities with an explicit per-setting timeout.
+func ProbeCompressionWithTimeout(ctx context.Context, binDir, _ string, timeout time.Duration) (CompressionCapabilities, error) {
 	if binDir == "" {
 		discovered, err := FindBinDir("")
 		if err != nil {
@@ -105,12 +132,12 @@ func ProbeCompression(ctx context.Context, binDir, _ string) (CompressionCapabil
 		return CompressionCapabilities{}, fmt.Errorf("failed to write probe postgresql.conf: %w", err)
 	}
 
-	hasZstd, err := probeSetting(ctx, postgresBin, tmpDir, "wal_compression", "zstd")
+	hasZstd, err := probeSetting(ctx, postgresBin, tmpDir, "wal_compression", "zstd", timeout)
 	if err != nil {
 		return CompressionCapabilities{}, err
 	}
 
-	hasLZ4, err := probeSetting(ctx, postgresBin, tmpDir, "default_toast_compression", "lz4")
+	hasLZ4, err := probeSetting(ctx, postgresBin, tmpDir, "default_toast_compression", "lz4", timeout)
 	if err != nil {
 		return CompressionCapabilities{}, err
 	}

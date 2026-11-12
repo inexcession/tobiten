@@ -57,6 +57,9 @@ type Options struct {
 	// compressionProbe overrides compression capability detection (for testing compression tuning and warnings).
 	compressionProbe func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
 
+	// probeTimeout overrides the per-setting timeout for probing compression (default 3s).
+	probeTimeout time.Duration
+
 	// postLaunchHook is an optional hook executed immediately after postmaster is launched,
 	// before readiness/state finalization. Used for testing post-launch failures/cancellations.
 	postLaunchHook func(s *Supervisor, pid int) error
@@ -88,6 +91,7 @@ type Supervisor struct {
 	compressionCaps   CompressionCapabilities
 	compressionErr    error
 	compressionProbe  func(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error)
+	probeTimeout      time.Duration
 	confirmExit       func(pid int, timeout time.Duration) error
 	resolvePIDTimeout time.Duration
 }
@@ -143,6 +147,11 @@ func New(opts Options) (*Supervisor, error) {
 		resolveTimeout = 1500 * time.Millisecond
 	}
 
+	probeTimeout := opts.probeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = DefaultProbeTimeout
+	}
+
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -158,6 +167,7 @@ func New(opts Options) (*Supervisor, error) {
 		logger:            logger,
 		fsProbe:           opts.fsProbe,
 		compressionProbe:  opts.compressionProbe,
+		probeTimeout:      probeTimeout,
 		confirmExit:       confirmFn,
 		resolvePIDTimeout: resolveTimeout,
 	}, nil
@@ -752,7 +762,7 @@ func (s *Supervisor) CheckCompression(ctx context.Context) (CompressionCapabilit
 
 	probe := s.compressionProbe
 	if probe == nil {
-		probe = defaultCompressionProbe
+		probe = s.defaultCompressionProbe
 	}
 
 	caps, err := probe(ctx, s.binDir, s.dataDir)
@@ -768,7 +778,7 @@ func (s *Supervisor) CheckCompression(ctx context.Context) (CompressionCapabilit
 func (s *Supervisor) applyCompressionSettings(ctx context.Context, settings *ConfigSettings) {
 	probe := s.compressionProbe
 	if probe == nil {
-		probe = defaultCompressionProbe
+		probe = s.defaultCompressionProbe
 	}
 
 	caps, err := probe(ctx, s.binDir, s.dataDir)
@@ -802,6 +812,6 @@ func (s *Supervisor) applyCompressionSettings(ctx context.Context, settings *Con
 	}
 }
 
-func defaultCompressionProbe(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error) {
-	return ProbeCompression(ctx, binDir, dataDir)
+func (s *Supervisor) defaultCompressionProbe(ctx context.Context, binDir, dataDir string) (CompressionCapabilities, error) {
+	return ProbeCompressionWithTimeout(ctx, binDir, dataDir, s.probeTimeout)
 }
