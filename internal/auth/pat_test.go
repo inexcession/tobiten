@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
 )
@@ -838,5 +839,171 @@ func TestPATAuthenticator_BoundedDetachedRetainedState(t *testing.T) {
 	detached := detachBoundedLogAttr(subID)
 	if detached != subID || unsafe.StringData(detached) == unsafe.StringData(fullTok) {
 		t.Fatalf("detachBoundedLogAttr must detach from large token backing buffer")
+	}
+}
+
+func TestPATAuthenticator_WarmedCacheRoleDemotionIsolated(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	currentTime := func() time.Time { return now }
+
+	var verifyCalls atomic.Int32
+	fastVerify := func(secret, encodedHash string) (bool, error) {
+		verifyCalls.Add(1)
+		return encodedHash == "fast:"+secret, nil
+	}
+
+	curatorRole, ok := domain.BuiltInRoleByID(domain.RoleCuratorID)
+	if !ok {
+		t.Fatal("RoleCuratorID not found")
+	}
+	readerRole, ok := domain.BuiltInRoleByID(domain.RoleReaderID)
+	if !ok {
+		t.Fatal("RoleReaderID not found")
+	}
+	restrictedRole, ok := domain.BuiltInRoleByID(domain.RoleRestrictedReaderID)
+	if !ok {
+		t.Fatal("RoleRestrictedReaderID not found")
+	}
+
+	user := domain.User{ID: "u-demote", Username: "demote-target"}
+	store := newStubPATStore()
+	store.setUserAndRoles(user, []domain.Role{curatorRole})
+
+	// Credential ID, presented token, SecretHash, and Scopes remain constant throughout.
+	const (
+		credID         = "pat-demote-1"
+		presentedToken = "tobiten_pat_" + credID + "_secret-constant"
+	)
+	scheme := HashSchemeArgon2id
+	hash := "fast:secret-constant"
+	exp := now.Add(30 * time.Minute)
+	store.setCredential(&domain.Credential{
+		ID:         credID,
+		UserID:     user.ID,
+		Kind:       domain.CredentialKindPAT,
+		Scopes:     []domain.PATScope{domain.ScopeAdmin},
+		SecretHash: &hash,
+		HashScheme: &scheme,
+		ExpiresAt:  &exp,
+	})
+
+	patAuth, err := NewPATAuthenticator(store, PATOptions{
+		CacheTTL:        5 * time.Minute,
+		DisableThrottle: true,
+		Now:             currentTime,
+		VerifyFunc:      fastVerify,
+	})
+	if err != nil {
+		t.Fatalf("NewPATAuthenticator: %v", err)
+	}
+
+	// 1. Warm the PAT cache while user holds Curator role (admin PAT is capped by Curator perms).
+	p1, err := patAuth.AuthenticatePAT(t.Context(), presentedToken, "10.0.0.10")
+	if err != nil || p1 == nil {
+		t.Fatalf("initial Curator AuthenticatePAT: p=%+v err=%v", p1, err)
+	}
+	if verifyCalls.Load() != 1 {
+		t.Fatalf("verifyCalls after warm = %d, want 1", verifyCalls.Load())
+	}
+	if p1.HasPermission(domain.PermissionLibraryAdmin) {
+		t.Fatal("Curator's admin-scoped PAT must still be capped below library:admin")
+	}
+
+	metadataMutations := 0
+	progressMutations := 0
+	if err := app.Authorize(p1, domain.PermissionMetadataEdit, func() error {
+		metadataMutations++
+		return nil
+	}); err != nil {
+		t.Fatalf("Curator metadata:edit = %v, want nil", err)
+	}
+	if err := app.Authorize(p1, domain.PermissionProgressWrite, func() error {
+		progressMutations++
+		return nil
+	}); err != nil {
+		t.Fatalf("Curator progress:write = %v, want nil", err)
+	}
+	if metadataMutations != 1 || progressMutations != 1 {
+		t.Fatalf("mutation counts = (%d, %d), want (1, 1)", metadataMutations, progressMutations)
+	}
+
+	// 2. Advance clock within CacheTTL and demote ONLY role grants (Curator -> Reader).
+	now = now.Add(1 * time.Minute)
+	store.setUserAndRoles(user, []domain.Role{readerRole})
+
+	p2, err := patAuth.AuthenticatePAT(t.Context(), presentedToken, "10.0.0.10")
+	if err != nil || p2 == nil {
+		t.Fatalf("Reader AuthenticatePAT: p=%+v err=%v", p2, err)
+	}
+	if verifyCalls.Load() != 1 {
+		t.Fatalf("expected warm PAT cache hit after role demotion, verifyCalls = %d", verifyCalls.Load())
+	}
+	if p2.CredentialID != credID || p2.RequiresAllowLabels() {
+		t.Fatalf("unexpected principal metadata after Reader demotion: %+v", p2)
+	}
+	if err := app.Authorize(p2, domain.PermissionMetadataEdit, func() error {
+		metadataMutations++
+		return nil
+	}); !errors.Is(err, app.ErrForbidden) {
+		t.Fatalf("Reader metadata:edit = %v, want ErrForbidden", err)
+	}
+	if metadataMutations != 1 {
+		t.Fatalf("denied metadata callback ran after demotion: metadataMutations=%d, want 1", metadataMutations)
+	}
+	if err := app.Authorize(p2, domain.PermissionProgressWrite, func() error {
+		progressMutations++
+		return nil
+	}); err != nil {
+		t.Fatalf("Reader progress:write = %v, want nil", err)
+	}
+
+	// 3. Still within CacheTTL, demote ONLY role grants (Reader -> Restricted reader).
+	now = now.Add(1 * time.Minute)
+	store.setUserAndRoles(user, []domain.Role{restrictedRole})
+
+	p3, err := patAuth.AuthenticatePAT(t.Context(), presentedToken, "10.0.0.10")
+	if err != nil || p3 == nil {
+		t.Fatalf("Restricted reader AuthenticatePAT: p=%+v err=%v", p3, err)
+	}
+	if verifyCalls.Load() != 1 {
+		t.Fatalf("expected warm PAT cache hit on Restricted reader demotion, verifyCalls = %d", verifyCalls.Load())
+	}
+	if !p3.RequiresAllowLabels() {
+		t.Fatal("Restricted reader principal must expose RequiresAllowLabels() == true (I-5)")
+	}
+	if err := app.Authorize(p3, domain.PermissionMetadataEdit, func() error {
+		metadataMutations++
+		return nil
+	}); !errors.Is(err, app.ErrForbidden) || metadataMutations != 1 {
+		t.Fatalf("Restricted reader metadata:edit err=%v mutations=%d, want ErrForbidden and 1", err, metadataMutations)
+	}
+
+	// 4. Still within CacheTTL, remove all role grants; read & progress write are also denied.
+	now = now.Add(1 * time.Minute)
+	store.setUserAndRoles(user, nil)
+
+	p4, err := patAuth.AuthenticatePAT(t.Context(), presentedToken, "10.0.0.10")
+	if err != nil || p4 == nil {
+		t.Fatalf("Zero-role AuthenticatePAT: p=%+v err=%v", p4, err)
+	}
+	if verifyCalls.Load() != 1 {
+		t.Fatalf("expected warm PAT cache hit on zero-role demotion, verifyCalls = %d", verifyCalls.Load())
+	}
+	if err := app.Authorize(p4, domain.PermissionProgressWrite, func() error {
+		progressMutations++
+		return nil
+	}); !errors.Is(err, app.ErrForbidden) {
+		t.Fatalf("Zero-role progress:write = %v, want ErrForbidden", err)
+	}
+	if err := app.Authorize(p4, domain.PermissionLibraryRead, func() error {
+		progressMutations++
+		return nil
+	}); !errors.Is(err, app.ErrForbidden) {
+		t.Fatalf("Zero-role library:read = %v, want ErrForbidden", err)
+	}
+	if progressMutations != 2 {
+		t.Fatalf("progressMutations = %d, want 2 (no callback after zero-role demotion)", progressMutations)
 	}
 }

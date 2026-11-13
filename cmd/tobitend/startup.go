@@ -198,11 +198,11 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	if err != nil {
 		return err
 	}
-	services := &app.Services{
+	services := app.NewAuthorizingServices(&app.Services{
 		Setup:     setup,
 		BasicAuth: basicAuth,
 		PATAuth:   patAuth,
-	}
+	})
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
