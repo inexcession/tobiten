@@ -29,7 +29,9 @@ func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository {
 
 var _ storage.SessionRepository = (*SessionRepository)(nil)
 
-// CreateSession inserts a new session record after validating domain invariants.
+// CreateSession inserts a new session record atomically while holding a FOR SHARE lock
+// on the originating credential so concurrent revocation, expiry, deletion, or secret_hash
+// rotation cannot commit alongside an unverified or stale digest.
 func (r *SessionRepository) CreateSession(ctx context.Context, session *domain.Session) error {
 	if err := session.Validate(); err != nil {
 		return err
@@ -39,7 +41,30 @@ func (r *SessionRepository) CreateSession(ctx context.Context, session *domain.S
 		createdAt = time.Now().UTC()
 	}
 
-	row, err := r.q.CreateSession(ctx, CreateSessionParams{
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning session transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	qTx := r.q.WithTx(tx)
+	cred, err := qTx.GetCredentialForSessionLock(ctx, session.CredentialID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return storage.ErrCredentialChanged
+		}
+		return fmt.Errorf("locking credential %q for session creation: %w", session.CredentialID, err)
+	}
+	if cred.UserID != session.UserID ||
+		cred.RevokedAt != nil ||
+		(cred.ExpiresAt != nil && !createdAt.Before(*cred.ExpiresAt)) ||
+		!domain.MatchesCredentialSecretDigest(domain.CredentialKind(cred.Kind), cred.SecretHash, session.CredentialHashDigest) {
+		return storage.ErrCredentialChanged
+	}
+
+	row, err := qTx.CreateSession(ctx, CreateSessionParams{
 		ID:                   session.ID,
 		UserID:               session.UserID,
 		CredentialID:         session.CredentialID,
@@ -59,10 +84,13 @@ func (r *SessionRepository) CreateSession(ctx context.Context, session *domain.S
 			case "23505":
 				return storage.ErrAlreadyExists
 			case "23503":
-				return storage.ErrNotFound
+				return storage.ErrCredentialChanged
 			}
 		}
 		return fmt.Errorf("creating session %q: %w", session.ID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing session creation: %w", err)
 	}
 	*session = sessionFromRow(row)
 	return nil

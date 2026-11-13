@@ -52,13 +52,26 @@ func (m *Module) buildRouter() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path
 		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {
-			mux.ServeHTTP(w, r)
-			return
+			if r.Method == http.MethodPost {
+				mux.ServeHTTP(w, r)
+				return
+			}
+			// Only POST handlers are registered on /auth/login and /auth/setup; let ServeMux
+			// answer 405 for safe methods (e.g. direct module GET/HEAD calls) while failing closed
+			// on any other unsafe method without a verified Principal and CSRF check.
+			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+				mux.ServeHTTP(w, r)
+				return
+			}
 		}
 
 		p, ok := domain.PrincipalFromContext(r.Context())
 		if !ok || p == nil {
 			middleware.WriteUnauthorized(w, r)
+			return
+		}
+		if middleware.IsCSRFUnverified(r.Context()) {
+			middleware.WriteForbidden(w, r, "invalid csrf token")
 			return
 		}
 		mux.ServeHTTP(w, r)

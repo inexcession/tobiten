@@ -1,11 +1,44 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// HashSHA256Hex computes the lowercase SHA-256 hex digest of raw.
+func HashSHA256Hex(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+// MatchesCredentialSecretDigest reports whether the credential's current secret hash
+// matches expectedDigest for its CredentialKind.
+func MatchesCredentialSecretDigest(kind CredentialKind, secretHash *string, expectedDigest string) bool {
+	switch kind {
+	case CredentialKindPassword, CredentialKindPAT:
+		if secretHash == nil || expectedDigest == "" {
+			return false
+		}
+		actual := HashSHA256Hex(*secretHash)
+		return subtle.ConstantTimeCompare([]byte(actual), []byte(expectedDigest)) == 1
+	case CredentialKindOIDCLink:
+		if expectedDigest == "" {
+			return secretHash == nil
+		}
+		if secretHash == nil {
+			return false
+		}
+		actual := HashSHA256Hex(*secretHash)
+		return subtle.ConstantTimeCompare([]byte(actual), []byte(expectedDigest)) == 1
+	default:
+		return false
+	}
+}
 
 // SessionKind identifies which protocol or browser boundary owns a session row.
 type SessionKind string

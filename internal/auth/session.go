@@ -3,10 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,8 +44,7 @@ type SessionOptions struct {
 
 // HashOpaqueToken computes the lowercase SHA-256 hex digest of an opaque token or secret hash.
 func HashOpaqueToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
+	return domain.HashSHA256Hex(raw)
 }
 
 // SessionService authenticates password logins via BasicAuthenticator and mints
@@ -105,7 +101,7 @@ func (s *SessionService) Login(ctx context.Context, req app.LoginRequest) (*app.
 	}
 
 	clientIP := extractClientIP(req.RemoteAddr)
-	principal, err := s.basic.AuthenticateBasic(ctx, req.Username, req.Password, clientIP)
+	principal, verifiedDigest, err := s.basic.authenticateBasicWithDigest(ctx, req.Username, req.Password, clientIP)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidCredentials):
@@ -118,7 +114,7 @@ func (s *SessionService) Login(ctx context.Context, req app.LoginRequest) (*app.
 			return nil, err
 		}
 	}
-	if principal == nil || principal.CredentialID == "" {
+	if principal == nil || principal.CredentialID == "" || verifiedDigest == "" {
 		return nil, fmt.Errorf("%w: %w", app.ErrUnauthorized, ErrInvalidCredentials)
 	}
 
@@ -126,17 +122,16 @@ func (s *SessionService) Login(ctx context.Context, req app.LoginRequest) (*app.
 	cred, err := s.creds.GetCredentialByID(ctx, principal.CredentialID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil, ErrInvalidCredentials
+			return nil, fmt.Errorf("%w: %w", app.ErrUnauthorized, ErrInvalidCredentials)
 		}
 		return nil, fmt.Errorf("loading originating credential: %w", err)
 	}
-	if cred.UserID != principal.User.ID || cred.IsRevoked() || cred.IsExpired(now) || !cred.Kind.IsValid() {
-		return nil, ErrInvalidCredentials
-	}
-
-	var credHashDigest string
-	if cred.SecretHash != nil {
-		credHashDigest = HashOpaqueToken(*cred.SecretHash)
+	if cred.UserID != principal.User.ID ||
+		cred.IsRevoked() ||
+		cred.IsExpired(now) ||
+		!cred.Kind.IsValid() ||
+		!domain.MatchesCredentialSecretDigest(cred.Kind, cred.SecretHash, verifiedDigest) {
+		return nil, fmt.Errorf("%w: %w", app.ErrUnauthorized, ErrInvalidCredentials)
 	}
 
 	sessionID, err := domain.NewID()
@@ -161,12 +156,15 @@ func (s *SessionService) Login(ctx context.Context, req app.LoginRequest) (*app.
 		Kind:                 domain.SessionKindNative,
 		TokenHash:            HashOpaqueToken(sessionToken),
 		CSRFTokenHash:        HashOpaqueToken(csrfToken),
-		CredentialHashDigest: credHashDigest,
+		CredentialHashDigest: verifiedDigest,
 		CreatedAt:            now,
 		LastUsedAt:           &lastUsed,
 		ExpiresAt:            expiresAt,
 	}
 	if err := s.sessions.CreateSession(ctx, sess); err != nil {
+		if errors.Is(err, storage.ErrCredentialChanged) || errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %w", app.ErrUnauthorized, ErrInvalidCredentials)
+		}
 		return nil, fmt.Errorf("persisting native session: %w", err)
 	}
 
@@ -312,25 +310,7 @@ func matchesCredentialDigest(cred *domain.Credential, expectedDigest string) boo
 	if cred == nil {
 		return false
 	}
-	switch cred.Kind {
-	case domain.CredentialKindPassword, domain.CredentialKindPAT:
-		if cred.SecretHash == nil || expectedDigest == "" {
-			return false
-		}
-		actual := HashOpaqueToken(*cred.SecretHash)
-		return subtle.ConstantTimeCompare([]byte(actual), []byte(expectedDigest)) == 1
-	case domain.CredentialKindOIDCLink:
-		if expectedDigest == "" {
-			return cred.SecretHash == nil
-		}
-		if cred.SecretHash == nil {
-			return false
-		}
-		actual := HashOpaqueToken(*cred.SecretHash)
-		return subtle.ConstantTimeCompare([]byte(actual), []byte(expectedDigest)) == 1
-	default:
-		return false
-	}
+	return domain.MatchesCredentialSecretDigest(cred.Kind, cred.SecretHash, expectedDigest)
 }
 
 func countCookiesNamed(r *http.Request, name string) int {

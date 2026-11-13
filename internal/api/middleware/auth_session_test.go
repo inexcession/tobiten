@@ -215,3 +215,183 @@ func TestAuthMiddleware_CSRFAndBrowserOriginEnforcement(t *testing.T) {
 		t.Fatalf("valid basic + ambient cookie without CSRF: code=%d called=%v", rec.Code, handlerCalled)
 	}
 }
+
+type stubPATExplicitAuth struct {
+	user domain.User
+}
+
+func (a stubPATExplicitAuth) Name() string                { return "pat" }
+func (a stubPATExplicitAuth) Tier() module.CredentialTier { return module.CredentialTierExplicit }
+func (a stubPATExplicitAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	key := r.Header.Get("X-API-Key")
+	if key == "" {
+		return module.AuthPass(), nil
+	}
+	if key != "pat-valid-key" {
+		return module.AuthResult{}, errors.New("invalid pat")
+	}
+	role := domain.Role{ID: "r1", Name: "ADMIN", Permissions: domain.AllPermissions()}
+	pr := domain.NewPrincipal(a.user, []domain.Role{role}, domain.CredentialKindPAT, "cred-pat", nil)
+	return module.AuthSuccess(pr), nil
+}
+
+type stubProxyAuth struct {
+	user domain.User
+}
+
+func (a stubProxyAuth) Name() string                { return "trusted-proxy" }
+func (a stubProxyAuth) Tier() module.CredentialTier { return module.CredentialTierTrustedProxy }
+func (a stubProxyAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	u := r.Header.Get("X-Remote-User")
+	if u == "" {
+		return module.AuthPass(), nil
+	}
+	if u != a.user.Username {
+		return module.AuthResult{}, errors.New("unknown proxy user")
+	}
+	role := domain.Role{ID: "r1", Name: "ADMIN", Permissions: domain.AllPermissions()}
+	pr := domain.NewPrincipal(a.user, []domain.Role{role}, domain.CredentialKindPassword, "cred-proxy", nil)
+	return module.AuthSuccess(pr), nil
+}
+
+func TestAuthMiddleware_BrowserOriginChecksForExplicitAndProxyAuth(t *testing.T) {
+	t.Parallel()
+
+	alice := domain.User{ID: "u-1", Username: "alice"}
+	resolver := stubOriginResolver{origin: "https://comics.example.com", https: true, cookiePath: "/"}
+
+	var handlerCalls int
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalls++
+		w.WriteHeader(http.StatusOK)
+	})
+
+	h := Auth(AuthOptions{
+		Authenticators: []module.Authenticator{
+			stubBasicExplicitAuth{user: alice},
+			stubPATExplicitAuth{user: alice},
+			stubSessionCookieAuth{token: "sess-valid-1", csrfHash: sha256Hex("csrf-secret"), user: alice},
+			stubProxyAuth{user: alice},
+		},
+		OriginResolver:  resolver,
+		SubPathResolver: resolver,
+	})(next)
+
+	run := func(r *http.Request) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+
+	tiers := []struct {
+		name   string
+		method string
+		attach func(r *http.Request)
+	}{
+		{
+			name:   "basic",
+			method: http.MethodPost,
+			attach: func(r *http.Request) { r.SetBasicAuth("alice", "secret") },
+		},
+		{
+			name:   "pat",
+			method: http.MethodPut,
+			attach: func(r *http.Request) { r.Header.Set("X-API-Key", "pat-valid-key") },
+		},
+		{
+			name:   "trusted-proxy",
+			method: http.MethodDelete,
+			attach: func(r *http.Request) { r.Header.Set("X-Remote-User", "alice") },
+		},
+	}
+
+	badHeaders := []struct {
+		name   string
+		origin string
+		ref    string
+		fetch  string
+	}{
+		{name: "foreign origin", origin: "https://evil.example"},
+		{name: "scheme mismatch origin", origin: "http://comics.example.com"},
+		{name: "null origin", origin: "null"},
+		{name: "foreign referer", ref: "https://evil.example/csrf"},
+		{name: "cross-site fetch", fetch: "cross-site"},
+		{name: "same-site fetch", fetch: "same-site"},
+	}
+
+	for _, tier := range tiers {
+		for _, hdr := range badHeaders {
+			before := handlerCalls
+			r := httptest.NewRequest(tier.method, "/api/v1/libraries/1", nil)
+			tier.attach(r)
+			if hdr.origin != "" {
+				r.Header.Set("Origin", hdr.origin)
+			}
+			if hdr.ref != "" {
+				r.Header.Set("Referer", hdr.ref)
+			}
+			if hdr.fetch != "" {
+				r.Header.Set("Sec-Fetch-Site", hdr.fetch)
+			}
+			rec := run(r)
+			if rec.Code != http.StatusForbidden || handlerCalls != before {
+				t.Fatalf("%s + %s: expected 403 and zero handler calls, got code=%d calls=%d",
+					tier.name, hdr.name, rec.Code, handlerCalls-before)
+			}
+		}
+
+		// Matching same-origin browser request succeeds without X-CSRF-Token.
+		before := handlerCalls
+		r := httptest.NewRequest(tier.method, "/api/v1/libraries/1", nil)
+		tier.attach(r)
+		r.Header.Set("Origin", "https://comics.example.com")
+		r.Header.Set("Referer", "https://comics.example.com/libraries")
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		if rec := run(r); rec.Code != http.StatusOK || handlerCalls != before+1 {
+			t.Fatalf("%s same-origin without CSRF: code=%d calls=%d", tier.name, rec.Code, handlerCalls-before)
+		}
+
+		// Header-omitting non-browser client succeeds without X-CSRF-Token.
+		before = handlerCalls
+		r = httptest.NewRequest(tier.method, "/api/v1/libraries/1", nil)
+		tier.attach(r)
+		if rec := run(r); rec.Code != http.StatusOK || handlerCalls != before+1 {
+			t.Fatalf("%s non-browser omission: code=%d calls=%d", tier.name, rec.Code, handlerCalls-before)
+		}
+	}
+
+	// Invalid explicit Basic or PAT must fail 401 with no cookie fallback, regardless of Origin headers.
+	invalidExplicit := []struct {
+		name   string
+		origin string
+		attach func(r *http.Request)
+	}{
+		{
+			name:   "bad basic foreign origin",
+			origin: "https://evil.example",
+			attach: func(r *http.Request) {
+				r.SetBasicAuth("alice", "wrong")
+				r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: "sess-valid-1"})
+				r.Header.Set("X-CSRF-Token", "csrf-secret")
+			},
+		},
+		{
+			name:   "bad pat same origin",
+			origin: "https://comics.example.com",
+			attach: func(r *http.Request) {
+				r.Header.Set("X-API-Key", "pat-wrong")
+				r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: "sess-valid-1"})
+				r.Header.Set("X-CSRF-Token", "csrf-secret")
+			},
+		},
+	}
+	for _, tc := range invalidExplicit {
+		before := handlerCalls
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/1", nil)
+		tc.attach(r)
+		r.Header.Set("Origin", tc.origin)
+		if rec := run(r); rec.Code != http.StatusUnauthorized || handlerCalls != before {
+			t.Fatalf("%s: expected 401 without handler call, got code=%d calls=%d", tc.name, rec.Code, handlerCalls-before)
+		}
+	}
+}

@@ -275,7 +275,7 @@ func TestDaemonSessionCSRFAndKomgaCookieIsolation(t *testing.T) {
 			t.Fatalf("invalid explicit + valid cookie status=%d called=%v", w.Code, handlerCalled)
 		}
 
-		// Valid explicit Basic + ambient cookie succeeds on mutation without X-CSRF-Token.
+		// Valid explicit Basic + ambient cookie succeeds on non-browser or same-origin mutation without X-CSRF-Token.
 		r = httptest.NewRequest(http.MethodPost, "/api/v1/probe", nil)
 		r.RemoteAddr = "198.51.100.30:1002"
 		r.SetBasicAuth("alice", "initial-secret-123")
@@ -285,6 +285,36 @@ func TestDaemonSessionCSRFAndKomgaCookieIsolation(t *testing.T) {
 		srv.Handler().ServeHTTP(w, r)
 		if w.Code != http.StatusOK || !handlerCalled {
 			t.Fatalf("valid explicit + cookie mutation status=%d called=%v", w.Code, handlerCalled)
+		}
+
+		// Valid explicit Basic MUST still enforce browser-origin and Sec-Fetch-Site checks on unsafe writes.
+		for _, tc := range []struct {
+			name   string
+			origin string
+			fetch  string
+			want   int
+			called bool
+		}{
+			{name: "basic null origin", origin: "null", want: http.StatusForbidden, called: false},
+			{name: "basic foreign origin", origin: "https://evil.example", want: http.StatusForbidden, called: false},
+			{name: "basic cross-site fetch", fetch: "cross-site", want: http.StatusForbidden, called: false},
+			{name: "basic same-origin", origin: "https://comics.example.com", fetch: "same-origin", want: http.StatusOK, called: true},
+		} {
+			reqBasic := httptest.NewRequest(http.MethodPost, "/api/v1/probe", nil)
+			reqBasic.RemoteAddr = "198.51.100.30:1003"
+			reqBasic.SetBasicAuth("alice", "initial-secret-123")
+			if tc.origin != "" {
+				reqBasic.Header.Set("Origin", tc.origin)
+			}
+			if tc.fetch != "" {
+				reqBasic.Header.Set("Sec-Fetch-Site", tc.fetch)
+			}
+			recBasic := httptest.NewRecorder()
+			handlerCalled = false
+			srv.Handler().ServeHTTP(recBasic, reqBasic)
+			if recBasic.Code != tc.want || handlerCalled != tc.called {
+				t.Fatalf("%s: code=%d want=%d called=%v wantCalled=%v", tc.name, recBasic.Code, tc.want, handlerCalled, tc.called)
+			}
 		}
 		return nil
 	}
@@ -410,15 +440,45 @@ func TestDaemonSessionCredentialLifecycleRoleSyncAndLoginThrottle(t *testing.T) 
 		if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = secret_hash || '-rotated' WHERE id = $1`, p3.CredentialID); err != nil {
 			t.Fatalf("rotate secret_hash: %v", err)
 		}
+		var revokedCount int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE credential_id = $1 AND revoked_at IS NOT NULL`, p3.CredentialID).Scan(&revokedCount); err != nil {
+			t.Fatalf("query revoked session after hash rotation: %v", err)
+		}
+		if revokedCount != 1 {
+			t.Fatalf("expected 1 persistently revoked session after secret_hash rotation, got %d", revokedCount)
+		}
 		getPrincipal(http.StatusUnauthorized)
 
+		// Restoring the previous secret_hash MUST NOT resurrect the revoked session cookie.
 		if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = $2 WHERE id = $1`, p3.CredentialID, secondHash); err != nil {
 			t.Fatalf("restore secret_hash: %v", err)
 		}
+		var activeAfterRestore int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE credential_id = $1 AND revoked_at IS NULL`, p3.CredentialID).Scan(&activeAfterRestore); err != nil {
+			t.Fatalf("query active sessions after restore: %v", err)
+		}
+		if activeAfterRestore != 0 {
+			t.Fatalf("expected 0 active sessions after hash restore, got %d", activeAfterRestore)
+		}
+		getPrincipal(http.StatusUnauthorized)
+
+		// Mint a fresh session against the active credential, then test RevokeCredential persistent revocation.
+		rec3, cookie3, _ := performLogin(t, srv.Handler(), "/api/v1/auth/login", `{"username":"alice","password":"second-secret-123"}`, "198.51.100.40:1003", nil)
+		if rec3.Code != http.StatusOK || cookie3 == nil {
+			t.Fatalf("third login failed: code=%d", rec3.Code)
+		}
+		cookie = cookie3
 		getPrincipal(http.StatusOK)
 
 		if err := userRepo.RevokeCredential(ctx, p3.CredentialID, time.Now().UTC()); err != nil {
 			t.Fatalf("RevokeCredential: %v", err)
+		}
+		var activeAfterRevoke int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE credential_id = $1 AND revoked_at IS NULL`, p3.CredentialID).Scan(&activeAfterRevoke); err != nil {
+			t.Fatalf("query active sessions after revoke: %v", err)
+		}
+		if activeAfterRevoke != 0 {
+			t.Fatalf("expected 0 active sessions after RevokeCredential, got %d", activeAfterRevoke)
 		}
 		getPrincipal(http.StatusUnauthorized)
 

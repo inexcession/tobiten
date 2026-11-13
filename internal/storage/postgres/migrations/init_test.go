@@ -457,6 +457,87 @@ func TestMigration0002_Sessions(t *testing.T) {
 	}
 }
 
+func TestMigration0003_SessionCredentialInvalidationTrigger(t *testing.T) {
+	t.Parallel()
+	db := apply0001Init(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	applied, err := migrations.Applied(ctx, db)
+	if err != nil {
+		t.Fatalf("querying applied migrations: %v", err)
+	}
+	if len(applied) < 3 || applied[2].Version != 3 || applied[2].Name != "0003_session_credential_invalidation.sql" {
+		t.Fatalf("expected 0003_session_credential_invalidation.sql as third migration, got %+v", applied)
+	}
+
+	if _, err := db.Exec(ctx, `INSERT INTO users (id, username) VALUES ('u1', 'alice'), ('u2', 'bob')`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO credentials (id, user_id, kind, secret_hash)
+		VALUES ('c1', 'u1', 'PASSWORD', 'hash-orig'), ('c2', 'u2', 'PASSWORD', 'hash-c2')`); err != nil {
+		t.Fatalf("insert credentials: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO sessions (id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, expires_at)
+		VALUES
+			('s1', 'u1', 'c1', 'NATIVE', 'th1', 'ch1', 'd1', now() + interval '1 hour'),
+			('s2', 'u2', 'c2', 'NATIVE', 'th2', 'ch2', 'd2', now() + interval '1 hour')`); err != nil {
+		t.Fatalf("insert sessions: %v", err)
+	}
+
+	// Updating last_used_at MUST NOT revoke active sessions.
+	if _, err := db.Exec(ctx, `UPDATE credentials SET last_used_at = now() WHERE id = 'c1'`); err != nil {
+		t.Fatalf("update last_used_at: %v", err)
+	}
+	var rev1, rev2 *time.Time
+	if err := db.QueryRow(ctx, `SELECT revoked_at FROM sessions WHERE id = 's1'`).Scan(&rev1); err != nil {
+		t.Fatalf("query s1 revoked_at: %v", err)
+	}
+	if rev1 != nil {
+		t.Fatalf("expected last_used_at update not to revoke s1, got %v", rev1)
+	}
+
+	// Updating secret_hash on c1 revokes s1 without affecting c2's session s2.
+	if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = 'hash-new' WHERE id = 'c1'`); err != nil {
+		t.Fatalf("update secret_hash: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT revoked_at FROM sessions WHERE id = 's1'`).Scan(&rev1); err != nil {
+		t.Fatalf("query s1 after hash rotation: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT revoked_at FROM sessions WHERE id = 's2'`).Scan(&rev2); err != nil {
+		t.Fatalf("query s2 after c1 hash rotation: %v", err)
+	}
+	if rev1 == nil || rev2 != nil {
+		t.Fatalf("expected s1 revoked (%v) and s2 untouched (%v)", rev1, rev2)
+	}
+
+	// Restoring original secret_hash leaves s1 permanently revoked.
+	if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = 'hash-orig' WHERE id = 'c1'`); err != nil {
+		t.Fatalf("restore secret_hash: %v", err)
+	}
+	var rev1Restored *time.Time
+	if err := db.QueryRow(ctx, `SELECT revoked_at FROM sessions WHERE id = 's1'`).Scan(&rev1Restored); err != nil {
+		t.Fatalf("query s1 after hash restore: %v", err)
+	}
+	if rev1Restored == nil {
+		t.Fatal("expected s1 to remain permanently revoked after old secret_hash restoration")
+	}
+
+	// Setting revoked_at on c2 revokes s2 persistently.
+	if _, err := db.Exec(ctx, `UPDATE credentials SET revoked_at = now() WHERE id = 'c2'`); err != nil {
+		t.Fatalf("revoke c2: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT revoked_at FROM sessions WHERE id = 's2'`).Scan(&rev2); err != nil {
+		t.Fatalf("query s2 after revoke: %v", err)
+	}
+	if rev2 == nil {
+		t.Fatal("expected s2 to be persistently revoked when c2 revoked")
+	}
+}
+
 func isCheckViolation(err error) bool {
 	if pgErr, ok := err.(*pgconn.PgError); ok {
 		return pgErr.Code == "23514" // check_violation

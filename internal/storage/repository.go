@@ -14,6 +14,10 @@ var (
 
 	// ErrAlreadyExists is returned when a unique constraint or primary key violation occurs.
 	ErrAlreadyExists = errors.New("record already exists")
+
+	// ErrCredentialChanged is returned when the originating credential is missing, revoked,
+	// expired, or rotated compared to the verified revision.
+	ErrCredentialChanged = errors.New("originating credential changed or invalid")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.

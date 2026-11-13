@@ -2,6 +2,8 @@ package api_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -852,6 +854,240 @@ func TestM1AC5_RoutingSecurityRegressions_ExemptionsBoundToPublicHandlers(t *tes
 		}
 		if recLogin.Code != http.StatusOK {
 			t.Errorf("login status = %d, want 200 (body: %s)", recLogin.Code, recLogin.Body.String())
+		}
+	})
+}
+
+type stubCookieSessionAuth struct {
+	sessions  map[string]string // session token -> expected csrf raw token
+	principal *domain.Principal
+}
+
+func (a *stubCookieSessionAuth) Name() string                { return "stub-session-cookie" }
+func (a *stubCookieSessionAuth) Tier() module.CredentialTier { return module.CredentialTierCookie }
+func (a *stubCookieSessionAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	c, err := r.Cookie("tobiten_session")
+	if errors.Is(err, http.ErrNoCookie) {
+		return module.AuthPass(), nil
+	}
+	if err != nil {
+		return module.AuthResult{Handled: true}, err
+	}
+	csrfRaw, ok := a.sessions[c.Value]
+	if !ok {
+		return module.AuthResult{Handled: true}, errors.New("invalid session")
+	}
+	sum := sha256.Sum256([]byte(csrfRaw))
+	return module.AuthSuccessCookie(a.principal, hex.EncodeToString(sum[:])), nil
+}
+
+func TestM1T86_CSRFExemptionsBoundToPublicHandlers(t *testing.T) {
+	testPrincipal := domain.NewPrincipal(
+		domain.User{ID: "usr_csrf", Username: "csrf-sentinel"},
+		domain.BuiltInRoles()[:1],
+		domain.CredentialKindPassword,
+		"cred_csrf",
+		nil,
+	)
+	cookieAuth := &stubCookieSessionAuth{
+		sessions: map[string]string{
+			"sess-a": "csrf-a",
+			"sess-b": "csrf-b",
+		},
+		principal: testPrincipal,
+	}
+
+	postWithCookie := func(h http.Handler, path, cookieVal, csrfHdr, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if cookieVal != "" {
+			req.AddCookie(&http.Cookie{Name: "tobiten_session", Value: cookieVal})
+		}
+		if csrfHdr != "" {
+			req.Header.Set("X-CSRF-Token", csrfHdr)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	assertProtectedMutationCSRFFailsClosed := func(t *testing.T, h http.Handler, path, marker string, calls *int) {
+		t.Helper()
+		for _, tc := range []struct {
+			name string
+			csrf string
+		}{
+			{name: "missing csrf", csrf: ""},
+			{name: "wrong csrf", csrf: "wrong-csrf"},
+			{name: "cross-session csrf", csrf: "csrf-b"},
+		} {
+			before := *calls
+			rec := postWithCookie(h, path, "sess-a", tc.csrf, `{}`)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s POST %s status=%d, want 403 (body=%s)", tc.name, path, rec.Code, rec.Body.String())
+			}
+			if *calls != before || strings.Contains(rec.Body.String(), marker) {
+				t.Fatalf("SECURITY VIOLATION (%s): protected sentinel at %s executed without valid CSRF", tc.name, path)
+			}
+		}
+
+		// Valid session-bound CSRF executes protected handler (direct precedence preserved).
+		before := *calls
+		recOK := postWithCookie(h, path, "sess-a", "csrf-a", `{}`)
+		if recOK.Code != http.StatusOK || *calls != before+1 || recOK.Body.String() != marker {
+			t.Fatalf("valid csrf POST %s: code=%d calls=%d body=%q", path, recOK.Code, *calls-before, recOK.Body.String())
+		}
+	}
+
+	t.Run("subpath collision /comics/api/v1/auth/login preserves CSRF while genuine /api/v1/auth/login works", func(t *testing.T) {
+		reg := module.NewRegistry()
+		_ = reg.Register(api.NewSystemModule())
+		_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+
+		marker := "PROTECTED_COLLISION_LOGIN"
+		collisionCalls := 0
+		collisionMod := module.NewSimpleModule("protected-collision")
+		collisionMod.Mounts = []module.RouteMount{
+			{
+				ModuleName: "protected-collision",
+				Prefix:     "/comics/api/v1/auth/login",
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					collisionCalls++
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(marker))
+				}),
+			},
+		}
+		_ = reg.Register(collisionMod)
+
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:         &config.Config{Host: "127.0.0.1", Port: 0, BaseURL: "http://localhost:8080/comics"},
+			Registry:       reg,
+			Authenticators: []module.Authenticator{cookieAuth},
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		h := srv.Handler()
+
+		// Colliding protected route enforces X-CSRF-Token even when authenticated via session cookie.
+		assertProtectedMutationCSRFFailsClosed(t, h, "/comics/api/v1/auth/login", marker, &collisionCalls)
+
+		// Genuine OpenAPI login with active cookie and NO X-CSRF-Token succeeds without hitting collision sentinel.
+		before := collisionCalls
+		recLogin := postWithCookie(h, "/api/v1/auth/login", "sess-a", "", `{"username":"admin","password":"password"}`)
+		if recLogin.Code != http.StatusOK || collisionCalls != before || strings.Contains(recLogin.Body.String(), marker) {
+			t.Fatalf("genuine /api/v1/auth/login failed: code=%d calls=%d body=%s", recLogin.Code, collisionCalls-before, recLogin.Body.String())
+		}
+
+		// When the colliding module is absent, /comics/api/v1/auth/login resolves to public OpenAPI login cleanly.
+		regClean := module.NewRegistry()
+		_ = regClean.Register(api.NewSystemModule())
+		_ = regClean.Register(openapi.NewModule(app.NewStubServices()))
+		srvClean, err := api.NewServer(api.ServerOptions{
+			Config:         &config.Config{Host: "127.0.0.1", Port: 0, BaseURL: "http://localhost:8080/comics"},
+			Registry:       regClean,
+			Authenticators: []module.Authenticator{cookieAuth},
+		})
+		if err != nil {
+			t.Fatalf("NewServer(clean): %v", err)
+		}
+		recAlias := postWithCookie(srvClean.Handler(), "/comics/api/v1/auth/login", "sess-a", "", `{"username":"admin","password":"password"}`)
+		if recAlias.Code != http.StatusOK {
+			t.Fatalf("uncollided alias /comics/api/v1/auth/login status=%d, want 200 (body=%s)", recAlias.Code, recAlias.Body.String())
+		}
+	})
+
+	t.Run("encoded subpath collision /a%2Fb decoded route vs escaped alias", func(t *testing.T) {
+		reg := module.NewRegistry()
+		_ = reg.Register(api.NewSystemModule())
+		_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+
+		marker := "PROTECTED_ENCODED_COLLISION"
+		collisionCalls := 0
+		mod := module.NewSimpleModule("encoded-collision")
+		mod.Mounts = []module.RouteMount{
+			{
+				ModuleName: "encoded-collision",
+				Prefix:     "/a/b/api/v1/auth/login",
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					collisionCalls++
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(marker))
+				}),
+			},
+		}
+		_ = reg.Register(mod)
+
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:         &config.Config{Host: "127.0.0.1", Port: 0, BaseURL: "http://localhost:8080/a%2Fb"},
+			Registry:       reg,
+			Authenticators: []module.Authenticator{cookieAuth},
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		h := srv.Handler()
+
+		// Decoded path hits colliding protected mount and must enforce X-CSRF-Token.
+		assertProtectedMutationCSRFFailsClosed(t, h, "/a/b/api/v1/auth/login", marker, &collisionCalls)
+		assertProtectedMutationCSRFFailsClosed(t, h, "/a/b/api/v1/auth/login/", marker, &collisionCalls)
+
+		// Canonical escaped subpath alias and direct route hit OpenAPI login with ambient cookie and no CSRF token.
+		for _, alias := range []string{"/a%2Fb/api/v1/auth/login", "/api/v1/auth/login"} {
+			before := collisionCalls
+			recLogin := postWithCookie(h, alias, "sess-a", "", `{"username":"admin","password":"password"}`)
+			if recLogin.Code != http.StatusOK || collisionCalls != before || strings.Contains(recLogin.Body.String(), marker) {
+				t.Fatalf("genuine %s status=%d calls=%d body=%s", alias, recLogin.Code, collisionCalls-before, recLogin.Body.String())
+			}
+		}
+	})
+
+	t.Run("missing or disabled openapi with protected root fallback enforces CSRF", func(t *testing.T) {
+		cases := []struct {
+			name            string
+			registerOpenAPI bool
+		}{
+			{name: "openapi absent", registerOpenAPI: false},
+			{name: "openapi disabled", registerOpenAPI: true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				reg := module.NewRegistry()
+				_ = reg.Register(api.NewSystemModule())
+				cfg := &config.Config{Host: "127.0.0.1", Port: 0, BaseURL: "http://localhost:8080"}
+				if tc.registerOpenAPI {
+					_ = reg.Register(openapi.NewModule(app.NewStubServices()))
+					cfg.DisabledModules = []string{"openapi"}
+				}
+				marker := "PROTECTED_ROOT_FALLBACK"
+				rootCalls := 0
+				rootMod := module.NewSimpleModule("protected-root")
+				rootMod.Mounts = []module.RouteMount{
+					{
+						ModuleName: "protected-root",
+						Prefix:     "/",
+						Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							rootCalls++
+							w.WriteHeader(http.StatusOK)
+							_, _ = w.Write([]byte(marker))
+						}),
+					},
+				}
+				_ = reg.Register(rootMod)
+
+				srv, err := api.NewServer(api.ServerOptions{
+					Config:         cfg,
+					Registry:       reg,
+					Authenticators: []module.Authenticator{cookieAuth},
+				})
+				if err != nil {
+					t.Fatalf("NewServer: %v", err)
+				}
+				h := srv.Handler()
+
+				assertProtectedMutationCSRFFailsClosed(t, h, "/api/v1/auth/login", marker, &rootCalls)
+				assertProtectedMutationCSRFFailsClosed(t, h, "/api/v1/auth/setup", marker, &rootCalls)
+			})
 		}
 	})
 }

@@ -1,3 +1,9 @@
+-- name: GetCredentialForSessionLock :one
+SELECT id, user_id, kind, secret_hash, expires_at, revoked_at
+FROM credentials
+WHERE id = $1
+FOR SHARE;
+
 -- name: CreateSession :one
 INSERT INTO sessions (
     id,

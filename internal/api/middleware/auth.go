@@ -108,13 +108,38 @@ func WriteForbidden(w http.ResponseWriter, r *http.Request, msg string) {
 	}
 }
 
-// RequirePrincipal wraps an http.Handler to ensure a verified domain.Principal exists in context.
-// Unauthenticated requests receive 401 Unauthorized with WWW-Authenticate: Basic and never an empty 200.
+type csrfUnverifiedCtxKey struct{}
+
+// WithCSRFUnverified marks ctx as carrying a cookie-authenticated request whose
+// session-bound CSRF token has not been verified (deferred exclusively to genuine
+// public login/setup handlers).
+func WithCSRFUnverified(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, csrfUnverifiedCtxKey{}, true)
+}
+
+// IsCSRFUnverified reports whether ctx carries an unverified cookie CSRF state.
+func IsCSRFUnverified(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(csrfUnverifiedCtxKey{}).(bool)
+	return v
+}
+
+// RequirePrincipal wraps an http.Handler to ensure a verified domain.Principal exists in context
+// and that any cookie-authenticated CSRF token has been verified.
 func RequirePrincipal(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := domain.PrincipalFromContext(r.Context())
 		if !ok || p == nil {
 			WriteUnauthorized(w, r)
+			return
+		}
+		if IsCSRFUnverified(r.Context()) {
+			WriteForbidden(w, r, "invalid csrf token")
 			return
 		}
 		h.ServeHTTP(w, r)
@@ -564,29 +589,44 @@ func verifySessionCSRF(r *http.Request, expectedHash string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expectedHash)) == 1
 }
 
+func publicAllowlistOwnerActive(reg module.Registry, targetPath string) bool {
+	if reg == nil {
+		return true
+	}
+	switch targetPath {
+	case "/healthz":
+		return reg.Module("system") != nil && reg.IsEnabled("system")
+	case "/api/v1/auth/login", "/api/v1/auth/setup":
+		return reg.Module("openapi") != nil && reg.IsEnabled("openapi")
+	default:
+		return false
+	}
+}
+
 func enforceAuthenticatedMutationPolicy(
 	w http.ResponseWriter,
 	r *http.Request,
 	expectedOrigin string,
 	res module.AuthResult,
-	allowlistMutation bool,
-) bool {
+	deferPublicCSRF bool,
+) (ok bool, csrfUnverified bool) {
 	if isSafeMethod(r.Method) {
-		return true
+		return true, false
 	}
-	if allowlistMutation || res.RequiresCSRF {
-		if !validateBrowserOriginAndFetchMetadata(r, expectedOrigin) {
-			WriteForbidden(w, r, "forbidden")
-			return false
-		}
+	if !validateBrowserOriginAndFetchMetadata(r, expectedOrigin) {
+		WriteForbidden(w, r, "forbidden")
+		return false, false
 	}
-	if res.RequiresCSRF && !allowlistMutation {
+	if res.RequiresCSRF {
 		if !verifySessionCSRF(r, res.CSRFTokenHash) {
+			if deferPublicCSRF {
+				return true, true
+			}
 			WriteForbidden(w, r, "invalid csrf token")
-			return false
+			return false, false
 		}
 	}
-	return true
+	return true, false
 }
 
 // Auth returns HTTP middleware that enforces Tobiten's mandatory authentication contract
@@ -614,13 +654,14 @@ func Auth(opts AuthOptions) func(http.Handler) http.Handler {
 
 			target, matched := matchRequestAllowlist(r, subDecoded, subEscaped)
 			methodAllowed := matched && isMethodAllowed(r.Method, target.allowedMethods)
+			ownerActive := matched && publicAllowlistOwnerActive(opts.Registry, target.path)
 
 			outcome := authenticateChainOutcome(r, collectAuthenticators(opts))
 			if outcome.err != nil {
-				// Allow stale/expired session cookies on allowlisted routes (e.g. POST /api/v1/auth/login
+				// Allow stale/expired session cookies on active allowlisted routes (e.g. POST /api/v1/auth/login
 				// or GET /healthz) so users can always re-authenticate, while still blocking invalid
 				// explicit credentials and blocking invalid cookies on all protected routes.
-				if matched && outcome.tier == module.CredentialTierCookie {
+				if matched && ownerActive && outcome.tier == module.CredentialTierCookie {
 					outcome = authOutcome{}
 				} else {
 					WriteUnauthorized(w, r)
@@ -629,10 +670,20 @@ func Auth(opts AuthOptions) func(http.Handler) http.Handler {
 			}
 
 			if outcome.res.Handled && outcome.res.Principal != nil {
-				if !enforceAuthenticatedMutationPolicy(w, r, expectedOrigin, outcome.res, methodAllowed) {
+				ok, csrfUnverified := enforceAuthenticatedMutationPolicy(
+					w,
+					r,
+					expectedOrigin,
+					outcome.res,
+					methodAllowed && ownerActive,
+				)
+				if !ok {
 					return
 				}
 				ctx := domain.ContextWithPrincipal(r.Context(), outcome.res.Principal)
+				if csrfUnverified {
+					ctx = WithCSRFUnverified(ctx)
+				}
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}

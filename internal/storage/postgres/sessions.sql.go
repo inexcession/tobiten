@@ -112,6 +112,36 @@ func (q *Queries) DeleteSessionsByCredentialID(ctx context.Context, credentialID
 	return result.RowsAffected(), nil
 }
 
+const getCredentialForSessionLock = `-- name: GetCredentialForSessionLock :one
+SELECT id, user_id, kind, secret_hash, expires_at, revoked_at
+FROM credentials
+WHERE id = $1
+FOR SHARE
+`
+
+type GetCredentialForSessionLockRow struct {
+	ID         string
+	UserID     string
+	Kind       string
+	SecretHash *string
+	ExpiresAt  *time.Time
+	RevokedAt  *time.Time
+}
+
+func (q *Queries) GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error) {
+	row := q.db.QueryRow(ctx, getCredentialForSessionLock, id)
+	var i GetCredentialForSessionLockRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.SecretHash,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
 SELECT id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, created_at, last_used_at, expires_at, revoked_at
 FROM sessions

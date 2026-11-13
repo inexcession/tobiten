@@ -141,55 +141,63 @@ func (a *BasicAuthenticator) Authenticate(r *http.Request) (module.AuthResult, e
 
 // AuthenticateBasic verifies username/password credentials and resolves a Principal with live roles.
 func (a *BasicAuthenticator) AuthenticateBasic(ctx context.Context, username, password, clientIP string) (*domain.Principal, error) {
+	p, _, err := a.authenticateBasicWithDigest(ctx, username, password, clientIP)
+	return p, err
+}
+
+// authenticateBasicWithDigest verifies username/password credentials and returns both the
+// resolved Principal and the SHA-256 hex digest of the exact credential secret_hash verified.
+func (a *BasicAuthenticator) authenticateBasicWithDigest(ctx context.Context, username, password, clientIP string) (*domain.Principal, string, error) {
 	if username == "" || password == "" || strings.ContainsRune(username, 0) || strings.ContainsRune(password, 0) {
 		a.rt.throttles.recordFailure(clientIP, "", a.rt.now())
-		return nil, ErrInvalidCredentials
+		return nil, "", ErrInvalidCredentials
 	}
 
 	now := a.rt.now()
 	if a.rt.throttles.isThrottled(clientIP, username, now) {
 		a.logThrottled(ctx, clientIP, username)
-		return nil, ErrAuthThrottled
+		return nil, "", ErrAuthThrottled
 	}
 
 	user, err := a.store.GetUserByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			if _, vErr := a.rt.verifyWithBounds(ctx, clientIP, username, password, dummyArgon2idHash); vErr != nil {
-				return nil, vErr
+				return nil, "", vErr
 			}
 			a.rt.throttles.recordFailure(clientIP, username, a.rt.now())
-			return nil, ErrInvalidCredentials
+			return nil, "", ErrInvalidCredentials
 		}
-		return nil, err
+		return nil, "", err
 	}
 
 	cred, err := a.store.GetActivePasswordCredentialByUserID(ctx, user.ID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			if _, vErr := a.rt.verifyWithBounds(ctx, clientIP, username, password, dummyArgon2idHash); vErr != nil {
-				return nil, vErr
+				return nil, "", vErr
 			}
 			a.rt.throttles.recordFailure(clientIP, username, a.rt.now())
-			return nil, ErrInvalidCredentials
+			return nil, "", ErrInvalidCredentials
 		}
-		return nil, err
+		return nil, "", err
 	}
 
 	if !isUsablePasswordCredential(cred, now) {
 		a.rt.throttles.recordFailure(clientIP, username, now)
-		return nil, ErrInvalidCredentials
+		return nil, "", ErrInvalidCredentials
 	}
 
+	verifiedDigest := HashOpaqueToken(*cred.SecretHash)
 	cacheKey := a.computeCacheKey(user.ID, username, cred.ID, *cred.SecretHash, password)
 	if a.rt.cache == nil || !a.rt.cache.get(cacheKey, now) {
 		match, vErr := a.rt.verifyWithBounds(ctx, clientIP, username, password, *cred.SecretHash)
 		if vErr != nil {
-			return nil, vErr
+			return nil, "", vErr
 		}
 		if !match {
 			a.rt.throttles.recordFailure(clientIP, username, a.rt.now())
-			return nil, ErrInvalidCredentials
+			return nil, "", ErrInvalidCredentials
 		}
 		if a.rt.cache != nil {
 			a.rt.cache.put(cacheKey, a.rt.now().Add(a.rt.cacheTTL))
@@ -200,10 +208,10 @@ func (a *BasicAuthenticator) AuthenticateBasic(ctx context.Context, username, pa
 
 	roles, err := a.store.ListUserRoles(ctx, user.ID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes), nil
+	return domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes), verifiedDigest, nil
 }
 
 // ClearCache removes all cached password verification entries.

@@ -31,8 +31,12 @@ func newMemSessionStore() *memSessionStore {
 	}
 }
 
-func (m *memSessionStore) addUserWithPassword(t *testing.T, id, username, password string, roles ...domain.Role) string {
+func (m *memSessionStore) addUserWithPassword(t *testing.T, password string, roles ...domain.Role) string {
 	t.Helper()
+	const (
+		id       = "u1"
+		username = "alice"
+	)
 	hash, err := HashPassword(password)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
@@ -121,6 +125,14 @@ func (m *memSessionStore) CreateSession(_ context.Context, s *domain.Session) er
 	if err := s.Validate(); err != nil {
 		return err
 	}
+	cred, ok := m.creds[s.CredentialID]
+	if !ok ||
+		cred.UserID != s.UserID ||
+		cred.IsRevoked() ||
+		cred.IsExpired(s.CreatedAt) ||
+		!domain.MatchesCredentialSecretDigest(cred.Kind, cred.SecretHash, s.CredentialHashDigest) {
+		return storage.ErrCredentialChanged
+	}
 	for _, existing := range m.sessions {
 		if existing.TokenHash == s.TokenHash {
 			return storage.ErrAlreadyExists
@@ -128,6 +140,53 @@ func (m *memSessionStore) CreateSession(_ context.Context, s *domain.Session) er
 	}
 	m.sessions[s.ID] = *s
 	return nil
+}
+
+func (m *memSessionStore) rotateSecretHash(credID, newHash string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.creds[credID]
+	if ok {
+		c.SecretHash = &newHash
+		m.creds[credID] = c
+	}
+	ts := at
+	for id, s := range m.sessions {
+		if s.CredentialID == credID && s.RevokedAt == nil {
+			s.RevokedAt = &ts
+			m.sessions[id] = s
+		}
+	}
+}
+
+func (m *memSessionStore) revokeCredential(credID string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.creds[credID]
+	if ok {
+		ts := at
+		c.RevokedAt = &ts
+		m.creds[credID] = c
+	}
+	ts := at
+	for id, s := range m.sessions {
+		if s.CredentialID == credID && s.RevokedAt == nil {
+			s.RevokedAt = &ts
+			m.sessions[id] = s
+		}
+	}
+}
+
+func (m *memSessionStore) activeSessionCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	count := 0
+	for _, s := range m.sessions {
+		if s.RevokedAt == nil {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *memSessionStore) GetSessionByTokenHash(_ context.Context, tokenHash string) (*domain.Session, error) {
@@ -245,7 +304,7 @@ func TestSessionLifecycleAndInvalidation(t *testing.T) {
 
 	adminRole := domain.Role{ID: "r-admin", Name: "ADMIN", Permissions: domain.AllPermissions()}
 	readerRole := domain.Role{ID: "r-reader", Name: "READER", Permissions: []domain.Permission{domain.PermissionLibraryRead}}
-	credID := store.addUserWithPassword(t, "u1", "alice", "correct-horse-battery", adminRole)
+	credID := store.addUserWithPassword(t, "correct-horse-battery", adminRole)
 
 	res, err := svc.Login(context.Background(), app.LoginRequest{
 		Username:   "alice",
@@ -303,56 +362,72 @@ func TestSessionLifecycleAndInvalidation(t *testing.T) {
 		t.Fatalf("expected live demotion to READER only, got caps=%v", authRes.Principal.Permissions)
 	}
 
-	// In-place password hash replacement immediately invalidates session.
+	// In-place password hash replacement permanently invalidates session in storage even if old hash is restored.
 	newHash, err := HashPassword("rotated-password-999")
 	if err != nil {
 		t.Fatalf("hash replacement password: %v", err)
 	}
 	store.mu.Lock()
 	origHash := *store.creds[credID].SecretHash
-	c := store.creds[credID]
-	c.SecretHash = &newHash
-	store.creds[credID] = c
 	store.mu.Unlock()
+	store.rotateSecretHash(credID, newHash, now)
 	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected invalidation on password hash replacement, got %v", err)
 	}
-
-	// Restore hash digest to continue testing revocation, deletion, and expiry.
-	store.mu.Lock()
-	c.SecretHash = &origHash
-	store.creds[credID] = c
-	store.mu.Unlock()
-	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); err != nil {
-		t.Fatalf("expected restored hash digest to authenticate, got %v", err)
+	store.rotateSecretHash(credID, origHash, now)
+	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expected old session to stay permanently invalidated after restoring old hash, got %v", err)
 	}
 
-	// Credential revocation immediately invalidates session.
-	revAt := now
-	store.mu.Lock()
-	c.RevokedAt = &revAt
-	store.creds[credID] = c
-	store.mu.Unlock()
-	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
+	// Mint a second session after rotation, test expiry on a third session, revocation, and deletion.
+	res2, err := svc.Login(context.Background(), app.LoginRequest{
+		Username:   "alice",
+		Password:   "correct-horse-battery",
+		RemoteAddr: "192.0.2.10:12346",
+	})
+	if err != nil {
+		t.Fatalf("second login failed: %v", err)
+	}
+	store.revokeCredential(credID, now)
+	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res2.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected invalidation on credential revocation, got %v", err)
 	}
-
-	// Clear revocation, then verify session expiry.
 	store.mu.Lock()
+	c := store.creds[credID]
 	c.RevokedAt = nil
 	store.creds[credID] = c
 	store.mu.Unlock()
+	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res2.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expected revoked session to remain permanently invalid, got %v", err)
+	}
+
+	res3, err := svc.Login(context.Background(), app.LoginRequest{
+		Username:   "alice",
+		Password:   "correct-horse-battery",
+		RemoteAddr: "192.0.2.10:12347",
+	})
+	if err != nil {
+		t.Fatalf("third login failed: %v", err)
+	}
 	now = now.Add(2 * time.Hour)
-	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
+	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res3.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected invalidation after session TTL, got %v", err)
 	}
 	now = now.Add(-2 * time.Hour)
 
+	res4, err := svc.Login(context.Background(), app.LoginRequest{
+		Username:   "alice",
+		Password:   "correct-horse-battery",
+		RemoteAddr: "192.0.2.10:12348",
+	})
+	if err != nil {
+		t.Fatalf("fourth login failed: %v", err)
+	}
 	// Deleting originating credential immediately invalidates session.
 	store.mu.Lock()
 	delete(store.creds, credID)
 	store.mu.Unlock()
-	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
+	if _, err := auth.Authenticate(reqWithCookie(NativeSessionCookieName, res4.SessionToken)); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected invalidation on credential deletion, got %v", err)
 	}
 }
@@ -362,7 +437,7 @@ func TestSessionRejectsNonNativeSessionKind(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	store, _, auth := newTestSessionHarness(t, func() time.Time { return now })
 	readerRole := domain.Role{ID: "r-reader", Name: "READER", Permissions: []domain.Permission{domain.PermissionLibraryRead}}
-	credID := store.addUserWithPassword(t, "u1", "alice", "secret", readerRole)
+	credID := store.addUserWithPassword(t, "secret", readerRole)
 
 	store.mu.Lock()
 	credHash := HashOpaqueToken(*store.creds[credID].SecretHash)
@@ -396,7 +471,7 @@ func TestSessionLoginThrottleStablePeerIPAcrossPorts(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	store, svc, _ := newTestSessionHarness(t, func() time.Time { return now })
 	readerRole := domain.Role{ID: "r-reader", Name: "READER", Permissions: []domain.Permission{domain.PermissionLibraryRead}}
-	store.addUserWithPassword(t, "u1", "alice", "correct-password", readerRole)
+	store.addUserWithPassword(t, "correct-password", readerRole)
 
 	ports := []string{
 		"198.51.100.25:40001",
@@ -423,4 +498,180 @@ func TestSessionLoginThrottleStablePeerIPAcrossPorts(t *testing.T) {
 	if !errors.Is(err, ErrAuthThrottled) || !errors.Is(err, app.ErrTooManyRequests) {
 		t.Fatalf("expected ErrAuthThrottled+ErrTooManyRequests on 4th attempt across port changes, got %v", err)
 	}
+}
+
+type barrierSessionRepo struct {
+	storage.SessionRepository
+	beforeCreate func()
+}
+
+func (b *barrierSessionRepo) CreateSession(ctx context.Context, s *domain.Session) error {
+	if b.beforeCreate != nil {
+		b.beforeCreate()
+	}
+	return b.SessionRepository.CreateSession(ctx, s)
+}
+
+func TestSessionLoginRace_CredentialRotationBarriers(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("rotation during password verification rejects login with zero active sessions", func(t *testing.T) {
+		store := newMemSessionStore()
+		adminRole := domain.Role{ID: "r-admin", Name: "Admin", Permissions: domain.AllPermissions()}
+		credID := store.addUserWithPassword(t, "old-pass", adminRole)
+		store.mu.Lock()
+		oldHash := *store.creds[credID].SecretHash
+		store.mu.Unlock()
+		const newHash = "digest:new-pass"
+		store.rotateSecretHash(credID, "digest:old-pass", now)
+		// Ensure rotation helper doesn't leave stale sessions, update back cleanly:
+		store.mu.Lock()
+		c := store.creds[credID]
+		c.SecretHash = &oldHash
+		store.creds[credID] = c
+		store.mu.Unlock()
+
+		enteredVerify := make(chan struct{})
+		proceedVerify := make(chan struct{})
+		var once sync.Once
+
+		limiter, err := NewHashLimiter(HashLimiterOptions{
+			MaxConcurrentHashes: 2,
+			MaxHashQueue:        8,
+			VerifyFunc: func(secret, encodedHash string) (bool, error) {
+				if encodedHash == oldHash && secret == "old-pass" {
+					once.Do(func() {
+						close(enteredVerify)
+						<-proceedVerify
+					})
+					return true, nil
+				}
+				return encodedHash == "digest:"+secret, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("new limiter: %v", err)
+		}
+		basic, err := NewBasicAuthenticator(store, BasicOptions{
+			Limiter:      limiter,
+			DisableCache: true,
+			Now:          func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("new basic: %v", err)
+		}
+		svc, err := NewSessionService(basic, store, store, SessionOptions{
+			TTL: time.Hour,
+			Now: func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("new session svc: %v", err)
+		}
+
+		type loginOutcome struct {
+			res *app.LoginResult
+			err error
+		}
+		ch := make(chan loginOutcome, 1)
+		go func() {
+			r, lErr := svc.Login(context.Background(), app.LoginRequest{
+				Username:   "alice",
+				Password:   "old-pass",
+				RemoteAddr: "198.51.100.10:1001",
+			})
+			ch <- loginOutcome{res: r, err: lErr}
+		}()
+
+		<-enteredVerify
+		store.rotateSecretHash(credID, newHash, now)
+		close(proceedVerify)
+
+		out := <-ch
+		if !errors.Is(out.err, app.ErrUnauthorized) || !errors.Is(out.err, ErrInvalidCredentials) || out.res != nil {
+			t.Fatalf("expected raced login to fail with ErrUnauthorized/ErrInvalidCredentials and nil result, got res=%v err=%v", out.res, out.err)
+		}
+		if store.activeSessionCount() != 0 {
+			t.Fatalf("expected 0 active sessions after raced login, got %d", store.activeSessionCount())
+		}
+		// Unchanged control with new password succeeds.
+		ctrlRes, ctrlErr := svc.Login(context.Background(), app.LoginRequest{
+			Username:   "alice",
+			Password:   "new-pass",
+			RemoteAddr: "198.51.100.10:1002",
+		})
+		if ctrlErr != nil || ctrlRes == nil {
+			t.Fatalf("expected unchanged new-password login control to succeed, got res=%v err=%v", ctrlRes, ctrlErr)
+		}
+	})
+
+	t.Run("rotation between credential check and CreateSession leaves zero active sessions", func(t *testing.T) {
+		store := newMemSessionStore()
+		adminRole := domain.Role{ID: "r-admin", Name: "Admin", Permissions: domain.AllPermissions()}
+		credID := store.addUserWithPassword(t, "old-pass", adminRole)
+		store.mu.Lock()
+		oldHash := *store.creds[credID].SecretHash
+		store.mu.Unlock()
+
+		enteredCreate := make(chan struct{})
+		proceedCreate := make(chan struct{})
+		var once sync.Once
+		barrierRepo := &barrierSessionRepo{
+			SessionRepository: store,
+			beforeCreate: func() {
+				once.Do(func() {
+					close(enteredCreate)
+					<-proceedCreate
+				})
+			},
+		}
+
+		limiter, err := NewHashLimiter(HashLimiterOptions{
+			MaxConcurrentHashes: 2,
+			MaxHashQueue:        8,
+			VerifyFunc: func(secret, encodedHash string) (bool, error) {
+				return encodedHash == oldHash && secret == "old-pass", nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("new limiter: %v", err)
+		}
+		basic, err := NewBasicAuthenticator(store, BasicOptions{
+			Limiter:      limiter,
+			DisableCache: true,
+			Now:          func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("new basic: %v", err)
+		}
+		svc, err := NewSessionService(basic, store, barrierRepo, SessionOptions{
+			TTL: time.Hour,
+			Now: func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("new session svc: %v", err)
+		}
+
+		ch := make(chan error, 1)
+		go func() {
+			_, lErr := svc.Login(context.Background(), app.LoginRequest{
+				Username:   "alice",
+				Password:   "old-pass",
+				RemoteAddr: "198.51.100.11:1001",
+			})
+			ch <- lErr
+		}()
+
+		<-enteredCreate
+		store.rotateSecretHash(credID, "digest:rotated", now)
+		close(proceedCreate)
+
+		lErr := <-ch
+		if !errors.Is(lErr, app.ErrUnauthorized) || !errors.Is(lErr, ErrInvalidCredentials) {
+			t.Fatalf("expected ErrUnauthorized/ErrInvalidCredentials when rotated before CreateSession, got %v", lErr)
+		}
+		if store.activeSessionCount() != 0 {
+			t.Fatalf("expected 0 active sessions after CreateSession race, got %d", store.activeSessionCount())
+		}
+	})
 }

@@ -24,6 +24,7 @@ type Querier interface {
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
+	GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
