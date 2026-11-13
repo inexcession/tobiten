@@ -180,8 +180,20 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		return err
 	}
 	defer setup.Close()
+	hashLimiter, err := auth.NewHashLimiter(auth.HashLimiterOptions{})
+	if err != nil {
+		return err
+	}
 	basicAuth, err := auth.NewBasicAuthenticator(userRepo, auth.BasicOptions{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
+		Limiter: hashLimiter,
+	})
+	if err != nil {
+		return err
+	}
+	patAuth, err := auth.NewPATAuthenticator(userRepo, auth.PATOptions{
+		Logger:  slog.Default(),
+		Limiter: hashLimiter,
 	})
 	if err != nil {
 		return err
@@ -189,6 +201,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	services := &app.Services{
 		Setup:     setup,
 		BasicAuth: basicAuth,
+		PATAuth:   patAuth,
 	}
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)

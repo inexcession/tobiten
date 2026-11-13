@@ -20,6 +20,7 @@ var (
 type Services struct {
 	Setup     SetupService
 	BasicAuth BasicAuthenticator
+	PATAuth   PATAuthenticator
 	Library   LibraryService
 	Reading   ReadingService
 	Curation  CurationService

@@ -57,6 +57,11 @@ type BasicAuthenticator interface {
 	AuthenticateBasic(ctx context.Context, username, password, clientIP string) (*domain.Principal, error)
 }
 
+// PATAuthenticator verifies personal access tokens and resolves a Principal.
+type PATAuthenticator interface {
+	AuthenticatePAT(ctx context.Context, token, clientIP string) (*domain.Principal, error)
+}
+
 // AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
 type AdminService interface {
 	SetupService

@@ -40,15 +40,15 @@ func TestDaemonBasicAuthRegistryAndPostgresLifecycle(t *testing.T) {
 	})
 
 	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
-		if services == nil || services.BasicAuth == nil {
-			t.Fatal("expected daemon to wire BasicAuth service")
+		if services == nil || services.BasicAuth == nil || services.PATAuth == nil {
+			t.Fatal("expected daemon to wire BasicAuth and PATAuth services")
 		}
 
 		// Build production registry without ServerOptions.Authenticators test injection.
 		reg := BuildRegistryWithServices(cfg, services)
 		auths := reg.Authenticators()
-		if len(auths) != 1 || auths[0].Name() != "basic" {
-			t.Fatalf("expected [basic] authenticator in registry, got %v", auths)
+		if len(auths) != 2 || auths[0].Name() != "basic" || auths[1].Name() != "pat" {
+			t.Fatalf("expected [basic pat] authenticators in registry, got %v", auths)
 		}
 
 		// Register a protected probe module to observe Principal resolution over HTTP.
