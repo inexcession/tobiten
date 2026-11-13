@@ -52,6 +52,11 @@ type SetupService interface {
 	SetupInitialAdmin(ctx context.Context, req SetupAdminRequest) (*domain.User, error)
 }
 
+// BasicAuthenticator verifies username/password credentials and resolves a Principal.
+type BasicAuthenticator interface {
+	AuthenticateBasic(ctx context.Context, username, password, clientIP string) (*domain.Principal, error)
+}
+
 // AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
 type AdminService interface {
 	SetupService

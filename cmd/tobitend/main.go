@@ -69,6 +69,14 @@ func BuildRegistryWithServices(cfg *config.Config, services *app.Services) modul
 	// Register compiled-in modules
 	_ = reg.Register(api.NewSystemModule())
 	_ = reg.Register(openapi.NewModule(services))
+	if services != nil && services.BasicAuth != nil {
+		if authenticator, ok := services.BasicAuth.(module.Authenticator); ok {
+			_ = reg.Register(&module.SimpleModule{
+				ModuleName: "auth",
+				Auths:      []module.Authenticator{authenticator},
+			})
+		}
+	}
 
 	// Apply configuration (e.g. disabled modules) after registering real modules
 	if cfg != nil {
