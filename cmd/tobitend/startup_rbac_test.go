@@ -63,6 +63,16 @@ func (s *spyProbeCuration) PurgeTrash(ctx context.Context, principal *domain.Pri
 	return s.CurationService.PurgeTrash(ctx, principal, req)
 }
 
+type spyProbeAdmin struct {
+	app.AdminService
+	createPATCalls atomic.Int32
+}
+
+func (s *spyProbeAdmin) CreatePAT(ctx context.Context, principal *domain.Principal, req app.CreatePATRequest) (*app.PATCreationResult, error) {
+	s.createPATCalls.Add(1)
+	return s.AdminService.CreatePAT(ctx, principal, req)
+}
+
 func writeProbeResult(w http.ResponseWriter, err error, payload any) {
 	switch {
 	case err == nil:
@@ -71,6 +81,8 @@ func writeProbeResult(w http.ResponseWriter, err error, payload any) {
 		if payload != nil {
 			_ = json.NewEncoder(w).Encode(payload)
 		}
+	case errors.Is(err, app.ErrInvalidInput):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, app.ErrUnauthorized):
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 	case errors.Is(err, app.ErrForbidden):
@@ -103,6 +115,7 @@ func TestDaemonRBACAndWarmedPATDemotionPostgres(t *testing.T) {
 		libSpy := &spyProbeLibrary{LibraryService: stubs.Library}
 		readSpy := &spyProbeReading{ReadingService: stubs.Reading}
 		curSpy := &spyProbeCuration{CurationService: stubs.Curation}
+		adminSpy := &spyProbeAdmin{AdminService: stubs.Admin}
 		wired := app.NewAuthorizingServices(&app.Services{
 			Setup:     services.Setup,
 			BasicAuth: services.BasicAuth,
@@ -110,6 +123,7 @@ func TestDaemonRBACAndWarmedPATDemotionPostgres(t *testing.T) {
 			Library:   libSpy,
 			Reading:   readSpy,
 			Curation:  curSpy,
+			Admin:     adminSpy,
 		})
 
 		var directMetaCallbacks atomic.Int32
@@ -160,6 +174,12 @@ func TestDaemonRBACAndWarmedPATDemotionPostgres(t *testing.T) {
 					case r.Method == http.MethodPost && r.URL.Path == "/api/v1/rbac-probe/trash-purge":
 						id, err := wired.Curation.PurgeTrash(r.Context(), p, app.PurgeTrashRequest{})
 						writeProbeResult(w, err, map[string]string{"job_id": id})
+					case r.Method == http.MethodPost && r.URL.Path == "/api/v1/rbac-probe/pats-admin":
+						res, err := wired.Admin.CreatePAT(r.Context(), p, app.CreatePATRequest{
+							Label:  "probe-admin-pat",
+							Scopes: []domain.PATScope{domain.ScopeAdmin},
+						})
+						writeProbeResult(w, err, res)
 					default:
 						http.NotFound(w, r)
 					}
@@ -253,9 +273,23 @@ func TestDaemonRBACAndWarmedPATDemotionPostgres(t *testing.T) {
 		if rec := call(http.MethodPost, "/api/v1/rbac-probe/metadata-helper", readPATToken, "198.51.100.20:1004"); rec.Code != http.StatusForbidden {
 			t.Fatalf("read PAT POST /metadata-helper status = %d, want 403", rec.Code)
 		}
-		if libSpy.readCalls.Load() != 1 || readSpy.writeCalls.Load() != 0 || curSpy.hideCalls.Load() != 0 || directMetaCallbacks.Load() != 0 {
-			t.Fatalf("unexpected callback counts for read PAT: libRead=%d progWrite=%d hide=%d metaCb=%d",
-				libSpy.readCalls.Load(), readSpy.writeCalls.Load(), curSpy.hideCalls.Load(), directMetaCallbacks.Load())
+		if rec := call(http.MethodPost, "/api/v1/rbac-probe/pats-admin", readPATToken, "198.51.100.20:1005"); rec.Code != http.StatusForbidden {
+			t.Fatalf("read PAT POST /pats-admin status = %d, want 403", rec.Code)
+		}
+		if libSpy.readCalls.Load() != 1 || readSpy.writeCalls.Load() != 0 || curSpy.hideCalls.Load() != 0 || directMetaCallbacks.Load() != 0 || adminSpy.createPATCalls.Load() != 0 {
+			t.Fatalf("unexpected callback counts for read PAT: libRead=%d progWrite=%d hide=%d metaCb=%d createPAT=%d",
+				libSpy.readCalls.Load(), readSpy.writeCalls.Load(), curSpy.hideCalls.Load(), directMetaCallbacks.Load(), adminSpy.createPATCalls.Load())
+		}
+
+		// Control: the same Admin user (alice) authenticated with Basic password CAN mint ScopeAdmin PAT.
+		basicReq := httptest.NewRequest(http.MethodPost, "/api/v1/rbac-probe/pats-admin", nil)
+		basicReq.RemoteAddr = "198.51.100.20:1006"
+		basicReq.SetBasicAuth("alice", "initial-secret-123")
+		basicRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(basicRec, basicReq)
+		if basicRec.Code != http.StatusOK || adminSpy.createPATCalls.Load() != 1 {
+			t.Fatalf("unscoped Basic admin POST /pats-admin status=%d createPATCalls=%d, want 200 and 1",
+				basicRec.Code, adminSpy.createPATCalls.Load())
 		}
 
 		// 3. Curator user with an admin-scoped PAT: PAT is capped at Curator perms;

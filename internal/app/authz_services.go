@@ -284,7 +284,7 @@ func (s *authorizingAdminService) DeleteUser(ctx context.Context, principal *dom
 }
 
 func (s *authorizingAdminService) CreatePAT(ctx context.Context, principal *domain.Principal, req CreatePATRequest) (*PATCreationResult, error) {
-	if err := requirePrincipal(principal); err != nil {
+	if err := RequirePATScopes(principal, req.Scopes); err != nil {
 		return nil, err
 	}
 	if s.next == nil {

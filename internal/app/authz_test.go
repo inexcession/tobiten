@@ -123,9 +123,10 @@ func (s *spyCurationService) PurgeTrash(context.Context, *domain.Principal, Purg
 }
 
 type spyAdminService struct {
-	publicCalls int
-	selfCalls   int
-	adminCalls  int
+	publicCalls    int
+	selfCalls      int
+	createPATCalls int
+	adminCalls     int
 }
 
 func (s *spyAdminService) IsSetupSealed(context.Context) (bool, error) {
@@ -163,9 +164,24 @@ func (s *spyAdminService) DeleteUser(context.Context, *domain.Principal, string)
 	return nil
 }
 
-func (s *spyAdminService) CreatePAT(context.Context, *domain.Principal, CreatePATRequest) (*PATCreationResult, error) {
+func (s *spyAdminService) CreatePAT(_ context.Context, principal *domain.Principal, req CreatePATRequest) (*PATCreationResult, error) {
 	s.selfCalls++
-	return &PATCreationResult{}, nil
+	s.createPATCalls++
+	userID := ""
+	if principal != nil {
+		userID = principal.User.ID
+	}
+	scopes := make([]domain.PATScope, len(req.Scopes))
+	copy(scopes, req.Scopes)
+	return &PATCreationResult{
+		Credential: &domain.Credential{
+			ID:     "cred-pat-created",
+			UserID: userID,
+			Kind:   domain.CredentialKindPAT,
+			Scopes: scopes,
+		},
+		Token: "tobiten_pat_created_secret",
+	}, nil
 }
 
 func (s *spyAdminService) RevokeCredential(context.Context, *domain.Principal, string) error {
@@ -464,4 +480,281 @@ func TestAuthorizingServices_NilAndRestrictedReaderFlagAndCuratorPermittedOps(t 
 	if _, err := svcs.Admin.CreatePAT(ctx, nil, CreatePATRequest{}); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("unauthenticated CreatePAT = %v, want ErrUnauthorized", err)
 	}
+}
+
+func TestAuthorizingAdminService_CreatePATCallerAuthorityAndValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	adminRole := builtInRoleByID(t, domain.RoleAdminID)
+	curatorRole := builtInRoleByID(t, domain.RoleCuratorID)
+	readerRole := builtInRoleByID(t, domain.RoleReaderID)
+	restrictedRole := builtInRoleByID(t, domain.RoleRestrictedReaderID)
+
+	adminUser := testUser("u-admin")
+	curatorUser := testUser("u-cur")
+	readerUser := testUser("u-reader")
+	restrictedUser := testUser("u-restr")
+
+	adminReadPAT := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPAT, "pat-read", []domain.PATScope{domain.ScopeRead})
+	adminProgressPAT := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPAT, "pat-prog", []domain.PATScope{domain.ScopeProgressWrite})
+	adminMetaPAT := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPAT, "pat-meta", []domain.PATScope{domain.ScopeMetadataWrite})
+	adminLibAdminPAT := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPAT, "pat-libadmin", []domain.PATScope{domain.ScopeLibraryAdmin})
+	curatorAdminPAT := domain.NewPrincipal(curatorUser, []domain.Role{curatorRole}, domain.CredentialKindPAT, "pat-cur-admin", []domain.PATScope{domain.ScopeAdmin})
+	emptyScopeAdminPAT := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPAT, "pat-empty", nil)
+
+	adminPassword := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "pw-admin", nil)
+	curatorOIDC := domain.NewPrincipal(curatorUser, []domain.Role{curatorRole}, domain.CredentialKindOIDCLink, "oidc-cur", nil)
+	readerPassword := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "pw-reader", nil)
+	restrictedPassword := domain.NewPrincipal(restrictedUser, []domain.Role{restrictedRole}, domain.CredentialKindPassword, "pw-restr", nil)
+	noRolePassword := domain.NewPrincipal(testUser("u-norole"), nil, domain.CredentialKindPassword, "pw-norole", nil)
+	spoofAdminPassword := domain.NewPrincipal(testUser("u-spoof"), []domain.Role{{ID: "role-spoof", Name: domain.RoleAdminName}}, domain.CredentialKindPassword, "pw-spoof", nil)
+
+	t.Run("rejected requests never reach delegate", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name      string
+			principal *domain.Principal
+			scopes    []domain.PATScope
+			wantErr   error
+		}{
+			{
+				name:      "nil principal",
+				principal: nil,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+				wantErr:   ErrUnauthorized,
+			},
+			{
+				name:      "admin read PAT requesting ScopeAdmin (M1-T8.5 escalation guard)",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{domain.ScopeAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin read PAT requesting ScopeProgressWrite",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{domain.ScopeProgressWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin read PAT requesting ScopeMetadataWrite",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{domain.ScopeMetadataWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin read PAT requesting ScopeLibraryAdmin",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{domain.ScopeLibraryAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin read PAT requesting union ScopeRead+ScopeProgressWrite",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{domain.ScopeRead, domain.ScopeProgressWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin progress PAT requesting ScopeMetadataWrite",
+				principal: adminProgressPAT,
+				scopes:    []domain.PATScope{domain.ScopeMetadataWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin metadata PAT requesting ScopeProgressWrite",
+				principal: adminMetaPAT,
+				scopes:    []domain.PATScope{domain.ScopeProgressWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin library:admin PAT requesting ScopeAdmin",
+				principal: adminLibAdminPAT,
+				scopes:    []domain.PATScope{domain.ScopeAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "curator admin PAT cannot mint ScopeLibraryAdmin",
+				principal: curatorAdminPAT,
+				scopes:    []domain.PATScope{domain.ScopeLibraryAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "unscoped reader password cannot mint ScopeMetadataWrite",
+				principal: readerPassword,
+				scopes:    []domain.PATScope{domain.ScopeMetadataWrite},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "unscoped reader password cannot mint ScopeAdmin",
+				principal: readerPassword,
+				scopes:    []domain.PATScope{domain.ScopeAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "unscoped curator OIDC cannot mint ScopeLibraryAdmin",
+				principal: curatorOIDC,
+				scopes:    []domain.PATScope{domain.ScopeLibraryAdmin},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "zero-permission no-role password requesting ScopeRead",
+				principal: noRolePassword,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "zero-permission no-role password with empty scopes",
+				principal: noRolePassword,
+				scopes:    nil,
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "zero-permission spoofed Admin role name requesting ScopeRead",
+				principal: spoofAdminPassword,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "zero-permission empty-scope PAT requesting ScopeRead",
+				principal: emptyScopeAdminPAT,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+				wantErr:   ErrForbidden,
+			},
+			{
+				name:      "admin password with empty scopes rejected as invalid input",
+				principal: adminPassword,
+				scopes:    []domain.PATScope{},
+				wantErr:   ErrInvalidInput,
+			},
+			{
+				name:      "admin password with unknown scope rejected as invalid input",
+				principal: adminPassword,
+				scopes:    []domain.PATScope{"bogus"},
+				wantErr:   ErrInvalidInput,
+			},
+			{
+				name:      "admin password with valid + unknown scope rejected as invalid input",
+				principal: adminPassword,
+				scopes:    []domain.PATScope{domain.ScopeRead, domain.PATScope("library:read")},
+				wantErr:   ErrInvalidInput,
+			},
+			{
+				name:      "read PAT with unknown scope rejected as invalid input",
+				principal: adminReadPAT,
+				scopes:    []domain.PATScope{"not-a-scope"},
+				wantErr:   ErrInvalidInput,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				adminSpy := &spyAdminService{}
+				svc := NewAuthorizingAdminService(adminSpy)
+				res, err := svc.CreatePAT(ctx, tc.principal, CreatePATRequest{
+					Label:  "test-pat",
+					Scopes: tc.scopes,
+				})
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("CreatePAT() err = %v, want %v", err, tc.wantErr)
+				}
+				if res != nil {
+					t.Fatalf("CreatePAT() result = %+v, want nil on rejection", res)
+				}
+				if adminSpy.createPATCalls != 0 {
+					t.Fatalf("delegate CreatePAT called %d times on rejection, want 0", adminSpy.createPATCalls)
+				}
+			})
+		}
+	})
+
+	t.Run("permitted self-service creation stays within caller authority", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name               string
+			principal          *domain.Principal
+			scopes             []domain.PATScope
+			wantChildAllowFlag bool
+		}{
+			{
+				name:      "unscoped admin password minting ScopeAdmin",
+				principal: adminPassword,
+				scopes:    []domain.PATScope{domain.ScopeAdmin},
+			},
+			{
+				name:      "unscoped admin password minting ScopeRead+ScopeMetadataWrite",
+				principal: adminPassword,
+				scopes:    []domain.PATScope{domain.ScopeRead, domain.ScopeMetadataWrite},
+			},
+			{
+				name:      "unscoped curator OIDC minting ScopeMetadataWrite",
+				principal: curatorOIDC,
+				scopes:    []domain.PATScope{domain.ScopeMetadataWrite},
+			},
+			{
+				name:      "unscoped reader password minting ScopeRead",
+				principal: readerPassword,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+			},
+			{
+				name:      "unscoped reader password minting ScopeProgressWrite",
+				principal: readerPassword,
+				scopes:    []domain.PATScope{domain.ScopeProgressWrite},
+			},
+			{
+				name:               "unscoped restricted reader password minting ScopeRead preserves RequiresAllowLabels",
+				principal:          restrictedPassword,
+				scopes:             []domain.PATScope{domain.ScopeRead},
+				wantChildAllowFlag: true,
+			},
+			{
+				name:      "scoped metadata PAT minting strictly narrower ScopeRead",
+				principal: adminMetaPAT,
+				scopes:    []domain.PATScope{domain.ScopeRead},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				adminSpy := &spyAdminService{}
+				svc := NewAuthorizingAdminService(adminSpy)
+				res, err := svc.CreatePAT(ctx, tc.principal, CreatePATRequest{
+					Label:  "permitted-pat",
+					Scopes: tc.scopes,
+				})
+				if err != nil {
+					t.Fatalf("CreatePAT() unexpected err = %v", err)
+				}
+				if res == nil || res.Credential == nil {
+					t.Fatalf("expected non-nil PATCreationResult and Credential, got %+v", res)
+				}
+				if adminSpy.createPATCalls != 1 {
+					t.Fatalf("delegate CreatePAT called %d times, want 1", adminSpy.createPATCalls)
+				}
+
+				// Resolving the created PAT must never grant any permission absent from the caller.
+				child := domain.NewPrincipal(tc.principal.User, tc.principal.Roles, res.Credential.Kind, res.Credential.ID, res.Credential.Scopes)
+				for _, perm := range child.Permissions {
+					if !tc.principal.HasPermission(perm) {
+						t.Fatalf("child PAT gained permission %q absent from caller %v", perm, tc.principal.Permissions)
+					}
+				}
+				if child.RequiresAllowLabels() != tc.wantChildAllowFlag {
+					t.Fatalf("child RequiresAllowLabels() = %v, want %v", child.RequiresAllowLabels(), tc.wantChildAllowFlag)
+				}
+			})
+		}
+	})
+
+	t.Run("nil delegate fails closed consistently", func(t *testing.T) {
+		t.Parallel()
+		nilAdmin := NewAuthorizingAdminService(nil)
+		if _, err := nilAdmin.CreatePAT(ctx, adminReadPAT, CreatePATRequest{Scopes: []domain.PATScope{domain.ScopeAdmin}}); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("denied CreatePAT against nil delegate = %v, want ErrForbidden", err)
+		}
+		if _, err := nilAdmin.CreatePAT(ctx, adminPassword, CreatePATRequest{Scopes: []domain.PATScope{domain.ScopeRead}}); !errors.Is(err, ErrNotImplemented) {
+			t.Fatalf("permitted CreatePAT against nil delegate = %v, want ErrNotImplemented", err)
+		}
+	})
 }

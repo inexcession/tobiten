@@ -106,3 +106,25 @@ func AuthorizeAnyValue[T any](principal *domain.Principal, perms []domain.Permis
 	}
 	return fn()
 }
+
+// RequirePATScopes verifies that principal is authenticated and holds every permission
+// conferred by the requested PAT scopes. It returns ErrUnauthorized if principal is nil,
+// ErrForbidden if principal has no permissions or lacks any permission mapped to scopes,
+// and ErrInvalidInput if scopes is empty or contains an unrecognized scope.
+func RequirePATScopes(principal *domain.Principal, scopes []domain.PATScope) error {
+	if err := requirePrincipal(principal); err != nil {
+		return err
+	}
+	if len(principal.Permissions) == 0 {
+		return ErrForbidden
+	}
+	if len(scopes) == 0 {
+		return ErrInvalidInput
+	}
+	for _, scope := range scopes {
+		if !scope.IsValid() {
+			return ErrInvalidInput
+		}
+	}
+	return RequireAllPermissions(principal, domain.ScopesToPermissions(scopes)...)
+}
