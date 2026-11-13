@@ -573,3 +573,270 @@ func TestAuthMiddleware_PrecedenceAndClassification(t *testing.T) {
 		}
 	})
 }
+
+type untieredStubAuth struct {
+	name string
+	fn   func(r *http.Request) (module.AuthResult, error)
+}
+
+func (a *untieredStubAuth) Name() string { return a.name }
+func (a *untieredStubAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	return a.fn(r)
+}
+
+type tierFallbackFixture struct {
+	explicitPrincipal    *domain.Principal
+	lowerCookiePrincipal *domain.Principal
+	lowerProxyPrincipal  *domain.Principal
+}
+
+func newTierFallbackFixture() tierFallbackFixture {
+	adminRole, _ := domain.BuiltInRoleByID(domain.RoleAdminID)
+	readerRole, _ := domain.BuiltInRoleByID(domain.RoleReaderID)
+	return tierFallbackFixture{
+		explicitPrincipal: domain.NewPrincipal(
+			domain.User{ID: "usr-explicit", Username: "explicit-user"},
+			[]domain.Role{readerRole},
+			domain.CredentialKindPAT,
+			"cred-explicit",
+			[]domain.PATScope{domain.ScopeRead},
+		),
+		lowerCookiePrincipal: domain.NewPrincipal(
+			domain.User{ID: "usr-legacy-cookie", Username: "legacy-cookie-user"},
+			[]domain.Role{adminRole},
+			domain.CredentialKindPassword,
+			"cred-legacy-cookie",
+			nil,
+		),
+		lowerProxyPrincipal: domain.NewPrincipal(
+			domain.User{ID: "usr-legacy-proxy", Username: "legacy-proxy-user"},
+			[]domain.Role{adminRole},
+			domain.CredentialKindOIDCLink,
+			"cred-legacy-proxy",
+			nil,
+		),
+	}
+}
+
+func (f tierFallbackFixture) makeCookieFn(calls *int) func(*http.Request) (module.AuthResult, error) {
+	return func(r *http.Request) (module.AuthResult, error) {
+		*calls++
+		c, err := r.Cookie("tobiten_session")
+		if err != nil {
+			if errors.Is(err, http.ErrNoCookie) {
+				return module.AuthPass(), nil
+			}
+			return module.AuthResult{Handled: true}, err
+		}
+		if c.Value == "valid-cookie" {
+			return module.AuthSuccess(f.lowerCookiePrincipal), nil
+		}
+		return module.AuthResult{Handled: true}, errors.New("invalid cookie")
+	}
+}
+
+func (f tierFallbackFixture) makeProxyFn(calls *int) func(*http.Request) (module.AuthResult, error) {
+	return func(r *http.Request) (module.AuthResult, error) {
+		*calls++
+		u := r.Header.Get("Remote-User")
+		if u == "" {
+			return module.AuthPass(), nil
+		}
+		if u == "proxy-user" {
+			return module.AuthSuccess(f.lowerProxyPrincipal), nil
+		}
+		return module.AuthResult{Handled: true}, errors.New("invalid proxy user")
+	}
+}
+
+func (f tierFallbackFixture) makeBasicVerifier() module.Authenticator {
+	return &tieredStubAuth{
+		name: "basic-verifier",
+		tier: module.CredentialTierExplicit,
+		fn: func(r *http.Request) (module.AuthResult, error) {
+			u, p, ok := r.BasicAuth()
+			if !ok {
+				hdr := strings.ToLower(strings.TrimSpace(r.Header.Get("Authorization")))
+				if strings.HasPrefix(hdr, "basic") {
+					return module.AuthResult{Handled: true}, errors.New("malformed basic")
+				}
+				return module.AuthPass(), nil
+			}
+			if u == "alice" && p == "secret" {
+				return module.AuthSuccess(f.explicitPrincipal), nil
+			}
+			return module.AuthResult{Handled: true}, errors.New("bad basic")
+		},
+	}
+}
+
+func (f tierFallbackFixture) makeBearerVerifier() module.Authenticator {
+	return &tieredStubAuth{
+		name: "bearer-verifier",
+		tier: module.CredentialTierExplicit,
+		fn: func(r *http.Request) (module.AuthResult, error) {
+			raw := r.Header.Get("Authorization")
+			tok, ok := strings.CutPrefix(raw, "Bearer ")
+			if !ok {
+				if strings.EqualFold(strings.TrimSpace(raw), "bearer") {
+					return module.AuthResult{Handled: true}, errors.New("empty bearer")
+				}
+				return module.AuthPass(), nil
+			}
+			if tok == "valid-pat" {
+				return module.AuthSuccess(f.explicitPrincipal), nil
+			}
+			return module.AuthResult{Handled: true}, errors.New("bad bearer")
+		},
+	}
+}
+
+type lowerTierVariant struct {
+	name         string
+	wantUsername string
+	applyValid   func(*http.Request)
+	build        func(calls *int) module.Authenticator
+}
+
+func (f tierFallbackFixture) variants() []lowerTierVariant {
+	return []lowerTierVariant{
+		{
+			name:         "no-tier-cookie",
+			wantUsername: "legacy-cookie-user",
+			applyValid:   func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: "valid-cookie"}) },
+			build: func(calls *int) module.Authenticator {
+				return &untieredStubAuth{name: "no-tier-cookie", fn: f.makeCookieFn(calls)}
+			},
+		},
+		{
+			name:         "unspecified-cookie",
+			wantUsername: "legacy-cookie-user",
+			applyValid:   func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: "valid-cookie"}) },
+			build: func(calls *int) module.Authenticator {
+				return &tieredStubAuth{name: "unspecified-cookie", tier: module.CredentialTierUnspecified, fn: f.makeCookieFn(calls)}
+			},
+		},
+		{
+			name:         "unknown-tier-cookie",
+			wantUsername: "legacy-cookie-user",
+			applyValid:   func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: "valid-cookie"}) },
+			build: func(calls *int) module.Authenticator {
+				return &tieredStubAuth{name: "unknown-tier-cookie", tier: module.CredentialTier(99), fn: f.makeCookieFn(calls)}
+			},
+		},
+		{
+			name:         "no-tier-proxy",
+			wantUsername: "legacy-proxy-user",
+			applyValid:   func(r *http.Request) { r.Header.Set("Remote-User", "proxy-user") },
+			build: func(calls *int) module.Authenticator {
+				return &untieredStubAuth{name: "no-tier-proxy", fn: f.makeProxyFn(calls)}
+			},
+		},
+		{
+			name:         "unspecified-proxy",
+			wantUsername: "legacy-proxy-user",
+			applyValid:   func(r *http.Request) { r.Header.Set("Remote-User", "proxy-user") },
+			build: func(calls *int) module.Authenticator {
+				return &tieredStubAuth{name: "unspecified-proxy", tier: module.CredentialTierUnspecified, fn: f.makeProxyFn(calls)}
+			},
+		},
+		{
+			name:         "unknown-tier-proxy",
+			wantUsername: "legacy-proxy-user",
+			applyValid:   func(r *http.Request) { r.Header.Set("Remote-User", "proxy-user") },
+			build: func(calls *int) module.Authenticator {
+				return &tieredStubAuth{name: "unknown-tier-proxy", tier: module.CredentialTier(99), fn: f.makeProxyFn(calls)}
+			},
+		},
+	}
+}
+
+func assertRejectsWithoutLowerCall(t *testing.T, auths []module.Authenticator, applyLower, mutate func(*http.Request), lowerCalls *int) {
+	t.Helper()
+	h := middleware.Auth(middleware.AuthOptions{Authenticators: auths})(testTargetHandler())
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/protected"},
+		{http.MethodGet, "/healthz"},
+		{http.MethodPost, "/api/v1/auth/login"},
+		{http.MethodPost, "/api/v1/auth/setup"},
+	}
+	for _, rt := range routes {
+		*lowerCalls = 0
+		req := httptest.NewRequest(rt.method, rt.path, nil)
+		applyLower(req)
+		mutate(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s: status = %d, want 401", rt.method, rt.path, rec.Code)
+		}
+		if *lowerCalls != 0 {
+			t.Fatalf("%s %s: lowerCalls = %d, want 0", rt.method, rt.path, *lowerCalls)
+		}
+	}
+}
+
+func TestAuthMiddleware_UntieredAndUnknownTierFallback(t *testing.T) {
+	f := newTierFallbackFixture()
+	for _, v := range f.variants() {
+		t.Run(v.name, func(t *testing.T) {
+			var lowerCalls int
+			lowerAuth := v.build(&lowerCalls)
+
+			t.Run("unverified X-Auth-Token returns 401 without calling lower provider", func(t *testing.T) {
+				mutate := func(r *http.Request) { r.Header.Set("X-Auth-Token", "unverified-token") }
+				assertRejectsWithoutLowerCall(t, []module.Authenticator{f.makeBasicVerifier(), f.makeBearerVerifier(), lowerAuth}, v.applyValid, mutate, &lowerCalls)
+				assertRejectsWithoutLowerCall(t, []module.Authenticator{lowerAuth, f.makeBearerVerifier(), f.makeBasicVerifier()}, v.applyValid, mutate, &lowerCalls)
+			})
+
+			t.Run("missing-verifier and malformed Basic or Bearer return 401 without calling lower provider", func(t *testing.T) {
+				cases := []struct {
+					name   string
+					auths  []module.Authenticator
+					mutate func(*http.Request)
+				}{
+					{"missing Basic verifier with valid-syntax Basic", []module.Authenticator{f.makeBearerVerifier(), lowerAuth}, func(r *http.Request) { r.SetBasicAuth("alice", "secret") }},
+					{"missing Basic verifier with malformed Basic base64", []module.Authenticator{lowerAuth, f.makeBearerVerifier()}, func(r *http.Request) { r.Header.Set("Authorization", "Basic not_base64") }},
+					{"missing Basic verifier with empty Basic", []module.Authenticator{lowerAuth}, func(r *http.Request) { r.Header.Set("Authorization", "Basic") }},
+					{"missing Bearer verifier with Bearer token", []module.Authenticator{f.makeBasicVerifier(), lowerAuth}, func(r *http.Request) { r.Header.Set("Authorization", "Bearer tobiten_pat_id_secret") }},
+					{"missing Bearer verifier with malformed empty Bearer", []module.Authenticator{lowerAuth, f.makeBasicVerifier()}, func(r *http.Request) { r.Header.Set("Authorization", "Bearer") }},
+					{"missing X-API-Key verifier", []module.Authenticator{lowerAuth, f.makeBasicVerifier()}, func(r *http.Request) { r.Header.Set("X-API-Key", "tobiten_pat_id_secret") }},
+					{"unsupported Authorization scheme", []module.Authenticator{lowerAuth, f.makeBasicVerifier(), f.makeBearerVerifier()}, func(r *http.Request) { r.Header.Set("Authorization", `Digest username="alice"`) }},
+				}
+				for _, tc := range cases {
+					t.Run(tc.name, func(t *testing.T) {
+						assertRejectsWithoutLowerCall(t, tc.auths, v.applyValid, tc.mutate, &lowerCalls)
+					})
+				}
+			})
+
+			t.Run("positive controls: matching explicit wins and lower-only still works", func(t *testing.T) {
+				h := middleware.Auth(middleware.AuthOptions{
+					Authenticators: []module.Authenticator{lowerAuth, f.makeBasicVerifier(), f.makeBearerVerifier()},
+				})(testTargetHandler())
+
+				lowerCalls = 0
+				reqExp := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+				v.applyValid(reqExp)
+				reqExp.SetBasicAuth("alice", "secret")
+				recExp := httptest.NewRecorder()
+				h.ServeHTTP(recExp, reqExp)
+				if recExp.Code != http.StatusOK || recExp.Header().Get("X-Principal") != "explicit-user" || lowerCalls != 0 {
+					t.Fatalf("explicit control: status=%d principal=%q lowerCalls=%d", recExp.Code, recExp.Header().Get("X-Principal"), lowerCalls)
+				}
+
+				lowerCalls = 0
+				reqLow := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+				v.applyValid(reqLow)
+				recLow := httptest.NewRecorder()
+				h.ServeHTTP(recLow, reqLow)
+				if recLow.Code != http.StatusOK || recLow.Header().Get("X-Principal") != v.wantUsername || lowerCalls != 1 {
+					t.Fatalf("lower-only control: status=%d principal=%q lowerCalls=%d", recLow.Code, recLow.Header().Get("X-Principal"), lowerCalls)
+				}
+			})
+		})
+	}
+}

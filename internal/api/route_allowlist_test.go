@@ -26,6 +26,8 @@ type tokenAuth struct {
 
 func (a *tokenAuth) Name() string { return "token-auth" }
 
+func (a *tokenAuth) Tier() module.CredentialTier { return module.CredentialTierExplicit }
+
 func (a *tokenAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
 	tok := r.Header.Get("X-Auth-Token")
 	if tok == "" {

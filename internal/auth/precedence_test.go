@@ -791,6 +791,214 @@ func equalTimePtr(a, b *time.Time) bool {
 	return a.Equal(*b)
 }
 
+type legacyUntieredAuth struct {
+	name  string
+	calls *atomic.Int32
+	fn    func(*http.Request) (module.AuthResult, error)
+}
+
+func (a *legacyUntieredAuth) Name() string { return a.name }
+
+func (a *legacyUntieredAuth) Authenticate(r *http.Request) (module.AuthResult, error) {
+	a.calls.Add(1)
+	return a.fn(r)
+}
+
+type customTierAuth struct {
+	*legacyUntieredAuth
+	tier module.CredentialTier
+}
+
+func (a *customTierAuth) Tier() module.CredentialTier { return a.tier }
+
+func TestCredentialPrecedence_RealProvidersUntieredAndUnknownFallback(t *testing.T) {
+	f := newPrecedenceFixture(t)
+
+	checkCookieFn := func(r *http.Request) (module.AuthResult, error) {
+		c, err := r.Cookie("tobiten_session")
+		if err != nil {
+			if errors.Is(err, http.ErrNoCookie) {
+				return module.AuthPass(), nil
+			}
+			return module.AuthResult{Handled: true}, err
+		}
+		if c.Value == f.cookieToken {
+			return module.AuthSuccess(f.cookiePrinc), nil
+		}
+		return module.AuthResult{Handled: true}, ErrInvalidCredentials
+	}
+	checkProxyFn := func(r *http.Request) (module.AuthResult, error) {
+		u := strings.TrimSpace(r.Header.Get("Remote-User"))
+		if u == "" {
+			return module.AuthPass(), nil
+		}
+		if u == "bob" {
+			return module.AuthSuccess(f.proxyPrincipal), nil
+		}
+		return module.AuthResult{Handled: true}, ErrInvalidCredentials
+	}
+
+	type lowerSpec struct {
+		name       string
+		applyValid func(*http.Request)
+		wantCredID string
+		wantUserID string
+		build      func(*atomic.Int32) module.Authenticator
+	}
+
+	specs := []lowerSpec{
+		{
+			name:       "no-tier-cookie",
+			applyValid: func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: f.cookieToken}) },
+			wantCredID: f.cookieCredID,
+			wantUserID: f.alice.ID,
+			build: func(c *atomic.Int32) module.Authenticator {
+				return &legacyUntieredAuth{name: "no-tier-cookie", calls: c, fn: checkCookieFn}
+			},
+		},
+		{
+			name:       "unspecified-cookie",
+			applyValid: func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: f.cookieToken}) },
+			wantCredID: f.cookieCredID,
+			wantUserID: f.alice.ID,
+			build: func(c *atomic.Int32) module.Authenticator {
+				return &customTierAuth{legacyUntieredAuth: &legacyUntieredAuth{name: "unspecified-cookie", calls: c, fn: checkCookieFn}, tier: module.CredentialTierUnspecified}
+			},
+		},
+		{
+			name:       "unknown-tier-cookie",
+			applyValid: func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "tobiten_session", Value: f.cookieToken}) },
+			wantCredID: f.cookieCredID,
+			wantUserID: f.alice.ID,
+			build: func(c *atomic.Int32) module.Authenticator {
+				return &customTierAuth{legacyUntieredAuth: &legacyUntieredAuth{name: "unknown-tier-cookie", calls: c, fn: checkCookieFn}, tier: module.CredentialTier(99)}
+			},
+		},
+		{
+			name:       "no-tier-proxy",
+			applyValid: func(r *http.Request) { r.Header.Set("Remote-User", "bob") },
+			wantCredID: f.proxyCredID,
+			wantUserID: f.bob.ID,
+			build: func(c *atomic.Int32) module.Authenticator {
+				return &legacyUntieredAuth{name: "no-tier-proxy", calls: c, fn: checkProxyFn}
+			},
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /api/v1/protected", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(domain.MustPrincipalFromContext(r.Context()))
+	})
+
+	for _, sp := range specs {
+		t.Run(sp.name, func(t *testing.T) {
+			var lowerCalls atomic.Int32
+			lower := sp.build(&lowerCalls)
+
+			chains := []struct {
+				name  string
+				auths []module.Authenticator
+			}{
+				{"real_basic_pat_then_lower", []module.Authenticator{f.basicAuth, f.patAuth, lower}},
+				{"lower_then_real_pat_basic", []module.Authenticator{lower, f.patAuth, f.basicAuth}},
+			}
+
+			for _, ch := range chains {
+				h := middleware.Auth(middleware.AuthOptions{Authenticators: ch.auths})(mux)
+				for _, target := range []string{"/api/v1/protected", "/healthz"} {
+					beforeKDF := f.kdfCalls.Load()
+					lowerCalls.Store(0)
+					req := httptest.NewRequest(http.MethodGet, target, nil)
+					sp.applyValid(req)
+					req.Header.Set("X-Auth-Token", "unverified-token")
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, req)
+					if rec.Code != http.StatusUnauthorized {
+						t.Fatalf("%s %s: status = %d, want 401", ch.name, target, rec.Code)
+					}
+					if lowerCalls.Load() != 0 {
+						t.Fatalf("%s %s: lowerCalls = %d, want 0", ch.name, target, lowerCalls.Load())
+					}
+					if f.kdfCalls.Load() != beforeKDF {
+						t.Fatalf("%s %s: unexpected KDF work (%d -> %d)", ch.name, target, beforeKDF, f.kdfCalls.Load())
+					}
+				}
+			}
+
+			// Missing Basic/PAT verifier regressions with real partial explicit chains.
+			hBasicOnly := middleware.Auth(middleware.AuthOptions{Authenticators: []module.Authenticator{lower, f.basicAuth}})(mux)
+			for _, mutate := range []func(*http.Request){
+				func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+f.patReadToken) },
+				func(r *http.Request) { r.Header.Set("Authorization", "Bearer") },
+				func(r *http.Request) { r.Header.Set("X-API-Key", f.patReadToken) },
+			} {
+				lowerCalls.Store(0)
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+				sp.applyValid(req)
+				mutate(req)
+				rec := httptest.NewRecorder()
+				hBasicOnly.ServeHTTP(rec, req)
+				if rec.Code != http.StatusUnauthorized || lowerCalls.Load() != 0 {
+					t.Fatalf("basic-only missing PAT verifier: status=%d lowerCalls=%d", rec.Code, lowerCalls.Load())
+				}
+			}
+
+			hPATOnly := middleware.Auth(middleware.AuthOptions{Authenticators: []module.Authenticator{lower, f.patAuth}})(mux)
+			for _, mutate := range []func(*http.Request){
+				func(r *http.Request) { r.SetBasicAuth("alice", f.basicPass) },
+				func(r *http.Request) { r.Header.Set("Authorization", "Basic not_base64") },
+			} {
+				lowerCalls.Store(0)
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+				sp.applyValid(req)
+				mutate(req)
+				rec := httptest.NewRecorder()
+				hPATOnly.ServeHTTP(rec, req)
+				if rec.Code != http.StatusUnauthorized || lowerCalls.Load() != 0 {
+					t.Fatalf("pat-only missing Basic verifier: status=%d lowerCalls=%d", rec.Code, lowerCalls.Load())
+				}
+			}
+
+			// Positive controls: valid explicit wins and lower-only works without explicit headers.
+			hFull := middleware.Auth(middleware.AuthOptions{Authenticators: []module.Authenticator{lower, f.basicAuth, f.patAuth}})(mux)
+
+			lowerCalls.Store(0)
+			reqPAT := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+			sp.applyValid(reqPAT)
+			reqPAT.Header.Set("Authorization", "Bearer "+f.patReadToken)
+			recPAT := httptest.NewRecorder()
+			hFull.ServeHTTP(recPAT, reqPAT)
+			if recPAT.Code != http.StatusOK || lowerCalls.Load() != 0 {
+				t.Fatalf("valid PAT positive control: status=%d lowerCalls=%d", recPAT.Code, lowerCalls.Load())
+			}
+			var gotPAT domain.Principal
+			if err := json.Unmarshal(recPAT.Body.Bytes(), &gotPAT); err != nil {
+				t.Fatalf("decode PAT principal: %v", err)
+			}
+			if gotPAT.CredentialID != f.patReadID {
+				t.Fatalf("PAT control credential = %q, want %q", gotPAT.CredentialID, f.patReadID)
+			}
+
+			lowerCalls.Store(0)
+			reqLow := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+			sp.applyValid(reqLow)
+			recLow := httptest.NewRecorder()
+			hFull.ServeHTTP(recLow, reqLow)
+			if recLow.Code != http.StatusOK || lowerCalls.Load() != 1 {
+				t.Fatalf("lower-only positive control: status=%d lowerCalls=%d", recLow.Code, lowerCalls.Load())
+			}
+			var gotLow domain.Principal
+			if err := json.Unmarshal(recLow.Body.Bytes(), &gotLow); err != nil {
+				t.Fatalf("decode lower principal: %v", err)
+			}
+			if gotLow.CredentialID != sp.wantCredID || gotLow.User.ID != sp.wantUserID {
+				t.Fatalf("lower control = (%s,%s), want (%s,%s)", gotLow.User.ID, gotLow.CredentialID, sp.wantUserID, sp.wantCredID)
+			}
+		})
+	}
+}
+
 var (
 	_ module.TieredAuthenticator = (*BasicAuthenticator)(nil)
 	_ module.TieredAuthenticator = (*PATAuthenticator)(nil)

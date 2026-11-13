@@ -364,12 +364,9 @@ func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.P
 	tiers := partitionAuthenticators(auths)
 
 	// Explicit credentials (X-API-Key, Bearer, Basic, X-Auth-Token) take strict precedence
-	// over trusted-proxy and cookie tiers and must never fall back (ADR-0006 §3).
+	// over trusted-proxy, cookie, and unspecified providers and must never fall back (ADR-0006 §3).
 	if explicit.kind != explicitNone {
 		if p, handled, err := authenticateTier(r, tiers.explicit, true); err != nil || handled {
-			return p, handled, err
-		}
-		if p, handled, err := authenticateTier(r, tiers.unspecified, false); err != nil || handled {
 			return p, handled, err
 		}
 		return nil, false, errUnhandledExplicitCredential
