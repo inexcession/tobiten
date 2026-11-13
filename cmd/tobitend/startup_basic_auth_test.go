@@ -47,8 +47,8 @@ func TestDaemonBasicAuthRegistryAndPostgresLifecycle(t *testing.T) {
 		// Build production registry without ServerOptions.Authenticators test injection.
 		reg := BuildRegistryWithServices(cfg, services)
 		auths := reg.Authenticators()
-		if len(auths) != 2 || auths[0].Name() != "basic" || auths[1].Name() != "pat" {
-			t.Fatalf("expected [basic pat] authenticators in registry, got %v", auths)
+		if len(auths) != 3 || auths[0].Name() != "basic" || auths[1].Name() != "pat" || auths[2].Name() != "native-session" {
+			t.Fatalf("expected [basic pat native-session] authenticators in registry, got %v", auths)
 		}
 
 		// Register a protected probe module to observe Principal resolution over HTTP.

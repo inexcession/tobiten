@@ -198,10 +198,21 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	if err != nil {
 		return err
 	}
+	sessionRepo := postgres.NewSessionRepository(d.pool)
+	sessionService, err := auth.NewSessionService(basicAuth, userRepo, sessionRepo, auth.SessionOptions{})
+	if err != nil {
+		return err
+	}
+	sessionAuth, err := auth.NewSessionAuthenticator(userRepo, sessionRepo, auth.SessionOptions{})
+	if err != nil {
+		return err
+	}
 	services := app.NewAuthorizingServices(&app.Services{
-		Setup:     setup,
-		BasicAuth: basicAuth,
-		PATAuth:   patAuth,
+		Setup:       setup,
+		BasicAuth:   basicAuth,
+		PATAuth:     patAuth,
+		Session:     sessionService,
+		SessionAuth: sessionAuth,
 	})
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)

@@ -119,7 +119,11 @@ func TestDaemonInteractiveSetupAndRestart(t *testing.T) {
 		}
 		setupHTTP(t, srv.Handler(), "/books%20shelf/api/v1/auth/setup", `malformed`, 403)
 		setupHTTP(t, srv.Handler(), "/api/v1/auth/setup", `{}`, 403)
-		setupHTTP(t, srv.Handler(), "/api/v1/auth/login", `{"username":"alice","password":"anything"}`, 503)
+		setupHTTP(t, srv.Handler(), "/api/v1/auth/login", `{"username":"alice","password":"anything"}`, 401)
+		loginRec := setupHTTP(t, srv.Handler(), "/api/v1/auth/login", `{"username":"alice","password":"private-password"}`, 200)
+		if len(loginRec.Result().Cookies()) == 0 || loginRec.Header().Get("X-CSRF-Token") == "" {
+			t.Fatalf("expected session cookie and X-CSRF-Token on login, cookies=%v csrf=%q", loginRec.Result().Cookies(), loginRec.Header().Get("X-CSRF-Token"))
+		}
 		user, err := postgres.NewUserRepository(db.Pool).GetUserByID(ctx, firstID)
 		if err != nil || user.Username != "alice" {
 			t.Fatalf("persisted user=%v err=%v", user, err)

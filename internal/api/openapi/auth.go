@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
 )
 
@@ -15,7 +17,8 @@ type loginRequest struct {
 }
 
 type loginResponse struct {
-	User domainUserResponse `json:"user"`
+	User      domainUserResponse `json:"user"`
+	CSRFToken string             `json:"csrf_token,omitempty"`
 }
 
 type domainUserResponse struct {
@@ -49,7 +52,7 @@ func (m *Module) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if m.services == nil || m.services.Admin == nil {
+	if m.services == nil || (m.services.Session == nil && m.services.Admin == nil) {
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -63,6 +66,61 @@ func (m *Module) handleLogin(w http.ResponseWriter, r *http.Request) {
 	req.Username = strings.TrimSpace(req.Username)
 	if req.Username == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+
+	if m.services.Session != nil {
+		res, err := m.services.Session.Login(r.Context(), app.LoginRequest{
+			Username:   req.Username,
+			Password:   req.Password,
+			RemoteAddr: r.RemoteAddr,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, app.ErrTooManyRequests):
+				writeError(w, http.StatusTooManyRequests, "too many authentication attempts")
+			case errors.Is(err, app.ErrServiceBusy):
+				writeError(w, http.StatusServiceUnavailable, "authentication service busy")
+			case errors.Is(err, app.ErrUnauthorized):
+				writeError(w, http.StatusUnauthorized, "invalid username or password")
+			default:
+				writeError(w, http.StatusInternalServerError, "authentication error")
+			}
+			return
+		}
+		if res == nil || res.Principal == nil || res.SessionToken == "" || res.CSRFToken == "" {
+			writeError(w, http.StatusInternalServerError, "authentication error")
+			return
+		}
+
+		cookiePath := "/"
+		secure := false
+		if resolver := middleware.OriginResolverFromContext(r.Context()); resolver != nil {
+			cookiePath = resolver.NativeCookiePath()
+			secure = resolver.IsHTTPS()
+		}
+		maxAge := max(int(time.Until(res.ExpiresAt).Seconds()), 1)
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     app.NativeSessionCookieName,
+			Value:    res.SessionToken,
+			Path:     cookiePath,
+			Expires:  res.ExpiresAt,
+			MaxAge:   maxAge,
+			HttpOnly: true,
+			Secure:   secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-CSRF-Token", res.CSRFToken)
+
+		writeJSON(w, http.StatusOK, loginResponse{
+			User: domainUserResponse{
+				ID:       res.Principal.User.ID,
+				Username: res.Principal.User.Username,
+			},
+			CSRFToken: res.CSRFToken,
+		})
 		return
 	}
 

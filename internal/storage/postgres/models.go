@@ -91,6 +91,20 @@ type RolePermission struct {
 	Permission string
 }
 
+type Session struct {
+	ID                   string
+	UserID               string
+	CredentialID         string
+	Kind                 string
+	TokenHash            string
+	CsrfTokenHash        string
+	CredentialHashDigest string
+	CreatedAt            time.Time
+	LastUsedAt           *time.Time
+	ExpiresAt            time.Time
+	RevokedAt            *time.Time
+}
+
 type SystemSetting struct {
 	Key       string
 	Value     []byte

@@ -77,6 +77,9 @@ func BuildRegistryWithServices(cfg *config.Config, services *app.Services) modul
 		if authenticator, ok := services.PATAuth.(module.Authenticator); ok {
 			auths = append(auths, authenticator)
 		}
+		if authenticator, ok := services.SessionAuth.(module.Authenticator); ok {
+			auths = append(auths, authenticator)
+		}
 	}
 	if len(auths) > 0 {
 		_ = reg.Register(&module.SimpleModule{

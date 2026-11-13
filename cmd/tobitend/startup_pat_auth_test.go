@@ -45,8 +45,8 @@ func TestDaemonPATAuthRegistryAndPostgresLifecycle(t *testing.T) {
 		for _, a := range reg.Authenticators() {
 			authNames = append(authNames, a.Name())
 		}
-		if len(authNames) != 2 || authNames[0] != "basic" || authNames[1] != "pat" {
-			t.Fatalf("expected [basic pat] authenticators in production registry, got %v", authNames)
+		if len(authNames) != 3 || authNames[0] != "basic" || authNames[1] != "pat" || authNames[2] != "native-session" {
+			t.Fatalf("expected [basic pat native-session] authenticators in production registry, got %v", authNames)
 		}
 
 		probeMod := module.NewSimpleModule("probe")

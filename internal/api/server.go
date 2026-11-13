@@ -95,6 +95,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Registry:        reg,
 		Authenticators:  opts.Authenticators,
 		SubPathResolver: ub,
+		OriginResolver:  ub,
 		Logger:          logger,
 	}
 	handler := middleware.RequestLogger(logger)(

@@ -13,9 +13,11 @@ func NewAuthorizingServices(next *Services) *Services {
 		return nil
 	}
 	out := &Services{
-		Setup:     next.Setup,
-		BasicAuth: next.BasicAuth,
-		PATAuth:   next.PATAuth,
+		Setup:       next.Setup,
+		BasicAuth:   next.BasicAuth,
+		PATAuth:     next.PATAuth,
+		Session:     next.Session,
+		SessionAuth: next.SessionAuth,
 	}
 	if next.Library != nil {
 		out.Library = NewAuthorizingLibraryService(next.Library)

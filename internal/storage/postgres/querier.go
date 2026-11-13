@@ -6,14 +6,19 @@ package postgres
 
 import (
 	"context"
+	"time"
 )
 
 type Querier interface {
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
 	CountUsers(ctx context.Context) (int64, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
+	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) error
 	DeleteCredential(ctx context.Context, id string) (int64, error)
+	DeleteExpiredSessions(ctx context.Context, expiresAt time.Time) (int64, error)
+	DeleteSession(ctx context.Context, id string) (int64, error)
+	DeleteSessionsByCredentialID(ctx context.Context, credentialID string) (int64, error)
 	DeleteSystemSetting(ctx context.Context, key string) error
 	DeleteUser(ctx context.Context, id string) (int64, error)
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
@@ -21,6 +26,7 @@ type Querier interface {
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
+	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetSystemSetting(ctx context.Context, key string) (SystemSetting, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
@@ -33,7 +39,10 @@ type Querier interface {
 	ListUsers(ctx context.Context) ([]User, error)
 	RemoveUserRole(ctx context.Context, arg RemoveUserRoleParams) (int64, error)
 	RevokeCredential(ctx context.Context, arg RevokeCredentialParams) (int64, error)
+	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
+	RevokeSessionsByCredentialID(ctx context.Context, arg RevokeSessionsByCredentialIDParams) (int64, error)
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
+	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
 	UpsertSystemSetting(ctx context.Context, arg UpsertSystemSettingParams) (SystemSetting, error)
 }

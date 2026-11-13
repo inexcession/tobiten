@@ -115,6 +115,14 @@ type AuthResult struct {
 
 	// Principal is the resolved identity and authorization context when authentication succeeds.
 	Principal *domain.Principal
+
+	// RequiresCSRF indicates that the resolved Principal came from a browser session
+	// credential that requires a matching session-bound CSRF token on unsafe methods.
+	RequiresCSRF bool
+
+	// CSRFTokenHash holds the SHA-256 hex digest of the session's bound CSRF token
+	// when RequiresCSRF is true.
+	CSRFTokenHash string
 }
 
 // AuthPass returns an AuthResult indicating the authenticator did not recognize matching credentials.
@@ -125,6 +133,16 @@ func AuthPass() AuthResult {
 // AuthSuccess returns an AuthResult with the resolved Principal.
 func AuthSuccess(p *domain.Principal) AuthResult {
 	return AuthResult{Handled: true, Principal: p}
+}
+
+// AuthSuccessCookie returns an AuthResult for a native session cookie carrying its bound CSRF hash.
+func AuthSuccessCookie(p *domain.Principal, csrfTokenHash string) AuthResult {
+	return AuthResult{
+		Handled:       true,
+		Principal:     p,
+		RequiresCSRF:  true,
+		CSRFTokenHash: csrfTokenHash,
+	}
 }
 
 // JobKindProvider indicates a module provides background job kinds (ADR-0017, ADR-0018).

@@ -62,6 +62,35 @@ type PATAuthenticator interface {
 	AuthenticatePAT(ctx context.Context, token, clientIP string) (*domain.Principal, error)
 }
 
+// NativeSessionCookieName is the HTTP cookie carrying the native tobiten session token.
+const NativeSessionCookieName = "tobiten_session"
+
+// LoginRequest defines parameters for password-backed session creation.
+type LoginRequest struct {
+	Username   string
+	Password   string
+	RemoteAddr string
+}
+
+// LoginResult contains the resolved principal and newly minted session credentials.
+type LoginResult struct {
+	Principal    *domain.Principal
+	SessionToken string
+	CSRFToken    string
+	ExpiresAt    time.Time
+}
+
+// SessionService verifies credentials and creates native server-side sessions.
+type SessionService interface {
+	Login(ctx context.Context, req LoginRequest) (*LoginResult, error)
+}
+
+// SessionAuthenticator verifies native session cookie tokens and returns the live Principal
+// together with the SHA-256 hex digest of the session's bound CSRF token.
+type SessionAuthenticator interface {
+	AuthenticateSession(ctx context.Context, token string) (*domain.Principal, string, error)
+}
+
 // AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
 type AdminService interface {
 	SetupService

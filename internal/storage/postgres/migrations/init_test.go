@@ -36,11 +36,11 @@ func TestMigration0001_Applies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("querying applied migrations: %v", err)
 	}
-	if len(applied) != 1 {
-		t.Fatalf("expected 1 applied migration, got %d", len(applied))
+	if len(applied) < 1 {
+		t.Fatalf("expected at least 1 applied migration, got %d", len(applied))
 	}
 	if applied[0].Version != 1 || applied[0].Name != "0001_init.sql" {
-		t.Fatalf("unexpected applied migration: %+v", applied[0])
+		t.Fatalf("unexpected first applied migration: %+v", applied[0])
 	}
 
 	// Verify all 12 M1A tables exist
@@ -389,6 +389,71 @@ func TestMigration0001_JobsStateCheck(t *testing.T) {
 	}
 	if !isCheckViolation(err) {
 		t.Fatalf("expected check violation on invalid state, got: %v", err)
+	}
+}
+
+func TestMigration0002_Sessions(t *testing.T) {
+	t.Parallel()
+	db := apply0001Init(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	applied, err := migrations.Applied(ctx, db)
+	if err != nil {
+		t.Fatalf("querying applied migrations: %v", err)
+	}
+	if len(applied) < 2 || applied[1].Version != 2 || applied[1].Name != "0002_sessions.sql" {
+		t.Fatalf("expected 0002_sessions.sql as second migration, got %+v", applied)
+	}
+
+	_, err = db.Exec(ctx, `
+		INSERT INTO users (id, username) VALUES ('u1', 'alice')`)
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	_, err = db.Exec(ctx, `
+		INSERT INTO credentials (id, user_id, kind, secret_hash)
+		VALUES ('c1', 'u1', 'PASSWORD', 'hash1')`)
+	if err != nil {
+		t.Fatalf("insert credential: %v", err)
+	}
+
+	// Invalid kind must be rejected by CHECK constraint.
+	_, err = db.Exec(ctx, `
+		INSERT INTO sessions (id, user_id, credential_id, kind, token_hash, csrf_token_hash, expires_at)
+		VALUES ('s-bad', 'u1', 'c1', 'BAD_KIND', 'th-bad', 'ch1', now() + interval '1 hour')`)
+	if err == nil || !isCheckViolation(err) {
+		t.Fatalf("expected check violation on invalid session kind, got: %v", err)
+	}
+
+	// Valid session insert succeeds.
+	_, err = db.Exec(ctx, `
+		INSERT INTO sessions (id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, expires_at)
+		VALUES ('s1', 'u1', 'c1', 'NATIVE', 'th1', 'ch1', 'digest1', now() + interval '1 hour')`)
+	if err != nil {
+		t.Fatalf("insert valid session: %v", err)
+	}
+
+	// Duplicate token_hash must fail unique constraint.
+	_, err = db.Exec(ctx, `
+		INSERT INTO sessions (id, user_id, credential_id, kind, token_hash, csrf_token_hash, expires_at)
+		VALUES ('s2', 'u1', 'c1', 'NATIVE', 'th1', 'ch2', now() + interval '1 hour')`)
+	if err == nil || !isUniqueViolation(err) {
+		t.Fatalf("expected unique violation on duplicate token_hash, got: %v", err)
+	}
+
+	// Deleting the originating credential must cascade-delete the session.
+	_, err = db.Exec(ctx, `DELETE FROM credentials WHERE id = 'c1'`)
+	if err != nil {
+		t.Fatalf("delete credential: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id = 's1'`).Scan(&count); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected session s1 to be cascade-deleted when credential c1 deleted, count=%d", count)
 	}
 }
 

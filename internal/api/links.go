@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/config"
 )
 
@@ -110,6 +111,28 @@ func NewURLBuilderFromConfig(cfg *config.Config) (*URLBuilder, error) {
 // BaseURL returns the normalized public base URL without a trailing slash.
 func (ub *URLBuilder) BaseURL() string {
 	return ub.rawBaseURL
+}
+
+// Origin returns the canonical scheme://host[:port] origin derived from the resolved base URL.
+func (ub *URLBuilder) Origin() string {
+	if ub == nil || ub.base == nil {
+		return ""
+	}
+	return middleware.CanonicalOrigin(ub.base.Scheme, ub.base.Host)
+}
+
+// IsHTTPS reports whether the resolved public base URL uses the https scheme.
+func (ub *URLBuilder) IsHTTPS() bool {
+	return ub != nil && ub.base != nil && strings.EqualFold(ub.base.Scheme, "https")
+}
+
+// NativeCookiePath returns the cookie Path derived from the configured base URL sub-path
+// ("/" when mounted at root, or the sub-path prefix such as "/comics" when mounted under one).
+func (ub *URLBuilder) NativeCookiePath() string {
+	if ub == nil || ub.subPath == "" {
+		return "/"
+	}
+	return ub.subPath
 }
 
 // SubPath returns the sub-path component of the base URL, or empty string if root.

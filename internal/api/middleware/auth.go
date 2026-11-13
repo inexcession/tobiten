@@ -1,11 +1,17 @@
 package middleware
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -19,11 +25,39 @@ type SubPathResolver interface {
 	SubPathDecoded() string
 }
 
+// OriginResolver resolves the canonical public origin and cookie security attributes
+// from the configured TOBITEN_BASE_URL (never from forwarded request headers).
+type OriginResolver interface {
+	Origin() string
+	IsHTTPS() bool
+	NativeCookiePath() string
+}
+
+type originResolverCtxKey struct{}
+
+// WithOriginResolver attaches an OriginResolver to ctx.
+func WithOriginResolver(ctx context.Context, r OriginResolver) context.Context {
+	if r == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, originResolverCtxKey{}, r)
+}
+
+// OriginResolverFromContext extracts the configured OriginResolver from ctx, if present.
+func OriginResolverFromContext(ctx context.Context) OriginResolver {
+	if ctx == nil {
+		return nil
+	}
+	r, _ := ctx.Value(originResolverCtxKey{}).(OriginResolver)
+	return r
+}
+
 // AuthOptions configures the mandatory authentication middleware (ADR-0006 §1, ADR-0018 S1).
 type AuthOptions struct {
 	Registry        module.Registry
 	Authenticators  []module.Authenticator
 	SubPathResolver SubPathResolver
+	OriginResolver  OriginResolver
 	Logger          *slog.Logger
 }
 
@@ -57,6 +91,20 @@ func WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusUnauthorized)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write([]byte(`{"error":"unauthorized"}` + "\n"))
+	}
+}
+
+// WriteForbidden writes a 403 Forbidden JSON response without downstream handler execution.
+func WriteForbidden(w http.ResponseWriter, r *http.Request, msg string) {
+	if msg == "" {
+		msg = "forbidden"
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	if r.Method != http.MethodHead {
+		_ = json.NewEncoder(w).Encode(struct {
+			Error string `json:"error"`
+		}{Error: msg})
 	}
 }
 
@@ -328,37 +376,42 @@ func sameCredentialPrincipal(a, b *domain.Principal, requireCredID bool) bool {
 	return slices.Equal(a.Scopes, b.Scopes) && slices.Equal(a.Permissions, b.Permissions)
 }
 
-func authenticateTier(r *http.Request, auths []module.Authenticator, requireCredID bool) (*domain.Principal, bool, error) {
-	var matched *domain.Principal
+type authOutcome struct {
+	res  module.AuthResult
+	tier module.CredentialTier
+	err  error
+}
+
+func authenticateTier(r *http.Request, auths []module.Authenticator, requireCredID bool) (module.AuthResult, error) {
+	var matched module.AuthResult
 	for _, a := range auths {
 		res, err := a.Authenticate(r)
 		if err != nil {
-			return nil, false, err
+			return module.AuthResult{}, err
 		}
 		if !res.Handled {
 			continue
 		}
 		if res.Principal == nil {
-			return nil, false, errors.New("handled without principal")
+			return module.AuthResult{}, errors.New("handled without principal")
 		}
-		if matched == nil {
-			matched = res.Principal
+		if !matched.Handled {
+			matched = res
 			continue
 		}
-		if !sameCredentialPrincipal(matched, res.Principal, requireCredID) {
-			return nil, false, errConflictingExplicitCredential
+		if !sameCredentialPrincipal(matched.Principal, res.Principal, requireCredID) ||
+			matched.RequiresCSRF != res.RequiresCSRF ||
+			matched.CSRFTokenHash != res.CSRFTokenHash {
+			return module.AuthResult{}, errConflictingExplicitCredential
 		}
 	}
-	if matched != nil {
-		return matched, true, nil
-	}
-	return nil, false, nil
+	return matched, nil
 }
 
-func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.Principal, bool, error) {
+func authenticateChainOutcome(r *http.Request, auths []module.Authenticator) authOutcome {
 	explicit := classifyExplicitRequest(r)
 	if explicit.err != nil {
-		return nil, false, explicit.err
+		return authOutcome{tier: module.CredentialTierExplicit, err: explicit.err}
 	}
 
 	tiers := partitionAuthenticators(auths)
@@ -366,27 +419,174 @@ func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.P
 	// Explicit credentials (X-API-Key, Bearer, Basic, X-Auth-Token) take strict precedence
 	// over trusted-proxy, cookie, and unspecified providers and must never fall back (ADR-0006 §3).
 	if explicit.kind != explicitNone {
-		if p, handled, err := authenticateTier(r, tiers.explicit, true); err != nil || handled {
-			return p, handled, err
+		res, err := authenticateTier(r, tiers.explicit, true)
+		if err != nil {
+			return authOutcome{tier: module.CredentialTierExplicit, err: err}
 		}
-		return nil, false, errUnhandledExplicitCredential
+		if res.Handled {
+			return authOutcome{res: res, tier: module.CredentialTierExplicit}
+		}
+		return authOutcome{tier: module.CredentialTierExplicit, err: errUnhandledExplicitCredential}
 	}
 
 	for _, tier := range []struct {
+		kind          module.CredentialTier
 		auths         []module.Authenticator
 		requireCredID bool
 	}{
-		{auths: tiers.explicit, requireCredID: true},
-		{auths: tiers.proxy, requireCredID: true},
-		{auths: tiers.cookie, requireCredID: true},
-		{auths: tiers.unspecified, requireCredID: false},
+		{kind: module.CredentialTierExplicit, auths: tiers.explicit, requireCredID: true},
+		{kind: module.CredentialTierTrustedProxy, auths: tiers.proxy, requireCredID: true},
+		{kind: module.CredentialTierCookie, auths: tiers.cookie, requireCredID: true},
+		{kind: module.CredentialTierUnspecified, auths: tiers.unspecified, requireCredID: false},
 	} {
-		if p, handled, err := authenticateTier(r, tier.auths, tier.requireCredID); err != nil || handled {
-			return p, handled, err
+		res, err := authenticateTier(r, tier.auths, tier.requireCredID)
+		if err != nil {
+			return authOutcome{tier: tier.kind, err: err}
+		}
+		if res.Handled {
+			return authOutcome{res: res, tier: tier.kind}
 		}
 	}
 
-	return nil, false, nil
+	return authOutcome{}
+}
+
+// CanonicalOrigin normalizes an http/https scheme and host[:port] to its canonical origin
+// string ("scheme://host" or "scheme://host:port"), stripping default ports :80 and :443.
+func CanonicalOrigin(scheme, host string) string {
+	s := strings.ToLower(strings.TrimSpace(scheme))
+	if s != "http" && s != "https" {
+		return ""
+	}
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return ""
+	}
+	hostPart, port, err := net.SplitHostPort(h)
+	if err != nil {
+		// No port component; verify host has no stray port delimiter outside IPv6 brackets.
+		if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+			return s + "://" + strings.ToLower(h)
+		}
+		if strings.Contains(h, ":") {
+			return ""
+		}
+		return s + "://" + strings.ToLower(h)
+	}
+	hostPart = strings.ToLower(hostPart)
+	if hostPart == "" || port == "" {
+		return ""
+	}
+	if (s == "http" && port == "80") || (s == "https" && port == "443") {
+		if strings.Contains(hostPart, ":") {
+			return s + "://[" + hostPart + "]"
+		}
+		return s + "://" + hostPart
+	}
+	return s + "://" + net.JoinHostPort(hostPart, port)
+}
+
+func isSafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateBrowserOriginAndFetchMetadata(r *http.Request, expectedOrigin string) bool {
+	secFetch := r.Header.Values("Sec-Fetch-Site")
+	origins := r.Header.Values("Origin")
+	referers := r.Header.Values("Referer")
+
+	// Allow non-browser clients that omit all browser-origin/fetch-metadata headers.
+	if len(secFetch) == 0 && len(origins) == 0 && len(referers) == 0 {
+		return true
+	}
+	if expectedOrigin == "" {
+		return false
+	}
+
+	if len(secFetch) > 0 {
+		if len(secFetch) != 1 || !strings.EqualFold(strings.TrimSpace(secFetch[0]), "same-origin") {
+			return false
+		}
+	}
+
+	if len(origins) > 0 {
+		if len(origins) != 1 {
+			return false
+		}
+		raw := strings.TrimSpace(origins[0])
+		if raw == "" || strings.EqualFold(raw, "null") {
+			return false
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return false
+		}
+		if CanonicalOrigin(u.Scheme, u.Host) != expectedOrigin {
+			return false
+		}
+	}
+
+	if len(referers) > 0 {
+		if len(referers) != 1 {
+			return false
+		}
+		raw := strings.TrimSpace(referers[0])
+		if raw == "" {
+			return false
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.User != nil {
+			return false
+		}
+		if CanonicalOrigin(u.Scheme, u.Host) != expectedOrigin {
+			return false
+		}
+	}
+
+	return true
+}
+
+func verifySessionCSRF(r *http.Request, expectedHash string) bool {
+	if expectedHash == "" {
+		return false
+	}
+	vals := r.Header.Values("X-CSRF-Token")
+	if len(vals) != 1 || vals[0] == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(vals[0]))
+	got := hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expectedHash)) == 1
+}
+
+func enforceAuthenticatedMutationPolicy(
+	w http.ResponseWriter,
+	r *http.Request,
+	expectedOrigin string,
+	res module.AuthResult,
+	allowlistMutation bool,
+) bool {
+	if isSafeMethod(r.Method) {
+		return true
+	}
+	if allowlistMutation || res.RequiresCSRF {
+		if !validateBrowserOriginAndFetchMetadata(r, expectedOrigin) {
+			WriteForbidden(w, r, "forbidden")
+			return false
+		}
+	}
+	if res.RequiresCSRF && !allowlistMutation {
+		if !verifySessionCSRF(r, res.CSRFTokenHash) {
+			WriteForbidden(w, r, "invalid csrf token")
+			return false
+		}
+	}
+	return true
 }
 
 // Auth returns HTTP middleware that enforces Tobiten's mandatory authentication contract
@@ -397,33 +597,56 @@ func authenticateChain(r *http.Request, auths []module.Authenticator) (*domain.P
 // Unauthenticated or invalid requests receive 401 Unauthorized with WWW-Authenticate: Basic
 // and never an empty 200.
 func Auth(opts AuthOptions) func(http.Handler) http.Handler {
-	var subDecoded, subEscaped string
+	var subDecoded, subEscaped, expectedOrigin string
 	if opts.SubPathResolver != nil {
 		subDecoded = opts.SubPathResolver.SubPathDecoded()
 		subEscaped = opts.SubPathResolver.SubPath()
 	}
+	if opts.OriginResolver != nil {
+		expectedOrigin = opts.OriginResolver.Origin()
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			auths := collectAuthenticators(opts)
-			principal, ok, err := authenticateChain(r, auths)
-			if err != nil {
-				WriteUnauthorized(w, r)
-				return
+			if opts.OriginResolver != nil {
+				r = r.WithContext(WithOriginResolver(r.Context(), opts.OriginResolver))
 			}
-			if ok && principal != nil {
-				ctx := domain.ContextWithPrincipal(r.Context(), principal)
+
+			target, matched := matchRequestAllowlist(r, subDecoded, subEscaped)
+			methodAllowed := matched && isMethodAllowed(r.Method, target.allowedMethods)
+
+			outcome := authenticateChainOutcome(r, collectAuthenticators(opts))
+			if outcome.err != nil {
+				// Allow stale/expired session cookies on allowlisted routes (e.g. POST /api/v1/auth/login
+				// or GET /healthz) so users can always re-authenticate, while still blocking invalid
+				// explicit credentials and blocking invalid cookies on all protected routes.
+				if matched && outcome.tier == module.CredentialTierCookie {
+					outcome = authOutcome{}
+				} else {
+					WriteUnauthorized(w, r)
+					return
+				}
+			}
+
+			if outcome.res.Handled && outcome.res.Principal != nil {
+				if !enforceAuthenticatedMutationPolicy(w, r, expectedOrigin, outcome.res, methodAllowed) {
+					return
+				}
+				ctx := domain.ContextWithPrincipal(r.Context(), outcome.res.Principal)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 
-			target, matched := matchRequestAllowlist(r, subDecoded, subEscaped)
 			if matched {
-				if isMethodAllowed(r.Method, target.allowedMethods) {
-					next.ServeHTTP(w, r)
+				if !methodAllowed {
+					writeMethodNotAllowed(w, r, target.allowedMethods)
 					return
 				}
-				writeMethodNotAllowed(w, r, target.allowedMethods)
+				if !isSafeMethod(r.Method) && !validateBrowserOriginAndFetchMetadata(r, expectedOrigin) {
+					WriteForbidden(w, r, "forbidden")
+					return
+				}
+				next.ServeHTTP(w, r)
 				return
 			}
 

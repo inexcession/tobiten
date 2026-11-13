@@ -35,7 +35,7 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			}
 
 			// 2. Verify all seeded M1A tables contain sample rows.
-			verifySeededData(ctx, t, db)
+			verifySeededData(ctx, t, db, 1)
 
 			// 3. Migrate the seeded database up to HEAD schema.
 			if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
@@ -66,7 +66,7 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			}
 
 			// 5. Verify seeded data survived the migration to head intact.
-			verifySeededData(ctx, t, db)
+			verifySeededData(ctx, t, db, len(coreMigrations))
 		})
 	}
 }
@@ -259,7 +259,7 @@ func TestUpgradeSeeds_PsqlRestore(t *testing.T) {
 	}
 }
 
-func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB) {
+func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expectedMigrations int) {
 	t.Helper()
 
 	checkCount := func(table string, expected int) {
@@ -284,7 +284,7 @@ func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB) {
 	checkCount("event_subscribers", 2)
 	checkCount("jobs", 2)
 	checkCount("system_settings", 3)
-	checkCount("schema_migrations", 1)
+	checkCount("schema_migrations", expectedMigrations)
 
 	// Roles: 4 built-in roles + 1 custom Junior Curator = 5
 	var roleCount int
