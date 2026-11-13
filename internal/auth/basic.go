@@ -135,8 +135,8 @@ func NewBasicAuthenticator(store BasicStore, opts BasicOptions) (*BasicAuthentic
 
 	var ipThrottle, userThrottle *boundedThrottleMap
 	if !opts.DisableThrottle {
-		ipThrottle = newBoundedThrottleMap(opts.IPMaxFailures, opts.FailureWindow, opts.BaseCooldown, opts.MaxCooldown, opts.ThrottleMaxKeys)
-		userThrottle = newBoundedThrottleMap(opts.UserMaxFailures, opts.FailureWindow, opts.BaseCooldown, opts.MaxCooldown, opts.ThrottleMaxKeys)
+		ipThrottle = newBoundedThrottleMap(secret[:], "throttle-ip", opts.IPMaxFailures, opts.FailureWindow, opts.BaseCooldown, opts.MaxCooldown, opts.ThrottleMaxKeys)
+		userThrottle = newBoundedThrottleMap(secret[:], "throttle-user", opts.UserMaxFailures, opts.FailureWindow, opts.BaseCooldown, opts.MaxCooldown, opts.ThrottleMaxKeys)
 	}
 
 	return &BasicAuthenticator{
@@ -329,13 +329,22 @@ func isUsablePasswordCredential(cred *domain.Credential, now time.Time) bool {
 	return true
 }
 
+const maxThrottleLogAttrBytes = 128
+
 func (a *BasicAuthenticator) logThrottled(ctx context.Context, clientIP, username string) {
 	if a.logger != nil {
 		a.logger.WarnContext(ctx, "basic authentication throttled",
-			slog.String("client_ip", clientIP),
-			slog.String("username", username),
+			slog.String("client_ip", detachBoundedLogAttr(clientIP)),
+			slog.String("username", detachBoundedLogAttr(username)),
 		)
 	}
+}
+
+func detachBoundedLogAttr(s string) string {
+	if len(s) > maxThrottleLogAttrBytes {
+		s = s[:maxThrottleLogAttrBytes]
+	}
+	return strings.Clone(s)
 }
 
 func (a *BasicAuthenticator) isIPThrottled(clientIP string, now time.Time) bool {
@@ -581,7 +590,7 @@ func (c *verificationCache) clear() {
 }
 
 type throttleEntry struct {
-	key            string
+	key            [32]byte
 	failures       int
 	trips          int
 	lastFailure    time.Time
@@ -590,6 +599,8 @@ type throttleEntry struct {
 }
 
 type boundedThrottleMap struct {
+	hmacSecret   [32]byte
+	tag          string
 	maxFailures  int
 	window       time.Duration
 	baseCooldown time.Duration
@@ -597,26 +608,35 @@ type boundedThrottleMap struct {
 	maxEntries   int
 
 	mu      sync.Mutex
-	entries map[string]*throttleEntry
+	entries map[[32]byte]*throttleEntry
 	lru     *list.List
 }
 
-func newBoundedThrottleMap(maxFailures int, window, baseCooldown, maxCooldown time.Duration, maxEntries int) *boundedThrottleMap {
+func newBoundedThrottleMap(hmacSecret []byte, tag string, maxFailures int, window, baseCooldown, maxCooldown time.Duration, maxEntries int) *boundedThrottleMap {
+	var secret [32]byte
+	copy(secret[:], hmacSecret)
 	return &boundedThrottleMap{
+		hmacSecret:   secret,
+		tag:          tag,
 		maxFailures:  maxFailures,
 		window:       window,
 		baseCooldown: baseCooldown,
 		maxCooldown:  maxCooldown,
 		maxEntries:   maxEntries,
-		entries:      make(map[string]*throttleEntry),
+		entries:      make(map[[32]byte]*throttleEntry),
 		lru:          list.New(),
 	}
 }
 
-func (m *boundedThrottleMap) isThrottled(key string, now time.Time) bool {
-	if key == "" {
+func (m *boundedThrottleMap) keyFor(rawKey string) [32]byte {
+	return hmacLengthPrefixed(m.hmacSecret[:], m.tag, rawKey)
+}
+
+func (m *boundedThrottleMap) isThrottled(rawKey string, now time.Time) bool {
+	if rawKey == "" {
 		return false
 	}
+	key := m.keyFor(rawKey)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -635,10 +655,11 @@ func (m *boundedThrottleMap) isThrottled(key string, now time.Time) bool {
 	return true
 }
 
-func (m *boundedThrottleMap) recordFailure(key string, now time.Time) {
-	if key == "" {
+func (m *boundedThrottleMap) recordFailure(rawKey string, now time.Time) {
+	if rawKey == "" {
 		return
 	}
+	key := m.keyFor(rawKey)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -679,10 +700,11 @@ func (m *boundedThrottleMap) recordFailure(key string, now time.Time) {
 	}
 }
 
-func (m *boundedThrottleMap) reset(key string) {
-	if key == "" {
+func (m *boundedThrottleMap) reset(rawKey string) {
+	if rawKey == "" {
 		return
 	}
+	key := m.keyFor(rawKey)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

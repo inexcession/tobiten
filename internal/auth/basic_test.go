@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
@@ -764,4 +767,156 @@ func TestBasicAuthenticator_BackendErrorsDoNotThrottle(t *testing.T) {
 			t.Fatalf("DB failure should surface error without throttling, got %v", err)
 		}
 	}
+}
+
+func TestBasicAuthenticator_BoundedDetachedThrottleKeys(t *testing.T) {
+	// 1. Structural proof: throttle map keys and entries must be fixed-width [32]byte digests
+	// with zero retained string/slice references to request credential buffers.
+	mapKeyType := reflect.TypeOf((boundedThrottleMap{}).entries).Key()
+	if mapKeyType.Kind() != reflect.Array || mapKeyType.Len() != 32 || mapKeyType.Elem().Kind() != reflect.Uint8 {
+		t.Fatalf("throttle map key type = %v, want [32]uint8", mapKeyType)
+	}
+	entryType := reflect.TypeOf(throttleEntry{})
+	for i := range entryType.NumField() {
+		f := entryType.Field(i)
+		if f.Type.Kind() == reflect.String || f.Type.Kind() == reflect.Slice {
+			t.Fatalf("throttleEntry field %s has variable-length reference type %v; must stay fixed-width", f.Name, f.Type)
+		}
+	}
+
+	// Verify log attribute helper detaches from large backing strings and bounds length.
+	largeBuf := strings.Repeat("u", 64) + ":" + strings.Repeat("p", 128*1024)
+	shortSub := largeBuf[:64]
+	detachedShort := detachBoundedLogAttr(shortSub)
+	if detachedShort != shortSub || unsafe.StringData(detachedShort) == unsafe.StringData(largeBuf) {
+		t.Fatalf("detachBoundedLogAttr must copy short substrings off the large backing buffer")
+	}
+	detachedLong := detachBoundedLogAttr(largeBuf)
+	if len(detachedLong) != maxThrottleLogAttrBytes || unsafe.StringData(detachedLong) == unsafe.StringData(largeBuf) {
+		t.Fatalf("detachBoundedLogAttr long len = %d, want %d detached from backing buffer", len(detachedLong), maxThrottleLogAttrBytes)
+	}
+
+	store := newStubBasicStore()
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	currentTime := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+	}
+
+	var verifyCalls atomic.Int32
+	auth, err := NewBasicAuthenticator(store, BasicOptions{
+		UserMaxFailures: 3,
+		IPMaxFailures:   5,
+		FailureWindow:   1 * time.Minute,
+		BaseCooldown:    5 * time.Second,
+		MaxCooldown:     20 * time.Second,
+		ThrottleMaxKeys: 32,
+		Now:             currentTime,
+		VerifyFunc: func(password, encodedHash string) (bool, error) {
+			verifyCalls.Add(1)
+			return fastVerify(password, encodedHash)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewBasicAuthenticator: %v", err)
+	}
+
+	t.Run("large passwords with short usernames store fixed-width keys and stay bounded", func(t *testing.T) {
+		largePassword := strings.Repeat("P", 128*1024)
+		for i := range 64 {
+			username := fmt.Sprintf("u-%03d", i)
+			peer := fmt.Sprintf("[2001:db8::%x]:1234", i+1)
+			res, authErr := auth.Authenticate(makeBasicRequest(username, largePassword, peer))
+			if !res.Handled || !errors.Is(authErr, ErrInvalidCredentials) {
+				t.Fatalf("attempt %d expected ErrInvalidCredentials, got res=%+v err=%v", i, res, authErr)
+			}
+		}
+
+		if got := len(auth.userThrottle.entries); got != 32 {
+			t.Fatalf("userThrottle entries = %d, want 32 (ThrottleMaxKeys bound)", got)
+		}
+		if got := len(auth.ipThrottle.entries); got != 32 {
+			t.Fatalf("ipThrottle entries = %d, want 32 (ThrottleMaxKeys bound)", got)
+		}
+		// Latest entry must match the HMAC digest key of u-063.
+		expectedKey := auth.userThrottle.keyFor("u-063")
+		if _, ok := auth.userThrottle.entries[expectedKey]; !ok {
+			t.Fatalf("expected fixed-width digest key for u-063 in userThrottle")
+		}
+	})
+
+	t.Run("large usernames group across peers, throttle, recover, and evict", func(t *testing.T) {
+		auth.userThrottle.entries = make(map[[32]byte]*throttleEntry)
+		auth.userThrottle.lru.Init()
+		auth.ipThrottle.entries = make(map[[32]byte]*throttleEntry)
+		auth.ipThrottle.lru.Init()
+		verifyCalls.Store(0)
+
+		largeUser := strings.Repeat("x", 128*1024)
+		scheme := HashSchemeArgon2id
+		hash := "fast:right-secret"
+		readerRole, _ := domain.BuiltInRoleByID(domain.RoleReaderID)
+		store.setUser(
+			domain.User{ID: "u-large", Username: largeUser},
+			&domain.Credential{
+				ID:         "c-large",
+				UserID:     "u-large",
+				Kind:       domain.CredentialKindPassword,
+				SecretHash: &hash,
+				HashScheme: &scheme,
+			},
+			[]domain.Role{readerRole},
+		)
+
+		// 3 failures for the same 128 KiB username across 3 rotating peers collapse into 1 digest entry.
+		for i := range 3 {
+			peer := fmt.Sprintf("[2001:db8:1::%x]:443", i+1)
+			res, authErr := auth.Authenticate(makeBasicRequest(largeUser, "wrong-pass", peer))
+			if !res.Handled || !errors.Is(authErr, ErrInvalidCredentials) {
+				t.Fatalf("attempt %d expected ErrInvalidCredentials, got res=%+v err=%v", i+1, res, authErr)
+			}
+		}
+		if got := len(auth.userThrottle.entries); got != 1 {
+			t.Fatalf("userThrottle entries = %d, want 1 (same 128 KiB user grouped across peers)", got)
+		}
+		if _, ok := auth.userThrottle.entries[auth.userThrottle.keyFor(largeUser)]; !ok {
+			t.Fatalf("expected fixed-width digest key for largeUser")
+		}
+
+		// 4th attempt from a fresh peer is throttled before invoking KDF.
+		res, authErr := auth.Authenticate(makeBasicRequest(largeUser, "right-secret", "[2001:db8:1::99]:443"))
+		if !res.Handled || !errors.Is(authErr, ErrAuthThrottled) {
+			t.Fatalf("expected ErrAuthThrottled for largeUser, got res=%+v err=%v", res, authErr)
+		}
+		if verifyCalls.Load() != 3 {
+			t.Fatalf("throttled attempt must not run KDF, verifyCalls = %d", verifyCalls.Load())
+		}
+
+		// Advancing past BaseCooldown restores access and resets the largeUser throttle entry.
+		advance(6 * time.Second)
+		res, authErr = auth.Authenticate(makeBasicRequest(largeUser, "right-secret", "[2001:db8:1::99]:443"))
+		if authErr != nil || !res.Handled || res.Principal == nil {
+			t.Fatalf("expected largeUser recovery after cooldown, got res=%+v err=%v", res, authErr)
+		}
+		if got := len(auth.userThrottle.entries); got != 0 {
+			t.Fatalf("expected userThrottle entry cleared after valid login, got %d", got)
+		}
+
+		// Distinct 128 KiB usernames stay bounded by ThrottleMaxKeys=32.
+		for i := range 40 {
+			u := fmt.Sprintf("%s-%02d", strings.Repeat("y", 128*1024), i)
+			peer := fmt.Sprintf("[2001:db8:2::%x]:443", i+1)
+			_, _ = auth.Authenticate(makeBasicRequest(u, "bad", peer))
+		}
+		if got := len(auth.userThrottle.entries); got != 32 {
+			t.Fatalf("userThrottle entries = %d, want 32 after large-username flood", got)
+		}
+	})
 }
