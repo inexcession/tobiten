@@ -196,6 +196,21 @@ func TestBasicAuthenticator_HTTPHeaderParsingAndAuth(t *testing.T) {
 		}
 	})
 
+	t.Run("repeated identical basic headers accepted without widening", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		req.RemoteAddr = "10.0.0.3:12345"
+		encoded := base64.StdEncoding.EncodeToString([]byte("alice:p@ss:with:colons"))
+		req.Header.Add("Authorization", "Basic "+encoded)
+		req.Header.Add("Authorization", "basic "+encoded)
+		res, err := auth.Authenticate(req)
+		if err != nil || !res.Handled || res.Principal == nil {
+			t.Fatalf("expected success for repeated identical basic headers, got res=%+v err=%v", res, err)
+		}
+		if res.Principal.User.ID != "u-1" || res.Principal.CredentialID != "c-1" {
+			t.Fatalf("unexpected principal: %+v", res.Principal)
+		}
+	})
+
 	malformedCases := []struct {
 		name    string
 		headers []string
@@ -207,10 +222,24 @@ func TestBasicAuthenticator_HTTPHeaderParsingAndAuth(t *testing.T) {
 		{name: "empty password", headers: []string{"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:"))}},
 		{name: "null byte", headers: []string{"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:sec\x00ret"))}},
 		{
-			name: "multiple basic headers",
+			name: "multiple distinct basic headers",
 			headers: []string{
 				"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:p@ss:with:colons")),
 				"Basic " + base64.StdEncoding.EncodeToString([]byte("bob:other")),
+			},
+		},
+		{
+			name: "multiple distinct basic headers same user",
+			headers: []string{
+				"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:p@ss:with:colons")),
+				"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:different-password")),
+			},
+		},
+		{
+			name: "valid basic header plus malformed basic header",
+			headers: []string{
+				"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:p@ss:with:colons")),
+				"Basic !!!not-base64!!!",
 			},
 		},
 	}

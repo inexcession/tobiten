@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"log/slog"
@@ -107,6 +108,11 @@ func NewBasicAuthenticator(store BasicStore, opts BasicOptions) (*BasicAuthentic
 // Name returns the canonical authenticator name.
 func (a *BasicAuthenticator) Name() string {
 	return "basic"
+}
+
+// Tier returns CredentialTierExplicit per ADR-0006 §3 request precedence.
+func (a *BasicAuthenticator) Tier() module.CredentialTier {
+	return module.CredentialTierExplicit
 }
 
 // Authenticate implements module.Authenticator for HTTP Basic credentials.
@@ -238,36 +244,41 @@ func (a *BasicAuthenticator) computeCacheKey(userID, username, credID, secretHas
 }
 
 func parseBasicAuthHeader(r *http.Request) (username, password string, hasBasic bool, err error) {
-	var basicPayload string
-	basicCount := 0
+	var firstUser, firstPass string
 	for _, hdr := range r.Header.Values("Authorization") {
 		scheme, rest, found := strings.Cut(strings.TrimSpace(hdr), " ")
 		if !strings.EqualFold(scheme, "Basic") {
 			continue
 		}
-		basicCount++
 		if !found {
 			return "", "", true, ErrInvalidCredentials
 		}
-		basicPayload = strings.TrimSpace(rest)
+		payload := strings.TrimSpace(rest)
+		if payload == "" {
+			return "", "", true, ErrInvalidCredentials
+		}
+		decoded, decErr := base64.StdEncoding.DecodeString(payload)
+		if decErr != nil {
+			return "", "", true, ErrInvalidCredentials
+		}
+		user, pass, ok := strings.Cut(string(decoded), ":")
+		if !ok || user == "" || pass == "" || strings.ContainsRune(user, 0) || strings.ContainsRune(pass, 0) {
+			return "", "", true, ErrInvalidCredentials
+		}
+		if !hasBasic {
+			firstUser = user
+			firstPass = pass
+			hasBasic = true
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(firstUser), []byte(user)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(firstPass), []byte(pass)) != 1 {
+			return "", "", true, ErrInvalidCredentials
+		}
 	}
 
-	if basicCount == 0 {
+	if !hasBasic {
 		return "", "", false, nil
 	}
-	if basicCount > 1 || basicPayload == "" {
-		return "", "", true, ErrInvalidCredentials
-	}
-
-	decoded, decErr := base64.StdEncoding.DecodeString(basicPayload)
-	if decErr != nil {
-		return "", "", true, ErrInvalidCredentials
-	}
-
-	user, pass, ok := strings.Cut(string(decoded), ":")
-	if !ok || user == "" || pass == "" || strings.ContainsRune(user, 0) || strings.ContainsRune(pass, 0) {
-		return "", "", true, ErrInvalidCredentials
-	}
-
-	return user, pass, true, nil
+	return firstUser, firstPass, true, nil
 }

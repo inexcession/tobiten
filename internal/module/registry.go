@@ -78,10 +78,33 @@ type AuthenticatorProvider interface {
 	Authenticators() []Authenticator
 }
 
+// CredentialTier represents the precedence tier of an authentication source (ADR-0006 §3).
+// Higher tiers take precedence over lower tiers.
+type CredentialTier int
+
+const (
+	// CredentialTierUnspecified is for authenticators that do not declare a tier.
+	CredentialTierUnspecified CredentialTier = iota
+	// CredentialTierCookie is for session and remember-me cookie authenticators.
+	CredentialTierCookie
+	// CredentialTierTrustedProxy is for trusted reverse-proxy header authenticators.
+	CredentialTierTrustedProxy
+	// CredentialTierExplicit is for explicit per-request credentials
+	// (X-API-Key, Authorization: Bearer/Basic, X-Auth-Token).
+	CredentialTierExplicit
+)
+
 // Authenticator represents a declared pluggable authentication mechanism (ADR-0018 S1).
 type Authenticator interface {
 	Name() string
 	Authenticate(r *http.Request) (AuthResult, error)
+}
+
+// TieredAuthenticator is an optional interface implemented by authenticators
+// to declare their credential precedence tier (ADR-0006 §3).
+type TieredAuthenticator interface {
+	Authenticator
+	Tier() CredentialTier
 }
 
 // AuthResult represents the outcome of an Authenticator invocation.

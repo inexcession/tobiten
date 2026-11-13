@@ -123,6 +123,11 @@ func (a *PATAuthenticator) Name() string {
 	return "pat"
 }
 
+// Tier returns CredentialTierExplicit per ADR-0006 §3 request precedence.
+func (a *PATAuthenticator) Tier() module.CredentialTier {
+	return module.CredentialTierExplicit
+}
+
 // Authenticate implements module.Authenticator for Bearer and X-API-Key PAT credentials.
 func (a *PATAuthenticator) Authenticate(r *http.Request) (module.AuthResult, error) {
 	token, hasPAT, err := parsePATHeaders(r)
