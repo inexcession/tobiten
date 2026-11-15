@@ -222,20 +222,40 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	return err
 }
 
+const checkDaemonOwnershipSQL = `SELECT EXISTS (
+	SELECT 1
+	FROM pg_locks
+	WHERE pid = pg_backend_pid()
+	  AND locktype = 'advisory'
+	  AND granted
+	  AND classid = $1::oid
+	  AND objid = $2::oid
+	  AND objsubid = 1
+)`
+
 func monitorOwnership(ctx context.Context, owner *pgx.Conn, cancel context.CancelCauseFunc) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	classID := int64(uint32(daemonLockID >> 32))
+	objID := int64(uint32(daemonLockID & 0xffffffff))
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			checkCtx, stop := context.WithTimeout(ctx, 2*time.Second)
-			err := owner.Ping(checkCtx)
+			var stillOwned bool
+			err := owner.QueryRow(checkCtx, checkDaemonOwnershipSQL, classID, objID).Scan(&stillOwned)
 			stop()
 			if err != nil {
 				if ctx.Err() == nil {
 					cancel(fmt.Errorf("database ownership connection lost: %w", err))
+				}
+				return
+			}
+			if !stillOwned {
+				if ctx.Err() == nil {
+					cancel(errors.New("database ownership advisory lock lost"))
 				}
 				return
 			}

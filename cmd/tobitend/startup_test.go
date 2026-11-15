@@ -218,6 +218,39 @@ func TestRunDaemonOwnershipLossStopsServing(t *testing.T) {
 	}
 }
 
+func TestMonitorOwnershipDetectsLockUnlock(t *testing.T) {
+	db := testdb.New(t)
+	d, err := openDaemonStorage(t.Context(), hostedConfig(t, db.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := d.close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var unlocked bool
+	if err := d.owner.QueryRow(t.Context(), "SELECT pg_advisory_unlock($1)", daemonLockID).Scan(&unlocked); err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
+		t.Fatal("expected daemon advisory lock to be held and unlockable")
+	}
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	done := make(chan struct{})
+	go func() { defer close(done); monitorOwnership(ctx, d.owner, cancel) }()
+	select {
+	case <-ctx.Done():
+		if !strings.Contains(context.Cause(ctx).Error(), "advisory lock lost") {
+			t.Fatal(context.Cause(ctx))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("advisory lock loss not detected")
+	}
+	<-done
+}
+
 func TestLocalDaemonProvisioningAndRestart(t *testing.T) {
 	if _, err := embedded.FindBinDir(""); err != nil {
 		t.Skipf("local-supervisor coverage requires host PostgreSQL binaries: %v", err)
