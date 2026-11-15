@@ -2,6 +2,7 @@ package migrations_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
@@ -67,6 +69,33 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 
 			// 5. Verify seeded data survived the migration to head intact.
 			verifySeededData(ctx, t, db, len(coreMigrations))
+
+			// 6. Verify catalogue tables from 0004_catalogue.sql exist after upgrading from 0001.
+			for _, table := range []string{
+				"libraries",
+				"library_roots",
+				"series",
+				"volumes",
+				"series_memberships",
+				"people",
+				"credits",
+				"entities",
+				"volume_entities",
+				"media_assets",
+				"asset_digests",
+				"reading_progress",
+			} {
+				var exists bool
+				if err := db.QueryRow(ctx,
+					"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
+					table,
+				).Scan(&exists); err != nil {
+					t.Fatalf("checking table %q after upgrade: %v", table, err)
+				}
+				if !exists {
+					t.Errorf("expected table %q to exist after migrating %s to head", table, seedName)
+				}
+			}
 		})
 	}
 }
@@ -89,19 +118,21 @@ func TestUpgradeSeeds_FailsOnBrokenMigration(t *testing.T) {
 		t.Fatalf("expected 3 initial users, got %d", initialUsers)
 	}
 
-	// 2. Prepare a migration list that includes a breaking migration.
-	// Migration 0002 attempts to add a NOT NULL column with no DEFAULT to 'users'.
-	// Because 'users' already has 3 rows, this MUST fail with a NOT NULL constraint violation (SQLSTATE 23502).
+	// 2. Prepare a migration list that appends a breaking migration above HEAD.
+	// Attempting to add a NOT NULL column with no DEFAULT to 'users' MUST fail with
+	// PostgreSQL SQLSTATE 23502 (not_null_violation) rather than version ordering rejection.
 	coreMigrations, err := migrations.Collect(migrations.CoreFS)
 	if err != nil {
 		t.Fatalf("failed to collect core migrations: %v", err)
 	}
+	nextVersion := coreMigrations[len(coreMigrations)-1].Version + 1
+	brokenName := fmt.Sprintf("%04d_broken_not_null.sql", nextVersion)
 
 	breakingMigration := migrations.Migration{
-		Version:  2,
-		Name:     "0002_broken_not_null.sql",
+		Version:  nextVersion,
+		Name:     brokenName,
 		SQL:      "ALTER TABLE users ADD COLUMN email TEXT NOT NULL;",
-		Checksum: "sha256:breaking0002notnull",
+		Checksum: "sha256:breakingnotnull",
 	}
 
 	migrationPlan := append(coreMigrations, breakingMigration)
@@ -113,19 +144,26 @@ func TestUpgradeSeeds_FailsOnBrokenMigration(t *testing.T) {
 	}
 
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "0002_broken_not_null.sql") {
-		t.Errorf("expected error to mention broken migration name, got: %s", errMsg)
+	if !strings.Contains(errMsg, brokenName) {
+		t.Errorf("expected error to mention broken migration name %q, got: %s", brokenName, errMsg)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23502" {
+		t.Fatalf("expected PostgreSQL not_null_violation (23502), got: %v", err)
 	}
 
 	// 4. Verify transaction rollback:
-	// - Version 2 must NOT be recorded in schema_migrations
+	// - nextVersion must NOT be recorded in schema_migrations
 	applied, err := migrations.Applied(ctx, db)
 	if err != nil {
 		t.Fatalf("failed to query applied migrations: %v", err)
 	}
+	if len(applied) != len(coreMigrations) {
+		t.Errorf("expected %d applied migrations after rollback, got %d", len(coreMigrations), len(applied))
+	}
 	for _, app := range applied {
-		if app.Version == 2 {
-			t.Errorf("broken migration version 2 was recorded in schema_migrations despite failure")
+		if app.Version == nextVersion {
+			t.Errorf("broken migration version %d was recorded in schema_migrations despite failure", nextVersion)
 		}
 	}
 
@@ -162,27 +200,49 @@ func TestUpgradeSeeds_FailsOnIncompatibleConstraint(t *testing.T) {
 		t.Fatalf("failed to restore 0001 seed: %v", err)
 	}
 
-	// 2. Prepare a migration with an incompatible CHECK constraint.
+	// 2. Prepare a migration above HEAD with an incompatible CHECK constraint.
 	// system_settings has keys like 'events.retention_days' (length 21).
-	// Adding CHECK (length(key) < 5) must fail because of existing rows.
+	// Adding CHECK (length(key) < 5) must fail with SQLSTATE 23514 (check_violation).
 	coreMigrations, err := migrations.Collect(migrations.CoreFS)
 	if err != nil {
 		t.Fatalf("collecting core migrations: %v", err)
 	}
+	nextVersion := coreMigrations[len(coreMigrations)-1].Version + 1
+	brokenName := fmt.Sprintf("%04d_broken_check_constraint.sql", nextVersion)
 
 	breakingMigration := migrations.Migration{
-		Version:  2,
-		Name:     "0002_broken_check_constraint.sql",
+		Version:  nextVersion,
+		Name:     brokenName,
 		SQL:      "ALTER TABLE system_settings ADD CONSTRAINT check_short_keys CHECK (length(key) < 5);",
-		Checksum: "sha256:breaking0002check",
+		Checksum: "sha256:breakingcheck",
 	}
 
 	err = migrations.Run(ctx, db, append(coreMigrations, breakingMigration))
 	if err == nil {
 		t.Fatal("expected check constraint migration to fail on seeded rows, but succeeded")
 	}
+	if !strings.Contains(err.Error(), brokenName) {
+		t.Errorf("expected error to mention broken migration name %q, got: %s", brokenName, err.Error())
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("expected PostgreSQL check_violation (23514), got: %v", err)
+	}
 
 	// Verify rollback
+	applied, err := migrations.Applied(ctx, db)
+	if err != nil {
+		t.Fatalf("failed to query applied migrations: %v", err)
+	}
+	if len(applied) != len(coreMigrations) {
+		t.Errorf("expected %d applied migrations after rollback, got %d", len(coreMigrations), len(applied))
+	}
+	for _, app := range applied {
+		if app.Version == nextVersion {
+			t.Errorf("broken migration version %d was recorded in schema_migrations despite failure", nextVersion)
+		}
+	}
+
 	var constraintExists bool
 	conCheckSQL := `
 		SELECT EXISTS (

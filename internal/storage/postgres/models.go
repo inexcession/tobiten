@@ -10,6 +10,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AssetDigest struct {
+	AssetID    string
+	Kind       string
+	Value      string
+	IsCurrent  bool
+	Reason     string
+	RecordedAt time.Time
+}
+
 type Credential struct {
 	ID              string
 	UserID          string
@@ -25,6 +34,16 @@ type Credential struct {
 	RevokedAt       *time.Time
 }
 
+type Credit struct {
+	ID           string
+	PersonID     string
+	SeriesID     *string
+	VolumeID     *string
+	Role         string
+	Position     int32
+	LockedFields []byte
+}
+
 type DomainEvent struct {
 	ID                int64
 	PublishedSequence pgtype.Int8
@@ -35,6 +54,15 @@ type DomainEvent struct {
 	AggregateID       string
 	Payload           []byte
 	CreatedAt         time.Time
+}
+
+type Entity struct {
+	ID           string
+	Kind         string
+	Name         string
+	Aliases      []string
+	ExternalIds  []byte
+	LockedFields []byte
 }
 
 type EventSubscriber struct {
@@ -79,6 +107,72 @@ type Label struct {
 	BuiltIn bool
 }
 
+type Library struct {
+	ID                    string
+	Name                  string
+	Mode                  string
+	IntakePathBytes       []byte
+	IntakePathDisplay     *string
+	IntakePathMatch       *string
+	AutoMetadataWriteback bool
+	ResolverChain         []string
+	MetadataPrecedence    string
+	DefaultCoverPolicy    string
+	CreatedAt             time.Time
+}
+
+type LibraryRoot struct {
+	ID            string
+	LibraryID     string
+	PathBytes     []byte
+	PathDisplay   string
+	PathMatch     string
+	State         string
+	LastCheckedAt *time.Time
+	LastError     *string
+}
+
+type MediaAsset struct {
+	ID              string
+	VolumeID        string
+	LibraryRootID   string
+	RelPathBytes    []byte
+	RelPathDisplay  string
+	RelPathMatch    string
+	FileSize        int64
+	FileMtime       *time.Time
+	Format          string
+	PageCount       int32
+	CoverPageIndex  int32
+	SuppressedPages []int32
+	Diagnostics     []byte
+	MissingSince    *time.Time
+	RetiredAt       *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+type Person struct {
+	ID            string
+	Name          string
+	NameNative    *string
+	NameRomanized *string
+	Aliases       []string
+	ExternalIds   []byte
+	LockedFields  []byte
+}
+
+type ReadingProgress struct {
+	UserID           string
+	VolumeID         string
+	Locator          []byte
+	TotalProgression float32
+	Device           *string
+	Source           string
+	Completed        bool
+	UpdatedAt        time.Time
+}
+
 type Role struct {
 	ID                  string
 	Name                string
@@ -89,6 +183,44 @@ type Role struct {
 type RolePermission struct {
 	RoleID     string
 	Permission string
+}
+
+type Series struct {
+	ID               string
+	LibraryID        string
+	Title            string
+	TitleSort        string
+	Language         *string
+	OriginalTitle    *string
+	RomajiTitle      *string
+	Franchise        *string
+	EditionName      *string
+	Publisher        *string
+	Imprint          *string
+	Status           string
+	Summary          *string
+	AgeRating        *string
+	Genres           []string
+	Tags             []string
+	CoverPolicy      *string
+	CoverVolumeID    *string
+	CoverImageDigest *string
+	LockedFields     []byte
+	ExternalIds      []byte
+	TotalVolumes     pgtype.Int4
+	ReleaseYear      pgtype.Int4
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+type SeriesMembership struct {
+	VolumeID     string
+	SeriesID     string
+	IsPrimary    bool
+	Kind         string
+	Position     pgtype.Float8
+	Source       string
+	LockedFields []byte
 }
 
 type Session struct {
@@ -129,4 +261,29 @@ type UserLabelPolicy struct {
 type UserRole struct {
 	UserID string
 	RoleID string
+}
+
+type Volume struct {
+	ID                 string
+	LibraryID          string
+	Kind               string
+	Number             pgtype.Float8
+	ChapterStart       pgtype.Float8
+	ChapterEnd         pgtype.Float8
+	ChapterRangeSource *string
+	Title              *string
+	Summary            *string
+	ReleaseDate        pgtype.Date
+	PageCount          int32
+	PreferredAssetID   *string
+	ExternalIds        []byte
+	LockedFields       []byte
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+type VolumeEntity struct {
+	VolumeID     string
+	EntityID     string
+	LockedFields []byte
 }

@@ -112,9 +112,23 @@ func TestGenerateSeed0001(t *testing.T) {
 	db := testdb.New(t)
 	ctx := context.Background()
 
-	// 1. Apply core migrations (0001_init.sql)
-	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
-		t.Fatalf("applying core migrations: %v", err)
+	// 1. Apply only 0001_init.sql so the historical 0001 seed stays pinned to version 1.
+	coreMigrations, err := migrations.Collect(migrations.CoreFS)
+	if err != nil {
+		t.Fatalf("collecting core migrations: %v", err)
+	}
+	var mig0001 []migrations.Migration
+	for _, m := range coreMigrations {
+		if m.Version == 1 {
+			mig0001 = append(mig0001, m)
+			break
+		}
+	}
+	if len(mig0001) != 1 || mig0001[0].Name != "0001_init.sql" {
+		t.Fatalf("expected 0001_init.sql in CoreFS, got %+v", mig0001)
+	}
+	if err := migrations.Run(ctx, db, mig0001); err != nil {
+		t.Fatalf("applying 0001_init.sql: %v", err)
 	}
 
 	// 2. Insert sample seed rows
