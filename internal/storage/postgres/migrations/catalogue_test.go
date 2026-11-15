@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
+	"github.com/inexcession/tobiten/internal/testdb"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -1107,6 +1108,517 @@ func TestMigration0004_ConcurrentCrossTableRaces(t *testing.T) {
 			t.Fatal("expected tx2 to fail after tx1 committed membership in lib-a")
 		}
 	})
+}
+
+func TestMigration0004_RepeatableReadIsolationRaces(t *testing.T) {
+	t.Parallel()
+	db := applyCatalogueMigrations(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	seedBasicLibrary(ctx, t, db, "iso-lib-a", "Iso Lib A", "iso-root-a", "/iso-a")
+	seedBasicLibrary(ctx, t, db, "iso-lib-b", "Iso Lib B", "iso-root-b", "/iso-b")
+
+	for _, iso := range []struct {
+		name  string
+		level pgx.TxIsoLevel
+	}{
+		{name: "read_committed", level: pgx.ReadCommitted},
+		{name: "repeatable_read", level: pgx.RepeatableRead},
+	} {
+		t.Run("primary_membership_simultaneous/"+iso.name, func(t *testing.T) {
+			s1 := "pm-sim-s1-" + iso.name
+			s2 := "pm-sim-s2-" + iso.name
+			v := "pm-sim-v-" + iso.name
+
+			if _, err := db.Exec(ctx, `
+				INSERT INTO series (id, library_id, title, title_sort) VALUES
+					($1, 'iso-lib-a', 'S1', 'S1'),
+					($2, 'iso-lib-a', 'S2', 'S2')`, s1, s2); err != nil {
+				t.Fatalf("insert series: %v", err)
+			}
+			if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, 'iso-lib-a')`, v); err != nil {
+				t.Fatalf("insert volume: %v", err)
+			}
+			if _, err := db.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ($1, $2, TRUE)`, v, s1); err != nil {
+				t.Fatalf("insert initial primary: %v", err)
+			}
+
+			tx1, tx2 := beginPairWithIso(ctx, t, db, iso.level)
+			defer rollbackQuiet(ctx, tx1)
+			defer rollbackQuiet(ctx, tx2)
+
+			if _, err := tx1.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary, kind) VALUES ($1, $2, FALSE, 'SUB_SERIES')`, v, s2); err != nil {
+				t.Fatalf("tx1 insert secondary: %v", err)
+			}
+			if _, err := tx2.Exec(ctx, `DELETE FROM series_memberships WHERE volume_id = $1 AND series_id = $2`, v, s1); err != nil {
+				t.Fatalf("tx2 delete primary: %v", err)
+			}
+
+			err1, err2 := commitPairConcurrently(ctx, tx1, tx2)
+			if err1 == nil && err2 == nil {
+				t.Fatal("expected at least one concurrent transaction to fail, but both committed")
+			}
+
+			var total, primary int
+			if err := db.QueryRow(ctx, `
+				SELECT COUNT(*), COUNT(*) FILTER (WHERE is_primary)
+				FROM series_memberships
+				WHERE volume_id = $1`, v).Scan(&total, &primary); err != nil {
+				t.Fatalf("querying memberships: %v", err)
+			}
+			if (total > 0 && primary != 1) || total > 2 {
+				t.Fatalf("invalid final primary invariant (%s): total=%d primary=%d", iso.name, total, primary)
+			}
+			if err1 == nil && err2 != nil && (total != 2 || primary != 1) {
+				t.Fatalf("expected {s1 primary, s2 secondary} when tx1 wins (%s), got total=%d primary=%d", iso.name, total, primary)
+			}
+			if err2 == nil && err1 != nil && (total != 0 || primary != 0) {
+				t.Fatalf("expected empty memberships when tx2 wins (%s), got total=%d primary=%d", iso.name, total, primary)
+			}
+		})
+
+		t.Run("same_library_volume_side_simultaneous/"+iso.name, func(t *testing.T) {
+			s := "slv-sim-s-" + iso.name
+			v := "slv-sim-v-" + iso.name
+
+			if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, 'iso-lib-a', 'SLV', 'SLV')`, s); err != nil {
+				t.Fatalf("insert series: %v", err)
+			}
+			if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, 'iso-lib-a')`, v); err != nil {
+				t.Fatalf("insert volume: %v", err)
+			}
+
+			tx1, tx2 := beginPairWithIso(ctx, t, db, iso.level)
+			defer rollbackQuiet(ctx, tx1)
+			defer rollbackQuiet(ctx, tx2)
+
+			if _, err := tx1.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ($1, $2, TRUE)`, v, s); err != nil {
+				t.Fatalf("tx1 insert membership: %v", err)
+			}
+			if _, err := tx2.Exec(ctx, `UPDATE volumes SET library_id = 'iso-lib-b' WHERE id = $1`, v); err != nil {
+				t.Fatalf("tx2 update volume library: %v", err)
+			}
+
+			err1, err2 := commitPairConcurrently(ctx, tx1, tx2)
+			if err1 == nil && err2 == nil {
+				t.Fatal("expected at least one concurrent transaction to fail, but both committed")
+			}
+
+			assertSameLibraryMembershipState(ctx, t, db, v, s)
+		})
+
+		t.Run("same_library_series_side_simultaneous/"+iso.name, func(t *testing.T) {
+			s := "sls-sim-s-" + iso.name
+			v := "sls-sim-v-" + iso.name
+
+			if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, 'iso-lib-a', 'SLS', 'SLS')`, s); err != nil {
+				t.Fatalf("insert series: %v", err)
+			}
+			if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, 'iso-lib-a')`, v); err != nil {
+				t.Fatalf("insert volume: %v", err)
+			}
+
+			tx1, tx2 := beginPairWithIso(ctx, t, db, iso.level)
+			defer rollbackQuiet(ctx, tx1)
+			defer rollbackQuiet(ctx, tx2)
+
+			if _, err := tx1.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ($1, $2, TRUE)`, v, s); err != nil {
+				t.Fatalf("tx1 insert membership: %v", err)
+			}
+			if _, err := tx2.Exec(ctx, `UPDATE series SET library_id = 'iso-lib-b' WHERE id = $1`, s); err != nil {
+				t.Fatalf("tx2 update series library: %v", err)
+			}
+
+			err1, err2 := commitPairConcurrently(ctx, tx1, tx2)
+			if err1 == nil && err2 == nil {
+				t.Fatal("expected at least one concurrent transaction to fail, but both committed")
+			}
+
+			assertSameLibraryMembershipState(ctx, t, db, v, s)
+		})
+	}
+
+	// Staggered REPEATABLE READ snapshot-first tests:
+	// tx1 pins a snapshot before tx2 commits a new child/link, then tx1 attempts
+	// the conflicting parent/primary mutation. Without parent tuple-version bumps,
+	// tx1's stale snapshot would miss tx2's committed child row.
+	t.Run("primary_membership_snapshot_delete_after_secondary_commit", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO series (id, library_id, title, title_sort) VALUES
+				('pm-snap1-s1', 'iso-lib-a', 'PM1 S1', 'PM1 S1'),
+				('pm-snap1-s2', 'iso-lib-a', 'PM1 S2', 'PM1 S2')`); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ('pm-snap1-v', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volume: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ('pm-snap1-v', 'pm-snap1-s1', TRUE)`); err != nil {
+			t.Fatalf("insert primary: %v", err)
+		}
+
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary, kind) VALUES ('pm-snap1-v', 'pm-snap1-s2', FALSE, 'SUB_SERIES')`); err != nil {
+			t.Fatalf("tx2 insert secondary: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `DELETE FROM series_memberships WHERE volume_id = 'pm-snap1-v' AND series_id = 'pm-snap1-s1'`); err != nil {
+			t.Fatalf("tx1 delete primary: %v", err)
+		}
+		if err := tx1.Commit(ctx); err == nil {
+			t.Fatal("expected tx1 (RepeatableRead stale snapshot) deleting primary after secondary committed to fail")
+		}
+
+		var total, primary int
+		if err := db.QueryRow(ctx, `
+			SELECT COUNT(*), COUNT(*) FILTER (WHERE is_primary)
+			FROM series_memberships WHERE volume_id = 'pm-snap1-v'`).Scan(&total, &primary); err != nil {
+			t.Fatalf("query memberships: %v", err)
+		}
+		if total != 2 || primary != 1 {
+			t.Fatalf("expected 2 memberships with 1 primary preserved, got total=%d primary=%d", total, primary)
+		}
+	})
+
+	t.Run("primary_membership_snapshot_insert_secondary_after_delete_commit", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO series (id, library_id, title, title_sort) VALUES
+				('pm-snap2-s1', 'iso-lib-a', 'PM2 S1', 'PM2 S1'),
+				('pm-snap2-s2', 'iso-lib-a', 'PM2 S2', 'PM2 S2')`); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ('pm-snap2-v', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volume: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ('pm-snap2-v', 'pm-snap2-s1', TRUE)`); err != nil {
+			t.Fatalf("insert primary: %v", err)
+		}
+
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `DELETE FROM series_memberships WHERE volume_id = 'pm-snap2-v' AND series_id = 'pm-snap2-s1'`); err != nil {
+			t.Fatalf("tx2 delete primary: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary, kind) VALUES ('pm-snap2-v', 'pm-snap2-s2', FALSE, 'SUB_SERIES')`); err != nil {
+			t.Fatalf("tx1 insert secondary: %v", err)
+		}
+		if err := tx1.Commit(ctx); err == nil {
+			t.Fatal("expected tx1 (RepeatableRead stale snapshot) inserting secondary without primary after tx2 deleted primary to fail")
+		}
+
+		var total, primary int
+		if err := db.QueryRow(ctx, `
+			SELECT COUNT(*), COUNT(*) FILTER (WHERE is_primary)
+			FROM series_memberships WHERE volume_id = 'pm-snap2-v'`).Scan(&total, &primary); err != nil {
+			t.Fatalf("query memberships: %v", err)
+		}
+		if total != 0 || primary != 0 {
+			t.Fatalf("expected 0 memberships after tx2 delete and tx1 failure, got total=%d primary=%d", total, primary)
+		}
+	})
+
+	t.Run("same_library_volume_snapshot_move_after_membership_commit", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ('sl-vsnap-s', 'iso-lib-a', 'SLV', 'SLV')`); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ('sl-vsnap-v', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volume: %v", err)
+		}
+
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ('sl-vsnap-v', 'sl-vsnap-s', TRUE)`); err != nil {
+			t.Fatalf("tx2 insert membership: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `UPDATE volumes SET library_id = 'iso-lib-b' WHERE id = 'sl-vsnap-v'`); err == nil {
+			if cerr := tx1.Commit(ctx); cerr == nil {
+				t.Fatal("expected tx1 moving volume library after tx2 committed membership to fail")
+			}
+		}
+
+		assertSameLibraryMembershipState(ctx, t, db, "sl-vsnap-v", "sl-vsnap-s")
+		var count int
+		var volLib string
+		if err := db.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM series_memberships WHERE volume_id = 'sl-vsnap-v'), library_id FROM volumes WHERE id = 'sl-vsnap-v'`).Scan(&count, &volLib); err != nil {
+			t.Fatalf("query final volume state: %v", err)
+		}
+		if count != 1 || volLib != "iso-lib-a" {
+			t.Fatalf("expected committed membership preserved in iso-lib-a, got count=%d volLib=%s", count, volLib)
+		}
+	})
+
+	t.Run("same_library_series_snapshot_move_after_membership_commit", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ('sl-ssnap-s', 'iso-lib-a', 'SLS', 'SLS')`); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ('sl-ssnap-v', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volume: %v", err)
+		}
+
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ('sl-ssnap-v', 'sl-ssnap-s', TRUE)`); err != nil {
+			t.Fatalf("tx2 insert membership: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `UPDATE series SET library_id = 'iso-lib-b' WHERE id = 'sl-ssnap-s'`); err == nil {
+			if cerr := tx1.Commit(ctx); cerr == nil {
+				t.Fatal("expected tx1 moving series library after tx2 committed membership to fail")
+			}
+		}
+
+		assertSameLibraryMembershipState(ctx, t, db, "sl-ssnap-v", "sl-ssnap-s")
+		var count int
+		var serLib string
+		if err := db.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM series_memberships WHERE series_id = 'sl-ssnap-s'), library_id FROM series WHERE id = 'sl-ssnap-s'`).Scan(&count, &serLib); err != nil {
+			t.Fatalf("query final series state: %v", err)
+		}
+		if count != 1 || serLib != "iso-lib-a" {
+			t.Fatalf("expected committed membership preserved in iso-lib-a, got count=%d serLib=%s", count, serLib)
+		}
+	})
+
+	t.Run("asset_ownership_snapshot_move_volume_or_root_after_asset_commit", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO volumes (id, library_id) VALUES
+				('ao-snap-v1', 'iso-lib-a'),
+				('ao-snap-v2', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volumes: %v", err)
+		}
+		if _, err := db.Exec(ctx, `
+			INSERT INTO library_roots (id, library_id, path_bytes, path_display, path_match)
+			VALUES ('ao-snap-root', 'iso-lib-a', $1, '/ao', '/ao')`, []byte("/ao")); err != nil {
+			t.Fatalf("insert root: %v", err)
+		}
+
+		// Volume library move after asset commit on stale snapshot.
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `
+			INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, format, file_size)
+			VALUES ('ao-snap-a1', 'ao-snap-v1', 'iso-root-a', $1, 'a', 'a', 'CBZ', 10)`, []byte("a")); err != nil {
+			t.Fatalf("tx2 insert asset 1: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `UPDATE volumes SET library_id = 'iso-lib-b' WHERE id = 'ao-snap-v1'`); err == nil {
+			if cerr := tx1.Commit(ctx); cerr == nil {
+				t.Fatal("expected tx1 moving volume library after asset committed to fail")
+			}
+		}
+
+		// Root library move after asset commit on stale snapshot.
+		tx3 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx3)
+		pinRepeatableReadSnapshot(ctx, t, tx3)
+
+		tx4 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx4)
+		if _, err := tx4.Exec(ctx, `
+			INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, format, file_size)
+			VALUES ('ao-snap-a2', 'ao-snap-v2', 'ao-snap-root', $1, 'b', 'b', 'CBZ', 10)`, []byte("b")); err != nil {
+			t.Fatalf("tx4 insert asset 2: %v", err)
+		}
+		if err := tx4.Commit(ctx); err != nil {
+			t.Fatalf("tx4 commit failed: %v", err)
+		}
+
+		if _, err := tx3.Exec(ctx, `UPDATE library_roots SET library_id = 'iso-lib-b' WHERE id = 'ao-snap-root'`); err == nil {
+			if cerr := tx3.Commit(ctx); cerr == nil {
+				t.Fatal("expected tx3 moving root library after asset committed to fail")
+			}
+		}
+
+		var mismatchCount, assetCount int
+		var v1Lib, rootLib string
+		if err := db.QueryRow(ctx, `
+			SELECT
+				(SELECT COUNT(*)
+				 FROM media_assets a
+				 JOIN volumes v ON v.id = a.volume_id
+				 JOIN library_roots r ON r.id = a.library_root_id
+				 WHERE a.id IN ('ao-snap-a1', 'ao-snap-a2') AND v.library_id <> r.library_id),
+				(SELECT COUNT(*) FROM media_assets WHERE id IN ('ao-snap-a1', 'ao-snap-a2')),
+				(SELECT library_id FROM volumes WHERE id = 'ao-snap-v1'),
+				(SELECT library_id FROM library_roots WHERE id = 'ao-snap-root')`).Scan(&mismatchCount, &assetCount, &v1Lib, &rootLib); err != nil {
+			t.Fatalf("query asset mismatch: %v", err)
+		}
+		if mismatchCount != 0 || assetCount != 2 || v1Lib != "iso-lib-a" || rootLib != "iso-lib-a" {
+			t.Fatalf("unexpected asset/root ownership state: mismatch=%d assets=%d v1Lib=%s rootLib=%s", mismatchCount, assetCount, v1Lib, rootLib)
+		}
+	})
+
+	t.Run("series_cover_and_preferred_asset_snapshot_races", func(t *testing.T) {
+		if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ('cp-snap-s', 'iso-lib-a', 'CP', 'CP')`); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+		if _, err := db.Exec(ctx, `
+			INSERT INTO volumes (id, library_id) VALUES
+				('cp-snap-v1', 'iso-lib-a'),
+				('cp-snap-v2', 'iso-lib-a')`); err != nil {
+			t.Fatalf("insert volumes: %v", err)
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary) VALUES ('cp-snap-v1', 'cp-snap-s', TRUE)`); err != nil {
+			t.Fatalf("insert membership: %v", err)
+		}
+		if _, err := db.Exec(ctx, `
+			INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, format, file_size)
+			VALUES ('cp-snap-a1', 'cp-snap-v1', 'iso-root-a', $1, 'c', 'c', 'CBZ', 10)`, []byte("c")); err != nil {
+			t.Fatalf("insert asset: %v", err)
+		}
+
+		// Delete membership on stale snapshot after cover_volume_id was set.
+		tx1 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx1)
+		pinRepeatableReadSnapshot(ctx, t, tx1)
+
+		tx2 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx2)
+		if _, err := tx2.Exec(ctx, `UPDATE series SET cover_policy = 'MANUAL', cover_volume_id = 'cp-snap-v1' WHERE id = 'cp-snap-s'`); err != nil {
+			t.Fatalf("tx2 set cover: %v", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("tx2 commit failed: %v", err)
+		}
+
+		if _, err := tx1.Exec(ctx, `DELETE FROM series_memberships WHERE volume_id = 'cp-snap-v1' AND series_id = 'cp-snap-s'`); err != nil {
+			t.Fatalf("tx1 delete membership: %v", err)
+		}
+		if err := tx1.Commit(ctx); err == nil {
+			t.Fatal("expected tx1 deleting cover membership on stale snapshot to fail")
+		}
+
+		// Reparent asset on stale snapshot after preferred_asset_id was set.
+		tx3 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx3)
+		pinRepeatableReadSnapshot(ctx, t, tx3)
+
+		tx4 := beginTxWithIso(ctx, t, db, pgx.RepeatableRead)
+		defer rollbackQuiet(ctx, tx4)
+		if _, err := tx4.Exec(ctx, `UPDATE volumes SET preferred_asset_id = 'cp-snap-a1' WHERE id = 'cp-snap-v1'`); err != nil {
+			t.Fatalf("tx4 set preferred asset: %v", err)
+		}
+		if err := tx4.Commit(ctx); err != nil {
+			t.Fatalf("tx4 commit failed: %v", err)
+		}
+
+		if _, err := tx3.Exec(ctx, `UPDATE media_assets SET volume_id = 'cp-snap-v2' WHERE id = 'cp-snap-a1'`); err != nil {
+			t.Fatalf("tx3 reparent asset: %v", err)
+		}
+		if err := tx3.Commit(ctx); err == nil {
+			t.Fatal("expected tx3 reparenting preferred asset on stale snapshot to fail")
+		}
+
+		var coverBroken, prefBroken int
+		if err := db.QueryRow(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM series s WHERE s.id = 'cp-snap-s' AND s.cover_volume_id IS NOT NULL
+					AND NOT EXISTS (SELECT 1 FROM series_memberships m WHERE m.series_id = s.id AND m.volume_id = s.cover_volume_id)),
+				(SELECT COUNT(*) FROM volumes v JOIN media_assets a ON a.id = v.preferred_asset_id
+					WHERE v.id = 'cp-snap-v1' AND a.volume_id <> v.id)`).Scan(&coverBroken, &prefBroken); err != nil {
+			t.Fatalf("query final cover/preferred state: %v", err)
+		}
+		if coverBroken != 0 || prefBroken != 0 {
+			t.Fatalf("broken final cover/preferred state: coverBroken=%d prefBroken=%d", coverBroken, prefBroken)
+		}
+	})
+}
+
+func assertSameLibraryMembershipState(ctx context.Context, t *testing.T, db migrations.DB, volumeID, seriesID string) {
+	t.Helper()
+	var mismatchCount, membershipCount int
+	var volLib, serLib string
+	if err := db.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM series_memberships m
+			 JOIN volumes v ON v.id = m.volume_id
+			 JOIN series s ON s.id = m.series_id
+			 WHERE m.volume_id = $1 AND v.library_id <> s.library_id),
+			(SELECT COUNT(*) FROM series_memberships WHERE volume_id = $1 AND series_id = $2),
+			(SELECT library_id FROM volumes WHERE id = $1),
+			(SELECT library_id FROM series WHERE id = $2)`, volumeID, seriesID).Scan(&mismatchCount, &membershipCount, &volLib, &serLib); err != nil {
+		t.Fatalf("querying same-library final state: %v", err)
+	}
+	if mismatchCount != 0 {
+		t.Fatalf("found %d cross-library memberships", mismatchCount)
+	}
+	if membershipCount == 1 && volLib != serLib {
+		t.Fatalf("membership exists while volume library (%s) != series library (%s)", volLib, serLib)
+	}
+	if membershipCount > 1 {
+		t.Fatalf("unexpected membership count %d", membershipCount)
+	}
+}
+
+func beginTxWithIso(ctx context.Context, t *testing.T, db migrations.DB, iso pgx.TxIsoLevel) pgx.Tx {
+	t.Helper()
+	tdb, ok := db.(*testdb.TestDB)
+	if !ok {
+		t.Fatalf("expected *testdb.TestDB, got %T", db)
+	}
+	tx, err := tdb.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+	if err != nil {
+		t.Fatalf("begin tx (%s): %v", iso, err)
+	}
+	return tx
+}
+
+func beginPairWithIso(ctx context.Context, t *testing.T, db migrations.DB, iso pgx.TxIsoLevel) (pgx.Tx, pgx.Tx) {
+	t.Helper()
+	tx1 := beginTxWithIso(ctx, t, db, iso)
+	tdb := db.(*testdb.TestDB)
+	tx2, err := tdb.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+	if err != nil {
+		_ = tx1.Rollback(ctx)
+		t.Fatalf("begin tx2 (%s): %v", iso, err)
+	}
+	return tx1, tx2
+}
+
+func pinRepeatableReadSnapshot(ctx context.Context, t *testing.T, tx pgx.Tx) {
+	t.Helper()
+	var n int
+	if err := tx.QueryRow(ctx, `SELECT 1`).Scan(&n); err != nil {
+		t.Fatalf("pinning repeatable read snapshot: %v", err)
+	}
 }
 
 func beginPair(ctx context.Context, t *testing.T, db migrations.DB) (pgx.Tx, pgx.Tx) {
