@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -95,6 +96,19 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 				if !exists {
 					t.Errorf("expected table %q to exist after migrating %s to head", table, seedName)
 				}
+			}
+
+			// 7. Verify 0005_labels.sql built-in SERVER label seed exists after upgrade.
+			var labelScope string
+			var builtIn bool
+			if err := db.QueryRow(ctx,
+				`SELECT scope, built_in FROM labels WHERE id = $1 AND name = $2`,
+				domain.LabelMarkedForDeletionID, domain.LabelMarkedForDeletion,
+			).Scan(&labelScope, &builtIn); err != nil {
+				t.Fatalf("verify marked_for_deletion seed after upgrade: %v", err)
+			}
+			if labelScope != string(domain.LabelScopeServer) || !builtIn {
+				t.Fatalf("unexpected marked_for_deletion state after upgrade: scope=%q built_in=%v", labelScope, builtIn)
 			}
 		})
 	}

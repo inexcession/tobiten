@@ -113,7 +113,7 @@ func sortPermissionsCanonical(perms []domain.Permission) {
 	})
 }
 
-// CreateUser persists a new user account.
+// CreateUser persists a new user account and seeds its personal built-in labels.
 func (r *UserRepository) CreateUser(ctx context.Context, user *domain.User) error {
 	if err := user.Validate(); err != nil {
 		return fmt.Errorf("validating user: %w", err)
@@ -125,13 +125,23 @@ func (r *UserRepository) CreateUser(ctx context.Context, user *domain.User) erro
 	if user.UpdatedAt.IsZero() {
 		user.UpdatedAt = user.CreatedAt
 	}
-	err := r.q.CreateUser(ctx, CreateUserParams{
-		ID:        user.ID,
-		Username:  user.Username,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-	})
-	return mapPgError(err)
+	create := func(q *Queries) error {
+		if err := q.CreateUser(ctx, CreateUserParams{
+			ID:        user.ID,
+			Username:  user.Username,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+		}); err != nil {
+			return mapPgError(err)
+		}
+		return ensureUserBuiltInLabels(ctx, q, user.ID)
+	}
+	if r.db != nil {
+		return r.WithTx(ctx, func(txRepo storage.UserRepository) error {
+			return create(txRepo.(*UserRepository).q)
+		})
+	}
+	return create(r.q)
 }
 
 // GetUserByID retrieves a user by ID.

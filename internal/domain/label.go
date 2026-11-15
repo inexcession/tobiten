@@ -39,16 +39,39 @@ type Label struct {
 	BuiltIn bool       `json:"built_in"`
 }
 
-// Built-in label names.
+// Built-in label identifiers and names.
 const (
 	// Server labels
-	LabelMarkedForDeletion = "marked_for_deletion"
+	LabelMarkedForDeletion   = "marked_for_deletion"
+	LabelMarkedForDeletionID = "019318a0-0000-7000-8000-000000000030"
 
 	// User labels
 	LabelWantToRead = "want-to-read"
 	LabelFavorite   = "favorite"
 	LabelDNF        = "dnf"
 )
+
+// BuiltInServerLabels returns the built-in SERVER-scope labels seeded by migrations.
+func BuiltInServerLabels() []Label {
+	return []Label{
+		{
+			ID:      LabelMarkedForDeletionID,
+			Scope:   LabelScopeServer,
+			Name:    LabelMarkedForDeletion,
+			BuiltIn: true,
+		},
+	}
+}
+
+// BuiltInUserLabelNames returns the canonical names of built-in personal USER labels
+// seeded per user account.
+func BuiltInUserLabelNames() []string {
+	return []string{
+		LabelWantToRead,
+		LabelFavorite,
+		LabelDNF,
+	}
+}
 
 // Validate checks the invariants of a Label matching database constraints.
 func (l *Label) Validate() error {

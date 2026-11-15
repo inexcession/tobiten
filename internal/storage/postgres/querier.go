@@ -10,41 +10,60 @@ import (
 )
 
 type Querier interface {
+	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
 	CountUsers(ctx context.Context) (int64, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
+	CreateLabel(ctx context.Context, arg CreateLabelParams) error
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) error
 	DeleteCredential(ctx context.Context, id string) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt time.Time) (int64, error)
+	DeleteLabel(ctx context.Context, id string) (int64, error)
 	DeleteSession(ctx context.Context, id string) (int64, error)
 	DeleteSessionsByCredentialID(ctx context.Context, credentialID string) (int64, error)
 	DeleteSystemSetting(ctx context.Context, key string) error
 	DeleteUser(ctx context.Context, id string) (int64, error)
+	EnsureUserBuiltInLabel(ctx context.Context, arg EnsureUserBuiltInLabelParams) error
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error)
+	GetLabelByID(ctx context.Context, id string) (Label, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
+	GetServerLabelByName(ctx context.Context, name string) (Label, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetSystemSetting(ctx context.Context, key string) (SystemSetting, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
+	GetUserLabelByName(ctx context.Context, arg GetUserLabelByNameParams) (Label, error)
 	ListAllRolePermissions(ctx context.Context) ([]RolePermission, error)
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
+	ListItemIDsByLabel(ctx context.Context, arg ListItemIDsByLabelParams) ([]string, error)
+	ListItemLabels(ctx context.Context, arg ListItemLabelsParams) ([]Label, error)
+	ListLabelPoliciesByLabel(ctx context.Context, labelID string) ([]UserLabelPolicy, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
 	ListRoles(ctx context.Context) ([]Role, error)
+	ListServerLabels(ctx context.Context) ([]Label, error)
 	ListSystemSettings(ctx context.Context) ([]SystemSetting, error)
+	ListUserLabelPolicies(ctx context.Context, userID string) ([]UserLabelPolicy, error)
+	ListUserLabels(ctx context.Context, ownerID *string) ([]Label, error)
 	ListUserRoles(ctx context.Context, userID string) ([]ListUserRolesRow, error)
 	ListUsers(ctx context.Context) ([]User, error)
+	RemoveAllItemLabelsForItem(ctx context.Context, arg RemoveAllItemLabelsForItemParams) error
+	RemoveItemLabel(ctx context.Context, arg RemoveItemLabelParams) (int64, error)
+	RemoveUserLabelPolicy(ctx context.Context, arg RemoveUserLabelPolicyParams) (int64, error)
 	RemoveUserRole(ctx context.Context, arg RemoveUserRoleParams) (int64, error)
+	RenameLabel(ctx context.Context, arg RenameLabelParams) (Label, error)
 	RevokeCredential(ctx context.Context, arg RevokeCredentialParams) (int64, error)
 	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
 	RevokeSessionsByCredentialID(ctx context.Context, arg RevokeSessionsByCredentialIDParams) (int64, error)
+	SetUserLabelPolicy(ctx context.Context, arg SetUserLabelPolicyParams) error
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
+	UpsertBuiltInServerLabel(ctx context.Context, arg UpsertBuiltInServerLabelParams) error
 	UpsertSystemSetting(ctx context.Context, arg UpsertSystemSettingParams) (SystemSetting, error)
 }
 

@@ -635,3 +635,35 @@ func TestPolicyValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestBuiltInLabelDefinitions(t *testing.T) {
+	serverLabels := domain.BuiltInServerLabels()
+	if len(serverLabels) != 1 {
+		t.Fatalf("expected 1 built-in server label, got %d", len(serverLabels))
+	}
+	if err := serverLabels[0].Validate(); err != nil {
+		t.Fatalf("built-in server label invalid: %v", err)
+	}
+	if serverLabels[0].ID != domain.LabelMarkedForDeletionID || serverLabels[0].Name != domain.LabelMarkedForDeletion || !serverLabels[0].BuiltIn {
+		t.Errorf("unexpected built-in server label: %+v", serverLabels[0])
+	}
+
+	userNames := domain.BuiltInUserLabelNames()
+	expected := []string{domain.LabelWantToRead, domain.LabelFavorite, domain.LabelDNF}
+	if !slices.Equal(userNames, expected) {
+		t.Errorf("BuiltInUserLabelNames() = %v, want %v", userNames, expected)
+	}
+	ownerID := "019318a0-0000-7000-8000-000000000010"
+	for _, name := range userNames {
+		lbl := domain.Label{
+			ID:      "lbl_" + name,
+			Scope:   domain.LabelScopeUser,
+			OwnerID: &ownerID,
+			Name:    name,
+			BuiltIn: true,
+		}
+		if err := lbl.Validate(); err != nil {
+			t.Errorf("built-in user label %q invalid: %v", name, err)
+		}
+	}
+}

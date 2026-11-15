@@ -18,6 +18,14 @@ var (
 	// ErrCredentialChanged is returned when the originating credential is missing, revoked,
 	// expired, or rotated compared to the verified revision.
 	ErrCredentialChanged = errors.New("originating credential changed or invalid")
+
+	// ErrLabelInUse is returned when attempting to delete a SERVER label that is still
+	// referenced by one or more user_label_policies rows (ON DELETE RESTRICT).
+	ErrLabelInUse = errors.New("label is referenced by active user label policies")
+
+	// ErrInvalidLabelPolicy is returned when a user_label_policies write violates the
+	// SERVER-only label constraint.
+	ErrInvalidLabelPolicy = errors.New("user label policy must reference a SERVER label")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.
