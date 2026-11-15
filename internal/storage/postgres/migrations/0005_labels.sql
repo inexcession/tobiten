@@ -27,30 +27,48 @@ $$ LANGUAGE plpgsql;
 
 -- Ensure the canonical SERVER trash label row (id = 019318a0-0000-7000-8000-000000000030,
 -- name = marked_for_deletion) exists cleanly, preserving any pre-existing marks and policies.
+-- Reject any unrelated label occupying the reserved canonical ID so an upgrade never silently
+-- repurposes it or merges its policy effects with an independent legacy trash label.
 DO $$
 DECLARE
     v_canonical_id CONSTANT TEXT := '019318a0-0000-7000-8000-000000000030';
-    v_existing_id TEXT;
+    v_occupant     labels%ROWTYPE;
+    v_existing_id  TEXT;
 BEGIN
+    SELECT * INTO v_occupant
+    FROM labels
+    WHERE id = v_canonical_id;
+
+    IF FOUND THEN
+        IF v_occupant.scope <> 'SERVER'
+           OR v_occupant.owner_id IS NOT NULL
+           OR v_occupant.name <> 'marked_for_deletion' THEN
+            RAISE EXCEPTION 'reserved trash label ID % is occupied by unrelated label (scope=%, owner_id=%, name=%); resolve the ID conflict before running 0005_labels.sql',
+                v_canonical_id, v_occupant.scope, COALESCE(v_occupant.owner_id, '<NULL>'), v_occupant.name;
+        END IF;
+
+        IF NOT v_occupant.built_in THEN
+            UPDATE labels
+            SET built_in = TRUE
+            WHERE id = v_canonical_id;
+        END IF;
+        RETURN;
+    END IF;
+
     SELECT id INTO v_existing_id
     FROM labels
     WHERE scope = 'SERVER' AND name = 'marked_for_deletion';
 
-    IF v_existing_id IS NOT NULL AND v_existing_id <> v_canonical_id THEN
+    IF v_existing_id IS NOT NULL THEN
         UPDATE labels
         SET name = '__legacy_marked_for_deletion__' || v_existing_id
         WHERE id = v_existing_id;
     END IF;
 
     INSERT INTO labels (id, scope, owner_id, name, built_in)
-    VALUES (v_canonical_id, 'SERVER', NULL, 'marked_for_deletion', TRUE)
-    ON CONFLICT (id) DO UPDATE
-    SET scope = 'SERVER',
-        owner_id = NULL,
-        name = 'marked_for_deletion',
-        built_in = TRUE;
+    VALUES (v_canonical_id, 'SERVER', NULL, 'marked_for_deletion', TRUE);
 
-    IF v_existing_id IS NOT NULL AND v_existing_id <> v_canonical_id THEN
+    IF v_existing_id IS NOT NULL THEN
         INSERT INTO item_labels (label_id, item_type, item_id)
         SELECT v_canonical_id, item_type, item_id
         FROM item_labels

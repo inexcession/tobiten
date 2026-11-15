@@ -454,3 +454,224 @@ func TestMigration0005_PersonalBuiltInBackfillAndTrashProtection(t *testing.T) {
 		t.Fatalf("expected trash mark to survive attempted delete/rename, count=%d err=%v", trashMarksAfter, err)
 	}
 }
+
+func applyPre0005Migrations(ctx context.Context, t *testing.T, db migrations.DB) {
+	t.Helper()
+	coreMigs, err := migrations.Collect(migrations.CoreFS)
+	if err != nil {
+		t.Fatalf("Collect(CoreFS): %v", err)
+	}
+	var pre0005 []migrations.Migration
+	for _, m := range coreMigs {
+		if m.Version < 5 {
+			pre0005 = append(pre0005, m)
+		}
+	}
+	if err := migrations.Run(ctx, db, pre0005); err != nil {
+		t.Fatalf("Run pre-0005 migrations: %v", err)
+	}
+}
+
+func TestMigration0005_RejectsUnrelatedLabelAtReservedTrashID(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("USERLabelOccupantWithLegacyTrash", func(t *testing.T) {
+		db := testdb.New(t)
+		applyPre0005Migrations(ctx, t, db)
+
+		userID := domain.MustNewID()
+		legacyTrashID := domain.MustNewID()
+		seriesID := domain.MustNewID()
+		volumeID := domain.MustNewID()
+		insertTestUser(ctx, t, db, userID, "collision-user")
+
+		// Seed an unrelated private USER label at the reserved canonical trash ID.
+		if _, err := db.Exec(ctx,
+			`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'USER', $2, 'private-bookmark', FALSE)`,
+			domain.LabelMarkedForDeletionID, userID,
+		); err != nil {
+			t.Fatalf("seed unrelated USER occupant: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'SERIES', $2)`,
+			domain.LabelMarkedForDeletionID, seriesID,
+		); err != nil {
+			t.Fatalf("seed unrelated USER item_labels: %v", err)
+		}
+
+		// Also seed an independent legacy SERVER trash label with its own assignment & policy.
+		if _, err := db.Exec(ctx,
+			`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'SERVER', NULL, 'marked_for_deletion', FALSE)`,
+			legacyTrashID,
+		); err != nil {
+			t.Fatalf("seed legacy trash label: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'VOLUME', $2)`,
+			legacyTrashID, volumeID,
+		); err != nil {
+			t.Fatalf("seed legacy trash item_labels: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO user_label_policies (user_id, label_id, effect) VALUES ($1, $2, 'RESTRICT')`,
+			userID, legacyTrashID,
+		); err != nil {
+			t.Fatalf("seed legacy trash policy: %v", err)
+		}
+
+		// Migration 0005 must fail with an actionable error instead of repurposing the USER label.
+		err := migrations.RunFS(ctx, db, migrations.CoreFS)
+		if err == nil || !strings.Contains(err.Error(), "reserved trash label ID") {
+			t.Fatalf("expected actionable reserved-trash-ID collision error, got: %v", err)
+		}
+
+		// Failed migration 5 must NOT be recorded in schema_migrations.
+		applied, err := migrations.Applied(ctx, db)
+		if err != nil {
+			t.Fatalf("query Applied migrations: %v", err)
+		}
+		if len(applied) != 4 || applied[len(applied)-1].Version != 4 {
+			t.Fatalf("expected applied migrations to stay at version 4, got: %+v", applied)
+		}
+
+		// Original USER occupant metadata, assignments, legacy trash, policy, and no partial built-ins survive.
+		var (
+			gotScope   string
+			gotOwnerID *string
+			gotName    string
+			gotBuiltIn bool
+		)
+		if err := db.QueryRow(ctx,
+			`SELECT scope, owner_id, name, built_in FROM labels WHERE id = $1`,
+			domain.LabelMarkedForDeletionID,
+		).Scan(&gotScope, &gotOwnerID, &gotName, &gotBuiltIn); err != nil {
+			t.Fatalf("query unrelated occupant after rollback: %v", err)
+		}
+		if gotScope != "USER" || gotOwnerID == nil || *gotOwnerID != userID || gotName != "private-bookmark" || gotBuiltIn {
+			t.Fatalf("unrelated occupant changed after rollback: scope=%q owner=%v name=%q built_in=%v", gotScope, gotOwnerID, gotName, gotBuiltIn)
+		}
+
+		var cnt int
+		if err := db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM item_labels WHERE label_id = $1 AND item_type = 'SERIES' AND item_id = $2`,
+			domain.LabelMarkedForDeletionID, seriesID,
+		).Scan(&cnt); err != nil || cnt != 1 {
+			t.Fatalf("unrelated USER item assignment lost: cnt=%d err=%v", cnt, err)
+		}
+
+		if err := db.QueryRow(ctx,
+			`SELECT scope, owner_id, name, built_in FROM labels WHERE id = $1`,
+			legacyTrashID,
+		).Scan(&gotScope, &gotOwnerID, &gotName, &gotBuiltIn); err != nil {
+			t.Fatalf("query legacy trash after rollback: %v", err)
+		}
+		if gotScope != "SERVER" || gotOwnerID != nil || gotName != "marked_for_deletion" || gotBuiltIn {
+			t.Fatalf("legacy trash changed after rollback: scope=%q owner=%v name=%q built_in=%v", gotScope, gotOwnerID, gotName, gotBuiltIn)
+		}
+
+		var gotEffect string
+		if err := db.QueryRow(ctx,
+			`SELECT effect FROM user_label_policies WHERE user_id = $1 AND label_id = $2`,
+			userID, legacyTrashID,
+		).Scan(&gotEffect); err != nil || gotEffect != "RESTRICT" {
+			t.Fatalf("legacy trash policy lost or altered: effect=%q err=%v", gotEffect, err)
+		}
+
+		var builtInCount int
+		if err := db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM labels WHERE owner_id = $1 AND built_in = TRUE`,
+			userID,
+		).Scan(&builtInCount); err != nil || builtInCount != 0 {
+			t.Fatalf("expected 0 backfilled built-ins after atomic rollback, got=%d err=%v", builtInCount, err)
+		}
+	})
+
+	t.Run("SERVERLabelOccupantWithConflictingPolicies", func(t *testing.T) {
+		db := testdb.New(t)
+		applyPre0005Migrations(ctx, t, db)
+
+		userID := domain.MustNewID()
+		legacyTrashID := domain.MustNewID()
+		seriesID := domain.MustNewID()
+		insertTestUser(ctx, t, db, userID, "collision-server-user")
+
+		// Seed an unrelated SERVER label at the reserved trash ID with an ALLOW policy.
+		if _, err := db.Exec(ctx,
+			`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'SERVER', NULL, 'mature-18', FALSE)`,
+			domain.LabelMarkedForDeletionID,
+		); err != nil {
+			t.Fatalf("seed unrelated SERVER occupant: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'SERIES', $2)`,
+			domain.LabelMarkedForDeletionID, seriesID,
+		); err != nil {
+			t.Fatalf("seed unrelated SERVER item_labels: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO user_label_policies (user_id, label_id, effect) VALUES ($1, $2, 'ALLOW')`,
+			userID, domain.LabelMarkedForDeletionID,
+		); err != nil {
+			t.Fatalf("seed unrelated SERVER policy: %v", err)
+		}
+
+		// Also seed an independent legacy SERVER trash label with a conflicting RESTRICT policy for the same user.
+		if _, err := db.Exec(ctx,
+			`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'SERVER', NULL, 'marked_for_deletion', FALSE)`,
+			legacyTrashID,
+		); err != nil {
+			t.Fatalf("seed legacy trash label: %v", err)
+		}
+		if _, err := db.Exec(ctx,
+			`INSERT INTO user_label_policies (user_id, label_id, effect) VALUES ($1, $2, 'RESTRICT')`,
+			userID, legacyTrashID,
+		); err != nil {
+			t.Fatalf("seed legacy trash policy: %v", err)
+		}
+
+		err := migrations.RunFS(ctx, db, migrations.CoreFS)
+		if err == nil || !strings.Contains(err.Error(), "reserved trash label ID") {
+			t.Fatalf("expected actionable reserved-trash-ID collision error, got: %v", err)
+		}
+
+		applied, err := migrations.Applied(ctx, db)
+		if err != nil {
+			t.Fatalf("query Applied migrations: %v", err)
+		}
+		if len(applied) != 4 || applied[len(applied)-1].Version != 4 {
+			t.Fatalf("expected applied migrations to stay at version 4, got: %+v", applied)
+		}
+
+		// Both labels, assignments, and both distinct policy effects survive atomically untouched.
+		var gotName string
+		var gotBuiltIn bool
+		if err := db.QueryRow(ctx,
+			`SELECT name, built_in FROM labels WHERE id = $1`,
+			domain.LabelMarkedForDeletionID,
+		).Scan(&gotName, &gotBuiltIn); err != nil || gotName != "mature-18" || gotBuiltIn {
+			t.Fatalf("unrelated SERVER occupant altered: name=%q built_in=%v err=%v", gotName, gotBuiltIn, err)
+		}
+
+		var gotOccupantEffect, gotTrashEffect string
+		if err := db.QueryRow(ctx,
+			`SELECT effect FROM user_label_policies WHERE user_id = $1 AND label_id = $2`,
+			userID, domain.LabelMarkedForDeletionID,
+		).Scan(&gotOccupantEffect); err != nil || gotOccupantEffect != "ALLOW" {
+			t.Fatalf("unrelated SERVER policy lost or altered: effect=%q err=%v", gotOccupantEffect, err)
+		}
+		if err := db.QueryRow(ctx,
+			`SELECT effect FROM user_label_policies WHERE user_id = $1 AND label_id = $2`,
+			userID, legacyTrashID,
+		).Scan(&gotTrashEffect); err != nil || gotTrashEffect != "RESTRICT" {
+			t.Fatalf("legacy trash policy lost or altered: effect=%q err=%v", gotTrashEffect, err)
+		}
+
+		var cnt int
+		if err := db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM item_labels WHERE label_id = $1 AND item_type = 'SERIES' AND item_id = $2`,
+			domain.LabelMarkedForDeletionID, seriesID,
+		).Scan(&cnt); err != nil || cnt != 1 {
+			t.Fatalf("unrelated SERVER assignment lost: cnt=%d err=%v", cnt, err)
+		}
+	})
+}
