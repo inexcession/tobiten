@@ -333,6 +333,74 @@ func (r *CatalogueRepository) GetSeriesWithSQLCBypass(ctx context.Context, scope
 		assertRejected(t, mutated, "GetSeriesWithSQLCBypass invokes sqlc New()", "direct sqlc New(r.db) query inside guarded method")
 	})
 
+	t.Run("rejects filter builder with unguarded success before guarded success", func(t *testing.T) {
+		mutated := string(baseSrc) + `
+func buildSeriesFilterMixedBefore(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
+	if filter.LibraryID != "" {
+		return " WHERE s.library_id = 'bypass'", nil, nil
+	}
+	frag, err := pred.SeriesFragment("s", 1)
+	if err != nil {
+		return "", nil, err
+	}
+	return " WHERE (" + frag.SQL + ")", frag.Args, nil
+}
+
+func (r *CatalogueRepository) ListSeriesMixedBefore(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	whereClause, args, err := buildSeriesFilterMixedBefore(pred, filter)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
+	if err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return nil, nil
+}
+`
+		assertRejected(t, mutated, "buildSeriesFilterMixedBefore has successful return path without matching SQLFragment SQL and Args", "mixed builder with unguarded early return")
+		assertRejected(t, mutated, "ListSeriesMixedBefore executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of mixed builder with unguarded early return")
+	})
+
+	t.Run("rejects filter builder with guarded success before unguarded success", func(t *testing.T) {
+		mutated := string(baseSrc) + `
+func buildSeriesFilterMixedAfter(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
+	if filter.LibraryID != "" {
+		frag, err := pred.SeriesFragment("s", 2)
+		if err != nil {
+			return "", nil, err
+		}
+		return " WHERE s.library_id = $1 AND (" + frag.SQL + ")", append([]any{filter.LibraryID}, frag.Args...), nil
+	}
+	return "", nil, nil
+}
+
+func (r *CatalogueRepository) ListSeriesMixedAfter(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	whereClause, args, err := buildSeriesFilterMixedAfter(pred, filter)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
+	if err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return nil, nil
+}
+`
+		assertRejected(t, mutated, "buildSeriesFilterMixedAfter has successful return path without matching SQLFragment SQL and Args", "mixed builder with unguarded fallback return")
+		assertRejected(t, mutated, "ListSeriesMixedAfter executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of mixed builder with unguarded fallback return")
+	})
+
 	t.Run("rejects new read method missing from enforcement test map", func(t *testing.T) {
 		withExtra := append(slices.Clone([]string{"GetSeriesByID", "ListSeries"}), "CountUnwiredBooks")
 		if err := checkEnforcementCoverageParity(withExtra, catalogueReadEnforcementSpecs); err == nil {
@@ -593,17 +661,18 @@ func intersectTaintSets(a, b taintSet) taintSet {
 }
 
 type funcTaintState struct {
-	info            *auditedFuncInfo
-	funcs           map[string]*auditedFuncInfo
-	sqlVars         map[string]taintSet
-	argsVars        map[string]taintSet
-	fragVarsSQL     map[string]int
-	fragVarsArgs    map[string]int
-	nextSourceID    int
-	consumedByQuery map[int]bool
-	returnedSQL     taintSet
-	returnedArgs    taintSet
-	isBuilder       bool
+	info                  *auditedFuncInfo
+	funcs                 map[string]*auditedFuncInfo
+	sqlVars               map[string]taintSet
+	argsVars              map[string]taintSet
+	fragVarsSQL           map[string]int
+	fragVarsArgs          map[string]int
+	nextSourceID          int
+	consumedByQuery       map[int]bool
+	isBuilder             bool
+	nonNilErrs            map[string]bool
+	builderFailed         bool
+	builderSuccessReturns int
 }
 
 func analyzeHelperSignatures(info *auditedFuncInfo) {
@@ -646,7 +715,7 @@ func analyzeHelperSignatures(info *auditedFuncInfo) {
 		return
 	}
 
-	retParamMatches := make(map[int]map[int]bool)
+	retParamCounts := make(map[int]map[int]int)
 	checkedRets := 0
 	for _, ret := range rets {
 		if len(ret.Results) == 0 {
@@ -660,10 +729,10 @@ func analyzeHelperSignatures(info *auditedFuncInfo) {
 		for idx, expr := range ret.Results {
 			if ident, ok := expr.(*ast.Ident); ok {
 				if pIdx, exists := paramIndex[ident.Name]; exists {
-					if retParamMatches[idx] == nil {
-						retParamMatches[idx] = make(map[int]bool)
+					if retParamCounts[idx] == nil {
+						retParamCounts[idx] = make(map[int]int)
 					}
-					retParamMatches[idx][pIdx] = true
+					retParamCounts[idx][pIdx]++
 				}
 			}
 		}
@@ -671,11 +740,14 @@ func analyzeHelperSignatures(info *auditedFuncInfo) {
 	if checkedRets == 0 {
 		return
 	}
-	for retIdx, pSet := range retParamMatches {
-		if len(pSet) != 1 {
+	for retIdx, counts := range retParamCounts {
+		if len(counts) != 1 {
 			continue
 		}
-		for pIdx := range pSet {
+		for pIdx, cnt := range counts {
+			if cnt != checkedRets {
+				continue
+			}
 			switch pIdx {
 			case 0:
 				sig.sqlRetToParam[retIdx] = pIdx
@@ -699,8 +771,13 @@ func auditFuncBody(info *auditedFuncInfo, funcs map[string]*auditedFuncInfo) {
 		fragVarsArgs:    make(map[string]int),
 		consumedByQuery: make(map[int]bool),
 		isBuilder:       acceptsLabelPredicateParam(info.decl) && info.receiverType == "",
+		nonNilErrs:      make(map[string]bool),
 	}
 	st.walkBlock(info.decl.Body)
+
+	if st.isBuilder && (st.builderFailed || st.builderSuccessReturns == 0) {
+		info.builderSig = nil
+	}
 
 	// Verify that every fragment generated directly in a non-builder function was wired into at least one query.
 	if !st.isBuilder {
@@ -805,9 +882,15 @@ func (st *funcTaintState) walkIfStmt(s *ast.IfStmt) {
 	st.scanCallsInExpr(s.Cond)
 
 	preSQL, preArgs := st.snapshotVars()
+	preErrs := maps.Clone(st.nonNilErrs)
+	if errVar, ok := condNonNilErrIdent(s.Cond, token.NEQ); ok {
+		st.nonNilErrs[errVar] = true
+	}
+
 	thenTerminates := blockAlwaysReturns(s.Body)
 	st.walkBlock(s.Body)
 	thenSQL, thenArgs := st.snapshotVars()
+	st.nonNilErrs = preErrs
 
 	if s.Else == nil {
 		if thenTerminates {
@@ -821,8 +904,12 @@ func (st *funcTaintState) walkIfStmt(s *ast.IfStmt) {
 	}
 
 	st.sqlVars, st.argsVars = preSQL, preArgs
+	if errVar, ok := condNonNilErrIdent(s.Cond, token.EQL); ok {
+		st.nonNilErrs[errVar] = true
+	}
 	elseTerminates := stmtAlwaysReturns(s.Else)
 	st.walkStmt(s.Else)
+	st.nonNilErrs = preErrs
 	if thenTerminates && !elseTerminates {
 		return
 	}
@@ -831,6 +918,25 @@ func (st *funcTaintState) walkIfStmt(s *ast.IfStmt) {
 		return
 	}
 	st.intersectVarMaps(thenSQL, thenArgs)
+}
+
+func condNonNilErrIdent(cond ast.Expr, op token.Token) (string, bool) {
+	bin, ok := cond.(*ast.BinaryExpr)
+	if !ok || bin.Op != op {
+		return "", false
+	}
+	if id, ok := bin.X.(*ast.Ident); ok && isNilIdent(bin.Y) {
+		return id.Name, true
+	}
+	if id, ok := bin.Y.(*ast.Ident); ok && isNilIdent(bin.X) {
+		return id.Name, true
+	}
+	return "", false
+}
+
+func isNilIdent(expr ast.Expr) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == "nil"
 }
 
 func blockAlwaysReturns(b *ast.BlockStmt) bool {
@@ -878,6 +984,11 @@ func (st *funcTaintState) walkDeclStmt(s *ast.DeclStmt) {
 func (st *funcTaintState) walkAssignStmt(assign *ast.AssignStmt) {
 	for _, rhs := range assign.Rhs {
 		st.scanCallsInExpr(rhs)
+	}
+	for _, lhs := range assign.Lhs {
+		if ident, ok := lhs.(*ast.Ident); ok {
+			delete(st.nonNilErrs, ident.Name)
+		}
 	}
 
 	if len(assign.Rhs) == 1 {
@@ -1010,35 +1121,90 @@ func (st *funcTaintState) walkReturnStmt(ret *ast.ReturnStmt) {
 	for _, expr := range ret.Results {
 		st.scanCallsInExpr(expr)
 	}
-	if !st.isBuilder || len(ret.Results) < 2 {
+	if !st.isBuilder {
 		return
 	}
-	// Check non-error returns to determine which return indices carry matching fragment SQL and Args.
-	if errIdent, ok := ret.Results[len(ret.Results)-1].(*ast.Ident); !ok || errIdent.Name != "nil" {
+	if len(ret.Results) < 2 {
+		st.failBuilder("has return without expected (sql, args, err) tuple")
+		return
+	}
+	if st.isExplicitErrorReturn(ret.Results[len(ret.Results)-1]) {
 		return
 	}
 
-	var sqlIdx, argsIdx = -1, -1
-	for i, expr := range ret.Results {
-		sqlS := st.evalExprSQL(expr)
-		argsS := st.evalExprArgs(expr)
-		if len(sqlS) > 0 {
-			sqlIdx = i
-			st.returnedSQL = unionTaintSets(st.returnedSQL, sqlS)
-		}
-		if len(argsS) > 0 {
-			argsIdx = i
-			st.returnedArgs = unionTaintSets(st.returnedArgs, argsS)
-		}
+	st.builderSuccessReturns++
+	sqlIdx, argsIdx, shared := st.inspectBuilderReturnTuple(ret.Results)
+	if sqlIdx < 0 || argsIdx < 0 || len(shared) == 0 {
+		st.failBuilder("has successful return path without matching SQLFragment SQL and Args")
+		return
 	}
-	shared := intersectTaintSets(st.returnedSQL, st.returnedArgs)
-	if sqlIdx >= 0 && argsIdx >= 0 && len(shared) > 0 {
+	if st.builderFailed {
+		return
+	}
+	if st.info.builderSig == nil {
 		st.info.builderSig = &builderReturnSig{
 			sqlRetIdx:  sqlIdx,
 			argsRetIdx: argsIdx,
 			hasErrRet:  true,
 		}
+		return
 	}
+	if st.info.builderSig.sqlRetIdx != sqlIdx || st.info.builderSig.argsRetIdx != argsIdx {
+		st.failBuilder("returns predicate SQL/Args at inconsistent tuple positions across branches")
+	}
+}
+
+func (st *funcTaintState) failBuilder(reason string) {
+	st.builderFailed = true
+	st.info.builderSig = nil
+	st.info.auditViolations = append(st.info.auditViolations, st.info.name+" "+reason)
+}
+
+func (st *funcTaintState) isExplicitErrorReturn(errExpr ast.Expr) bool {
+	if errExpr == nil || isNilIdent(errExpr) {
+		return false
+	}
+	if ident, ok := errExpr.(*ast.Ident); ok {
+		return st.nonNilErrs[ident.Name]
+	}
+	call, ok := errExpr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return (pkg.Name == "fmt" && sel.Sel.Name == "Errorf") ||
+		(pkg.Name == "errors" && (sel.Sel.Name == "New" || sel.Sel.Name == "Join"))
+}
+
+func (st *funcTaintState) inspectBuilderReturnTuple(results []ast.Expr) (int, int, taintSet) {
+	sqlIdx, argsIdx := -1, -1
+	var sqlTaint, argsTaint taintSet
+	for i := range len(results) - 1 {
+		s := st.evalExprSQL(results[i])
+		a := st.evalExprArgs(results[i])
+		if len(s) > 0 {
+			if sqlIdx >= 0 {
+				return -1, -1, nil
+			}
+			sqlIdx = i
+			sqlTaint = s
+		}
+		if len(a) > 0 {
+			if argsIdx >= 0 {
+				return -1, -1, nil
+			}
+			argsIdx = i
+			argsTaint = a
+		}
+	}
+	return sqlIdx, argsIdx, intersectTaintSets(sqlTaint, argsTaint)
 }
 
 func (st *funcTaintState) checkBarePredicateCallExpr(expr ast.Expr) {
