@@ -34,10 +34,12 @@ type LabelRepository interface {
 
 	// RenameLabel updates the display name of a label while preserving its ID,
 	// item_labels assignments, and user_label_policies references.
+	// Returns ErrProtectedLabel if the target is the canonical trash label.
 	RenameLabel(ctx context.Context, id, newName string) (*domain.Label, error)
 
-	// DeleteLabel removes a label by ID. Returns ErrLabelInUse if any user_label_policies
-	// still reference the label (ON DELETE RESTRICT), or ErrNotFound if no such label exists.
+	// DeleteLabel removes a label by ID. Returns ErrProtectedLabel for the canonical
+	// trash label, ErrLabelInUse if any user_label_policies still reference the label
+	// (ON DELETE RESTRICT), or ErrNotFound if no such label exists.
 	DeleteLabel(ctx context.Context, id string) error
 
 	// EnsureBuiltInServerLabels idempotently ensures built-in SERVER labels
@@ -45,7 +47,8 @@ type LabelRepository interface {
 	EnsureBuiltInServerLabels(ctx context.Context) error
 
 	// EnsureUserBuiltInLabels idempotently ensures personal built-in USER labels
-	// (want-to-read, favorite, dnf) exist for ownerID.
+	// (want-to-read, favorite, dnf) exist for ownerID while preserving existing IDs
+	// and item assignments.
 	EnsureUserBuiltInLabels(ctx context.Context, ownerID string) error
 
 	// AssignItemLabel attaches a label to a SERIES, VOLUME, or ASSET idempotently.
@@ -55,11 +58,23 @@ type LabelRepository interface {
 	// Returns ErrNotFound if the assignment does not exist.
 	RemoveItemLabel(ctx context.Context, itemLabel *domain.ItemLabel) error
 
-	// ListItemLabels returns all labels attached to the specified item ordered by scope and name.
-	ListItemLabels(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error)
+	// ListItemLabels returns all labels attached to (itemType, itemID) visible to
+	// viewerUserID: all SERVER labels plus USER labels owned by viewerUserID,
+	// ordered by scope and name.
+	ListItemLabels(ctx context.Context, viewerUserID string, itemType domain.ItemType, itemID string) ([]domain.Label, error)
 
-	// ListItemIDsByLabel returns all item IDs of itemType tagged with labelID ordered by item_id.
-	ListItemIDsByLabel(ctx context.Context, labelID string, itemType domain.ItemType) ([]string, error)
+	// ListServerItemLabels returns only SERVER-scoped labels attached to (itemType, itemID)
+	// ordered by name, without exposing any user's private USER labels.
+	ListServerItemLabels(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error)
+
+	// ListAllItemLabelsForMaintenance returns every label (SERVER and all USER scopes)
+	// attached to (itemType, itemID) for privileged maintenance/purge operations.
+	ListAllItemLabelsForMaintenance(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error)
+
+	// ListItemIDsByLabel returns all item IDs of itemType tagged with labelID visible
+	// to viewerUserID (a SERVER label or a USER label owned by viewerUserID) ordered by item_id.
+	// Returns an empty slice when labelID is another user's private USER label.
+	ListItemIDsByLabel(ctx context.Context, viewerUserID, labelID string, itemType domain.ItemType) ([]string, error)
 
 	// RemoveAllItemLabelsForItem removes all label assignments for the specified item
 	// (e.g. during item purge).

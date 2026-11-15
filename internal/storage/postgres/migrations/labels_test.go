@@ -298,3 +298,159 @@ func TestMigration0005_RepeatableRead_ScopeChangeVsPolicyInsert(t *testing.T) {
 		rollbackQuiet(ctx, txChange)
 	})
 }
+
+func TestMigration0005_PersonalBuiltInBackfillAndTrashProtection(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+
+	coreMigs, err := migrations.Collect(migrations.CoreFS)
+	if err != nil {
+		t.Fatalf("Collect(CoreFS): %v", err)
+	}
+	var pre0005 []migrations.Migration
+	for _, m := range coreMigs {
+		if m.Version < 5 {
+			pre0005 = append(pre0005, m)
+		}
+	}
+	if err := migrations.Run(ctx, db, pre0005); err != nil {
+		t.Fatalf("Run pre-0005 migrations: %v", err)
+	}
+
+	userEmptyID := domain.MustNewID()
+	userPartialID := domain.MustNewID()
+	existingWantID := domain.MustNewID()
+	existingFavID := domain.MustNewID()
+	legacyTrashID := domain.MustNewID()
+	seriesID := domain.MustNewID()
+	volumeID := domain.MustNewID()
+
+	insertTestUser(ctx, t, db, userEmptyID, "pre-empty")
+	insertTestUser(ctx, t, db, userPartialID, "pre-partial")
+
+	// Partial user has want-to-read (built_in=FALSE) and favorite (built_in=TRUE), missing dnf.
+	if _, err := db.Exec(ctx,
+		`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'USER', $2, 'want-to-read', FALSE), ($3, 'USER', $2, 'favorite', TRUE)`,
+		existingWantID, userPartialID, existingFavID,
+	); err != nil {
+		t.Fatalf("seed partial user labels: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'SERIES', $2)`,
+		existingWantID, seriesID,
+	); err != nil {
+		t.Fatalf("seed pre-existing user item_labels: %v", err)
+	}
+
+	// Simulate pre-0005 SERVER marked_for_deletion under a legacy ID with staged marks & policy.
+	if _, err := db.Exec(ctx,
+		`INSERT INTO labels (id, scope, owner_id, name, built_in) VALUES ($1, 'SERVER', NULL, 'marked_for_deletion', FALSE)`,
+		legacyTrashID,
+	); err != nil {
+		t.Fatalf("seed legacy trash label: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'VOLUME', $2)`,
+		legacyTrashID, volumeID,
+	); err != nil {
+		t.Fatalf("seed legacy trash mark: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO user_label_policies (user_id, label_id, effect) VALUES ($1, $2, 'RESTRICT')`,
+		userEmptyID, legacyTrashID,
+	); err != nil {
+		t.Fatalf("seed legacy trash policy: %v", err)
+	}
+
+	// Upgrade to head (runs 0005_labels.sql).
+	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
+		t.Fatalf("RunFS(CoreFS) upgrade failed: %v", err)
+	}
+
+	// Both empty and partial users must have all 3 personal built-ins with built_in=TRUE.
+	for _, uid := range []string{userEmptyID, userPartialID} {
+		for _, name := range domain.BuiltInUserLabelNames() {
+			var (
+				gotID   string
+				builtIn bool
+			)
+			if err := db.QueryRow(ctx,
+				`SELECT id, built_in FROM labels WHERE scope = 'USER' AND owner_id = $1 AND name = $2`,
+				uid, name,
+			).Scan(&gotID, &builtIn); err != nil {
+				t.Fatalf("query backfilled label %q for user %s: %v", name, uid, err)
+			}
+			if gotID == "" || !builtIn {
+				t.Fatalf("unexpected backfilled label %q for user %s: id=%q built_in=%v", name, uid, gotID, builtIn)
+			}
+			if uid == userPartialID && name == domain.LabelWantToRead && gotID != existingWantID {
+				t.Fatalf("expected existing want-to-read ID %s to be preserved, got %s", existingWantID, gotID)
+			}
+			if uid == userPartialID && name == domain.LabelFavorite && gotID != existingFavID {
+				t.Fatalf("expected existing favorite ID %s to be preserved, got %s", existingFavID, gotID)
+			}
+		}
+	}
+
+	// Existing personal item assignment must survive upgrade untouched.
+	var wantCount int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM item_labels WHERE label_id = $1 AND item_type = 'SERIES' AND item_id = $2`,
+		existingWantID, seriesID,
+	).Scan(&wantCount); err != nil || wantCount != 1 {
+		t.Fatalf("expected pre-existing user item_labels mark to survive upgrade, count=%d err=%v", wantCount, err)
+	}
+
+	// Legacy trash label marks and policies must migrate onto the canonical trash label ID cleanly.
+	var trashMarks int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM item_labels WHERE label_id = $1 AND item_type = 'VOLUME' AND item_id = $2`,
+		domain.LabelMarkedForDeletionID, volumeID,
+	).Scan(&trashMarks); err != nil || trashMarks != 1 {
+		t.Fatalf("expected legacy trash mark on canonical ID %s, count=%d err=%v", domain.LabelMarkedForDeletionID, trashMarks, err)
+	}
+	var trashPolicies int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM user_label_policies WHERE user_id = $1 AND label_id = $2 AND effect = 'RESTRICT'`,
+		userEmptyID, domain.LabelMarkedForDeletionID,
+	).Scan(&trashPolicies); err != nil || trashPolicies != 1 {
+		t.Fatalf("expected legacy trash policy on canonical ID %s, count=%d err=%v", domain.LabelMarkedForDeletionID, trashPolicies, err)
+	}
+
+	// Remove the policy so ON DELETE RESTRICT wouldn't block deletion, then prove DB trigger
+	// still protects canonical trash label from generic renames, field edits, and deletion.
+	if _, err := db.Exec(ctx,
+		`DELETE FROM user_label_policies WHERE user_id = $1 AND label_id = $2`,
+		userEmptyID, domain.LabelMarkedForDeletionID,
+	); err != nil {
+		t.Fatalf("delete trash policy: %v", err)
+	}
+
+	if _, err := db.Exec(ctx,
+		`UPDATE labels SET name = 'renamed-trash' WHERE id = $1`,
+		domain.LabelMarkedForDeletionID,
+	); err == nil || !strings.Contains(err.Error(), "cannot modify protected built-in trash label") {
+		t.Fatalf("expected protected trash rename error, got: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`UPDATE labels SET built_in = FALSE WHERE id = $1`,
+		domain.LabelMarkedForDeletionID,
+	); err == nil || !strings.Contains(err.Error(), "cannot modify protected built-in trash label") {
+		t.Fatalf("expected protected trash built_in edit error, got: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`DELETE FROM labels WHERE id = $1`,
+		domain.LabelMarkedForDeletionID,
+	); err == nil || !strings.Contains(err.Error(), "cannot delete protected built-in trash label") {
+		t.Fatalf("expected protected trash delete error, got: %v", err)
+	}
+
+	// Verify canonical trash row and its staged mark are completely untouched.
+	var trashMarksAfter int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM item_labels WHERE label_id = $1 AND item_type = 'VOLUME' AND item_id = $2`,
+		domain.LabelMarkedForDeletionID, volumeID,
+	).Scan(&trashMarksAfter); err != nil || trashMarksAfter != 1 {
+		t.Fatalf("expected trash mark to survive attempted delete/rename, count=%d err=%v", trashMarksAfter, err)
+	}
+}

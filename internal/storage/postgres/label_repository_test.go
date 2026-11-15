@@ -98,7 +98,18 @@ func TestLabelRepository_BuiltInSeedsAndUserCreation(t *testing.T) {
 		}
 	}
 
-	// EnsureUserBuiltInLabels preserves existing IDs and row counts.
+	// EnsureUserBuiltInLabels preserves existing IDs and item assignments when completing partial sets.
+	seriesID := domain.MustNewID()
+	if err := labelRepo.AssignItemLabel(ctx, &domain.ItemLabel{
+		LabelID:  aliceIDsByName[domain.LabelFavorite],
+		ItemType: domain.ItemTypeSeries,
+		ItemID:   seriesID,
+	}); err != nil {
+		t.Fatalf("AssignItemLabel(favorite): %v", err)
+	}
+	if err := labelRepo.DeleteLabel(ctx, aliceIDsByName[domain.LabelDNF]); err != nil {
+		t.Fatalf("DeleteLabel(dnf): %v", err)
+	}
 	if err := labelRepo.EnsureUserBuiltInLabels(ctx, alice.ID); err != nil {
 		t.Fatalf("EnsureUserBuiltInLabels(alice): %v", err)
 	}
@@ -107,16 +118,68 @@ func TestLabelRepository_BuiltInSeedsAndUserCreation(t *testing.T) {
 		t.Fatalf("ListUserLabels(alice) after ensure: %v", err)
 	}
 	if len(aliceLabelsAfter) != len(wantNames) {
-		t.Fatalf("expected %d labels after idempotent ensure, got %d", len(wantNames), len(aliceLabelsAfter))
+		t.Fatalf("expected %d labels after partial completion, got %d", len(wantNames), len(aliceLabelsAfter))
 	}
 	for _, lbl := range aliceLabelsAfter {
-		if lbl.ID != aliceIDsByName[lbl.Name] {
+		if lbl.Name != domain.LabelDNF && lbl.ID != aliceIDsByName[lbl.Name] {
 			t.Fatalf("EnsureUserBuiltInLabels replaced existing label ID for %q: %s -> %s", lbl.Name, aliceIDsByName[lbl.Name], lbl.ID)
 		}
+	}
+	assigned, err := labelRepo.ListItemIDsByLabel(ctx, alice.ID, aliceIDsByName[domain.LabelFavorite], domain.ItemTypeSeries)
+	if err != nil || len(assigned) != 1 || assigned[0] != seriesID {
+		t.Fatalf("expected favorite item assignment to survive EnsureUserBuiltInLabels, got=%v err=%v", assigned, err)
 	}
 
 	if err := labelRepo.EnsureUserBuiltInLabels(ctx, domain.MustNewID()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound seeding nonexistent user, got: %v", err)
+	}
+}
+
+func TestLabelRepository_CanonicalTrashLabelProtection(t *testing.T) {
+	ctx := context.Background()
+	labelRepo, userRepo := setupLabelRepos(t)
+
+	alice := createSeededTestUser(ctx, t, userRepo, "alice-trash")
+	seriesID := domain.MustNewID()
+	volumeID := domain.MustNewID()
+
+	// Stage items with the canonical trash label.
+	for _, il := range []*domain.ItemLabel{
+		{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeVolume, ItemID: volumeID},
+	} {
+		if err := labelRepo.AssignItemLabel(ctx, il); err != nil {
+			t.Fatalf("AssignItemLabel(trash): %v", err)
+		}
+	}
+
+	// Generic RenameLabel and DeleteLabel must refuse to modify or delete the canonical trash label.
+	if _, err := labelRepo.RenameLabel(ctx, domain.LabelMarkedForDeletionID, "custom-trash"); !errors.Is(err, storage.ErrProtectedLabel) {
+		t.Fatalf("expected ErrProtectedLabel renaming canonical trash label, got: %v", err)
+	}
+	if _, err := labelRepo.RenameLabel(ctx, domain.LabelMarkedForDeletionID, domain.LabelMarkedForDeletion); !errors.Is(err, storage.ErrProtectedLabel) {
+		t.Fatalf("expected ErrProtectedLabel on same-name RenameLabel of canonical trash label, got: %v", err)
+	}
+	if err := labelRepo.DeleteLabel(ctx, domain.LabelMarkedForDeletionID); !errors.Is(err, storage.ErrProtectedLabel) {
+		t.Fatalf("expected ErrProtectedLabel deleting canonical trash label, got: %v", err)
+	}
+
+	// Reseeding must stay idempotent and preserve the canonical ID and staged marks.
+	if err := labelRepo.EnsureBuiltInServerLabels(ctx); err != nil {
+		t.Fatalf("EnsureBuiltInServerLabels after rejected mutations: %v", err)
+	}
+	trashLbl, err := labelRepo.GetServerLabelByName(ctx, domain.LabelMarkedForDeletion)
+	if err != nil || trashLbl.ID != domain.LabelMarkedForDeletionID || !trashLbl.BuiltIn {
+		t.Fatalf("unexpected canonical trash label state: lbl=%+v err=%v", trashLbl, err)
+	}
+
+	seriesLabels, err := labelRepo.ListItemLabels(ctx, alice.ID, domain.ItemTypeSeries, seriesID)
+	if err != nil || len(seriesLabels) != 1 || seriesLabels[0].ID != domain.LabelMarkedForDeletionID {
+		t.Fatalf("expected staged series trash mark to remain intact, got=%+v err=%v", seriesLabels, err)
+	}
+	trashedVolumes, err := labelRepo.ListItemIDsByLabel(ctx, alice.ID, domain.LabelMarkedForDeletionID, domain.ItemTypeVolume)
+	if err != nil || len(trashedVolumes) != 1 || trashedVolumes[0] != volumeID {
+		t.Fatalf("expected staged volume trash mark to remain intact, got=%v err=%v", trashedVolumes, err)
 	}
 }
 
@@ -175,7 +238,7 @@ func TestLabelRepository_LabelCRUDAndOwnerIsolation(t *testing.T) {
 		t.Fatalf("GetLabelByID(bob): got=%+v err=%v", gotByID, err)
 	}
 
-	// Renaming preserves label ID.
+	// Renaming ordinary labels preserves ID.
 	renamed, err := labelRepo.RenameLabel(ctx, aliceLbl.ID, "reading-archive")
 	if err != nil {
 		t.Fatalf("RenameLabel: %v", err)
@@ -202,29 +265,62 @@ func TestLabelRepository_LabelCRUDAndOwnerIsolation(t *testing.T) {
 	}
 }
 
-func TestLabelRepository_ItemLabelsCRUD(t *testing.T) {
+func TestLabelRepository_ItemLabelsCRUDAndViewerScoping(t *testing.T) {
 	ctx := context.Background()
 	labelRepo, userRepo := setupLabelRepos(t)
 
 	alice := createSeededTestUser(ctx, t, userRepo, "alice-items")
-	fav, err := labelRepo.GetUserLabelByName(ctx, alice.ID, domain.LabelFavorite)
+	bob := createSeededTestUser(ctx, t, userRepo, "bob-items")
+
+	aliceFav, err := labelRepo.GetUserLabelByName(ctx, alice.ID, domain.LabelFavorite)
 	if err != nil {
-		t.Fatalf("GetUserLabelByName: %v", err)
+		t.Fatalf("GetUserLabelByName(alice): %v", err)
 	}
-	del, err := labelRepo.GetServerLabelByName(ctx, domain.LabelMarkedForDeletion)
+	bobDNF, err := labelRepo.GetUserLabelByName(ctx, bob.ID, domain.LabelDNF)
 	if err != nil {
-		t.Fatalf("GetServerLabelByName: %v", err)
+		t.Fatalf("GetUserLabelByName(bob): %v", err)
+	}
+
+	mature := &domain.Label{
+		ID:    domain.MustNewID(),
+		Scope: domain.LabelScopeServer,
+		Name:  "mature-content",
+	}
+	if err := labelRepo.CreateLabel(ctx, mature); err != nil {
+		t.Fatalf("CreateLabel(mature): %v", err)
+	}
+	aliceCustom := &domain.Label{
+		ID:      domain.MustNewID(),
+		Scope:   domain.LabelScopeUser,
+		OwnerID: &alice.ID,
+		Name:    "alice-weekend",
+	}
+	bobCustom := &domain.Label{
+		ID:      domain.MustNewID(),
+		Scope:   domain.LabelScopeUser,
+		OwnerID: &bob.ID,
+		Name:    "bob-backlog",
+	}
+	for _, lbl := range []*domain.Label{aliceCustom, bobCustom} {
+		if err := labelRepo.CreateLabel(ctx, lbl); err != nil {
+			t.Fatalf("CreateLabel(%s): %v", lbl.Name, err)
+		}
 	}
 
 	seriesID := domain.MustNewID()
 	volumeID := domain.MustNewID()
 	assetID := domain.MustNewID()
 
+	// Both Alice and Bob tag the same shared series, plus SERVER labels mature and marked_for_deletion.
 	assignments := []*domain.ItemLabel{
-		{LabelID: fav.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
-		{LabelID: del.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
-		{LabelID: fav.ID, ItemType: domain.ItemTypeVolume, ItemID: volumeID},
-		{LabelID: del.ID, ItemType: domain.ItemTypeAsset, ItemID: assetID},
+		{LabelID: aliceFav.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: aliceCustom.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: bobDNF.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: bobCustom.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: mature.ID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeSeries, ItemID: seriesID},
+		{LabelID: aliceFav.ID, ItemType: domain.ItemTypeVolume, ItemID: volumeID},
+		{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeAsset, ItemID: assetID},
 	}
 	for _, a := range assignments {
 		if err := labelRepo.AssignItemLabel(ctx, a); err != nil {
@@ -244,23 +340,62 @@ func TestLabelRepository_ItemLabelsCRUD(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for unknown label assignment, got: %v", err)
 	}
 
-	seriesLabels, err := labelRepo.ListItemLabels(ctx, domain.ItemTypeSeries, seriesID)
-	if err != nil {
-		t.Fatalf("ListItemLabels: %v", err)
+	// Empty viewer is rejected on viewer-scoped reads.
+	if _, err := labelRepo.ListItemLabels(ctx, "", domain.ItemTypeSeries, seriesID); !errors.Is(err, domain.ErrEmptyUserID) {
+		t.Fatalf("expected ErrEmptyUserID on empty viewer ListItemLabels, got: %v", err)
 	}
-	if len(seriesLabels) != 2 {
-		t.Fatalf("expected 2 labels on series, got %d", len(seriesLabels))
-	}
-
-	favSeriesIDs, err := labelRepo.ListItemIDsByLabel(ctx, fav.ID, domain.ItemTypeSeries)
-	if err != nil {
-		t.Fatalf("ListItemIDsByLabel: %v", err)
-	}
-	if len(favSeriesIDs) != 1 || favSeriesIDs[0] != seriesID {
-		t.Fatalf("unexpected series IDs for favorite: %v", favSeriesIDs)
+	if _, err := labelRepo.ListItemIDsByLabel(ctx, "", mature.ID, domain.ItemTypeSeries); !errors.Is(err, domain.ErrEmptyUserID) {
+		t.Fatalf("expected ErrEmptyUserID on empty viewer ListItemIDsByLabel, got: %v", err)
 	}
 
-	// Remove one assignment.
+	// Alice sees SERVER labels + Alice's USER labels only (zero Bob labels).
+	aliceVisible, err := labelRepo.ListItemLabels(ctx, alice.ID, domain.ItemTypeSeries, seriesID)
+	if err != nil {
+		t.Fatalf("ListItemLabels(alice): %v", err)
+	}
+	assertLabelIDSet(t, "alice ListItemLabels", aliceVisible,
+		domain.LabelMarkedForDeletionID, mature.ID, aliceFav.ID, aliceCustom.ID)
+
+	// Bob sees SERVER labels + Bob's USER labels only (zero Alice labels).
+	bobVisible, err := labelRepo.ListItemLabels(ctx, bob.ID, domain.ItemTypeSeries, seriesID)
+	if err != nil {
+		t.Fatalf("ListItemLabels(bob): %v", err)
+	}
+	assertLabelIDSet(t, "bob ListItemLabels", bobVisible,
+		domain.LabelMarkedForDeletionID, mature.ID, bobDNF.ID, bobCustom.ID)
+
+	// SERVER-only read excludes all USER labels while preserving SERVER visibility.
+	serverVisible, err := labelRepo.ListServerItemLabels(ctx, domain.ItemTypeSeries, seriesID)
+	if err != nil {
+		t.Fatalf("ListServerItemLabels: %v", err)
+	}
+	assertLabelIDSet(t, "ListServerItemLabels", serverVisible,
+		domain.LabelMarkedForDeletionID, mature.ID)
+
+	// Privileged maintenance read returns all 6 labels across SERVER and both users.
+	allMaint, err := labelRepo.ListAllItemLabelsForMaintenance(ctx, domain.ItemTypeSeries, seriesID)
+	if err != nil {
+		t.Fatalf("ListAllItemLabelsForMaintenance: %v", err)
+	}
+	assertLabelIDSet(t, "ListAllItemLabelsForMaintenance", allMaint,
+		domain.LabelMarkedForDeletionID, mature.ID, aliceFav.ID, aliceCustom.ID, bobDNF.ID, bobCustom.ID)
+
+	// Reverse lookup respects viewer scope: Alice sees her favorite series, Bob sees nothing for Alice's label ID.
+	aliceSeriesByFav, err := labelRepo.ListItemIDsByLabel(ctx, alice.ID, aliceFav.ID, domain.ItemTypeSeries)
+	if err != nil || len(aliceSeriesByFav) != 1 || aliceSeriesByFav[0] != seriesID {
+		t.Fatalf("ListItemIDsByLabel(alice, aliceFav): got=%v err=%v", aliceSeriesByFav, err)
+	}
+	bobSeriesByAliceFav, err := labelRepo.ListItemIDsByLabel(ctx, bob.ID, aliceFav.ID, domain.ItemTypeSeries)
+	if err != nil || len(bobSeriesByAliceFav) != 0 {
+		t.Fatalf("expected Bob reverse lookup on Alice private label to return empty, got=%v err=%v", bobSeriesByAliceFav, err)
+	}
+	// Both Alice and Bob retain reverse lookup visibility for SERVER labels.
+	bobSeriesByMature, err := labelRepo.ListItemIDsByLabel(ctx, bob.ID, mature.ID, domain.ItemTypeSeries)
+	if err != nil || len(bobSeriesByMature) != 1 || bobSeriesByMature[0] != seriesID {
+		t.Fatalf("ListItemIDsByLabel(bob, SERVER mature): got=%v err=%v", bobSeriesByMature, err)
+	}
+
+	// Remove one assignment and verify ErrNotFound on repeat.
 	if err := labelRepo.RemoveItemLabel(ctx, assignments[0]); err != nil {
 		t.Fatalf("RemoveItemLabel: %v", err)
 	}
@@ -275,9 +410,25 @@ func TestLabelRepository_ItemLabelsCRUD(t *testing.T) {
 	if err := labelRepo.RemoveAllItemLabelsForItem(ctx, domain.ItemTypeSeries, seriesID); err != nil {
 		t.Fatalf("idempotent RemoveAllItemLabelsForItem: %v", err)
 	}
-	remaining, err := labelRepo.ListItemLabels(ctx, domain.ItemTypeSeries, seriesID)
+	remaining, err := labelRepo.ListAllItemLabelsForMaintenance(ctx, domain.ItemTypeSeries, seriesID)
 	if err != nil || len(remaining) != 0 {
-		t.Fatalf("expected 0 remaining series labels, got=%d err=%v", len(remaining), err)
+		t.Fatalf("expected 0 remaining series labels after purge cleanup, got=%d err=%v", len(remaining), err)
+	}
+}
+
+func assertLabelIDSet(t *testing.T, label string, got []domain.Label, wantIDs ...string) {
+	t.Helper()
+	gotSet := make(map[string]bool, len(got))
+	for _, l := range got {
+		gotSet[l.ID] = true
+	}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("%s: expected %d labels (%v), got %d (%+v)", label, len(wantIDs), wantIDs, len(got), got)
+	}
+	for _, id := range wantIDs {
+		if !gotSet[id] {
+			t.Fatalf("%s: missing expected label ID %s in %+v", label, id, got)
+		}
 	}
 }
 

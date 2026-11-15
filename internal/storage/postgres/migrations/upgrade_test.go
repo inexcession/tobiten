@@ -98,7 +98,7 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 				}
 			}
 
-			// 7. Verify 0005_labels.sql built-in SERVER label seed exists after upgrade.
+			// 7. Verify 0005_labels.sql built-in SERVER label seed and personal built-in backfill.
 			var labelScope string
 			var builtIn bool
 			if err := db.QueryRow(ctx,
@@ -109,6 +109,54 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			}
 			if labelScope != string(domain.LabelScopeServer) || !builtIn {
 				t.Fatalf("unexpected marked_for_deletion state after upgrade: scope=%q built_in=%v", labelScope, builtIn)
+			}
+
+			// Verify all seeded users (empty admin/bob and partial alice) have all 3 personal built-ins.
+			seededUsers := []string{
+				"019318a0-0000-7000-8000-000000000010", // admin
+				"019318a0-0000-7000-8000-000000000011", // alice
+				"019318a0-0000-7000-8000-000000000012", // bob
+			}
+			for _, uid := range seededUsers {
+				for _, name := range domain.BuiltInUserLabelNames() {
+					var (
+						id         string
+						lblBuiltIn bool
+					)
+					if err := db.QueryRow(ctx,
+						`SELECT id, built_in FROM labels WHERE scope = 'USER' AND owner_id = $1 AND name = $2`,
+						uid, name,
+					).Scan(&id, &lblBuiltIn); err != nil {
+						t.Fatalf("missing backfilled personal label %q for user %s: %v", name, uid, err)
+					}
+					if id == "" || !lblBuiltIn {
+						t.Fatalf("unexpected backfilled personal label %q for user %s: id=%q built_in=%v", name, uid, id, lblBuiltIn)
+					}
+				}
+			}
+
+			// Verify alice's existing personal label IDs and item_labels assignment survived upgrade.
+			aliceExisting := []struct {
+				id   string
+				name string
+			}{
+				{id: "019318a0-0000-7000-8000-000000000033", name: domain.LabelFavorite},
+				{id: "019318a0-0000-7000-8000-000000000034", name: domain.LabelWantToRead},
+			}
+			for _, want := range aliceExisting {
+				var gotName string
+				if err := db.QueryRow(ctx,
+					`SELECT name FROM labels WHERE id = $1 AND scope = 'USER' AND owner_id = '019318a0-0000-7000-8000-000000000011'`,
+					want.id,
+				).Scan(&gotName); err != nil || gotName != want.name {
+					t.Fatalf("alice pre-existing label %s (%s) was not preserved: name=%q err=%v", want.id, want.name, gotName, err)
+				}
+			}
+			var assignedCount int
+			if err := db.QueryRow(ctx,
+				`SELECT COUNT(*) FROM item_labels WHERE label_id = '019318a0-0000-7000-8000-000000000033' AND item_type = 'VOLUME' AND item_id = '019318a0-0000-7000-8000-000000000092'`,
+			).Scan(&assignedCount); err != nil || assignedCount != 1 {
+				t.Fatalf("alice pre-existing item_labels assignment did not survive upgrade: count=%d err=%v", assignedCount, err)
 			}
 		})
 	}
@@ -351,7 +399,13 @@ func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expec
 	checkCount("users", 3)
 	checkCount("credentials", 4)
 	checkCount("user_roles", 3)
-	checkCount("labels", 5)
+	if expectedMigrations == 1 {
+		checkCount("labels", 5)
+	} else {
+		// 0005_labels.sql retains the 5 seeded labels (preserving IDs/assignments) and
+		// completes the 3 personal built-in USER labels for all 3 existing users (12 total).
+		checkCount("labels", 12)
+	}
 	checkCount("item_labels", 3)
 	checkCount("user_label_policies", 2)
 	checkCount("domain_events", 2)

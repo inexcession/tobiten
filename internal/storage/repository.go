@@ -26,6 +26,10 @@ var (
 	// ErrInvalidLabelPolicy is returned when a user_label_policies write violates the
 	// SERVER-only label constraint.
 	ErrInvalidLabelPolicy = errors.New("user label policy must reference a SERVER label")
+
+	// ErrProtectedLabel is returned when attempting to rename, modify, or delete
+	// the protected canonical trash label (marked_for_deletion).
+	ErrProtectedLabel = errors.New("protected built-in label cannot be modified or deleted")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.

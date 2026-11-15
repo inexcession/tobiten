@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -86,13 +87,24 @@ func toDomainPolicies(rows []UserLabelPolicy) []domain.UserLabelPolicy {
 	return out
 }
 
+func isProtectedLabelPgError(pgErr *pgconn.PgError) bool {
+	return pgErr.Code == "P0001" &&
+		(strings.Contains(pgErr.Message, "cannot delete protected built-in trash label") ||
+			strings.Contains(pgErr.Message, "cannot modify protected built-in trash label"))
+}
+
 func mapLabelWriteError(err error) error {
 	if err == nil {
 		return nil
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-		return storage.ErrNotFound
+	if errors.As(err, &pgErr) {
+		if isProtectedLabelPgError(pgErr) {
+			return storage.ErrProtectedLabel
+		}
+		if pgErr.Code == "23503" {
+			return storage.ErrNotFound
+		}
 	}
 	return mapPgError(err)
 }
@@ -102,8 +114,13 @@ func mapDeleteLabelError(err error) error {
 		return nil
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && (pgErr.Code == "23001" || pgErr.Code == "23503") {
-		return storage.ErrLabelInUse
+	if errors.As(err, &pgErr) {
+		if isProtectedLabelPgError(pgErr) {
+			return storage.ErrProtectedLabel
+		}
+		if pgErr.Code == "23001" || pgErr.Code == "23503" {
+			return storage.ErrLabelInUse
+		}
 	}
 	return mapPgError(err)
 }
@@ -127,6 +144,16 @@ func mapPolicyWriteError(err error) error {
 		}
 	}
 	return mapPgError(err)
+}
+
+func validateItemKey(itemType domain.ItemType, itemID string) error {
+	if !slices.Contains(domain.ValidItemTypes(), itemType) {
+		return domain.ErrInvalidItemType
+	}
+	if strings.TrimSpace(itemID) == "" {
+		return errors.New("item_id must not be empty")
+	}
+	return nil
 }
 
 func ensureUserBuiltInLabels(ctx context.Context, q *Queries, ownerID string) error {
@@ -229,9 +256,13 @@ func (r *LabelRepository) ListUserLabels(ctx context.Context, ownerID string) ([
 
 // RenameLabel updates the display name of a label while preserving its ID,
 // item_labels assignments, and user_label_policies references.
+// Returns storage.ErrProtectedLabel for the canonical trash label.
 func (r *LabelRepository) RenameLabel(ctx context.Context, id, newName string) (*domain.Label, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("label id must not be empty")
+	}
+	if id == domain.LabelMarkedForDeletionID {
+		return nil, storage.ErrProtectedLabel
 	}
 	trimmed := strings.TrimSpace(newName)
 	if trimmed == "" {
@@ -248,8 +279,9 @@ func (r *LabelRepository) RenameLabel(ctx context.Context, id, newName string) (
 	return &lbl, nil
 }
 
-// DeleteLabel removes a label by ID. Returns ErrLabelInUse if any user_label_policies
-// still reference the label (ON DELETE RESTRICT), or ErrNotFound if no such label exists.
+// DeleteLabel removes a label by ID. Returns ErrProtectedLabel for the canonical
+// trash label, ErrLabelInUse if any user_label_policies still reference the label
+// (ON DELETE RESTRICT), or ErrNotFound if no such label exists.
 func (r *LabelRepository) DeleteLabel(ctx context.Context, id string) error {
 	rows, err := r.q.DeleteLabel(ctx, id)
 	if err != nil {
@@ -279,7 +311,8 @@ func (r *LabelRepository) EnsureBuiltInServerLabels(ctx context.Context) error {
 }
 
 // EnsureUserBuiltInLabels idempotently ensures personal built-in USER labels
-// (want-to-read, favorite, dnf) exist for ownerID.
+// (want-to-read, favorite, dnf) exist for ownerID while preserving existing IDs
+// and item assignments.
 func (r *LabelRepository) EnsureUserBuiltInLabels(ctx context.Context, ownerID string) error {
 	if r.tx != nil {
 		return r.WithTx(ctx, func(txRepo storage.LabelRepository) error {
@@ -328,9 +361,33 @@ func (r *LabelRepository) RemoveItemLabel(ctx context.Context, itemLabel *domain
 	return nil
 }
 
-// ListItemLabels returns all labels attached to the specified item ordered by scope and name.
-func (r *LabelRepository) ListItemLabels(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error) {
+// ListItemLabels returns all labels attached to (itemType, itemID) visible to
+// viewerUserID: all SERVER labels plus USER labels owned by viewerUserID.
+func (r *LabelRepository) ListItemLabels(ctx context.Context, viewerUserID string, itemType domain.ItemType, itemID string) ([]domain.Label, error) {
+	if strings.TrimSpace(viewerUserID) == "" {
+		return nil, domain.ErrEmptyUserID
+	}
+	if err := validateItemKey(itemType, itemID); err != nil {
+		return nil, err
+	}
+	viewerPtr := viewerUserID
 	rows, err := r.q.ListItemLabels(ctx, ListItemLabelsParams{
+		ItemType: string(itemType),
+		ItemID:   itemID,
+		OwnerID:  &viewerPtr,
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return toDomainLabels(rows), nil
+}
+
+// ListServerItemLabels returns only SERVER-scoped labels attached to (itemType, itemID).
+func (r *LabelRepository) ListServerItemLabels(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error) {
+	if err := validateItemKey(itemType, itemID); err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListServerItemLabels(ctx, ListServerItemLabelsParams{
 		ItemType: string(itemType),
 		ItemID:   itemID,
 	})
@@ -340,11 +397,39 @@ func (r *LabelRepository) ListItemLabels(ctx context.Context, itemType domain.It
 	return toDomainLabels(rows), nil
 }
 
-// ListItemIDsByLabel returns all item IDs of itemType tagged with labelID ordered by item_id.
-func (r *LabelRepository) ListItemIDsByLabel(ctx context.Context, labelID string, itemType domain.ItemType) ([]string, error) {
+// ListAllItemLabelsForMaintenance returns all labels (SERVER and all USER scopes)
+// attached to (itemType, itemID) for privileged maintenance/purge operations.
+func (r *LabelRepository) ListAllItemLabelsForMaintenance(ctx context.Context, itemType domain.ItemType, itemID string) ([]domain.Label, error) {
+	if err := validateItemKey(itemType, itemID); err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListAllItemLabelsForMaintenance(ctx, ListAllItemLabelsForMaintenanceParams{
+		ItemType: string(itemType),
+		ItemID:   itemID,
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return toDomainLabels(rows), nil
+}
+
+// ListItemIDsByLabel returns all item IDs of itemType tagged with labelID visible to
+// viewerUserID (a SERVER label or a USER label owned by viewerUserID) ordered by item_id.
+func (r *LabelRepository) ListItemIDsByLabel(ctx context.Context, viewerUserID, labelID string, itemType domain.ItemType) ([]string, error) {
+	if strings.TrimSpace(viewerUserID) == "" {
+		return nil, domain.ErrEmptyUserID
+	}
+	if strings.TrimSpace(labelID) == "" {
+		return nil, errors.New("label_id must not be empty")
+	}
+	if !slices.Contains(domain.ValidItemTypes(), itemType) {
+		return nil, domain.ErrInvalidItemType
+	}
+	viewerPtr := viewerUserID
 	ids, err := r.q.ListItemIDsByLabel(ctx, ListItemIDsByLabelParams{
 		LabelID:  labelID,
 		ItemType: string(itemType),
+		OwnerID:  &viewerPtr,
 	})
 	if err != nil {
 		return nil, mapPgError(err)
@@ -357,6 +442,9 @@ func (r *LabelRepository) ListItemIDsByLabel(ctx context.Context, labelID string
 
 // RemoveAllItemLabelsForItem removes all label assignments for the specified item.
 func (r *LabelRepository) RemoveAllItemLabelsForItem(ctx context.Context, itemType domain.ItemType, itemID string) error {
+	if err := validateItemKey(itemType, itemID); err != nil {
+		return err
+	}
 	err := r.q.RemoveAllItemLabelsForItem(ctx, RemoveAllItemLabelsForItemParams{
 		ItemType: string(itemType),
 		ItemID:   itemID,

@@ -64,14 +64,36 @@ WHERE label_id = $1 AND item_type = $2 AND item_id = $3;
 SELECT l.id, l.scope, l.owner_id, l.name, l.built_in
 FROM item_labels il
 JOIN labels l ON l.id = il.label_id
-WHERE il.item_type = $1 AND il.item_id = $2
+WHERE il.item_type = $1
+  AND il.item_id = $2
+  AND (l.scope = 'SERVER' OR (l.scope = 'USER' AND l.owner_id = $3))
 ORDER BY l.scope, l.name, l.id;
 
+-- name: ListServerItemLabels :many
+SELECT l.id, l.scope, l.owner_id, l.name, l.built_in
+FROM item_labels il
+JOIN labels l ON l.id = il.label_id
+WHERE il.item_type = $1
+  AND il.item_id = $2
+  AND l.scope = 'SERVER'
+ORDER BY l.name, l.id;
+
+-- name: ListAllItemLabelsForMaintenance :many
+SELECT l.id, l.scope, l.owner_id, l.name, l.built_in
+FROM item_labels il
+JOIN labels l ON l.id = il.label_id
+WHERE il.item_type = $1
+  AND il.item_id = $2
+ORDER BY l.scope, l.owner_id NULLS FIRST, l.name, l.id;
+
 -- name: ListItemIDsByLabel :many
-SELECT item_id
-FROM item_labels
-WHERE label_id = $1 AND item_type = $2
-ORDER BY item_id;
+SELECT il.item_id
+FROM item_labels il
+JOIN labels l ON l.id = il.label_id
+WHERE il.label_id = $1
+  AND il.item_type = $2
+  AND (l.scope = 'SERVER' OR (l.scope = 'USER' AND l.owner_id = $3))
+ORDER BY il.item_id;
 
 -- name: RemoveAllItemLabelsForItem :exec
 DELETE FROM item_labels
