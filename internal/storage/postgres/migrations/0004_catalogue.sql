@@ -220,8 +220,9 @@ CREATE TABLE reading_progress (
 -- =============================================================================
 -- Deferred Cross-Table Constraint Triggers (ARCHITECTURE §4.5, ADR-0008, ADR-0010, ADR-0018, ADR-0019)
 -- Every trigger re-reads current committed/transaction row state at execution time (commit or
--- SET CONSTRAINTS IMMEDIATE) and acquires FOR SHARE / FOR NO KEY UPDATE row locks so concurrent
--- transactions cannot commit inconsistent cross-table state.
+-- SET CONSTRAINTS IMMEDIATE) and acquires row locks (including parent-row no-op updates on
+-- unindexed non-trigger columns) so both READ COMMITTED and REPEATABLE READ transactions
+-- serialize concurrent cross-table writes instead of committing against stale snapshots.
 -- =============================================================================
 
 -- Helper: verify that if volume v_volume_id has any series_memberships, it has exactly one primary.
@@ -231,7 +232,9 @@ DECLARE
     v_total   BIGINT;
     v_primary BIGINT;
 BEGIN
-    PERFORM 1 FROM volumes WHERE id = v_volume_id FOR NO KEY UPDATE;
+    -- Bump the parent volume's tuple version (without changing values or firing column-scoped
+    -- library/preferred-asset triggers) so concurrent REPEATABLE READ membership edits serialize.
+    UPDATE volumes SET updated_at = updated_at WHERE id = v_volume_id;
     IF NOT FOUND THEN
         -- Volume was deleted (e.g., ON DELETE CASCADE removed all its memberships).
         RETURN;
@@ -265,7 +268,7 @@ BEGIN
 
         IF EXISTS (SELECT 1 FROM series_memberships WHERE volume_id = NEW.volume_id AND series_id = NEW.series_id) THEN
             SELECT library_id INTO v_vol_lib FROM volumes WHERE id = NEW.volume_id FOR SHARE;
-            SELECT library_id INTO v_ser_lib FROM series WHERE id = NEW.series_id FOR SHARE;
+            UPDATE series SET updated_at = updated_at WHERE id = NEW.series_id RETURNING library_id INTO v_ser_lib;
             IF v_vol_lib IS DISTINCT FROM v_ser_lib THEN
                 RAISE EXCEPTION 'series_memberships volume % (library %) and series % (library %) must belong to the same library',
                     NEW.volume_id, v_vol_lib, NEW.series_id, v_ser_lib;
@@ -287,7 +290,7 @@ BEGIN
 
         IF EXISTS (SELECT 1 FROM series_memberships WHERE volume_id = NEW.volume_id AND series_id = NEW.series_id) THEN
             SELECT library_id INTO v_vol_lib FROM volumes WHERE id = NEW.volume_id FOR SHARE;
-            SELECT library_id INTO v_ser_lib FROM series WHERE id = NEW.series_id FOR SHARE;
+            UPDATE series SET updated_at = updated_at WHERE id = NEW.series_id RETURNING library_id INTO v_ser_lib;
             IF v_vol_lib IS DISTINCT FROM v_ser_lib THEN
                 RAISE EXCEPTION 'series_memberships volume % (library %) and series % (library %) must belong to the same library',
                     NEW.volume_id, v_vol_lib, NEW.series_id, v_ser_lib;
@@ -295,7 +298,7 @@ BEGIN
         END IF;
 
         IF OLD.series_id IS DISTINCT FROM NEW.series_id OR OLD.volume_id IS DISTINCT FROM NEW.volume_id THEN
-            SELECT cover_volume_id INTO v_cover_vol FROM series WHERE id = OLD.series_id FOR SHARE;
+            UPDATE series SET updated_at = updated_at WHERE id = OLD.series_id RETURNING cover_volume_id INTO v_cover_vol;
             IF FOUND AND v_cover_vol = OLD.volume_id THEN
                 IF NOT EXISTS (SELECT 1 FROM series_memberships WHERE series_id = OLD.series_id AND volume_id = OLD.volume_id) THEN
                     RAISE EXCEPTION 'cannot move membership (%, %) while series % references volume as cover_volume_id',
@@ -307,7 +310,7 @@ BEGIN
     ELSIF TG_OP = 'DELETE' THEN
         PERFORM check_volume_primary_membership(OLD.volume_id);
 
-        SELECT cover_volume_id INTO v_cover_vol FROM series WHERE id = OLD.series_id FOR SHARE;
+        UPDATE series SET updated_at = updated_at WHERE id = OLD.series_id RETURNING cover_volume_id INTO v_cover_vol;
         IF FOUND AND v_cover_vol = OLD.volume_id THEN
             IF NOT EXISTS (SELECT 1 FROM series_memberships WHERE series_id = OLD.series_id AND volume_id = OLD.volume_id) THEN
                 RAISE EXCEPTION 'cannot delete membership (%, %) while series % references volume as cover_volume_id',
@@ -465,16 +468,17 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    SELECT library_id INTO v_vol_lib FROM volumes WHERE id = v_vol_id FOR SHARE;
-    SELECT library_id INTO v_root_lib FROM library_roots WHERE id = v_root_id FOR SHARE;
+    -- Bump parent tuple versions (without changing values or firing library_id/preferred_asset_id
+    -- triggers) so concurrent REPEATABLE READ root/volume library updates serialize safely.
+    UPDATE library_roots SET state = state WHERE id = v_root_id RETURNING library_id INTO v_root_lib;
+    UPDATE volumes SET updated_at = updated_at WHERE id = v_vol_id RETURNING library_id INTO v_vol_lib;
     IF v_vol_lib IS DISTINCT FROM v_root_lib THEN
         RAISE EXCEPTION 'media_asset % volume % (library %) and library_root % (library %) must belong to the same library',
             NEW.id, v_vol_id, v_vol_lib, v_root_id, v_root_lib;
     END IF;
 
     IF TG_OP = 'UPDATE' AND OLD.volume_id IS DISTINCT FROM v_vol_id THEN
-        SELECT preferred_asset_id INTO v_pref_asset
-        FROM volumes WHERE id = OLD.volume_id FOR SHARE;
+        UPDATE volumes SET updated_at = updated_at WHERE id = OLD.volume_id RETURNING preferred_asset_id INTO v_pref_asset;
         IF FOUND AND v_pref_asset = OLD.id THEN
             RAISE EXCEPTION 'cannot reassign asset % from volume % while it is preferred_asset_id',
                 OLD.id, OLD.volume_id;

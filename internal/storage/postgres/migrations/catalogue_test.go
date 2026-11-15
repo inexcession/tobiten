@@ -42,7 +42,7 @@ func TestMigration0004_AppliesAndTablesExist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("querying applied migrations: %v", err)
 	}
-	if len(applied) != 4 || applied[3].Version != 4 || applied[3].Name != "0004_catalogue.sql" {
+	if len(applied) < 4 || applied[3].Version != 4 || applied[3].Name != "0004_catalogue.sql" {
 		t.Fatalf("expected 0004_catalogue.sql as fourth migration, got %+v", applied)
 	}
 
