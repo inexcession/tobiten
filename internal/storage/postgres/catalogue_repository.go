@@ -51,6 +51,12 @@ const (
 		SELECT rp.user_id, rp.volume_id, rp.locator, rp.total_progression,
 		       rp.device, rp.source, rp.completed, rp.updated_at
 		FROM reading_progress rp`
+
+	selectSeriesMembershipColumns = `
+		SELECT sm.volume_id, sm.series_id, sm.is_primary, sm.kind, sm.position,
+		       sm.source, sm.locked_fields
+		FROM series_memberships sm
+		JOIN series s_m ON s_m.id = sm.series_id`
 )
 
 // CatalogueRepository implements storage.CatalogueRepository backed by PostgreSQL,
@@ -154,16 +160,25 @@ func (r *CatalogueRepository) CountSeries(ctx context.Context, scope storage.Cat
 	if err != nil {
 		return 0, err
 	}
-	return r.queryCountWithSQL(ctx, "SELECT COUNT(*) FROM series s"+whereClause, args...)
+	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM series s"+whereClause, args...))
 }
 
-// GetVolumeByID retrieves a single volume if visible under the principal's label predicate.
+// GetVolumeByID retrieves a single volume if visible under the principal's label predicate,
+// populating its authorized Memberships and Assets and clearing PreferredAssetID when unauthorized.
 func (r *CatalogueRepository) GetVolumeByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Volume, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
-	return r.getVolumeWithPredicate(ctx, pred, id)
+	vol, err := r.getVolumeWithPredicate(ctx, pred, id)
+	if err != nil {
+		return nil, err
+	}
+	vols := []domain.Volume{*vol}
+	if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, vols); err != nil {
+		return nil, err
+	}
+	return &vols[0], nil
 }
 
 func (r *CatalogueRepository) getVolumeWithPredicate(ctx context.Context, pred *LabelPredicate, id string) (*domain.Volume, error) {
@@ -176,7 +191,8 @@ func (r *CatalogueRepository) getVolumeWithPredicate(ctx context.Context, pred *
 	return scanVolumeRow(r.db.QueryRow(ctx, query, args...))
 }
 
-// ListVolumes returns volumes visible under the principal's label predicate matching filter.
+// ListVolumes returns volumes visible under the principal's label predicate matching filter,
+// populating each volume's authorized Memberships and Assets and clearing PreferredAssetID when unauthorized.
 func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter) ([]domain.Volume, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -213,7 +229,124 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 	if err := rows.Err(); err != nil {
 		return nil, mapPgError(err)
 	}
+	if len(out) > 0 {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, out); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, volumes []domain.Volume) error {
+	if len(volumes) == 0 {
+		return nil
+	}
+	volumeIDs := make([]string, len(volumes))
+	for i := range volumes {
+		volumeIDs[i] = volumes[i].ID
+	}
+
+	membershipsByVol, err := r.listAuthorizedMembershipsByVolumeIDs(ctx, pred, volumeIDs)
+	if err != nil {
+		return err
+	}
+	assetsByVol, err := r.listAuthorizedAssetsByVolumeIDs(ctx, pred, volumeIDs)
+	if err != nil {
+		return err
+	}
+
+	for i := range volumes {
+		v := &volumes[i]
+		v.Memberships = membershipsByVol[v.ID]
+		if v.Memberships == nil {
+			v.Memberships = []domain.SeriesMembership{}
+		}
+		v.Assets = assetsByVol[v.ID]
+		if v.Assets == nil {
+			v.Assets = []domain.MediaAsset{}
+		}
+		if v.PreferredAssetID != nil && !hasAuthorizedAssetID(v.Assets, *v.PreferredAssetID) {
+			v.PreferredAssetID = nil
+		}
+	}
+	return nil
+}
+
+func hasAuthorizedAssetID(assets []domain.MediaAsset, assetID string) bool {
+	for i := range assets {
+		if assets[i].ID == assetID {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *CatalogueRepository) listAuthorizedMembershipsByVolumeIDs(
+	ctx context.Context,
+	pred *LabelPredicate,
+	volumeIDs []string,
+) (map[string][]domain.SeriesMembership, error) {
+	frag, err := pred.SeriesFragment("s_m", 2)
+	if err != nil {
+		return nil, fmt.Errorf("building series membership label predicate: %w", err)
+	}
+	query := selectSeriesMembershipColumns +
+		" WHERE sm.volume_id = ANY($1::text[]) AND (" + frag.SQL + ")" +
+		" ORDER BY sm.volume_id ASC, sm.is_primary DESC, sm.series_id ASC"
+	args := append([]any{volumeIDs}, frag.Args...)
+
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	byVol := make(map[string][]domain.SeriesMembership, len(volumeIDs))
+	for rows.Next() {
+		item, err := scanSeriesMembershipRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		byVol[item.VolumeID] = append(byVol[item.VolumeID], item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return byVol, nil
+}
+
+func (r *CatalogueRepository) listAuthorizedAssetsByVolumeIDs(
+	ctx context.Context,
+	pred *LabelPredicate,
+	volumeIDs []string,
+) (map[string][]domain.MediaAsset, error) {
+	frag, err := pred.AssetFragment("a", 2)
+	if err != nil {
+		return nil, fmt.Errorf("building volume asset label predicate: %w", err)
+	}
+	query := selectAssetColumns +
+		" WHERE a.volume_id = ANY($1::text[]) AND (" + frag.SQL + ")" +
+		" ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC"
+	args := append([]any{volumeIDs}, frag.Args...)
+
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	byVol := make(map[string][]domain.MediaAsset, len(volumeIDs))
+	for rows.Next() {
+		item, err := scanAssetRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		byVol[item.VolumeID] = append(byVol[item.VolumeID], *item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return byVol, nil
 }
 
 // CountVolumes returns the count of volumes visible under the principal's label predicate matching filter.
@@ -226,7 +359,7 @@ func (r *CatalogueRepository) CountVolumes(ctx context.Context, scope storage.Ca
 	if err != nil {
 		return 0, err
 	}
-	return r.queryCountWithSQL(ctx, "SELECT COUNT(*) FROM volumes v"+joinClause+whereClause, args...)
+	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM volumes v"+joinClause+whereClause, args...))
 }
 
 // GetAssetByID retrieves a single media asset if visible under the principal's label predicate.
@@ -279,7 +412,7 @@ func (r *CatalogueRepository) CountAssetsByVolume(ctx context.Context, scope sto
 	}
 	query := "SELECT COUNT(*) FROM media_assets a WHERE a.volume_id = $1 AND (" + frag.SQL + ")"
 	args := append([]any{volumeID}, frag.Args...)
-	return r.queryCountWithSQL(ctx, query, args...)
+	return scanCountRow(r.db.QueryRow(ctx, query, args...))
 }
 
 // GetAuthorizedAssetFile retrieves the root and asset path projection for assetID
@@ -290,9 +423,12 @@ func (r *CatalogueRepository) GetAuthorizedAssetFile(ctx context.Context, scope 
 
 // SelectPreferredAssetFileForVolume resolves the preferred readable asset file projection for volumeID
 // per ADR-0018 S5 (explicit preference -> user's progress locator -> oldest eligible available asset),
-// strictly constrained by the principal's label predicate.
+// strictly constrained by the principal's label predicate. Trashed items (marked_for_deletion) are always
+// excluded from preferred readable selection even when scope.IncludeTrashed is set on an admin trash view.
 func (r *CatalogueRepository) SelectPreferredAssetFileForVolume(ctx context.Context, scope storage.CatalogueReadScope, volumeID string) (*storage.AuthorizedAssetFile, error) {
-	pred, err := r.loadPredicate(ctx, scope)
+	readableScope := scope
+	readableScope.IncludeTrashed = false
+	pred, err := r.loadPredicate(ctx, readableScope)
 	if err != nil {
 		return nil, err
 	}
@@ -448,12 +584,12 @@ func (r *CatalogueRepository) CountReadingProgress(ctx context.Context, scope st
 	if err != nil {
 		return 0, err
 	}
-	return r.queryCountWithSQL(ctx, "SELECT COUNT(*) FROM reading_progress rp"+whereClause, args...)
+	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM reading_progress rp"+whereClause, args...))
 }
 
-func (r *CatalogueRepository) queryCountWithSQL(ctx context.Context, query string, args ...any) (int64, error) {
+func scanCountRow(row pgx.Row) (int64, error) {
 	var count int64
-	if err := r.db.QueryRow(ctx, query, args...).Scan(&count); err != nil {
+	if err := row.Scan(&count); err != nil {
 		return 0, mapPgError(err)
 	}
 	return count, nil
@@ -463,7 +599,7 @@ func principalUserID(scope storage.CatalogueReadScope) string {
 	if scope.Principal == nil {
 		return ""
 	}
-	return strings.TrimSpace(scope.Principal.User.ID)
+	return scope.Principal.User.ID
 }
 
 func escapeILIKE(term string) string {
@@ -702,6 +838,39 @@ func scanVolumeRow(row pgx.Row) (*domain.Volume, error) {
 		return nil, fmt.Errorf("decoding volume locked_fields: %w", err)
 	}
 	return &v, nil
+}
+
+func scanSeriesMembershipRow(row pgx.Row) (domain.SeriesMembership, error) {
+	var (
+		m           domain.SeriesMembership
+		kind        string
+		position    pgtype.Float8
+		source      string
+		lockedBytes []byte
+	)
+	err := row.Scan(
+		&m.VolumeID,
+		&m.SeriesID,
+		&m.IsPrimary,
+		&kind,
+		&position,
+		&source,
+		&lockedBytes,
+	)
+	if err != nil {
+		return domain.SeriesMembership{}, mapPgError(err)
+	}
+	m.Kind = domain.MembershipKind(kind)
+	if position.Valid {
+		p := position.Float64
+		m.Position = &p
+	}
+	m.Source = domain.MembershipSource(source)
+	m.LockedFields, err = decodeFieldLocks(lockedBytes)
+	if err != nil {
+		return domain.SeriesMembership{}, fmt.Errorf("decoding series_membership locked_fields: %w", err)
+	}
+	return m, nil
 }
 
 func scanAssetRow(row pgx.Row) (*domain.MediaAsset, error) {

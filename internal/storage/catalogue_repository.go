@@ -64,7 +64,13 @@ type AuthorizedAssetFile struct {
 // CatalogueRepository defines label-enforced read and count operations across series,
 // volumes, media assets, authorized file projections, and per-user reading progress (ADR-0006 §5).
 // Every method must apply the repository LabelPredicate and fail closed on missing principals
-// or predicate errors.
+// or predicate errors:
+//   - GetVolumeByID and ListVolumes populate each volume's authorized Memberships and Assets
+//     and clear PreferredAssetID when the referenced asset is not authorized for scope.
+//   - SelectPreferredAssetFileForVolume always excludes trashed items (marked_for_deletion),
+//     even when scope.IncludeTrashed is true for an admin.
+//   - Reading progress methods bind ownership strictly to the exact scope.Principal.User.ID
+//     in addition to enforcing volume visibility.
 type CatalogueRepository interface {
 	GetSeriesByID(ctx context.Context, scope CatalogueReadScope, id string) (*domain.Series, error)
 	ListSeries(ctx context.Context, scope CatalogueReadScope, filter SeriesReadFilter) ([]domain.Series, error)

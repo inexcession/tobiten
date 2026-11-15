@@ -399,6 +399,59 @@ func enforceGetVolumeByID(t *testing.T, ec *catalogueEnforcementCtx) {
 	if err != nil || got.ID != ec.cat.vInKids {
 		t.Fatalf("timmy GetVolumeByID(vInKids) = (%+v, %v)", got, err)
 	}
+	if got.IsStandalone() || len(got.Memberships) != 1 || got.Memberships[0].SeriesID != ec.cat.sKids {
+		t.Fatalf("timmy vInKids Memberships = %+v, want [%s]", got.Memberships, ec.cat.sKids)
+	}
+	if !got.IsOwned() || len(got.Assets) != 1 || got.Assets[0].ID != ec.cat.aKidsClean {
+		t.Fatalf("timmy vInKids Assets = %+v, want [%s]", got.Assets, ec.cat.aKidsClean)
+	}
+
+	// Cross-series membership filtering: vInKidsAndClean belongs to sKids + sClean, so timmy sees ONLY sKids.
+	vCross, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vInKidsAndClean)
+	if err != nil {
+		t.Fatalf("timmy GetVolumeByID(vInKidsAndClean) err: %v", err)
+	}
+	if len(vCross.Memberships) != 1 || vCross.Memberships[0].SeriesID != ec.cat.sKids {
+		t.Fatalf("timmy GetVolumeByID(vInKidsAndClean) leaked hidden series membership: %+v", vCross.Memberships)
+	}
+	// Reader sees both authorized memberships on vInKidsAndClean.
+	vCrossReader, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.vInKidsAndClean)
+	if err != nil || len(vCrossReader.Memberships) != 2 {
+		t.Fatalf("reader GetVolumeByID(vInKidsAndClean) Memberships = %+v, err=%v (want 2)", vCrossReader, err)
+	}
+
+	// Standalone and zero-asset checks populate empty non-nil associations truthfully.
+	vStandalone, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vStandaloneKids)
+	if err != nil || !vStandalone.IsStandalone() || len(vStandalone.Memberships) != 0 {
+		t.Fatalf("timmy standalone GetVolumeByID = (%+v, %v)", vStandalone, err)
+	}
+	vZero, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vZeroAssetsInKids)
+	if err != nil || vZero.IsOwned() || !vZero.IsMissing() || len(vZero.Assets) != 0 {
+		t.Fatalf("timmy zero-assets GetVolumeByID = (%+v, %v)", vZero, err)
+	}
+
+	// PreferredAssetID redaction: set preferred_asset_id = aKidsNSFW on vInKids.
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, ec.cat.aKidsNSFW, ec.cat.vInKids); err != nil {
+		t.Fatalf("set preferred_asset_id=aKidsNSFW: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = ec.cat.tdb.Exec(context.Background(), `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
+	})
+	vReader, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.vInKids)
+	if err != nil {
+		t.Fatalf("reader GetVolumeByID(vInKids) err: %v", err)
+	}
+	if vReader.PreferredAssetID != nil {
+		t.Fatalf("reader GetVolumeByID(vInKids) leaked restricted PreferredAssetID %q", *vReader.PreferredAssetID)
+	}
+	if len(vReader.Assets) != 1 || vReader.Assets[0].ID != ec.cat.aKidsClean {
+		t.Fatalf("reader GetVolumeByID(vInKids) Assets = %+v, want [%s]", vReader.Assets, ec.cat.aKidsClean)
+	}
+	vAdmin, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.vInKids)
+	if err != nil || vAdmin.PreferredAssetID == nil || *vAdmin.PreferredAssetID != ec.cat.aKidsNSFW || len(vAdmin.Assets) != 2 {
+		t.Fatalf("admin GetVolumeByID(vInKids) = (%+v, %v)", vAdmin, err)
+	}
+	_, _ = ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
 
 	for _, tc := range []struct {
 		name  string
@@ -420,7 +473,7 @@ func enforceGetVolumeByID(t *testing.T, ec *catalogueEnforcementCtx) {
 		assertNotFound(t, tc.name, err)
 	}
 
-	// Admin trash view sees trashed volumes
+	// Admin trash view sees trashed volumes and trashed asset associations.
 	trashed, err := ec.repo.GetVolumeByID(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vTrashedInKids)
 	if err != nil || trashed.ID != ec.cat.vTrashedInKids {
 		t.Fatalf("admin trash GetVolumeByID(vTrashedInKids) = (%+v, %v)", trashed, err)
@@ -428,7 +481,7 @@ func enforceGetVolumeByID(t *testing.T, ec *catalogueEnforcementCtx) {
 }
 
 func enforceListVolumes(t *testing.T, ec *catalogueEnforcementCtx) {
-	assertVolIDs := func(name string, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter, want []string) {
+	assertVolIDs := func(name string, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter, want []string) []domain.Volume {
 		t.Helper()
 		list, err := ec.repo.ListVolumes(ec.ctx, scope, filter)
 		if err != nil {
@@ -444,13 +497,45 @@ func enforceListVolumes(t *testing.T, ec *catalogueEnforcementCtx) {
 		if !slices.Equal(got, wantSorted) {
 			t.Fatalf("%s: ListVolumes IDs = %v, want %v", name, got, wantSorted)
 		}
+		return list
 	}
 
 	assertVolIDs("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, storage.VolumeReadFilter{}, nil)
 	assertVolIDs("multiRole fail closed", storage.CatalogueReadScope{Principal: ec.multiRole}, storage.VolumeReadFilter{}, nil)
-	assertVolIDs("timmy ALLOW kids + RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{}, []string{
+	timmyVols := assertVolIDs("timmy ALLOW kids + RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{}, []string{
 		ec.cat.vInKids, ec.cat.vInKidsAndClean, ec.cat.vZeroAssetsInKids, ec.cat.vStandaloneKids,
 	})
+	for _, v := range timmyVols {
+		if v.ID == ec.cat.vInKidsAndClean && (len(v.Memberships) != 1 || v.Memberships[0].SeriesID != ec.cat.sKids) {
+			t.Fatalf("timmy ListVolumes leaked unauthorized membership on vInKidsAndClean: %+v", v.Memberships)
+		}
+		if v.ID == ec.cat.vInKids && (len(v.Assets) != 1 || v.Assets[0].ID != ec.cat.aKidsClean) {
+			t.Fatalf("timmy ListVolumes leaked restricted/trashed asset on vInKids: %+v", v.Assets)
+		}
+	}
+
+	// Verify ListVolumes redacts unauthorized PreferredAssetID on listed volumes.
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, ec.cat.aKidsTrashed, ec.cat.vInKids); err != nil {
+		t.Fatalf("set preferred_asset_id=aKidsTrashed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = ec.cat.tdb.Exec(context.Background(), `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
+	})
+	adminNormalVols := assertVolIDs("admin normal SeriesID=sKids excludes trashed preferred_asset_id", storage.CatalogueReadScope{Principal: ec.admin}, storage.VolumeReadFilter{SeriesID: ec.cat.sKids}, []string{
+		ec.cat.vInKids, ec.cat.vInKidsVolRestricted, ec.cat.vAltPathRestrictedPrimary, ec.cat.vAltPathRestrictedSec, ec.cat.vInKidsAndClean, ec.cat.vZeroAssetsInKids,
+	})
+	for _, v := range adminNormalVols {
+		if v.ID == ec.cat.vInKids {
+			if v.PreferredAssetID != nil {
+				t.Fatalf("admin normal ListVolumes leaked trashed PreferredAssetID %q", *v.PreferredAssetID)
+			}
+			if len(v.Assets) != 2 {
+				t.Fatalf("admin normal ListVolumes(vInKids) Assets = %+v, want 2 non-trashed assets", v.Assets)
+			}
+		}
+	}
+	_, _ = ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
+
 	// Cross-series visibility check: vInKidsAndClean is in sKids + sClean, but sClean is hidden from timmy!
 	assertVolIDs("timmy SeriesID=sClean hides vInKidsAndClean", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{SeriesID: ec.cat.sClean}, nil)
 	assertVolIDs("timmy SeriesID=sKids shows vInKidsAndClean", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{SeriesID: ec.cat.sKids}, []string{
@@ -644,7 +729,58 @@ func enforceSelectPreferredAssetFileForVolume(t *testing.T, ec *catalogueEnforce
 		t.Fatalf("reader SelectPreferredAssetFileForVolume(vInKids) = (%+v, %v), want %s", readerChosen, err, ec.cat.aKidsClean)
 	}
 
-	// Restricted/hidden/zero-asset volumes return ErrNotFound.
+	// Admin with IncludeTrashed=true must still exclude trashed preferred_asset_id and trashed locator targets.
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, ec.cat.aKidsTrashed, ec.cat.vInKids); err != nil {
+		t.Fatalf("set preferred_asset_id=aKidsTrashed: %v", err)
+	}
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `
+		UPDATE reading_progress
+		SET locator = jsonb_build_object('type', 'page', 'page', 5, 'page_count', 20, 'asset_id', $1::text)
+		WHERE user_id = $2 AND volume_id = $3`,
+		ec.cat.aKidsTrashed, ec.cat.adminUser.ID, ec.cat.vInKids,
+	); err != nil {
+		t.Fatalf("set admin locator asset_id: %v", err)
+	}
+	adminTrashPref, err := ec.repo.SelectPreferredAssetFileForVolume(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vInKids)
+	if err != nil || adminTrashPref.AssetID != ec.cat.aKidsClean {
+		t.Fatalf("admin IncludeTrashed=true SelectPreferredAssetFileForVolume(vInKids) = (%+v, %v), want non-trashed fallback %s", adminTrashPref, err, ec.cat.aKidsClean)
+	}
+	_, _ = ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
+
+	// Exact principal ID binding for locator lookup: padded user ID must not resolve real reader's locator.
+	const cleanAltAssetID = "a-kids-clean-locator-check"
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `
+		INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format, page_count, created_at)
+		VALUES ($1, $2, $3, $4, 'kids-clean-2.cbz', 'kids-clean-2.cbz', 1024, 'CBZ', 20, NOW() + INTERVAL '1 hour')`,
+		cleanAltAssetID, ec.cat.vInKids, ec.cat.rootID, []byte("kids-clean-2.cbz"),
+	); err != nil {
+		t.Fatalf("insert secondary clean asset: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = ec.cat.tdb.Exec(context.Background(), `DELETE FROM media_assets WHERE id = $1`, cleanAltAssetID)
+	})
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `
+		UPDATE reading_progress
+		SET locator = jsonb_build_object('type', 'page', 'page', 3, 'page_count', 20, 'asset_id', $1::text)
+		WHERE user_id = $2 AND volume_id = $3`,
+		cleanAltAssetID, ec.cat.readerUser.ID, ec.cat.vInKids,
+	); err != nil {
+		t.Fatalf("point reader locator to %s: %v", cleanAltAssetID, err)
+	}
+	readerByLocator, err := ec.repo.SelectPreferredAssetFileForVolume(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.vInKids)
+	if err != nil || readerByLocator.AssetID != cleanAltAssetID {
+		t.Fatalf("reader locator selection = (%+v, %v), want %s", readerByLocator, err, cleanAltAssetID)
+	}
+	paddedReader := domain.NewPrincipal(domain.User{ID: " " + ec.cat.readerUser.ID + " ", Username: ec.cat.readerUser.Username}, ec.reader.Roles, domain.CredentialKindPassword, "c-pad", nil)
+	paddedChosen, err := ec.repo.SelectPreferredAssetFileForVolume(ec.ctx, storage.CatalogueReadScope{Principal: paddedReader}, ec.cat.vInKids)
+	if err != nil || paddedChosen.AssetID != ec.cat.aKidsClean {
+		t.Fatalf("padded reader ID must not resolve reader locator; got (%+v, %v), want oldest %s", paddedChosen, err, ec.cat.aKidsClean)
+	}
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `DELETE FROM media_assets WHERE id = $1`, cleanAltAssetID); err != nil {
+		t.Fatalf("cleanup secondary clean asset: %v", err)
+	}
+
+	// Restricted/hidden/trashed/zero-asset volumes return ErrNotFound.
 	for _, tc := range []struct {
 		name  string
 		scope storage.CatalogueReadScope
@@ -657,6 +793,8 @@ func enforceSelectPreferredAssetFileForVolume(t *testing.T, ec *catalogueEnforce
 		{"timmy on vAllowedVolInClean", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vAllowedVolInClean},
 		{"timmy on vZeroAssetsInKids", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vZeroAssetsInKids},
 		{"admin normal on vTrashedInKids", storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.vTrashedInKids},
+		{"admin IncludeTrashed=true excludes trashed volume vTrashedInKids", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vTrashedInKids},
+		{"admin IncludeTrashed=true excludes volume in trashed series", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vInTrashedSeries},
 		{"adminPAT IncludeTrashed=true on vTrashedInKids", storage.CatalogueReadScope{Principal: ec.adminPAT, IncludeTrashed: true}, ec.cat.vTrashedInKids},
 	} {
 		_, err := ec.repo.SelectPreferredAssetFileForVolume(ec.ctx, tc.scope, tc.volID)
@@ -688,13 +826,19 @@ func enforceGetReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {
 		t.Fatalf("admin GetReadingProgress(vInKids) = (%+v, %v)", rpAdmin, err)
 	}
 
-	// Restricted/other-user/trashed progress returns ErrNotFound.
+	paddedReader := domain.NewPrincipal(domain.User{ID: " " + ec.cat.readerUser.ID, Username: ec.cat.readerUser.Username}, ec.reader.Roles, domain.CredentialKindPassword, "c-pad-r", nil)
+	paddedAdmin := domain.NewPrincipal(domain.User{ID: ec.cat.adminUser.ID + " ", Username: ec.cat.adminUser.Username}, ec.admin.Roles, domain.CredentialKindPassword, "c-pad-a", nil)
+
+	// Restricted/other-user/padded-ID/trashed progress returns ErrNotFound.
 	for _, tc := range []struct {
 		name  string
 		scope storage.CatalogueReadScope
 		volID string
 	}{
 		{"nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, ec.cat.vInKids},
+		{"whitespace-only user ID", storage.CatalogueReadScope{Principal: domain.NewPrincipal(domain.User{ID: "   "}, ec.admin.Roles, domain.CredentialKindPassword, "c-ws", nil), IncludeTrashed: true}, ec.cat.vInKids},
+		{"padded reader ID must not match reader progress", storage.CatalogueReadScope{Principal: paddedReader}, ec.cat.vInKids},
+		{"padded admin ID must not match admin progress", storage.CatalogueReadScope{Principal: paddedAdmin, IncludeTrashed: true}, ec.cat.vInKids},
 		{"multiRole zero policies", storage.CatalogueReadScope{Principal: ec.multiRole}, ec.cat.vInKids},
 		{"timmy cannot see reader or admin progress on vInKids", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vInKids},
 		{"admin cannot see reader progress on vStandaloneKids", storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.vStandaloneKids},
@@ -737,7 +881,9 @@ func enforceListReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {
 		}
 	}
 
+	paddedAdmin := domain.NewPrincipal(domain.User{ID: " " + ec.cat.adminUser.ID + " ", Username: ec.cat.adminUser.Username}, ec.admin.Roles, domain.CredentialKindPassword, "c-pad-a", nil)
 	assertProgressVols("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, storage.ReadingProgressReadFilter{}, "", nil)
+	assertProgressVols("padded admin ID sees nothing", storage.CatalogueReadScope{Principal: paddedAdmin, IncludeTrashed: true}, storage.ReadingProgressReadFilter{}, "", nil)
 	assertProgressVols("timmy has no progress", storage.CatalogueReadScope{Principal: ec.timmy}, storage.ReadingProgressReadFilter{}, ec.cat.restrictedUser.ID, nil)
 	assertProgressVols("reader RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.reader}, storage.ReadingProgressReadFilter{}, ec.cat.readerUser.ID, []string{
 		ec.cat.vInKids, ec.cat.vAllowedVolInClean, ec.cat.vStandaloneKids,
@@ -762,7 +908,9 @@ func enforceCountReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {
 		}
 	}
 
+	paddedReader := domain.NewPrincipal(domain.User{ID: ec.cat.readerUser.ID + " ", Username: ec.cat.readerUser.Username}, ec.reader.Roles, domain.CredentialKindPassword, "c-pad-r", nil)
 	assertCount("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, storage.ReadingProgressReadFilter{}, 0)
+	assertCount("padded reader ID counts 0", storage.CatalogueReadScope{Principal: paddedReader}, storage.ReadingProgressReadFilter{}, 0)
 	assertCount("multiRole zero policies", storage.CatalogueReadScope{Principal: ec.multiRole}, storage.ReadingProgressReadFilter{}, 0)
 	assertCount("timmy has 0 progress", storage.CatalogueReadScope{Principal: ec.timmy}, storage.ReadingProgressReadFilter{}, 0)
 	assertCount("reader RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.reader}, storage.ReadingProgressReadFilter{}, 3)
