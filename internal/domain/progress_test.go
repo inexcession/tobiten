@@ -155,27 +155,119 @@ func TestLocatorValidationAndMatchesAsset(t *testing.T) {
 
 func TestReadingProgressValidate(t *testing.T) {
 	now := time.Now().UTC()
-	valid := ReadingProgress{
-		UserID:           "user-1",
-		VolumeID:         "vol-1",
-		Locator:          NewPageLocator(0, 100, "asset-1", nil),
-		TotalProgression: 0.0,
-		Source:           "KOMGA",
-		UpdatedAt:        now,
-	}
-	if err := valid.Validate(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	digest := &LocatorDigest{Kind: DigestKindXXH364Partial, Value: "0123456789abcdef"}
 
-	badProg := valid
-	badProg.TotalProgression = 1.5
-	if !errors.Is(badProg.Validate(), ErrInvalidTotalProgression) {
-		t.Fatalf("expected ErrInvalidTotalProgression, got %v", badProg.Validate())
-	}
+	t.Run("complete page locator control passes", func(t *testing.T) {
+		validPage := ReadingProgress{
+			UserID:           "user-1",
+			VolumeID:         "vol-1",
+			Locator:          NewPageLocator(0, 190, "asset-1", digest),
+			TotalProgression: 0.0,
+			Source:           "KOMGA",
+			UpdatedAt:        now,
+		}
+		if err := validPage.Validate(); err != nil {
+			t.Fatalf("unexpected error for complete page progress: %v", err)
+		}
+	})
 
-	noSource := valid
-	noSource.Source = ""
-	if !errors.Is(noSource.Validate(), ErrEmptyProgressSource) {
-		t.Fatalf("expected ErrEmptyProgressSource, got %v", noSource.Validate())
-	}
+	t.Run("complete text locator control passes", func(t *testing.T) {
+		validText := ReadingProgress{
+			UserID:           "user-1",
+			VolumeID:         "vol-1",
+			Locator:          NewTextLocator("OEBPS/ch01.xhtml", 0.0, nil, "asset-2", digest),
+			TotalProgression: 0.0,
+			Source:           "WEB",
+			UpdatedAt:        now,
+		}
+		if err := validText.Validate(); err != nil {
+			t.Fatalf("unexpected error for complete text progress: %v", err)
+		}
+	})
+
+	t.Run("incomplete decoded locators rejected on recorded progress", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			rawJSON string
+			wantErr error
+		}{
+			{
+				name:    "page locator missing asset_id, digest, and page_count",
+				rawJSON: `{"type":"page","page":0}`,
+				wantErr: ErrMissingLocatorAssetID,
+			},
+			{
+				name:    "page locator missing asset_digest",
+				rawJSON: `{"type":"page","page":0,"page_count":190,"asset_id":"asset-1"}`,
+				wantErr: ErrMissingLocatorDigest,
+			},
+			{
+				name:    "page locator missing page_count",
+				rawJSON: `{"type":"page","page":0,"asset_id":"asset-1","asset_digest":{"kind":"XXH3_64_PARTIAL","value":"abc"}}`,
+				wantErr: ErrMissingRecordedPageCount,
+			},
+			{
+				name:    "page locator with zero page_count",
+				rawJSON: `{"type":"page","page":0,"page_count":0,"asset_id":"asset-1","asset_digest":{"kind":"XXH3_64_PARTIAL","value":"abc"}}`,
+				wantErr: ErrMissingRecordedPageCount,
+			},
+			{
+				name:    "text locator missing asset_id and digest",
+				rawJSON: `{"type":"text","href":"chapter.xhtml","progression":0}`,
+				wantErr: ErrMissingLocatorAssetID,
+			},
+			{
+				name:    "text locator missing asset_digest",
+				rawJSON: `{"type":"text","href":"chapter.xhtml","progression":0,"asset_id":"asset-2"}`,
+				wantErr: ErrMissingLocatorDigest,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var loc Locator
+				if err := json.Unmarshal([]byte(tc.rawJSON), &loc); err != nil {
+					t.Fatalf("json.Unmarshal error: %v", err)
+				}
+				// Shape validation still allows partial DTO-level locators when numeric positions are valid.
+				if err := loc.Validate(); err != nil {
+					t.Fatalf("expected Locator.Validate() shape check to pass, got %v", err)
+				}
+				rp := ReadingProgress{
+					UserID:           "user-1",
+					VolumeID:         "vol-1",
+					Locator:          loc,
+					TotalProgression: 0.0,
+					Source:           "KOMGA",
+					UpdatedAt:        now,
+				}
+				if err := rp.Validate(); !errors.Is(err, tc.wantErr) {
+					t.Fatalf("ReadingProgress.Validate() = %v, want %v", err, tc.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("total progression and source bounds", func(t *testing.T) {
+		valid := ReadingProgress{
+			UserID:           "user-1",
+			VolumeID:         "vol-1",
+			Locator:          NewPageLocator(0, 100, "asset-1", digest),
+			TotalProgression: 0.0,
+			Source:           "KOMGA",
+			UpdatedAt:        now,
+		}
+
+		badProg := valid
+		badProg.TotalProgression = 1.5
+		if !errors.Is(badProg.Validate(), ErrInvalidTotalProgression) {
+			t.Fatalf("expected ErrInvalidTotalProgression, got %v", badProg.Validate())
+		}
+
+		noSource := valid
+		noSource.Source = ""
+		if !errors.Is(noSource.Validate(), ErrEmptyProgressSource) {
+			t.Fatalf("expected ErrEmptyProgressSource, got %v", noSource.Validate())
+		}
+	})
 }

@@ -11,15 +11,18 @@ import (
 
 // Common domain errors for reading progress and locators.
 var (
-	ErrInvalidLocatorType      = errors.New("invalid locator type (must be page or text)")
-	ErrMissingPagePosition     = errors.New("page locator requires non-negative page")
-	ErrInvalidPageCount        = errors.New("page locator page_count cannot be negative")
-	ErrMissingTextHref         = errors.New("text locator requires non-empty href")
-	ErrMissingTextProgression  = errors.New("text locator requires progression between 0 and 1")
-	ErrInvalidTotalProgression = errors.New("total_progression must be between 0 and 1")
-	ErrUnexpectedLocatorField  = errors.New("locator contains fields incompatible with its type")
-	ErrInvalidLocatorDigest    = errors.New("locator asset_digest requires non-empty kind and value")
-	ErrEmptyProgressSource     = errors.New("reading progress source cannot be empty")
+	ErrInvalidLocatorType       = errors.New("invalid locator type (must be page or text)")
+	ErrMissingPagePosition      = errors.New("page locator requires non-negative page")
+	ErrInvalidPageCount         = errors.New("page locator page_count cannot be negative")
+	ErrMissingTextHref          = errors.New("text locator requires non-empty href")
+	ErrMissingTextProgression   = errors.New("text locator requires progression between 0 and 1")
+	ErrInvalidTotalProgression  = errors.New("total_progression must be between 0 and 1")
+	ErrUnexpectedLocatorField   = errors.New("locator contains fields incompatible with its type")
+	ErrInvalidLocatorDigest     = errors.New("locator asset_digest requires non-empty kind and value")
+	ErrMissingLocatorAssetID    = errors.New("recorded locator requires non-empty asset_id")
+	ErrMissingLocatorDigest     = errors.New("recorded locator requires asset_digest")
+	ErrMissingRecordedPageCount = errors.New("recorded page locator requires positive page_count")
+	ErrEmptyProgressSource      = errors.New("reading progress source cannot be empty")
 )
 
 // LocatorType identifies the Readium-style locator variant (ADR-0018 S4).
@@ -175,6 +178,25 @@ func (l *Locator) Validate() error {
 	}
 }
 
+// ValidateRecorded checks invariants for a persisted locator in reading_progress (ADR-0018 S4):
+// in addition to shape validation, recorded locators must carry the source asset_id and
+// asset_digest, and recorded page locators must carry a positive source page_count.
+func (l *Locator) ValidateRecorded() error {
+	if err := l.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(l.AssetID) == "" {
+		return ErrMissingLocatorAssetID
+	}
+	if l.AssetDigest == nil {
+		return ErrMissingLocatorDigest
+	}
+	if l.Type == LocatorTypePage && (l.PageCount == nil || *l.PageCount <= 0) {
+		return ErrMissingRecordedPageCount
+	}
+	return nil
+}
+
 // MatchesAsset reports whether the locator was recorded against the given asset and current digest.
 func (l *Locator) MatchesAsset(assetID string, current *AssetDigest) bool {
 	if assetID == "" || l.AssetID != assetID || l.AssetDigest == nil || current == nil {
@@ -195,7 +217,7 @@ type ReadingProgress struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
-// Validate checks ReadingProgress invariants aligned with the reading_progress table.
+// Validate checks ReadingProgress invariants aligned with the reading_progress table (ADR-0018 S4).
 func (p *ReadingProgress) Validate() error {
 	if strings.TrimSpace(p.UserID) == "" {
 		return ErrEmptyUserID
@@ -209,5 +231,5 @@ func (p *ReadingProgress) Validate() error {
 	if math.IsNaN(p.TotalProgression) || p.TotalProgression < 0.0 || p.TotalProgression > 1.0 {
 		return ErrInvalidTotalProgression
 	}
-	return p.Locator.Validate()
+	return p.Locator.ValidateRecorded()
 }

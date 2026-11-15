@@ -102,22 +102,33 @@ func TestLocatorAppMappingRoundTrip(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("partial client DTO locator without source identity remains valid shape", func(t *testing.T) {
+		got, err := LocatorToDomain(Locator{Type: "page", Page: 0})
+		if err != nil {
+			t.Fatalf("LocatorToDomain error: %v", err)
+		}
+		if got.Page == nil || *got.Page != 0 {
+			t.Fatalf("expected page 0 preserved, got %v", got.Page)
+		}
+	})
 }
 
 func TestReadingProgressAndJobInfoMappings(t *testing.T) {
 	now := time.Now().UTC()
 	dev := "Pixel"
+	digest := &domain.LocatorDigest{Kind: domain.DigestKindXXH364Partial, Value: "deadbeef"}
 	prog := ReadingProgressFromDomain(domain.ReadingProgress{
 		UserID:           "u1",
 		VolumeID:         "v1",
-		Locator:          domain.NewPageLocator(0, 50, "a1", nil),
+		Locator:          domain.NewPageLocator(0, 50, "a1", digest),
 		TotalProgression: 0.0,
 		Device:           &dev,
 		Source:           "KOMGA",
 		Completed:        false,
 		UpdatedAt:        now,
 	})
-	if prog.Device != "Pixel" || prog.Locator.Page != 0 || prog.Locator.PageCount != 50 {
+	if prog.Device != "Pixel" || prog.Locator.Page != 0 || prog.Locator.PageCount != 50 || prog.Locator.AssetDigest != "XXH3_64_PARTIAL:deadbeef" {
 		t.Fatalf("ReadingProgressFromDomain mismatch: %+v", prog)
 	}
 

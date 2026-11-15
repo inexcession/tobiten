@@ -415,28 +415,45 @@ func TestVolumeSelectPreferredAsset(t *testing.T) {
 		Assets:           []MediaAsset{assetA, assetB, assetC, assetMissing},
 	}
 
-	// 1. Explicit manual preferred asset wins when available and permitted.
-	chosen, ok := v.SelectPreferredAsset("a-2", nil)
+	allowAll := func(MediaAsset) bool { return true }
+
+	// 0. Nil eligibility predicate fails closed even when available assets exist.
+	if chosen, ok := v.SelectPreferredAsset("a-2", nil); ok || chosen != nil {
+		t.Fatalf("expected nil eligibility predicate to fail closed, got (%+v, %v)", chosen, ok)
+	}
+
+	// 1. Explicit manual preferred asset wins when available and eligible.
+	chosen, ok := v.SelectPreferredAsset("a-2", allowAll)
 	if !ok || chosen.ID != "a-1" {
 		t.Fatalf("expected manual preferred a-1, got (%+v, %v)", chosen, ok)
 	}
 
-	// 2. If manual preferred is restricted, fall back to locator asset.
-	chosen, ok = v.SelectPreferredAsset("a-2", func(a MediaAsset) bool {
-		return a.ID != "a-1"
-	})
+	// 2. If manual preferred is restricted, fall back to eligible locator asset.
+	restrictedIDs := map[string]bool{"a-1": true}
+	trashedIDs := map[string]bool{}
+	eligibility := func(a MediaAsset) bool {
+		return !restrictedIDs[a.ID] && !trashedIDs[a.ID]
+	}
+	chosen, ok = v.SelectPreferredAsset("a-2", eligibility)
 	if !ok || chosen.ID != "a-2" {
-		t.Fatalf("expected locator asset a-2, got (%+v, %v)", chosen, ok)
+		t.Fatalf("expected locator asset a-2 when a-1 restricted, got (%+v, %v)", chosen, ok)
 	}
 
-	// 3. If neither manual nor locator is eligible, choose oldest by (CreatedAt, ID), skipping missing.
-	v.PreferredAssetID = strPtr("a-missing")
-	chosen, ok = v.SelectPreferredAsset("a-missing", nil)
+	// 3. If manual preferred and locator asset are trashed or restricted, fall back to oldest eligible (CreatedAt, ID).
+	trashedIDs["a-2"] = true
+	chosen, ok = v.SelectPreferredAsset("a-2", eligibility)
 	if !ok || chosen.ID != "a-0" {
-		t.Fatalf("expected oldest eligible a-0 (tie-broken over a-2 at t0), got (%+v, %v)", chosen, ok)
+		t.Fatalf("expected oldest non-trashed/non-restricted a-0, got (%+v, %v)", chosen, ok)
 	}
 
-	// 4. Zero eligible assets returns false.
+	// 4. Missing/retired assets remain excluded even if predicate returns true.
+	v.PreferredAssetID = strPtr("a-missing")
+	chosen, ok = v.SelectPreferredAsset("a-missing", allowAll)
+	if !ok || chosen.ID != "a-0" {
+		t.Fatalf("expected oldest available a-0 (tie-broken over a-2 at t0), got (%+v, %v)", chosen, ok)
+	}
+
+	// 5. Zero eligible assets returns false.
 	chosen, ok = v.SelectPreferredAsset("", func(MediaAsset) bool { return false })
 	if ok || chosen != nil {
 		t.Fatalf("expected no eligible asset, got (%+v, %v)", chosen, ok)
@@ -446,14 +463,41 @@ func TestVolumeSelectPreferredAsset(t *testing.T) {
 func TestMediaAssetValidateAndDigests(t *testing.T) {
 	now := time.Now().UTC()
 
+	goodPaths := [][]byte{
+		[]byte("Series/v01.cbz"),
+		[]byte("a:sample.cbz"),
+		[]byte(`\sample.cbz`),
+		[]byte(`..\sample.cbz`),
+		[]byte(`dir/a:sample.cbz`),
+		[]byte(`dir/\sample.cbz`),
+		[]byte(".hidden.cbz"),
+		[]byte("..dots.cbz"),
+		{0xff, 0xfe, '/', 'b', 'o', 'o', 'k', '.', 'c', 'b', 'z'},
+	}
+	for _, p := range goodPaths {
+		a := MediaAsset{
+			ID:            "asset-1",
+			VolumeID:      "vol-1",
+			LibraryRootID: "root-1",
+			RelPathBytes:  p,
+			Format:        MediaFormatCBZ,
+		}
+		if err := a.Validate(); err != nil {
+			t.Errorf("expected valid Unix relative path %q to pass Validate(), got %v", p, err)
+		}
+	}
+
 	badPaths := [][]byte{
 		nil,
 		{},
 		[]byte("/abs/path.cbz"),
-		[]byte(`\win\abs.cbz`),
-		[]byte(`C:\drive\path.cbz`),
 		[]byte("../escape.cbz"),
 		[]byte("sub/../../escape.cbz"),
+		[]byte("sub/.."),
+		[]byte("."),
+		[]byte("./book.cbz"),
+		[]byte("sub//book.cbz"),
+		[]byte("sub/"),
 		[]byte("nul\x00byte.cbz"),
 	}
 	for _, p := range badPaths {

@@ -494,20 +494,19 @@ func (v *Volume) SecondaryMemberships() []SeriesMembership {
 }
 
 // SelectPreferredAsset resolves the stable preferred file for the volume per ADR-0018 S5:
-//  1. explicit manual preferred_asset_id if available and permitted;
-//  2. the asset recorded in the user's existing locator if available and permitted;
+//  1. explicit manual preferred_asset_id if available and eligible;
+//  2. the asset recorded in the user's existing locator if available and eligible;
 //  3. the oldest eligible asset ordered by (CreatedAt, ID).
 //
-// If isPermitted is nil, all available assets are treated as permitted.
-func (v *Volume) SelectPreferredAsset(locatorAssetID string, isPermitted func(MediaAsset) bool) (*MediaAsset, bool) {
+// Callers must supply a non-nil isEligible predicate that enforces repository-derived
+// access restrictions and trash exclusions (marked_for_deletion). A nil predicate fails
+// closed and selects no asset.
+func (v *Volume) SelectPreferredAsset(locatorAssetID string, isEligible func(MediaAsset) bool) (*MediaAsset, bool) {
+	if isEligible == nil {
+		return nil, false
+	}
 	eligible := func(a MediaAsset) bool {
-		if !a.IsAvailable() {
-			return false
-		}
-		if isPermitted != nil && !isPermitted(a) {
-			return false
-		}
-		return true
+		return a.IsAvailable() && isEligible(a)
 	}
 
 	if v.PreferredAssetID != nil && *v.PreferredAssetID != "" {
@@ -725,22 +724,20 @@ func isSafeRelativePathBytes(raw []byte) bool {
 	if bytes.IndexByte(raw, 0) >= 0 {
 		return false
 	}
-	// Reject leading path separators (POSIX / or Windows \).
-	if raw[0] == '/' || raw[0] == '\\' {
+	// Reject absolute POSIX paths.
+	if raw[0] == '/' {
 		return false
 	}
-	// Reject Windows drive-prefixed paths (e.g. C:...).
-	if len(raw) >= 2 && raw[1] == ':' && ((raw[0] >= 'a' && raw[0] <= 'z') || (raw[0] >= 'A' && raw[0] <= 'Z')) {
-		return false
-	}
-	// Reject any ".." segment.
-	segments := bytes.FieldsFunc(raw, func(r rune) bool {
-		return r == '/' || r == '\\'
-	})
-	if len(segments) == 0 {
-		return false
-	}
-	for _, seg := range segments {
+	// Validate Unix path components directly on raw OS bytes: reject empty components,
+	// "." self-references, and ".." traversal while preserving legal Unix filename bytes
+	// such as colons and backslashes.
+	for _, seg := range bytes.Split(raw, []byte{'/'}) {
+		if len(seg) == 0 {
+			return false
+		}
+		if len(seg) == 1 && seg[0] == '.' {
+			return false
+		}
 		if len(seg) == 2 && seg[0] == '.' && seg[1] == '.' {
 			return false
 		}
