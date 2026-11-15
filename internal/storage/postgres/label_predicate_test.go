@@ -58,6 +58,35 @@ func TestLabelPredicate_FailClosedAndParameterization(t *testing.T) {
 		}
 	})
 
+	t.Run("zero-value predicate fails closed", func(t *testing.T) {
+		for _, zeroPred := range []*postgres.LabelPredicate{{}, new(postgres.LabelPredicate)} {
+			if !zeroPred.IsDenyAll() {
+				t.Fatal("zero-value predicate must report IsDenyAll=true")
+			}
+			if zeroPred.IncludesTrashed() {
+				t.Fatal("zero-value predicate must not include trashed")
+			}
+			if zeroPred.AllowIDs() != nil || zeroPred.RestrictIDs() != nil {
+				t.Fatalf("zero-value predicate must return nil AllowIDs/RestrictIDs, got allow=%v restrict=%v",
+					zeroPred.AllowIDs(), zeroPred.RestrictIDs())
+			}
+			for _, fn := range []func(string, int) (postgres.SQLFragment, error){
+				zeroPred.SeriesFragment,
+				zeroPred.VolumeFragment,
+				zeroPred.AssetFragment,
+				zeroPred.ReadingProgressFragment,
+			} {
+				frag, err := fn("t", 1)
+				if err != nil {
+					t.Fatalf("unexpected error for zero-value predicate: %v", err)
+				}
+				if frag.SQL != "FALSE" || len(frag.Args) != 0 {
+					t.Fatalf("expected FALSE with 0 args, got %+v", frag)
+				}
+			}
+		}
+	})
+
 	t.Run("missing or empty-user principal fails closed even with IncludeTrashed", func(t *testing.T) {
 		for _, p := range []*domain.Principal{
 			nil,
@@ -229,6 +258,59 @@ func TestLabelPredicate_FailClosedAndParameterization(t *testing.T) {
 		}
 		if !slices.Contains(pred.RestrictIDs(), domain.LabelMarkedForDeletionID) {
 			t.Fatalf("expected RestrictIDs to include marked_for_deletion, got %v", pred.RestrictIDs())
+		}
+	})
+
+	t.Run("user policy rows for other or empty users are ignored", func(t *testing.T) {
+		pRest := postgres.NewLabelPredicate(
+			restrictedPrincipal,
+			[]domain.UserLabelPolicy{
+				{UserID: "other-user", LabelID: "lbl-kids", Effect: domain.PolicyEffectAllow},
+				{UserID: "", LabelID: "lbl-kids", Effect: domain.PolicyEffectAllow},
+			},
+			nil,
+			postgres.LabelPredicateOptions{},
+		)
+		if !pRest.IsDenyAll() {
+			t.Fatal("Restricted reader must fail closed when only foreign/empty-user ALLOW rows are supplied")
+		}
+
+		pMixed := postgres.NewLabelPredicate(
+			restrictedPrincipal,
+			[]domain.UserLabelPolicy{
+				{UserID: user.ID, LabelID: "lbl-kids", Effect: domain.PolicyEffectAllow},
+				{UserID: "other-user", LabelID: "lbl-nsfw", Effect: domain.PolicyEffectAllow},
+				{UserID: "other-user", LabelID: "lbl-kids", Effect: domain.PolicyEffectRestrict},
+				{UserID: "", LabelID: "lbl-extra", Effect: domain.PolicyEffectAllow},
+			},
+			nil,
+			postgres.LabelPredicateOptions{},
+		)
+		if pMixed.IsDenyAll() {
+			t.Fatal("foreign RESTRICT must not cancel principal's own ALLOW")
+		}
+		if !slices.Equal(pMixed.AllowIDs(), []string{"lbl-kids"}) {
+			t.Fatalf("expected only principal's ALLOW lbl-kids, got %v", pMixed.AllowIDs())
+		}
+		if !slices.Equal(pMixed.RestrictIDs(), []string{domain.LabelMarkedForDeletionID}) {
+			t.Fatalf("expected only marked_for_deletion restrict, got %v", pMixed.RestrictIDs())
+		}
+
+		pReader := domain.NewPrincipal(user, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-reader", nil)
+		pReaderPred := postgres.NewLabelPredicate(
+			pReader,
+			[]domain.UserLabelPolicy{
+				{UserID: "other-user", LabelID: "lbl-kids", Effect: domain.PolicyEffectAllow},
+				{UserID: "other-user", LabelID: "lbl-nsfw", Effect: domain.PolicyEffectRestrict},
+			},
+			nil,
+			postgres.LabelPredicateOptions{},
+		)
+		if len(pReaderPred.AllowIDs()) != 0 {
+			t.Fatalf("foreign ALLOW rows must not narrow principal; got %v", pReaderPred.AllowIDs())
+		}
+		if !slices.Equal(pReaderPred.RestrictIDs(), []string{domain.LabelMarkedForDeletionID}) {
+			t.Fatalf("foreign RESTRICT rows must not apply to principal; got %v", pReaderPred.RestrictIDs())
 		}
 	})
 
@@ -1166,6 +1248,140 @@ func TestLabelPredicate_SeededCatalogueMatrix(t *testing.T) {
 		})
 		if !ok || chosen == nil || chosen.ID != cat.aKidsClean {
 			t.Fatalf("SelectPreferredAsset = (%v, %v), want %s", chosen, ok, cat.aKidsClean)
+		}
+	})
+
+	t.Run("zero-value LabelPredicate denies all rows in PostgreSQL", func(t *testing.T) {
+		var zero postgres.LabelPredicate
+		s, v, a, rp := cat.queryVisibleIDsAndCount(ctx, t, &zero)
+		if len(s) != 0 || len(v) != 0 || len(a) != 0 || len(rp) != 0 {
+			t.Fatalf("zero-value predicate must return 0 rows across all entities; got s=%v v=%v a=%v rp=%v", s, v, a, rp)
+		}
+	})
+
+	t.Run("outer aliases matching subquery names do not shadow row references in PostgreSQL", func(t *testing.T) {
+		predicates := []struct {
+			name string
+			pred *postgres.LabelPredicate
+		}{
+			{
+				name: "restrict-only",
+				pred: postgres.NewLabelPredicate(
+					readerPrincipal,
+					[]domain.UserLabelPolicy{
+						{UserID: cat.readerUser.ID, LabelID: cat.lblNSFW, Effect: domain.PolicyEffectRestrict},
+					},
+					nil,
+					postgres.LabelPredicateOptions{},
+				),
+			},
+			{
+				name: "allow+restrict",
+				pred: postgres.NewLabelPredicate(
+					restrictedPrincipal,
+					[]domain.UserLabelPolicy{
+						{UserID: cat.restrictedUser.ID, LabelID: cat.lblKids, Effect: domain.PolicyEffectAllow},
+						{UserID: cat.restrictedUser.ID, LabelID: cat.lblNSFW, Effect: domain.PolicyEffectRestrict},
+					},
+					nil,
+					postgres.LabelPredicateOptions{},
+				),
+			},
+		}
+
+		outerAliases := []string{
+			"l", "il", "sm",
+			"L", "IL", "SM",
+			"_lp_l", "_lp_il", "_lp_sm",
+			"labels", "item_labels", "series_memberships",
+		}
+
+		for _, tc := range predicates {
+			t.Run(tc.name, func(t *testing.T) {
+				wantS, wantV, wantA, wantRP := cat.queryVisibleIDsAndCount(ctx, t, tc.pred)
+				for _, alias := range outerAliases {
+					sFrag, err := tc.pred.SeriesFragment(alias, 2)
+					if err != nil {
+						t.Fatalf("SeriesFragment(%q): %v", alias, err)
+					}
+					gotS := cat.queryIDs(ctx, t,
+						fmt.Sprintf(`SELECT %s.id FROM series %s WHERE %s.library_id = $1 AND %s ORDER BY %s.id`, alias, alias, alias, sFrag.SQL, alias),
+						append([]any{cat.libraryID}, sFrag.Args...)...)
+					if !slices.Equal(gotS, wantS) {
+						t.Fatalf("SeriesFragment(%q) = %v, want %v", alias, gotS, wantS)
+					}
+
+					vFrag, err := tc.pred.VolumeFragment(alias, 1)
+					if err != nil {
+						t.Fatalf("VolumeFragment(%q): %v", alias, err)
+					}
+					gotV := cat.queryIDs(ctx, t,
+						fmt.Sprintf(`SELECT %s.id FROM volumes %s WHERE %s ORDER BY %s.id`, alias, alias, vFrag.SQL, alias),
+						vFrag.Args...)
+					if !slices.Equal(gotV, wantV) {
+						t.Fatalf("VolumeFragment(%q) = %v, want %v", alias, gotV, wantV)
+					}
+
+					aFrag, err := tc.pred.AssetFragment(alias, 1)
+					if err != nil {
+						t.Fatalf("AssetFragment(%q): %v", alias, err)
+					}
+					gotA := cat.queryIDs(ctx, t,
+						fmt.Sprintf(`SELECT %s.id FROM media_assets %s WHERE %s ORDER BY %s.id`, alias, alias, aFrag.SQL, alias),
+						aFrag.Args...)
+					if !slices.Equal(gotA, wantA) {
+						t.Fatalf("AssetFragment(%q) = %v, want %v", alias, gotA, wantA)
+					}
+
+					rpFrag, err := tc.pred.ReadingProgressFragment(alias, 2)
+					if err != nil {
+						t.Fatalf("ReadingProgressFragment(%q): %v", alias, err)
+					}
+					gotRP := cat.queryIDs(ctx, t,
+						fmt.Sprintf(`SELECT %s.volume_id FROM reading_progress %s WHERE %s.user_id = $1 AND %s ORDER BY %s.volume_id`, alias, alias, alias, rpFrag.SQL, alias),
+						append([]any{cat.progressUser}, rpFrag.Args...)...)
+					if !slices.Equal(gotRP, wantRP) {
+						t.Fatalf("ReadingProgressFragment(%q) = %v, want %v", alias, gotRP, wantRP)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("foreign user_label_policies rows are ignored in PostgreSQL", func(t *testing.T) {
+		foreignOnly := postgres.NewLabelPredicate(
+			restrictedPrincipal,
+			[]domain.UserLabelPolicy{
+				{UserID: cat.readerUser.ID, LabelID: cat.lblKids, Effect: domain.PolicyEffectAllow},
+			},
+			nil,
+			postgres.LabelPredicateOptions{},
+		)
+		s, v, a, rp := cat.queryVisibleIDsAndCount(ctx, t, foreignOnly)
+		if len(s) != 0 || len(v) != 0 || len(a) != 0 || len(rp) != 0 {
+			t.Fatalf("Restricted reader must see 0 rows with only foreign ALLOW rows; got s=%v v=%v a=%v rp=%v", s, v, a, rp)
+		}
+
+		mixed := postgres.NewLabelPredicate(
+			restrictedPrincipal,
+			[]domain.UserLabelPolicy{
+				{UserID: cat.restrictedUser.ID, LabelID: cat.lblKids, Effect: domain.PolicyEffectAllow},
+				{UserID: cat.readerUser.ID, LabelID: cat.lblKids, Effect: domain.PolicyEffectRestrict},
+				{UserID: cat.readerUser.ID, LabelID: cat.lblNSFW, Effect: domain.PolicyEffectAllow},
+			},
+			nil,
+			postgres.LabelPredicateOptions{},
+		)
+		wantS, wantV, wantA, wantRP := cat.domainReferenceVisible(
+			restrictedPrincipal,
+			[]domain.UserLabelPolicy{{UserID: cat.restrictedUser.ID, LabelID: cat.lblKids, Effect: domain.PolicyEffectAllow}},
+			nil,
+			false,
+		)
+		gotS, gotV, gotA, gotRP := cat.queryVisibleIDsAndCount(ctx, t, mixed)
+		if !slices.Equal(gotS, wantS) || !slices.Equal(gotV, wantV) || !slices.Equal(gotA, wantA) || !slices.Equal(gotRP, wantRP) {
+			t.Fatalf("foreign user policies affected SQL visibility:\ngot:  s=%v v=%v a=%v rp=%v\nwant: s=%v v=%v a=%v rp=%v",
+				gotS, gotV, gotA, gotRP, wantS, wantV, wantA, wantRP)
 		}
 	})
 }

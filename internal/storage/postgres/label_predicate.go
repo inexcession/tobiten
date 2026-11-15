@@ -26,8 +26,9 @@ type SQLFragment struct {
 
 // LabelPredicate encapsulates a principal's resolved SERVER-label access policy and trash filter,
 // producing parameterized PostgreSQL WHERE fragments for series, volumes, assets, and reading progress.
+// The zero value is uninitialized and denies all rows.
 type LabelPredicate struct {
-	denyAll        bool
+	initialized    bool
 	allowIDs       []string
 	restrictIDs    []string
 	includeTrashed bool
@@ -35,6 +36,7 @@ type LabelPredicate struct {
 
 // NewLabelPredicate constructs a LabelPredicate from a principal, user policies, and group policies.
 // Missing principals and label-required roles with zero effective ALLOW policies fail closed (deny all).
+// Supplied user-policy rows whose UserID does not match principal.User.ID are ignored.
 // Personal USER labels never participate in access decisions; trash is filtered unless IncludeTrashed
 // is requested AND the principal holds domain.PermissionTrashPurge.
 func NewLabelPredicate(
@@ -44,15 +46,15 @@ func NewLabelPredicate(
 	opts LabelPredicateOptions,
 ) *LabelPredicate {
 	if principal == nil || strings.TrimSpace(principal.User.ID) == "" {
-		return &LabelPredicate{denyAll: true}
+		return &LabelPredicate{}
 	}
 
-	filteredUser := filterValidUserPolicies(userPolicies)
+	filteredUser := filterValidUserPolicies(principal.User.ID, userPolicies)
 	filteredGroup := filterValidGroupPolicies(groupPolicies)
 
 	effective := domain.NewEffectiveLabelPolicyForPrincipal(principal, filteredUser, filteredGroup)
 	if effective.RequiresAllowLabels() && !effective.HasAllowLabels() {
-		return &LabelPredicate{denyAll: true}
+		return &LabelPredicate{}
 	}
 
 	allowIDs := effective.AllowLabelIDs()
@@ -65,7 +67,7 @@ func NewLabelPredicate(
 	}
 
 	return &LabelPredicate{
-		denyAll:        false,
+		initialized:    true,
 		allowIDs:       allowIDs,
 		restrictIDs:    restrictIDs,
 		includeTrashed: includeTrashed,
@@ -82,15 +84,15 @@ func LoadLabelPredicate(
 	opts LabelPredicateOptions,
 ) (*LabelPredicate, error) {
 	if principal == nil || strings.TrimSpace(principal.User.ID) == "" {
-		return &LabelPredicate{denyAll: true}, nil
+		return &LabelPredicate{}, nil
 	}
 	if db == nil {
-		return &LabelPredicate{denyAll: true}, errors.New("database handle must not be nil")
+		return &LabelPredicate{}, errors.New("database handle must not be nil")
 	}
 
 	rows, err := New(db).ListUserLabelPolicies(ctx, principal.User.ID)
 	if err != nil {
-		return &LabelPredicate{denyAll: true}, mapPgError(err)
+		return &LabelPredicate{}, mapPgError(err)
 	}
 	return NewLabelPredicate(principal, toDomainPolicies(rows), groupPolicies, opts), nil
 }
@@ -104,32 +106,32 @@ func (r *LabelRepository) LabelPredicate(
 	opts LabelPredicateOptions,
 ) (*LabelPredicate, error) {
 	if principal == nil || strings.TrimSpace(principal.User.ID) == "" {
-		return &LabelPredicate{denyAll: true}, nil
+		return &LabelPredicate{}, nil
 	}
 	if r == nil || r.q == nil {
-		return &LabelPredicate{denyAll: true}, errors.New("label repository is not initialized")
+		return &LabelPredicate{}, errors.New("label repository is not initialized")
 	}
 
 	policies, err := r.ListUserLabelPolicies(ctx, principal.User.ID)
 	if err != nil {
-		return &LabelPredicate{denyAll: true}, err
+		return &LabelPredicate{}, err
 	}
 	return NewLabelPredicate(principal, policies, groupPolicies, opts), nil
 }
 
 // IsDenyAll reports whether the predicate unconditionally denies every row.
 func (p *LabelPredicate) IsDenyAll() bool {
-	return p == nil || p.denyAll
+	return p == nil || !p.initialized
 }
 
 // IncludesTrashed reports whether items tagged marked_for_deletion are permitted by this predicate.
 func (p *LabelPredicate) IncludesTrashed() bool {
-	return p != nil && !p.denyAll && p.includeTrashed
+	return p != nil && p.initialized && p.includeTrashed
 }
 
 // AllowIDs returns a defensive copy of the effective ALLOW SERVER label IDs.
 func (p *LabelPredicate) AllowIDs() []string {
-	if p == nil || p.denyAll || len(p.allowIDs) == 0 {
+	if p.IsDenyAll() || len(p.allowIDs) == 0 {
 		return nil
 	}
 	return slices.Clone(p.allowIDs)
@@ -138,7 +140,7 @@ func (p *LabelPredicate) AllowIDs() []string {
 // RestrictIDs returns a defensive copy of the effective RESTRICT SERVER label IDs
 // (including the protected trash label when trash filtering is active).
 func (p *LabelPredicate) RestrictIDs() []string {
-	if p == nil || p.denyAll || len(p.restrictIDs) == 0 {
+	if p.IsDenyAll() || len(p.restrictIDs) == 0 {
 		return nil
 	}
 	return slices.Clone(p.restrictIDs)
@@ -147,17 +149,19 @@ func (p *LabelPredicate) RestrictIDs() []string {
 // SeriesFragment returns the parameterized SQL WHERE condition for a series table row.
 // When alias is empty, columns qualify against "series". Positional parameters begin at $startParam.
 func (p *LabelPredicate) SeriesFragment(alias string, startParam int) (SQLFragment, error) {
-	idExpr, err := qualifyIdentifier(alias, "series", "id")
+	qualifier, err := resolveOuterQualifier(alias, "series")
 	if err != nil {
 		return SQLFragment{SQL: "FALSE"}, err
 	}
+	idExpr := qualifier + ".id"
+	sa := makeSubqueryAliases(qualifier)
 	return p.assembleFragment(startParam, func(allowParam, restrictParam int) []string {
 		var clauses []string
 		if restrictParam > 0 {
-			clauses = append(clauses, buildItemRestrictClause(domain.ItemTypeSeries, idExpr, restrictParam))
+			clauses = append(clauses, buildItemRestrictClause(sa, domain.ItemTypeSeries, idExpr, restrictParam))
 		}
 		if allowParam > 0 {
-			clauses = append(clauses, buildSeriesAllowClause(idExpr, allowParam))
+			clauses = append(clauses, buildSeriesAllowClause(sa, idExpr, allowParam))
 		}
 		return clauses
 	})
@@ -166,31 +170,31 @@ func (p *LabelPredicate) SeriesFragment(alias string, startParam int) (SQLFragme
 // VolumeFragment returns the parameterized SQL WHERE condition for a volumes table row.
 // When alias is empty, columns qualify against "volumes". Positional parameters begin at $startParam.
 func (p *LabelPredicate) VolumeFragment(alias string, startParam int) (SQLFragment, error) {
-	idExpr, err := qualifyIdentifier(alias, "volumes", "id")
+	qualifier, err := resolveOuterQualifier(alias, "volumes")
 	if err != nil {
 		return SQLFragment{SQL: "FALSE"}, err
 	}
-	return p.volumeFragmentForIDExpr(idExpr, startParam)
+	sa := makeSubqueryAliases(qualifier)
+	return p.volumeFragmentForIDExpr(sa, qualifier+".id", startParam)
 }
 
 // AssetFragment returns the parameterized SQL WHERE condition for a media_assets table row.
 // It enforces asset-level restrictions as well as full parent-volume and series visibility rules.
 // When alias is empty, columns qualify against "media_assets". Positional parameters begin at $startParam.
 func (p *LabelPredicate) AssetFragment(alias string, startParam int) (SQLFragment, error) {
-	assetIDExpr, err := qualifyIdentifier(alias, "media_assets", "id")
+	qualifier, err := resolveOuterQualifier(alias, "media_assets")
 	if err != nil {
 		return SQLFragment{SQL: "FALSE"}, err
 	}
-	volumeIDExpr, err := qualifyIdentifier(alias, "media_assets", "volume_id")
-	if err != nil {
-		return SQLFragment{SQL: "FALSE"}, err
-	}
+	assetIDExpr := qualifier + ".id"
+	volumeIDExpr := qualifier + ".volume_id"
+	sa := makeSubqueryAliases(qualifier)
 	return p.assembleFragment(startParam, func(allowParam, restrictParam int) []string {
 		var clauses []string
 		if restrictParam > 0 {
-			clauses = append(clauses, buildItemRestrictClause(domain.ItemTypeAsset, assetIDExpr, restrictParam))
+			clauses = append(clauses, buildItemRestrictClause(sa, domain.ItemTypeAsset, assetIDExpr, restrictParam))
 		}
-		clauses = append(clauses, buildVolumeClauses(volumeIDExpr, allowParam, restrictParam)...)
+		clauses = append(clauses, buildVolumeClauses(sa, volumeIDExpr, allowParam, restrictParam)...)
 		return clauses
 	})
 }
@@ -198,16 +202,17 @@ func (p *LabelPredicate) AssetFragment(alias string, startParam int) (SQLFragmen
 // ReadingProgressFragment returns the parameterized SQL WHERE condition for a reading_progress table row,
 // enforcing visibility of its referenced volume. When alias is empty, columns qualify against "reading_progress".
 func (p *LabelPredicate) ReadingProgressFragment(alias string, startParam int) (SQLFragment, error) {
-	volumeIDExpr, err := qualifyIdentifier(alias, "reading_progress", "volume_id")
+	qualifier, err := resolveOuterQualifier(alias, "reading_progress")
 	if err != nil {
 		return SQLFragment{SQL: "FALSE"}, err
 	}
-	return p.volumeFragmentForIDExpr(volumeIDExpr, startParam)
+	sa := makeSubqueryAliases(qualifier)
+	return p.volumeFragmentForIDExpr(sa, qualifier+".volume_id", startParam)
 }
 
-func (p *LabelPredicate) volumeFragmentForIDExpr(volumeIDExpr string, startParam int) (SQLFragment, error) {
+func (p *LabelPredicate) volumeFragmentForIDExpr(sa subqueryAliases, volumeIDExpr string, startParam int) (SQLFragment, error) {
 	return p.assembleFragment(startParam, func(allowParam, restrictParam int) []string {
-		return buildVolumeClauses(volumeIDExpr, allowParam, restrictParam)
+		return buildVolumeClauses(sa, volumeIDExpr, allowParam, restrictParam)
 	})
 }
 
@@ -215,7 +220,7 @@ func (p *LabelPredicate) assembleFragment(
 	startParam int,
 	clausesFn func(allowParam, restrictParam int) []string,
 ) (SQLFragment, error) {
-	if p == nil || p.denyAll {
+	if p.IsDenyAll() {
 		return SQLFragment{SQL: "FALSE"}, nil
 	}
 	if startParam < 1 {
@@ -252,54 +257,82 @@ func (p *LabelPredicate) assembleFragment(
 	}, nil
 }
 
-func buildVolumeClauses(volumeIDExpr string, allowParam, restrictParam int) []string {
+type subqueryAliases struct {
+	il string
+	l  string
+	sm string
+}
+
+func makeSubqueryAliases(outerQualifier string) subqueryAliases {
+	return subqueryAliases{
+		il: pickSafeAlias("_lp_il", outerQualifier),
+		l:  pickSafeAlias("_lp_l", outerQualifier),
+		sm: pickSafeAlias("_lp_sm", outerQualifier),
+	}
+}
+
+func pickSafeAlias(base, outerQualifier string) string {
+	candidate := base
+	for strings.EqualFold(candidate, outerQualifier) {
+		candidate += "_"
+	}
+	return candidate
+}
+
+func buildVolumeClauses(sa subqueryAliases, volumeIDExpr string, allowParam, restrictParam int) []string {
 	var clauses []string
 	if restrictParam > 0 {
 		clauses = append(clauses,
-			buildItemRestrictClause(domain.ItemTypeVolume, volumeIDExpr, restrictParam),
-			buildSeriesMembershipRestrictClause(volumeIDExpr, restrictParam),
+			buildItemRestrictClause(sa, domain.ItemTypeVolume, volumeIDExpr, restrictParam),
+			buildSeriesMembershipRestrictClause(sa, volumeIDExpr, restrictParam),
 		)
 	}
 	if allowParam > 0 {
-		clauses = append(clauses, buildVolumeAllowClause(volumeIDExpr, allowParam))
+		clauses = append(clauses, buildVolumeAllowClause(sa, volumeIDExpr, allowParam))
 	}
 	return clauses
 }
 
-func buildItemRestrictClause(itemType domain.ItemType, itemIDExpr string, restrictParam int) string {
+func buildItemRestrictClause(sa subqueryAliases, itemType domain.ItemType, itemIDExpr string, restrictParam int) string {
 	return fmt.Sprintf(
-		"NOT EXISTS (SELECT 1 FROM item_labels il JOIN labels l ON l.id = il.label_id WHERE il.item_type = '%s' AND il.item_id = %s AND l.scope = 'SERVER' AND il.label_id = ANY($%d::text[]))",
-		itemType, itemIDExpr, restrictParam,
+		"NOT EXISTS (SELECT 1 FROM item_labels %s JOIN labels %s ON %s.id = %s.label_id WHERE %s.item_type = '%s' AND %s.item_id = %s AND %s.scope = 'SERVER' AND %s.label_id = ANY($%d::text[]))",
+		sa.il, sa.l, sa.l, sa.il, sa.il, itemType, sa.il, itemIDExpr, sa.l, sa.il, restrictParam,
 	)
 }
 
-func buildSeriesMembershipRestrictClause(volumeIDExpr string, restrictParam int) string {
+func buildSeriesMembershipRestrictClause(sa subqueryAliases, volumeIDExpr string, restrictParam int) string {
 	return fmt.Sprintf(
-		"NOT EXISTS (SELECT 1 FROM series_memberships sm JOIN item_labels il ON il.item_type = 'SERIES' AND il.item_id = sm.series_id JOIN labels l ON l.id = il.label_id WHERE sm.volume_id = %s AND l.scope = 'SERVER' AND il.label_id = ANY($%d::text[]))",
-		volumeIDExpr, restrictParam,
+		"NOT EXISTS (SELECT 1 FROM series_memberships %s JOIN item_labels %s ON %s.item_type = 'SERIES' AND %s.item_id = %s.series_id JOIN labels %s ON %s.id = %s.label_id WHERE %s.volume_id = %s AND %s.scope = 'SERVER' AND %s.label_id = ANY($%d::text[]))",
+		sa.sm, sa.il, sa.il, sa.il, sa.sm, sa.l, sa.l, sa.il, sa.sm, volumeIDExpr, sa.l, sa.il, restrictParam,
 	)
 }
 
-func buildSeriesAllowClause(seriesIDExpr string, allowParam int) string {
+func buildSeriesAllowClause(sa subqueryAliases, seriesIDExpr string, allowParam int) string {
 	return fmt.Sprintf(
-		"EXISTS (SELECT 1 FROM item_labels il JOIN labels l ON l.id = il.label_id WHERE il.item_type = 'SERIES' AND il.item_id = %s AND l.scope = 'SERVER' AND il.label_id = ANY($%d::text[]))",
-		seriesIDExpr, allowParam,
+		"EXISTS (SELECT 1 FROM item_labels %s JOIN labels %s ON %s.id = %s.label_id WHERE %s.item_type = 'SERIES' AND %s.item_id = %s AND %s.scope = 'SERVER' AND %s.label_id = ANY($%d::text[]))",
+		sa.il, sa.l, sa.l, sa.il, sa.il, sa.il, seriesIDExpr, sa.l, sa.il, allowParam,
 	)
 }
 
-func buildVolumeAllowClause(volumeIDExpr string, allowParam int) string {
+func buildVolumeAllowClause(sa subqueryAliases, volumeIDExpr string, allowParam int) string {
 	return fmt.Sprintf(
-		"((EXISTS (SELECT 1 FROM series_memberships sm WHERE sm.volume_id = %s) AND EXISTS (SELECT 1 FROM series_memberships sm JOIN item_labels il ON il.item_type = 'SERIES' AND il.item_id = sm.series_id JOIN labels l ON l.id = il.label_id WHERE sm.volume_id = %s AND l.scope = 'SERVER' AND il.label_id = ANY($%d::text[]))) OR (NOT EXISTS (SELECT 1 FROM series_memberships sm WHERE sm.volume_id = %s) AND EXISTS (SELECT 1 FROM item_labels il JOIN labels l ON l.id = il.label_id WHERE il.item_type = 'VOLUME' AND il.item_id = %s AND l.scope = 'SERVER' AND il.label_id = ANY($%d::text[]))))",
-		volumeIDExpr, volumeIDExpr, allowParam, volumeIDExpr, volumeIDExpr, allowParam,
+		"((EXISTS (SELECT 1 FROM series_memberships %s WHERE %s.volume_id = %s) AND EXISTS (SELECT 1 FROM series_memberships %s JOIN item_labels %s ON %s.item_type = 'SERIES' AND %s.item_id = %s.series_id JOIN labels %s ON %s.id = %s.label_id WHERE %s.volume_id = %s AND %s.scope = 'SERVER' AND %s.label_id = ANY($%d::text[]))) OR (NOT EXISTS (SELECT 1 FROM series_memberships %s WHERE %s.volume_id = %s) AND EXISTS (SELECT 1 FROM item_labels %s JOIN labels %s ON %s.id = %s.label_id WHERE %s.item_type = 'VOLUME' AND %s.item_id = %s AND %s.scope = 'SERVER' AND %s.label_id = ANY($%d::text[]))))",
+		sa.sm, sa.sm, volumeIDExpr,
+		sa.sm, sa.il, sa.il, sa.il, sa.sm, sa.l, sa.l, sa.il, sa.sm, volumeIDExpr, sa.l, sa.il, allowParam,
+		sa.sm, sa.sm, volumeIDExpr,
+		sa.il, sa.l, sa.l, sa.il, sa.il, sa.il, volumeIDExpr, sa.l, sa.il, allowParam,
 	)
 }
 
-func filterValidUserPolicies(in []domain.UserLabelPolicy) []domain.UserLabelPolicy {
-	if len(in) == 0 {
+func filterValidUserPolicies(principalUserID string, in []domain.UserLabelPolicy) []domain.UserLabelPolicy {
+	if len(in) == 0 || principalUserID == "" {
 		return nil
 	}
 	out := make([]domain.UserLabelPolicy, 0, len(in))
 	for _, p := range in {
+		if p.UserID != principalUserID {
+			continue
+		}
 		if strings.TrimSpace(p.LabelID) == "" {
 			continue
 		}
@@ -328,14 +361,14 @@ func filterValidGroupPolicies(in []domain.GroupLabelPolicy) []domain.GroupLabelP
 	return out
 }
 
-func qualifyIdentifier(alias, defaultTable, column string) (string, error) {
+func resolveOuterQualifier(alias, defaultTable string) (string, error) {
 	if alias == "" {
-		return defaultTable + "." + column, nil
+		return defaultTable, nil
 	}
 	if !isValidSQLIdentifier(alias) {
 		return "", fmt.Errorf("invalid SQL alias %q", alias)
 	}
-	return alias + "." + column, nil
+	return alias, nil
 }
 
 func isValidSQLIdentifier(s string) bool {
