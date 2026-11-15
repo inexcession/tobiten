@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -52,6 +53,16 @@ const (
 		       rp.device, rp.source, rp.completed, rp.updated_at
 		FROM reading_progress rp`
 
+	selectAuthorizedAssetCandidatesColumns = `
+		SELECT a.id, a.volume_id, r.library_id, a.library_root_id,
+		       r.path_bytes, r.path_display, r.state,
+		       a.rel_path_bytes, a.rel_path_display, a.rel_path_match,
+		       a.file_size, a.file_mtime, a.format, a.page_count,
+		       a.cover_page_index, a.suppressed_pages, a.diagnostics,
+		       a.missing_since, a.retired_at, a.created_at, a.updated_at
+		FROM media_assets a
+		JOIN library_roots r ON r.id = a.library_root_id`
+
 	selectSeriesMembershipColumns = `
 		SELECT sm.volume_id, sm.series_id, sm.is_primary, sm.kind, sm.position,
 		       sm.source, sm.locked_fields
@@ -59,22 +70,35 @@ const (
 		JOIN series s_m ON s_m.id = sm.series_id`
 )
 
-// CatalogueRepository implements storage.CatalogueRepository backed by PostgreSQL,
-// enforcing LabelPredicate visibility on every read and count path (ADR-0006 §5).
-type CatalogueRepository struct {
+// predicateClause binds a table alias in the query to a LabelPredicate SQL fragment generator.
+type predicateClause struct {
+	alias      string
+	fragmentFn func(*LabelPredicate, string, int) (SQLFragment, error)
+}
+
+// guardedQuerySpec describes a parameterized SQL query executed through guardedCatalogueDB.
+type guardedQuerySpec struct {
+	selectFrom string
+	whereParts []string
+	args       []any
+	predicates []predicateClause
+	orderBy    string
+	limit      int
+	offset     int
+}
+
+// guardedCatalogueDB is the shared query boundary for CatalogueRepository.
+// Every catalogue SELECT/COUNT executes through query or queryRow, which unconditionally
+// requires a non-nil LabelPredicate and applies every declared predicateClause fail-closed.
+type guardedCatalogueDB struct {
 	db DBTX
 }
 
-// NewCatalogueRepository creates a new CatalogueRepository using the provided database handle.
-func NewCatalogueRepository(db DBTX) *CatalogueRepository {
-	return &CatalogueRepository{db: db}
-}
-
-func (r *CatalogueRepository) loadPredicate(ctx context.Context, scope storage.CatalogueReadScope) (*LabelPredicate, error) {
-	if r == nil || r.db == nil {
+func (g *guardedCatalogueDB) loadPredicate(ctx context.Context, scope storage.CatalogueReadScope) (*LabelPredicate, error) {
+	if g == nil || g.db == nil {
 		return nil, errors.New("catalogue repository is not initialized")
 	}
-	pred, err := LoadLabelPredicate(ctx, r.db, scope.Principal, scope.GroupPolicies, LabelPredicateOptions{
+	pred, err := LoadLabelPredicate(ctx, g.db, scope.Principal, scope.GroupPolicies, LabelPredicateOptions{
 		IncludeTrashed: scope.IncludeTrashed,
 	})
 	if err != nil {
@@ -86,59 +110,97 @@ func (r *CatalogueRepository) loadPredicate(ctx context.Context, scope storage.C
 	return pred, nil
 }
 
-func getByIDWithPredicate[T any](
-	ctx context.Context,
-	r *CatalogueRepository,
-	scope storage.CatalogueReadScope,
-	id string,
-	selectCols string,
-	alias string,
-	fragmentFn func(*LabelPredicate, string, int) (SQLFragment, error),
-	scanFn func(pgx.Row) (*T, error),
-) (*T, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
+func (g *guardedCatalogueDB) prepare(pred *LabelPredicate, spec guardedQuerySpec) (string, []any, error) {
+	if g == nil || g.db == nil {
+		return "", nil, errors.New("catalogue repository is not initialized")
 	}
-	frag, err := fragmentFn(pred, alias, 2)
-	if err != nil {
-		return nil, fmt.Errorf("building %s label predicate: %w", alias, err)
+	if pred == nil {
+		return "", nil, errors.New("label predicate is required")
 	}
-	query := selectCols + fmt.Sprintf(" WHERE %s.id = $1 AND (%s)", alias, frag.SQL)
-	args := append([]any{id}, frag.Args...)
-	return scanFn(r.db.QueryRow(ctx, query, args...))
+	if len(spec.predicates) == 0 {
+		return "", nil, errors.New("catalogue query requires at least one label predicate clause")
+	}
+	if spec.limit < 0 || spec.offset < 0 {
+		return "", nil, fmt.Errorf("invalid pagination limit=%d offset=%d", spec.limit, spec.offset)
+	}
+
+	whereParts := slices.Clone(spec.whereParts)
+	args := slices.Clone(spec.args)
+
+	for _, p := range spec.predicates {
+		if p.fragmentFn == nil {
+			return "", nil, errors.New("catalogue query predicate fragment builder must not be nil")
+		}
+		frag, err := p.fragmentFn(pred, p.alias, len(args)+1)
+		if err != nil {
+			return "", nil, fmt.Errorf("building %s label predicate: %w", p.alias, err)
+		}
+		whereParts = append(whereParts, "("+frag.SQL+")")
+		args = append(args, frag.Args...)
+	}
+
+	query := spec.selectFrom + " WHERE " + strings.Join(whereParts, " AND ") + spec.orderBy
+	if spec.limit > 0 {
+		args = append(args, spec.limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if spec.offset > 0 {
+		args = append(args, spec.offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+	return query, args, nil
 }
 
-// GetSeriesByID retrieves a single series if visible under the principal's label predicate.
-func (r *CatalogueRepository) GetSeriesByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Series, error) {
-	return getByIDWithPredicate(ctx, r, scope, id, selectSeriesColumns, "s", (*LabelPredicate).SeriesFragment, scanSeriesRow)
-}
-
-// ListSeries returns series visible under the principal's label predicate matching filter.
-func (r *CatalogueRepository) ListSeries(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
-	pred, err := r.loadPredicate(ctx, scope)
+func (g *guardedCatalogueDB) query(ctx context.Context, pred *LabelPredicate, spec guardedQuerySpec) (pgx.Rows, error) {
+	query, args, err := g.prepare(pred, spec)
 	if err != nil {
 		return nil, err
 	}
-	whereClause, args, err := buildSeriesFilterWhere(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	query := selectSeriesColumns + whereClause + " ORDER BY s.title_sort ASC, s.id ASC"
-	query, args, err = appendPagination(query, args, filter.Limit, filter.Offset)
-	if err != nil {
-		return nil, err
-	}
-
-	rows, err := r.db.Query(ctx, query, args...)
+	rows, err := g.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
+	return rows, nil
+}
+
+func (g *guardedCatalogueDB) queryRow(ctx context.Context, pred *LabelPredicate, spec guardedQuerySpec) (pgx.Row, error) {
+	query, args, err := g.prepare(pred, spec)
+	if err != nil {
+		return nil, err
+	}
+	return g.db.QueryRow(ctx, query, args...), nil
+}
+
+func queryOne[T any](
+	ctx context.Context,
+	g *guardedCatalogueDB,
+	pred *LabelPredicate,
+	spec guardedQuerySpec,
+	scanFn func(pgx.Row) (*T, error),
+) (*T, error) {
+	row, err := g.queryRow(ctx, pred, spec)
+	if err != nil {
+		return nil, err
+	}
+	return scanFn(row)
+}
+
+func queryList[T any](
+	ctx context.Context,
+	g *guardedCatalogueDB,
+	pred *LabelPredicate,
+	spec guardedQuerySpec,
+	scanFn func(pgx.Row) (*T, error),
+) ([]T, error) {
+	rows, err := g.query(ctx, pred, spec)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 
-	out := []domain.Series{}
+	out := []T{}
 	for rows.Next() {
-		item, err := scanSeriesRow(rows)
+		item, err := scanFn(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -150,17 +212,69 @@ func (r *CatalogueRepository) ListSeries(ctx context.Context, scope storage.Cata
 	return out, nil
 }
 
+func queryCount(
+	ctx context.Context,
+	g *guardedCatalogueDB,
+	pred *LabelPredicate,
+	spec guardedQuerySpec,
+) (int64, error) {
+	row, err := g.queryRow(ctx, pred, spec)
+	if err != nil {
+		return 0, err
+	}
+	return scanCountRow(row)
+}
+
+// CatalogueRepository implements storage.CatalogueRepository backed by PostgreSQL,
+// enforcing LabelPredicate visibility on every read and count path (ADR-0006 §5).
+type CatalogueRepository struct {
+	guard guardedCatalogueDB
+}
+
+// NewCatalogueRepository creates a new CatalogueRepository using the provided database handle.
+func NewCatalogueRepository(db DBTX) *CatalogueRepository {
+	return &CatalogueRepository{guard: guardedCatalogueDB{db: db}}
+}
+
+func (r *CatalogueRepository) loadPredicate(ctx context.Context, scope storage.CatalogueReadScope) (*LabelPredicate, error) {
+	if r == nil {
+		return nil, errors.New("catalogue repository is not initialized")
+	}
+	return r.guard.loadPredicate(ctx, scope)
+}
+
+// GetSeriesByID retrieves a single series if visible under the principal's label predicate.
+func (r *CatalogueRepository) GetSeriesByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Series, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		whereParts: []string{"s.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	}, scanSeriesRow)
+}
+
+// ListSeries returns series visible under the principal's label predicate matching filter.
+func (r *CatalogueRepository) ListSeries(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	spec := buildSeriesQuerySpec(selectSeriesColumns, filter, " ORDER BY s.title_sort ASC, s.id ASC", true)
+	return queryList(ctx, &r.guard, pred, spec, scanSeriesRow)
+}
+
 // CountSeries returns the count of series visible under the principal's label predicate matching filter.
 func (r *CatalogueRepository) CountSeries(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) (int64, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
 		return 0, err
 	}
-	whereClause, args, err := buildSeriesFilterWhere(pred, filter)
-	if err != nil {
-		return 0, err
-	}
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM series s"+whereClause, args...))
+	spec := buildSeriesQuerySpec("SELECT COUNT(*) FROM series s", filter, "", false)
+	return queryCount(ctx, &r.guard, pred, spec)
 }
 
 // GetVolumeByID retrieves a single volume if visible under the principal's label predicate,
@@ -182,13 +296,12 @@ func (r *CatalogueRepository) GetVolumeByID(ctx context.Context, scope storage.C
 }
 
 func (r *CatalogueRepository) getVolumeWithPredicate(ctx context.Context, pred *LabelPredicate, id string) (*domain.Volume, error) {
-	frag, err := pred.VolumeFragment("v", 2)
-	if err != nil {
-		return nil, fmt.Errorf("building volume label predicate: %w", err)
-	}
-	query := selectVolumeColumns + " WHERE v.id = $1 AND (" + frag.SQL + ")"
-	args := append([]any{id}, frag.Args...)
-	return scanVolumeRow(r.db.QueryRow(ctx, query, args...))
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectVolumeColumns,
+		whereParts: []string{"v.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "v", fragmentFn: (*LabelPredicate).VolumeFragment}},
+	}, scanVolumeRow)
 }
 
 // ListVolumes returns volumes visible under the principal's label predicate matching filter,
@@ -198,36 +311,14 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 	if err != nil {
 		return nil, err
 	}
-	joinClause, whereClause, args, err := buildVolumeFilterQuery(pred, filter)
-	if err != nil {
-		return nil, err
-	}
 	orderBy := " ORDER BY v.created_at ASC, v.id ASC"
 	if filter.SeriesID != "" {
 		orderBy = " ORDER BY sm_f.position ASC NULLS LAST, v.number ASC NULLS LAST, v.id ASC"
 	}
-	query := selectVolumeColumns + joinClause + whereClause + orderBy
-	query, args, err = appendPagination(query, args, filter.Limit, filter.Offset)
+	spec := buildVolumeQuerySpec(selectVolumeColumns, filter, orderBy, true)
+	out, err := queryList(ctx, &r.guard, pred, spec, scanVolumeRow)
 	if err != nil {
 		return nil, err
-	}
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	defer rows.Close()
-
-	out := []domain.Volume{}
-	for rows.Next() {
-		item, err := scanVolumeRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, mapPgError(err)
 	}
 	if len(out) > 0 {
 		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, out); err != nil {
@@ -286,18 +377,15 @@ func (r *CatalogueRepository) listAuthorizedMembershipsByVolumeIDs(
 	pred *LabelPredicate,
 	volumeIDs []string,
 ) (map[string][]domain.SeriesMembership, error) {
-	frag, err := pred.SeriesFragment("s_m", 2)
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: selectSeriesMembershipColumns,
+		whereParts: []string{"sm.volume_id = ANY($1::text[])"},
+		args:       []any{volumeIDs},
+		predicates: []predicateClause{{alias: "s_m", fragmentFn: (*LabelPredicate).SeriesFragment}},
+		orderBy:    " ORDER BY sm.volume_id ASC, sm.is_primary DESC, sm.series_id ASC",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("building series membership label predicate: %w", err)
-	}
-	query := selectSeriesMembershipColumns +
-		" WHERE sm.volume_id = ANY($1::text[]) AND (" + frag.SQL + ")" +
-		" ORDER BY sm.volume_id ASC, sm.is_primary DESC, sm.series_id ASC"
-	args := append([]any{volumeIDs}, frag.Args...)
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, mapPgError(err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -320,18 +408,15 @@ func (r *CatalogueRepository) listAuthorizedAssetsByVolumeIDs(
 	pred *LabelPredicate,
 	volumeIDs []string,
 ) (map[string][]domain.MediaAsset, error) {
-	frag, err := pred.AssetFragment("a", 2)
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: selectAssetColumns,
+		whereParts: []string{"a.volume_id = ANY($1::text[])"},
+		args:       []any{volumeIDs},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+		orderBy:    " ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("building volume asset label predicate: %w", err)
-	}
-	query := selectAssetColumns +
-		" WHERE a.volume_id = ANY($1::text[]) AND (" + frag.SQL + ")" +
-		" ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC"
-	args := append([]any{volumeIDs}, frag.Args...)
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, mapPgError(err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -355,16 +440,22 @@ func (r *CatalogueRepository) CountVolumes(ctx context.Context, scope storage.Ca
 	if err != nil {
 		return 0, err
 	}
-	joinClause, whereClause, args, err := buildVolumeFilterQuery(pred, filter)
-	if err != nil {
-		return 0, err
-	}
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM volumes v"+joinClause+whereClause, args...))
+	spec := buildVolumeQuerySpec("SELECT COUNT(*) FROM volumes v", filter, "", false)
+	return queryCount(ctx, &r.guard, pred, spec)
 }
 
 // GetAssetByID retrieves a single media asset if visible under the principal's label predicate.
 func (r *CatalogueRepository) GetAssetByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.MediaAsset, error) {
-	return getByIDWithPredicate(ctx, r, scope, id, selectAssetColumns, "a", (*LabelPredicate).AssetFragment, scanAssetRow)
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectAssetColumns,
+		whereParts: []string{"a.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+	}, scanAssetRow)
 }
 
 // ListAssetsByVolume returns all visible media asset manifestations for volumeID.
@@ -373,31 +464,13 @@ func (r *CatalogueRepository) ListAssetsByVolume(ctx context.Context, scope stor
 	if err != nil {
 		return nil, err
 	}
-	frag, err := pred.AssetFragment("a", 2)
-	if err != nil {
-		return nil, fmt.Errorf("building asset label predicate: %w", err)
-	}
-	query := selectAssetColumns + " WHERE a.volume_id = $1 AND (" + frag.SQL + ") ORDER BY a.created_at ASC, a.id ASC"
-	args := append([]any{volumeID}, frag.Args...)
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	defer rows.Close()
-
-	out := []domain.MediaAsset{}
-	for rows.Next() {
-		item, err := scanAssetRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, mapPgError(err)
-	}
-	return out, nil
+	return queryList(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectAssetColumns,
+		whereParts: []string{"a.volume_id = $1"},
+		args:       []any{volumeID},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+		orderBy:    " ORDER BY a.created_at ASC, a.id ASC",
+	}, scanAssetRow)
 }
 
 // CountAssetsByVolume returns the count of visible media asset manifestations for volumeID.
@@ -406,19 +479,27 @@ func (r *CatalogueRepository) CountAssetsByVolume(ctx context.Context, scope sto
 	if err != nil {
 		return 0, err
 	}
-	frag, err := pred.AssetFragment("a", 2)
-	if err != nil {
-		return 0, fmt.Errorf("building asset label predicate: %w", err)
-	}
-	query := "SELECT COUNT(*) FROM media_assets a WHERE a.volume_id = $1 AND (" + frag.SQL + ")"
-	args := append([]any{volumeID}, frag.Args...)
-	return scanCountRow(r.db.QueryRow(ctx, query, args...))
+	return queryCount(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: "SELECT COUNT(*) FROM media_assets a",
+		whereParts: []string{"a.volume_id = $1"},
+		args:       []any{volumeID},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+	})
 }
 
 // GetAuthorizedAssetFile retrieves the root and asset path projection for assetID
 // only when the asset, its parent volume, and its series satisfy the label predicate.
 func (r *CatalogueRepository) GetAuthorizedAssetFile(ctx context.Context, scope storage.CatalogueReadScope, assetID string) (*storage.AuthorizedAssetFile, error) {
-	return getByIDWithPredicate(ctx, r, scope, assetID, selectAuthorizedAssetFileColumns, "a", (*LabelPredicate).AssetFragment, scanAuthorizedAssetFileRow)
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectAuthorizedAssetFileColumns,
+		whereParts: []string{"a.id = $1"},
+		args:       []any{assetID},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+	}, scanAuthorizedAssetFileRow)
 }
 
 // SelectPreferredAssetFileForVolume resolves the preferred readable asset file projection for volumeID
@@ -472,26 +553,15 @@ func (r *CatalogueRepository) listAuthorizedAssetCandidatesWithPredicate(
 	pred *LabelPredicate,
 	volumeID string,
 ) ([]domain.MediaAsset, map[string]storage.AuthorizedAssetFile, error) {
-	frag, err := pred.AssetFragment("a", 2)
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: selectAuthorizedAssetCandidatesColumns,
+		whereParts: []string{"a.volume_id = $1"},
+		args:       []any{volumeID},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+		orderBy:    " ORDER BY a.created_at ASC, a.id ASC",
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("building asset label predicate: %w", err)
-	}
-	query := `
-		SELECT a.id, a.volume_id, r.library_id, a.library_root_id,
-		       r.path_bytes, r.path_display, r.state,
-		       a.rel_path_bytes, a.rel_path_display, a.rel_path_match,
-		       a.file_size, a.file_mtime, a.format, a.page_count,
-		       a.cover_page_index, a.suppressed_pages, a.diagnostics,
-		       a.missing_since, a.retired_at, a.created_at, a.updated_at
-		FROM media_assets a
-		JOIN library_roots r ON r.id = a.library_root_id
-		WHERE a.volume_id = $1 AND (` + frag.SQL + `)
-		ORDER BY a.created_at ASC, a.id ASC`
-	args := append([]any{volumeID}, frag.Args...)
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, nil, mapPgError(err)
+		return nil, nil, err
 	}
 	defer rows.Close()
 
@@ -527,13 +597,12 @@ func (r *CatalogueRepository) getReadingProgressWithPredicate(
 	userID string,
 	volumeID string,
 ) (*domain.ReadingProgress, error) {
-	frag, err := pred.ReadingProgressFragment("rp", 3)
-	if err != nil {
-		return nil, fmt.Errorf("building reading_progress label predicate: %w", err)
-	}
-	query := selectReadingProgressColumns + " WHERE rp.user_id = $1 AND rp.volume_id = $2 AND (" + frag.SQL + ")"
-	args := append([]any{userID, volumeID}, frag.Args...)
-	return scanReadingProgressRow(r.db.QueryRow(ctx, query, args...))
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectReadingProgressColumns,
+		whereParts: []string{"rp.user_id = $1", "rp.volume_id = $2"},
+		args:       []any{userID, volumeID},
+		predicates: []predicateClause{{alias: "rp", fragmentFn: (*LabelPredicate).ReadingProgressFragment}},
+	}, scanReadingProgressRow)
 }
 
 // ListReadingProgress returns the requesting user's reading progress entries
@@ -543,34 +612,8 @@ func (r *CatalogueRepository) ListReadingProgress(ctx context.Context, scope sto
 	if err != nil {
 		return nil, err
 	}
-	whereClause, args, err := buildProgressFilterWhere(pred, principalUserID(scope), filter)
-	if err != nil {
-		return nil, err
-	}
-	query := selectReadingProgressColumns + whereClause + " ORDER BY rp.updated_at DESC, rp.volume_id ASC"
-	query, args, err = appendPagination(query, args, filter.Limit, filter.Offset)
-	if err != nil {
-		return nil, err
-	}
-
-	rows, err := r.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	defer rows.Close()
-
-	out := []domain.ReadingProgress{}
-	for rows.Next() {
-		item, err := scanReadingProgressRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, mapPgError(err)
-	}
-	return out, nil
+	spec := buildProgressQuerySpec(selectReadingProgressColumns, principalUserID(scope), filter, " ORDER BY rp.updated_at DESC, rp.volume_id ASC", true)
+	return queryList(ctx, &r.guard, pred, spec, scanReadingProgressRow)
 }
 
 // CountReadingProgress returns the count of the requesting user's reading progress entries
@@ -580,11 +623,8 @@ func (r *CatalogueRepository) CountReadingProgress(ctx context.Context, scope st
 	if err != nil {
 		return 0, err
 	}
-	whereClause, args, err := buildProgressFilterWhere(pred, principalUserID(scope), filter)
-	if err != nil {
-		return 0, err
-	}
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM reading_progress rp"+whereClause, args...))
+	spec := buildProgressQuerySpec("SELECT COUNT(*) FROM reading_progress rp", principalUserID(scope), filter, "", false)
+	return queryCount(ctx, &r.guard, pred, spec)
 }
 
 func scanCountRow(row pgx.Row) (int64, error) {
@@ -611,22 +651,7 @@ func escapeILIKE(term string) string {
 	return "%" + replacer.Replace(term) + "%"
 }
 
-func appendPagination(query string, args []any, limit, offset int) (string, []any, error) {
-	if limit < 0 || offset < 0 {
-		return "", nil, fmt.Errorf("invalid pagination limit=%d offset=%d", limit, offset)
-	}
-	if limit > 0 {
-		args = append(args, limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-	}
-	if offset > 0 {
-		args = append(args, offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-	}
-	return query, args, nil
-}
-
-func buildSeriesFilterWhere(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
+func buildSeriesQuerySpec(selectFrom string, filter storage.SeriesReadFilter, orderBy string, withPagination bool) guardedQuerySpec {
 	var whereParts []string
 	var args []any
 
@@ -643,33 +668,31 @@ func buildSeriesFilterWhere(pred *LabelPredicate, filter storage.SeriesReadFilte
 		))
 	}
 
-	frag, err := pred.SeriesFragment("s", len(args)+1)
-	if err != nil {
-		return "", nil, fmt.Errorf("building series label predicate: %w", err)
+	spec := guardedQuerySpec{
+		selectFrom: selectFrom,
+		whereParts: whereParts,
+		args:       args,
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+		orderBy:    orderBy,
 	}
-	whereParts = append(whereParts, "("+frag.SQL+")")
-	args = append(args, frag.Args...)
-
-	return " WHERE " + strings.Join(whereParts, " AND "), args, nil
+	if withPagination {
+		spec.limit = filter.Limit
+		spec.offset = filter.Offset
+	}
+	return spec
 }
 
-func buildVolumeFilterQuery(pred *LabelPredicate, filter storage.VolumeReadFilter) (string, string, []any, error) {
-	var joinClause string
+func buildVolumeQuerySpec(baseSelect string, filter storage.VolumeReadFilter, orderBy string, withPagination bool) guardedQuerySpec {
 	var whereParts []string
 	var args []any
+	predicates := []predicateClause{{alias: "v", fragmentFn: (*LabelPredicate).VolumeFragment}}
 
 	if filter.SeriesID != "" {
-		joinClause = " JOIN series_memberships sm_f ON sm_f.volume_id = v.id JOIN series s_f ON s_f.id = sm_f.series_id"
+		baseSelect += " JOIN series_memberships sm_f ON sm_f.volume_id = v.id JOIN series s_f ON s_f.id = sm_f.series_id"
 		args = append(args, filter.SeriesID)
 		whereParts = append(whereParts, fmt.Sprintf("sm_f.series_id = $%d", len(args)))
-
-		// Guard series membership filter itself so hidden series cannot be enumerated via cross-series volumes.
-		sFrag, err := pred.SeriesFragment("s_f", len(args)+1)
-		if err != nil {
-			return "", "", nil, fmt.Errorf("building series filter label predicate: %w", err)
-		}
-		whereParts = append(whereParts, "("+sFrag.SQL+")")
-		args = append(args, sFrag.Args...)
+		// Guard the series membership join so hidden series cannot be enumerated via cross-series volumes.
+		predicates = append(predicates, predicateClause{alias: "s_f", fragmentFn: (*LabelPredicate).SeriesFragment})
 	}
 	if filter.LibraryID != "" {
 		args = append(args, filter.LibraryID)
@@ -680,17 +703,21 @@ func buildVolumeFilterQuery(pred *LabelPredicate, filter storage.VolumeReadFilte
 		whereParts = append(whereParts, fmt.Sprintf("COALESCE(v.title, '') ILIKE $%d ESCAPE '\\'", len(args)))
 	}
 
-	vFrag, err := pred.VolumeFragment("v", len(args)+1)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("building volume label predicate: %w", err)
+	spec := guardedQuerySpec{
+		selectFrom: baseSelect,
+		whereParts: whereParts,
+		args:       args,
+		predicates: predicates,
+		orderBy:    orderBy,
 	}
-	whereParts = append(whereParts, "("+vFrag.SQL+")")
-	args = append(args, vFrag.Args...)
-
-	return joinClause, " WHERE " + strings.Join(whereParts, " AND "), args, nil
+	if withPagination {
+		spec.limit = filter.Limit
+		spec.offset = filter.Offset
+	}
+	return spec
 }
 
-func buildProgressFilterWhere(pred *LabelPredicate, userID string, filter storage.ReadingProgressReadFilter) (string, []any, error) {
+func buildProgressQuerySpec(selectFrom, userID string, filter storage.ReadingProgressReadFilter, orderBy string, withPagination bool) guardedQuerySpec {
 	args := []any{userID}
 	whereParts := []string{"rp.user_id = $1"}
 
@@ -699,14 +726,18 @@ func buildProgressFilterWhere(pred *LabelPredicate, userID string, filter storag
 		whereParts = append(whereParts, fmt.Sprintf("rp.completed = $%d", len(args)))
 	}
 
-	frag, err := pred.ReadingProgressFragment("rp", len(args)+1)
-	if err != nil {
-		return "", nil, fmt.Errorf("building reading_progress label predicate: %w", err)
+	spec := guardedQuerySpec{
+		selectFrom: selectFrom,
+		whereParts: whereParts,
+		args:       args,
+		predicates: []predicateClause{{alias: "rp", fragmentFn: (*LabelPredicate).ReadingProgressFragment}},
+		orderBy:    orderBy,
 	}
-	whereParts = append(whereParts, "("+frag.SQL+")")
-	args = append(args, frag.Args...)
-
-	return " WHERE " + strings.Join(whereParts, " AND "), args, nil
+	if withPagination {
+		spec.limit = filter.Limit
+		spec.offset = filter.Offset
+	}
+	return spec
 }
 
 func scanSeriesRow(row pgx.Row) (*domain.Series, error) {

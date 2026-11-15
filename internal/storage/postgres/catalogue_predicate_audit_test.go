@@ -36,32 +36,26 @@ var dbExecutionMethods = map[string]bool{
 	"BeginTx":   true,
 }
 
-type builderReturnSig struct {
-	sqlRetIdx  int
-	argsRetIdx int
-	hasErrRet  bool
-}
-
-type passthroughSig struct {
-	sqlRetToParam  map[int]int
-	argsRetToParam map[int]int
+var guardedBoundaryQueries = map[string]bool{
+	"guardedCatalogueDB.query":    true,
+	"guardedCatalogueDB.queryRow": true,
 }
 
 type auditedFuncInfo struct {
 	key             string
 	name            string
+	filename        string
 	receiverType    string
+	receiverIdent   string
+	paramTypes      map[string]string
 	exported        bool
 	hasCtxAndScope  bool
 	decl            *ast.FuncDecl
 	directCalls     []string
-	fragmentCalls   []string
 	callsLoadPred   bool
-	callsDBQuery    bool
+	rawDBCalls      []string
 	callsSQLCNew    bool
 	auditViolations []string
-	builderSig      *builderReturnSig
-	passthroughSig  *passthroughSig
 }
 
 type cataloguePredicateAuditReport struct {
@@ -99,15 +93,7 @@ func TestCatalogueRepository_EveryReadMethodAppliesPredicate(t *testing.T) {
 		t.Fatalf("enforcement test coverage parity failed: %v", err)
 	}
 
-	// 3. Parse actual postgres package source and audit every exported CatalogueRepository method.
-	report, err := auditCatalogueRepositoryFiles([]string{
-		filepath.Join(".", "catalogue_repository.go"),
-	}, nil)
-	if err != nil {
-		t.Fatalf("auditing catalogue_repository.go: %v", err)
-	}
-
-	// Also check no other non-test .go files in internal/storage/postgres declare methods on CatalogueRepository.
+	// 3. Parse all non-test package files and run the structural boundary check.
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("reading package directory: %v", err)
@@ -125,7 +111,6 @@ func TestCatalogueRepository_EveryReadMethodAppliesPredicate(t *testing.T) {
 		t.Fatalf("auditing postgres package files: %v", err)
 	}
 
-	slices.Sort(report.exportedMethods)
 	slices.Sort(fullReport.exportedMethods)
 	if !slices.Equal(fullReport.exportedMethods, implMethods) {
 		t.Fatalf("AST exported methods %v != reflect methods %v", fullReport.exportedMethods, implMethods)
@@ -161,90 +146,61 @@ func TestCatalogueRepository_PredicateAuditDetectsMissingPredicate(t *testing.T)
 	t.Run("rejects new read method missing CatalogueReadScope", func(t *testing.T) {
 		mutated := string(baseSrc) + `
 func (r *CatalogueRepository) GetSeriesUnsafe(ctx context.Context, id string) (*domain.Series, error) {
-	return scanSeriesRow(r.db.QueryRow(ctx, selectSeriesColumns+" WHERE s.id = $1", id))
+	return scanSeriesRow(r.guard.db.QueryRow(ctx, selectSeriesColumns+" WHERE s.id = $1", id))
 }
 `
 		assertRejected(t, mutated, "GetSeriesUnsafe", "GetSeriesUnsafe without scope or predicate")
 	})
 
-	t.Run("rejects new read method with scope that skips LabelPredicate", func(t *testing.T) {
+	t.Run("rejects new read method skipping LabelPredicate", func(t *testing.T) {
 		mutated := string(baseSrc) + `
 func (r *CatalogueRepository) ListSeriesBypass(ctx context.Context, scope storage.CatalogueReadScope) ([]domain.Series, error) {
-	_, _ = r.db.Query(ctx, selectSeriesColumns)
+	_, _ = r.guard.query(ctx, nil, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	})
 	return nil, nil
 }
 `
-		assertRejected(t, mutated, "ListSeriesBypass", "ListSeriesBypass skipping LabelPredicate")
+		assertRejected(t, mutated, "ListSeriesBypass", "ListSeriesBypass skipping loadPredicate")
 	})
 
-	t.Run("rejects new read method calling loadPredicate without fragment", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) CountSeriesNoFragment(ctx context.Context, scope storage.CatalogueReadScope) (int64, error) {
-	if _, err := r.loadPredicate(ctx, scope); err != nil {
-		return 0, err
-	}
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM series s"))
-}
-`
-		assertRejected(t, mutated, "CountSeriesNoFragment", "CountSeriesNoFragment without fragment call")
-	})
-
-	t.Run("rejects new read method discarding fragment error", func(t *testing.T) {
+	t.Run("rejects new read method discarding loadPredicate error", func(t *testing.T) {
 		mutated := string(baseSrc) + `
 func (r *CatalogueRepository) CountSeriesDiscardedErr(ctx context.Context, scope storage.CatalogueReadScope) (int64, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return 0, err
-	}
-	frag, _ := pred.SeriesFragment("s", 1)
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM series s WHERE "+frag.SQL, frag.Args...))
+	pred, _ := r.loadPredicate(ctx, scope)
+	return queryCount(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: "SELECT COUNT(*) FROM series s",
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	})
 }
 `
-		assertRejected(t, mutated, "CountSeriesDiscardedErr", "CountSeriesDiscardedErr ignoring fragment error")
+		assertRejected(t, mutated, "CountSeriesDiscardedErr", "CountSeriesDiscardedErr ignoring loadPredicate error")
 	})
 
-	t.Run("rejects new read method ignoring SQLFragment SQL or Args", func(t *testing.T) {
+	t.Run("rejects raw DB query inside otherwise guarded method", func(t *testing.T) {
 		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) CountSeriesUnusedFragment(ctx context.Context, scope storage.CatalogueReadScope) (int64, error) {
+func (r *CatalogueRepository) GetSeriesWithRawQuery(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Series, error) {
 	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return 0, err
-	}
-	frag, err := pred.SeriesFragment("s", 1)
-	if err != nil {
-		return 0, err
-	}
-	_ = frag
-	return scanCountRow(r.db.QueryRow(ctx, "SELECT COUNT(*) FROM series s"))
-}
-`
-		assertRejected(t, mutated, "CountSeriesUnusedFragment", "CountSeriesUnusedFragment not wiring frag.SQL/frag.Args")
-	})
-
-	t.Run("rejects unguarded inline query in an otherwise guarded method", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) GetSeriesWithExtraUnguardedQuery(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Series, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	frag, err := pred.SeriesFragment("s", 2)
 	if err != nil {
 		return nil, err
 	}
 	var extra string
-	_ = r.db.QueryRow(ctx, "SELECT title FROM series WHERE id = $1", id).Scan(&extra)
-	query := selectSeriesColumns + " WHERE s.id = $1 AND (" + frag.SQL + ")"
-	args := append([]any{id}, frag.Args...)
-	return scanSeriesRow(r.db.QueryRow(ctx, query, args...))
+	_ = r.guard.db.QueryRow(ctx, "SELECT title FROM series WHERE id = $1", id).Scan(&extra)
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		whereParts: []string{"s.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	}, scanSeriesRow)
 }
 `
-		assertRejected(t, mutated, "GetSeriesWithExtraUnguardedQuery executes unguarded QueryRow", "unguarded second QueryRow in an otherwise guarded method")
+		assertRejected(t, mutated, "executes raw DB method QueryRow outside guardedCatalogueDB", "raw QueryRow inside guarded method")
 	})
 
-	t.Run("rejects unguarded helper query called from an otherwise guarded method", func(t *testing.T) {
+	t.Run("rejects raw DB query inside helper called from guarded method", func(t *testing.T) {
 		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) GetVolumeWithUnguardedHelper(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Volume, error) {
+func (r *CatalogueRepository) GetVolumeWithRawHelper(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Volume, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
 		return nil, err
@@ -253,14 +209,14 @@ func (r *CatalogueRepository) GetVolumeWithUnguardedHelper(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	if err := r.unguardedLoadMembershipsHelper(ctx, vol.ID); err != nil {
+	if err := r.rawLoadMembershipsHelper(ctx, vol.ID); err != nil {
 		return nil, err
 	}
 	return vol, nil
 }
 
-func (r *CatalogueRepository) unguardedLoadMembershipsHelper(ctx context.Context, volumeID string) error {
-	rows, err := r.db.Query(ctx, "SELECT series_id FROM series_memberships WHERE volume_id = $1", volumeID)
+func (r *CatalogueRepository) rawLoadMembershipsHelper(ctx context.Context, volumeID string) error {
+	rows, err := r.guard.db.Query(ctx, "SELECT series_id FROM series_memberships WHERE volume_id = $1", volumeID)
 	if err != nil {
 		return err
 	}
@@ -268,49 +224,7 @@ func (r *CatalogueRepository) unguardedLoadMembershipsHelper(ctx context.Context
 	return nil
 }
 `
-		assertRejected(t, mutated, "unguardedLoadMembershipsHelper executes unguarded Query", "unguarded helper query reachable from guarded method")
-	})
-
-	t.Run("rejects query wiring frag.SQL without frag.Args", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) CountSeriesMissingFragArgs(ctx context.Context, scope storage.CatalogueReadScope, id string) (int64, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return 0, err
-	}
-	frag, err := pred.SeriesFragment("s", 2)
-	if err != nil {
-		return 0, err
-	}
-	query := "SELECT COUNT(*) FROM series s WHERE s.id = $1 AND (" + frag.SQL + ")"
-	_ = frag.Args
-	return scanCountRow(r.db.QueryRow(ctx, query, id))
-}
-`
-		assertRejected(t, mutated, "CountSeriesMissingFragArgs executes unguarded QueryRow", "query referencing frag.SQL without passing frag.Args")
-	})
-
-	t.Run("rejects volume query using joinClause without whereClause", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func (r *CatalogueRepository) ListVolumesDropsWhereClause(ctx context.Context, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter) ([]domain.Volume, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	joinClause, whereClause, args, err := buildVolumeFilterQuery(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	_, _ = whereClause, args
-	rows, err := r.db.Query(ctx, selectVolumeColumns+joinClause)
-	if err != nil {
-		return nil, err
-	}
-	rows.Close()
-	return nil, nil
-}
-`
-		assertRejected(t, mutated, "ListVolumesDropsWhereClause executes unguarded Query", "query dropping whereClause from filter builder")
+		assertRejected(t, mutated, "rawLoadMembershipsHelper executes raw DB method Query outside guardedCatalogueDB", "raw Query in helper reachable from guarded method")
 	})
 
 	t.Run("rejects direct sqlc Queries bypass inside otherwise guarded method", func(t *testing.T) {
@@ -320,171 +234,57 @@ func (r *CatalogueRepository) GetSeriesWithSQLCBypass(ctx context.Context, scope
 	if err != nil {
 		return nil, err
 	}
-	_, _ = New(r.db).GetUserByID(ctx, "u-1")
-	frag, err := pred.SeriesFragment("s", 2)
-	if err != nil {
-		return nil, err
-	}
-	query := selectSeriesColumns + " WHERE s.id = $1 AND (" + frag.SQL + ")"
-	args := append([]any{id}, frag.Args...)
-	return scanSeriesRow(r.db.QueryRow(ctx, query, args...))
+	_, _ = New(r.guard.db).GetUserByID(ctx, "u-1")
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		whereParts: []string{"s.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	}, scanSeriesRow)
 }
 `
-		assertRejected(t, mutated, "GetSeriesWithSQLCBypass invokes sqlc New()", "direct sqlc New(r.db) query inside guarded method")
+		assertRejected(t, mutated, "GetSeriesWithSQLCBypass invokes sqlc New()", "direct sqlc New() bypass inside guarded method")
 	})
 
-	t.Run("rejects filter builder with unguarded success before guarded success", func(t *testing.T) {
+	t.Run("rejects guardedQuerySpec missing predicates", func(t *testing.T) {
 		mutated := string(baseSrc) + `
-func buildSeriesFilterMixedBefore(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
-	if filter.LibraryID != "" {
-		return " WHERE s.library_id = 'bypass'", nil, nil
-	}
-	frag, err := pred.SeriesFragment("s", 1)
-	if err != nil {
-		return "", nil, err
-	}
-	return " WHERE (" + frag.SQL + ")", frag.Args, nil
-}
-
-func (r *CatalogueRepository) ListSeriesMixedBefore(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
+func (r *CatalogueRepository) ListSeriesEmptyPredicates(ctx context.Context, scope storage.CatalogueReadScope) ([]domain.Series, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
-	whereClause, args, err := buildSeriesFilterMixedBefore(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
-	if err != nil {
-		return nil, err
-	}
-	rows.Close()
-	return nil, nil
+	return queryList(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+	}, scanSeriesRow)
 }
 `
-		assertRejected(t, mutated, "buildSeriesFilterMixedBefore has successful return path without matching SQLFragment SQL and Args", "mixed builder with unguarded early return")
-		assertRejected(t, mutated, "ListSeriesMixedBefore executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of mixed builder with unguarded early return")
+		assertRejected(t, mutated, "guardedQuerySpec missing predicates", "guardedQuerySpec omitting predicates")
 	})
 
-	t.Run("rejects filter builder with guarded success before unguarded success", func(t *testing.T) {
+	t.Run("rejects guardedQuerySpec with invalid predicate clause", func(t *testing.T) {
 		mutated := string(baseSrc) + `
-func buildSeriesFilterMixedAfter(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
-	if filter.LibraryID != "" {
-		frag, err := pred.SeriesFragment("s", 2)
-		if err != nil {
-			return "", nil, err
-		}
-		return " WHERE s.library_id = $1 AND (" + frag.SQL + ")", append([]any{filter.LibraryID}, frag.Args...), nil
-	}
-	return "", nil, nil
-}
-
-func (r *CatalogueRepository) ListSeriesMixedAfter(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
+func (r *CatalogueRepository) ListSeriesNilFragmentFn(ctx context.Context, scope storage.CatalogueReadScope) ([]domain.Series, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
-	whereClause, args, err := buildSeriesFilterMixedAfter(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
-	if err != nil {
-		return nil, err
-	}
-	rows.Close()
-	return nil, nil
+	return queryList(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		predicates: []predicateClause{{alias: "s"}},
+	}, scanSeriesRow)
 }
 `
-		assertRejected(t, mutated, "buildSeriesFilterMixedAfter has successful return path without matching SQLFragment SQL and Args", "mixed builder with unguarded fallback return")
-		assertRejected(t, mutated, "ListSeriesMixedAfter executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of mixed builder with unguarded fallback return")
+		assertRejected(t, mutated, "invalid predicateClause", "predicateClause without valid fragment builder")
 	})
 
-	t.Run("rejects filter builder with unguarded errors.Join error return", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func buildSeriesFilterErrorsJoin(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
-	if filter.LibraryID != "" {
-		return " WHERE s.library_id = 'bypass'", nil, errors.Join(nil, nil)
-	}
-	frag, err := pred.SeriesFragment("s", 1)
-	if err != nil {
-		return "", nil, err
-	}
-	return " WHERE (" + frag.SQL + ")", frag.Args, nil
-}
-
-func (r *CatalogueRepository) ListSeriesErrorsJoin(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	whereClause, args, err := buildSeriesFilterErrorsJoin(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
-	if err != nil {
-		return nil, err
-	}
-	rows.Close()
-	return nil, nil
-}
-`
-		assertRejected(t, mutated, "buildSeriesFilterErrorsJoin has successful return path without matching SQLFragment SQL and Args", "builder returning errors.Join without guard")
-		assertRejected(t, mutated, "ListSeriesErrorsJoin executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of builder returning errors.Join")
-	})
-
-	t.Run("rejects filter builder with nil-valued error variable after else err!=nil branch", func(t *testing.T) {
-		mutated := string(baseSrc) + `
-func buildSeriesFilterElseErrLeak(pred *LabelPredicate, filter storage.SeriesReadFilter) (string, []any, error) {
-	frag, err := pred.SeriesFragment("s", 1)
-	if err == nil {
-		_ = filter
-	} else {
-		return "", nil, err
-	}
-	var outErr error
-	if filter.LibraryID != "" {
-		return " WHERE s.library_id = 'bypass'", nil, outErr
-	}
-	_ = err
-	return " WHERE (" + frag.SQL + ")", frag.Args, err
-}
-
-func (r *CatalogueRepository) ListSeriesElseErrLeak(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	whereClause, args, err := buildSeriesFilterElseErrLeak(pred, filter)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := r.db.Query(ctx, selectSeriesColumns+whereClause, args...)
-	if err != nil {
-		return nil, err
-	}
-	rows.Close()
-	return nil, nil
-}
-`
-		assertRejected(t, mutated, "buildSeriesFilterElseErrLeak has successful return path without matching SQLFragment SQL and Args", "builder returning nil-valued error variable after else branch")
-		assertRejected(t, mutated, "ListSeriesElseErrLeak executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of builder with nil-valued error return")
-	})
-
-	t.Run("rejects passthrough helper with nil-valued error return", func(t *testing.T) {
+	t.Run("rejects guardedCatalogueDB queryRow bypassing prepare", func(t *testing.T) {
 		mutated := strings.Replace(
 			string(baseSrc),
-			"func appendPagination(query string, args []any, limit, offset int) (string, []any, error) {",
-			`func appendPagination(query string, args []any, limit, offset int) (string, []any, error) {
-	var sneakyErr error
-	if limit == 999 {
-		return "SELECT * FROM series", nil, sneakyErr
-	}`,
+			"func (g *guardedCatalogueDB) queryRow(ctx context.Context, pred *LabelPredicate, spec guardedQuerySpec) (pgx.Row, error) {\n\tquery, args, err := g.prepare(pred, spec)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn g.db.QueryRow(ctx, query, args...), nil\n}",
+			"func (g *guardedCatalogueDB) queryRow(ctx context.Context, pred *LabelPredicate, spec guardedQuerySpec) (pgx.Row, error) {\n\treturn g.db.QueryRow(ctx, spec.selectFrom), nil\n}",
 			1,
 		)
-		assertRejected(t, mutated, "ListSeries executes unguarded Query without matching predicate SQLFragment SQL and Args", "caller of passthrough helper with nil-valued error bypass")
+		assertRejected(t, mutated, "guardedCatalogueDB.queryRow", "guardedCatalogueDB.queryRow skipping prepare")
 	})
 
 	t.Run("rejects new read method missing from enforcement test map", func(t *testing.T) {
@@ -538,26 +338,41 @@ func checkEnforcementCoverageParity(methods []string, specs map[string]catalogue
 func auditCatalogueRepositoryFiles(paths []string, inline map[string]string) (*cataloguePredicateAuditReport, error) {
 	fset := token.NewFileSet()
 	funcs := make(map[string]*auditedFuncInfo)
+	var structuralViolations []string
+	sawRepoStruct := false
 
 	parseOne := func(filename string, src any) error {
 		fileAST, err := parser.ParseFile(fset, filename, src, 0)
 		if err != nil {
 			return fmt.Errorf("parsing %s: %w", filename, err)
 		}
+		base := filepath.Base(filename)
 		for _, decl := range fileAST.Decls {
-			fd, ok := decl.(*ast.FuncDecl)
-			if !ok || fd.Body == nil {
-				continue
-			}
-			recv := receiverTypeName(fd)
-			key := funcKey(recv, fd.Name.Name)
-			funcs[key] = &auditedFuncInfo{
-				key:            key,
-				name:           fd.Name.Name,
-				receiverType:   recv,
-				exported:       ast.IsExported(fd.Name.Name),
-				hasCtxAndScope: hasASTCtxAndScopeParams(fd),
-				decl:           fd,
+			switch d := decl.(type) {
+			case *ast.GenDecl:
+				if found, v := checkCatalogueRepositoryStruct(d); found {
+					sawRepoStruct = true
+					structuralViolations = append(structuralViolations, v...)
+				}
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				recv, recvIdent := receiverTypeAndIdent(d)
+				key := funcKey(recv, d.Name.Name)
+				info := &auditedFuncInfo{
+					key:            key,
+					name:           d.Name.Name,
+					filename:       base,
+					receiverType:   recv,
+					receiverIdent:  recvIdent,
+					paramTypes:     collectParamBaseTypes(d),
+					exported:       ast.IsExported(d.Name.Name),
+					hasCtxAndScope: hasASTCtxAndScopeParams(d),
+					decl:           d,
+				}
+				inspectFuncStructure(info)
+				funcs[key] = info
 			}
 		}
 		return nil
@@ -574,61 +389,266 @@ func auditCatalogueRepositoryFiles(paths []string, inline map[string]string) (*c
 		}
 	}
 
-	keys := make([]string, 0, len(funcs))
-	for k := range funcs {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-
-	// Pass 1: derive passthrough transforms before auditing builders and DB call sites.
-	for _, k := range keys {
-		if funcs[k].receiverType == "" {
-			analyzeHelperSignatures(funcs[k])
-		}
-	}
-
-	// Pass 2: analyze package-level *LabelPredicate filter builders first so their return taint signatures are known.
-	for _, k := range keys {
-		info := funcs[k]
-		if info.receiverType == "" && acceptsLabelPredicateParam(info.decl) {
-			auditFuncBody(info, funcs)
-		}
-	}
-
-	// Pass 3: run statement-level taint and per-query guard audit on all remaining functions.
-	for _, k := range keys {
-		info := funcs[k]
-		if info.receiverType != "" || !acceptsLabelPredicateParam(info.decl) {
-			auditFuncBody(info, funcs)
-		}
-	}
-
 	report := &cataloguePredicateAuditReport{}
+	if !sawRepoStruct {
+		structuralViolations = append(structuralViolations, "CatalogueRepository struct declaration not found")
+	}
+	structuralViolations = append(structuralViolations, checkGuardedBoundaryImplementation(funcs)...)
+
+	// Audit every function in catalogue_repository.go and every method on CatalogueRepository / guardedCatalogueDB
+	// across the package so no parallel unguarded query helper can hide in another file.
+	for _, info := range funcs {
+		if info.filename != "catalogue_repository.go" &&
+			info.receiverType != "CatalogueRepository" &&
+			info.receiverType != "guardedCatalogueDB" {
+			continue
+		}
+		structuralViolations = append(structuralViolations, checkRawAccess(info)...)
+	}
+
 	for _, info := range funcs {
 		if info.receiverType != "CatalogueRepository" || !info.exported {
 			continue
 		}
 		report.exportedMethods = append(report.exportedMethods, info.name)
-		violations := verifyExportedMethodPredicate(info.name, funcs)
-		report.violations = append(report.violations, violations...)
+		structuralViolations = append(structuralViolations, verifyExportedMethodUsesBoundary(info, funcs)...)
+	}
+
+	seen := make(map[string]bool, len(structuralViolations))
+	for _, v := range structuralViolations {
+		if !seen[v] {
+			seen[v] = true
+			report.violations = append(report.violations, v)
+		}
 	}
 	slices.Sort(report.exportedMethods)
 	slices.Sort(report.violations)
 	return report, nil
 }
 
-func funcKey(receiverType, name string) string {
-	if receiverType == "" {
-		return name
+func checkCatalogueRepositoryStruct(gd *ast.GenDecl) (bool, []string) {
+	if gd.Tok != token.TYPE {
+		return false, nil
 	}
-	return receiverType + "." + name
+	for _, spec := range gd.Specs {
+		ts, ok := spec.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "CatalogueRepository" {
+			continue
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok || st.Fields == nil || len(st.Fields.List) != 1 {
+			return true, []string{"CatalogueRepository must contain only the guard guardedCatalogueDB field"}
+		}
+		field := st.Fields.List[0]
+		id, ok := field.Type.(*ast.Ident)
+		if len(field.Names) != 1 || field.Names[0].Name != "guard" || !ok || id.Name != "guardedCatalogueDB" {
+			return true, []string{"CatalogueRepository must hold guard guardedCatalogueDB instead of raw DB handles"}
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
-func receiverTypeName(fd *ast.FuncDecl) string {
-	if fd.Recv == nil || len(fd.Recv.List) == 0 {
-		return ""
+func checkGuardedBoundaryImplementation(funcs map[string]*auditedFuncInfo) []string {
+	var violations []string
+
+	loadPred := funcs["guardedCatalogueDB.loadPredicate"]
+	if loadPred == nil {
+		violations = append(violations, "guardedCatalogueDB.loadPredicate is missing")
+	} else if !slices.Contains(loadPred.directCalls, "LoadLabelPredicate") {
+		violations = append(violations, "guardedCatalogueDB.loadPredicate must delegate to LoadLabelPredicate")
 	}
-	expr := fd.Recv.List[0].Type
+
+	prep := funcs["guardedCatalogueDB.prepare"]
+	if prep == nil {
+		violations = append(violations, "guardedCatalogueDB.prepare is missing")
+	} else {
+		violations = append(violations, verifyPrepareEnforcesPredicates(prep)...)
+	}
+
+	for _, fnName := range []string{"guardedCatalogueDB.query", "guardedCatalogueDB.queryRow"} {
+		fn := funcs[fnName]
+		if fn == nil {
+			violations = append(violations, fnName+" is missing")
+			continue
+		}
+		if !verifyBoundaryExecCallsPrepareFirst(fn) {
+			violations = append(violations, fmt.Sprintf("%s must validate via g.prepare(pred, spec) before executing DB query", fnName))
+		}
+	}
+	return violations
+}
+
+func verifyPrepareEnforcesPredicates(info *auditedFuncInfo) []string {
+	var (
+		hasEmptyPredCheck bool
+		hasFragCall       bool
+		hasFragErrCheck   bool
+		usesFragSQL       bool
+		usesFragArgs      bool
+	)
+
+	ast.Inspect(info.decl.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.IfStmt:
+			if hasLenCallOn(node.Cond, "spec", "predicates") {
+				hasEmptyPredCheck = true
+			}
+		case *ast.AssignStmt:
+			if len(node.Rhs) == 1 && isCallToSelector(node.Rhs[0], "fragmentFn") {
+				hasFragCall = true
+				if len(node.Lhs) == 2 && !isBlankIdent(node.Lhs[1]) {
+					hasFragErrCheck = true
+				}
+			}
+		case *ast.SelectorExpr:
+			if id, ok := node.X.(*ast.Ident); ok && id.Name == "frag" {
+				if node.Sel.Name == "SQL" {
+					usesFragSQL = true
+				}
+				if node.Sel.Name == "Args" {
+					usesFragArgs = true
+				}
+			}
+		}
+		return true
+	})
+
+	var violations []string
+	if !hasEmptyPredCheck {
+		violations = append(violations, "guardedCatalogueDB.prepare must reject empty spec.predicates")
+	}
+	if !hasFragCall || !hasFragErrCheck {
+		violations = append(violations, "guardedCatalogueDB.prepare must call predicate fragmentFn and check its error")
+	}
+	if !usesFragSQL || !usesFragArgs {
+		violations = append(violations, "guardedCatalogueDB.prepare must wire frag.SQL and frag.Args")
+	}
+	return violations
+}
+
+func verifyBoundaryExecCallsPrepareFirst(info *auditedFuncInfo) bool {
+	var preparePos, dbCallPos token.Pos
+	var prepareErrChecked bool
+
+	ast.Inspect(info.decl.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Rhs) == 1 && isCallToSelector(node.Rhs[0], "prepare") {
+				if len(node.Lhs) >= 3 && !isBlankIdent(node.Lhs[len(node.Lhs)-1]) {
+					preparePos = node.Pos()
+					prepareErrChecked = true
+				}
+			}
+		case *ast.CallExpr:
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && dbExecutionMethods[sel.Sel.Name] {
+				if dbCallPos == token.NoPos {
+					dbCallPos = node.Pos()
+				}
+			}
+		}
+		return true
+	})
+	return preparePos != token.NoPos && prepareErrChecked && dbCallPos != token.NoPos && preparePos < dbCallPos
+}
+
+func inspectFuncStructure(info *auditedFuncInfo) {
+	validPredSlices := collectValidPredicateSliceVars(info.decl.Body)
+
+	ast.Inspect(info.decl.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Rhs) == 1 && isLoadPredicateCall(node.Rhs[0]) {
+				if len(node.Lhs) != 2 || isBlankIdent(node.Lhs[0]) || isBlankIdent(node.Lhs[1]) {
+					info.auditViolations = append(info.auditViolations,
+						fmt.Sprintf("%s must retain both predicate and error from loadPredicate", info.key))
+				}
+				info.callsLoadPred = true
+			}
+		case *ast.ExprStmt:
+			if isLoadPredicateCall(node.X) {
+				info.auditViolations = append(info.auditViolations,
+					fmt.Sprintf("%s discards result/error from loadPredicate", info.key))
+				info.callsLoadPred = true
+			}
+		case *ast.CompositeLit:
+			if isIdentNamed(node.Type, "guardedQuerySpec") {
+				if reason := validateGuardedQuerySpec(node, validPredSlices); reason != "" {
+					info.auditViolations = append(info.auditViolations,
+						fmt.Sprintf("%s constructs invalid guardedQuerySpec: %s", info.key, reason))
+				}
+			}
+		case *ast.CallExpr:
+			recordCallInfo(info, node)
+		}
+		return true
+	})
+}
+
+func recordCallInfo(info *auditedFuncInfo, call *ast.CallExpr) {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		info.directCalls = append(info.directCalls, fn.Name)
+		if fn.Name == "New" {
+			info.callsSQLCNew = true
+		}
+	case *ast.IndexExpr:
+		if id, ok := fn.X.(*ast.Ident); ok {
+			info.directCalls = append(info.directCalls, id.Name)
+		}
+	case *ast.IndexListExpr:
+		if id, ok := fn.X.(*ast.Ident); ok {
+			info.directCalls = append(info.directCalls, id.Name)
+		}
+	case *ast.SelectorExpr:
+		if fn.Sel.Name == "loadPredicate" {
+			info.callsLoadPred = true
+		}
+		if dbExecutionMethods[fn.Sel.Name] {
+			info.rawDBCalls = append(info.rawDBCalls, fn.Sel.Name)
+		}
+		if target := resolveSelectorTarget(info, fn); target != "" {
+			info.directCalls = append(info.directCalls, target)
+		}
+	}
+}
+
+func resolveSelectorTarget(caller *auditedFuncInfo, sel *ast.SelectorExpr) string {
+	switch recv := sel.X.(type) {
+	case *ast.Ident:
+		if caller.receiverIdent != "" && recv.Name == caller.receiverIdent && caller.receiverType != "" {
+			return caller.receiverType + "." + sel.Sel.Name
+		}
+		if typ := caller.paramTypes[recv.Name]; typ != "" {
+			return typ + "." + sel.Sel.Name
+		}
+	case *ast.SelectorExpr:
+		if id, ok := recv.X.(*ast.Ident); ok && caller.receiverIdent != "" && id.Name == caller.receiverIdent &&
+			caller.receiverType == "CatalogueRepository" && recv.Sel.Name == "guard" {
+			return "guardedCatalogueDB." + sel.Sel.Name
+		}
+	}
+	return ""
+}
+
+func collectParamBaseTypes(fd *ast.FuncDecl) map[string]string {
+	out := make(map[string]string)
+	if fd.Type.Params == nil {
+		return out
+	}
+	for _, field := range fd.Type.Params.List {
+		base := baseTypeName(field.Type)
+		if base == "" {
+			continue
+		}
+		for _, name := range field.Names {
+			out[name.Name] = base
+		}
+	}
+	return out
+}
+
+func baseTypeName(expr ast.Expr) string {
 	for {
 		switch t := expr.(type) {
 		case *ast.StarExpr:
@@ -645,11 +665,220 @@ func receiverTypeName(fd *ast.FuncDecl) string {
 	}
 }
 
+func collectValidPredicateSliceVars(body *ast.BlockStmt) map[string]bool {
+	valid := make(map[string]bool)
+	invalidated := make(map[string]bool)
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		lhsIdent, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		lit, ok := assign.Rhs[0].(*ast.CompositeLit)
+		if !ok || !isPredicateClauseSliceType(lit.Type) {
+			return true
+		}
+		if validatePredicateSliceLiteral(lit) == "" {
+			valid[lhsIdent.Name] = true
+		} else {
+			invalidated[lhsIdent.Name] = true
+		}
+		return true
+	})
+
+	for name := range invalidated {
+		delete(valid, name)
+	}
+	return valid
+}
+
+func validateGuardedQuerySpec(lit *ast.CompositeLit, validPredSlices map[string]bool) string {
+	var predExpr ast.Expr
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			return "unkeyed guardedQuerySpec literal"
+		}
+		if keyIdent, ok := kv.Key.(*ast.Ident); ok && keyIdent.Name == "predicates" {
+			predExpr = kv.Value
+			break
+		}
+	}
+	if predExpr == nil {
+		return "guardedQuerySpec missing predicates"
+	}
+
+	switch val := predExpr.(type) {
+	case *ast.CompositeLit:
+		return validatePredicateSliceLiteral(val)
+	case *ast.Ident:
+		if !validPredSlices[val.Name] {
+			return fmt.Sprintf("predicates variable %q is not initialized with valid predicate clauses", val.Name)
+		}
+		return ""
+	default:
+		return "guardedQuerySpec predicates must be a slice literal or validated variable"
+	}
+}
+
+func validatePredicateSliceLiteral(lit *ast.CompositeLit) string {
+	if len(lit.Elts) == 0 {
+		return "empty predicates slice"
+	}
+	for _, elt := range lit.Elts {
+		if !isValidPredicateClauseExpr(elt) {
+			return "invalid predicateClause element"
+		}
+	}
+	return ""
+}
+
+func isValidPredicateClauseExpr(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		keyIdent, ok := kv.Key.(*ast.Ident)
+		if !ok || keyIdent.Name != "fragmentFn" {
+			continue
+		}
+		if sel, ok := kv.Value.(*ast.SelectorExpr); ok && predicateFragmentMethods[sel.Sel.Name] {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyExportedMethodUsesBoundary(method *auditedFuncInfo, funcs map[string]*auditedFuncInfo) []string {
+	var violations []string
+	if !method.hasCtxAndScope {
+		violations = append(violations, fmt.Sprintf("%s lacks (ctx context.Context, scope storage.CatalogueReadScope) parameters", method.name))
+	}
+
+	reachable := collectReachableFuncs(method.key, funcs)
+	usesLoadPred := false
+	usesGuardedQuery := false
+
+	keys := slices.Collect(maps.Keys(reachable))
+	slices.Sort(keys)
+	for _, k := range keys {
+		f := funcs[k]
+		if f == nil {
+			continue
+		}
+		violations = append(violations, f.auditViolations...)
+		if f.callsLoadPred {
+			usesLoadPred = true
+		}
+		if guardedBoundaryQueries[k] {
+			usesGuardedQuery = true
+		}
+		violations = append(violations, checkRawAccess(f)...)
+	}
+
+	if !usesLoadPred {
+		violations = append(violations, fmt.Sprintf("%s does not load LabelPredicate via loadPredicate", method.name))
+	}
+	if !usesGuardedQuery {
+		violations = append(violations, fmt.Sprintf("%s does not execute queries through guardedCatalogueDB", method.name))
+	}
+	return violations
+}
+
+func checkRawAccess(info *auditedFuncInfo) []string {
+	if info.key == "LoadLabelPredicate" || guardedBoundaryQueries[info.key] {
+		return nil
+	}
+	var violations []string
+	for _, method := range info.rawDBCalls {
+		violations = append(violations,
+			fmt.Sprintf("%s executes raw DB method %s outside guardedCatalogueDB", info.key, method))
+	}
+	if info.callsSQLCNew {
+		violations = append(violations, fmt.Sprintf("%s invokes sqlc New() directly outside LoadLabelPredicate", info.key))
+	}
+	return violations
+}
+
+func collectReachableFuncs(startKey string, funcs map[string]*auditedFuncInfo) map[string]bool {
+	visited := make(map[string]bool)
+	queue := []string{startKey}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		if visited[curr] {
+			continue
+		}
+		visited[curr] = true
+		if curr == "LoadLabelPredicate" || guardedBoundaryQueries[curr] {
+			continue
+		}
+		info := funcs[curr]
+		if info == nil {
+			continue
+		}
+		for _, next := range info.directCalls {
+			if !visited[next] {
+				queue = append(queue, next)
+			}
+		}
+	}
+	return visited
+}
+
+func funcKey(receiverType, name string) string {
+	if receiverType == "" {
+		return name
+	}
+	return receiverType + "." + name
+}
+
+func receiverTypeAndIdent(fd *ast.FuncDecl) (string, string) {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return "", ""
+	}
+	field := fd.Recv.List[0]
+	var identName string
+	if len(field.Names) > 0 {
+		identName = field.Names[0].Name
+	}
+	expr := field.Type
+	for {
+		switch t := expr.(type) {
+		case *ast.StarExpr:
+			expr = t.X
+		case *ast.IndexExpr:
+			expr = t.X
+		case *ast.IndexListExpr:
+			expr = t.X
+		case *ast.Ident:
+			return t.Name, identName
+		default:
+			return "", identName
+		}
+	}
+}
+
 func hasASTCtxAndScopeParams(fd *ast.FuncDecl) bool {
 	if fd.Type.Params == nil {
 		return false
 	}
-	paramTypes := flattenParamTypes(fd.Type.Params)
+	var paramTypes []ast.Expr
+	for _, field := range fd.Type.Params.List {
+		n := max(len(field.Names), 1)
+		for range n {
+			paramTypes = append(paramTypes, field.Type)
+		}
+	}
 	if len(paramTypes) < 2 {
 		return false
 	}
@@ -657,934 +886,66 @@ func hasASTCtxAndScopeParams(fd *ast.FuncDecl) bool {
 		isSelectorType(paramTypes[1], "storage", "CatalogueReadScope")
 }
 
-func flattenParamTypes(params *ast.FieldList) []ast.Expr {
-	if params == nil {
-		return nil
-	}
-	var out []ast.Expr
-	for _, field := range params.List {
-		n := max(len(field.Names), 1)
-		for range n {
-			out = append(out, field.Type)
-		}
-	}
-	return out
-}
-
-func flattenParamNames(params *ast.FieldList) []string {
-	if params == nil {
-		return nil
-	}
-	var out []string
-	for _, field := range params.List {
-		if len(field.Names) == 0 {
-			out = append(out, "")
-			continue
-		}
-		for _, ident := range field.Names {
-			out = append(out, ident.Name)
-		}
-	}
-	return out
-}
-
-func acceptsLabelPredicateParam(fd *ast.FuncDecl) bool {
-	for _, typ := range flattenParamTypes(fd.Type.Params) {
-		if star, ok := typ.(*ast.StarExpr); ok {
-			if ident, ok := star.X.(*ast.Ident); ok && ident.Name == "LabelPredicate" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func isSelectorType(expr ast.Expr, pkg, name string) bool {
 	sel, ok := expr.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
-	ident, ok := sel.X.(*ast.Ident)
-	return ok && ident.Name == pkg && sel.Sel.Name == name
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == pkg && sel.Sel.Name == name
 }
 
-type taintSet map[int]bool
-
-func cloneTaintSet(in taintSet) taintSet {
-	if len(in) == 0 {
-		return nil
-	}
-	return maps.Clone(in)
-}
-
-func unionTaintSets(sets ...taintSet) taintSet {
-	var out taintSet
-	for _, s := range sets {
-		for id := range s {
-			if out == nil {
-				out = make(taintSet)
-			}
-			out[id] = true
-		}
-	}
-	return out
-}
-
-func intersectTaintSets(a, b taintSet) taintSet {
-	if len(a) == 0 || len(b) == 0 {
-		return nil
-	}
-	var out taintSet
-	for id := range a {
-		if b[id] {
-			if out == nil {
-				out = make(taintSet)
-			}
-			out[id] = true
-		}
-	}
-	return out
-}
-
-type funcTaintState struct {
-	info                      *auditedFuncInfo
-	funcs                     map[string]*auditedFuncInfo
-	sqlVars                   map[string]taintSet
-	argsVars                  map[string]taintSet
-	fragVarsSQL               map[string]int
-	fragVarsArgs              map[string]int
-	nextSourceID              int
-	consumedByQuery           map[int]bool
-	isBuilder                 bool
-	isPassthrough             bool
-	nonNilErrs                map[string]bool
-	builderFailed             bool
-	builderSuccessReturns     int
-	passthroughFailed         bool
-	passthroughSuccessReturns int
-	passthroughSigCandidate   *builderReturnSig
-}
-
-func analyzeHelperSignatures(info *auditedFuncInfo) {
-	if info.decl.Type.Results == nil || len(info.decl.Type.Results.List) < 2 {
-		return
-	}
-	if acceptsLabelPredicateParam(info.decl) {
-		return
-	}
-
-	paramNames := flattenParamNames(info.decl.Type.Params)
-	if len(paramNames) < 2 || paramNames[0] == "" || paramNames[1] == "" {
-		return
-	}
-
-	hasDBCall := false
-	ast.Inspect(info.decl.Body, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			target := callTargetName(call.Fun)
-			if dbExecutionMethods[target] || target == "LoadLabelPredicate" || target == "New" {
-				hasDBCall = true
-			}
-		}
-		return true
-	})
-	if hasDBCall {
-		return
-	}
-
-	st := &funcTaintState{
-		info: info,
-		sqlVars: map[string]taintSet{
-			paramNames[0]: {1: true},
-		},
-		argsVars: map[string]taintSet{
-			paramNames[1]: {1: true},
-		},
-		consumedByQuery: make(map[int]bool),
-		isPassthrough:   true,
-		nonNilErrs:      make(map[string]bool),
-	}
-	st.walkBlock(info.decl.Body)
-
-	if st.passthroughFailed || st.passthroughSuccessReturns == 0 || st.passthroughSigCandidate == nil {
-		return
-	}
-	info.passthroughSig = &passthroughSig{
-		sqlRetToParam:  map[int]int{st.passthroughSigCandidate.sqlRetIdx: 0},
-		argsRetToParam: map[int]int{st.passthroughSigCandidate.argsRetIdx: 1},
-	}
-}
-
-func auditFuncBody(info *auditedFuncInfo, funcs map[string]*auditedFuncInfo) {
-	st := &funcTaintState{
-		info:            info,
-		funcs:           funcs,
-		sqlVars:         make(map[string]taintSet),
-		argsVars:        make(map[string]taintSet),
-		fragVarsSQL:     make(map[string]int),
-		fragVarsArgs:    make(map[string]int),
-		consumedByQuery: make(map[int]bool),
-		isBuilder:       acceptsLabelPredicateParam(info.decl) && info.receiverType == "",
-		nonNilErrs:      make(map[string]bool),
-	}
-	st.walkBlock(info.decl.Body)
-
-	if st.isBuilder && (st.builderFailed || st.builderSuccessReturns == 0) {
-		info.builderSig = nil
-	}
-
-	// Verify that every fragment generated directly in a non-builder function was wired into at least one query.
-	if !st.isBuilder {
-		for fragName, srcID := range st.fragVarsSQL {
-			if !st.consumedByQuery[srcID] {
-				info.auditViolations = append(info.auditViolations,
-					fmt.Sprintf("%s creates SQLFragment %q without wiring both .SQL and .Args into a query", info.name, fragName))
-			}
-		}
-	}
-}
-
-func (st *funcTaintState) allocSourceID() int {
-	st.nextSourceID++
-	return st.nextSourceID
-}
-
-func (st *funcTaintState) snapshotVars() (map[string]taintSet, map[string]taintSet) {
-	sqlCopy := make(map[string]taintSet, len(st.sqlVars))
-	for k, v := range st.sqlVars {
-		sqlCopy[k] = cloneTaintSet(v)
-	}
-	argsCopy := make(map[string]taintSet, len(st.argsVars))
-	for k, v := range st.argsVars {
-		argsCopy[k] = cloneTaintSet(v)
-	}
-	return sqlCopy, argsCopy
-}
-
-func (st *funcTaintState) intersectVarMaps(sqlOther, argsOther map[string]taintSet) {
-	for k, s := range st.sqlVars {
-		st.sqlVars[k] = intersectTaintSets(s, sqlOther[k])
-	}
-	for k, s := range st.argsVars {
-		st.argsVars[k] = intersectTaintSets(s, argsOther[k])
-	}
-}
-
-func (st *funcTaintState) walkBlock(block *ast.BlockStmt) {
-	if block == nil {
-		return
-	}
-	for _, stmt := range block.List {
-		st.walkStmt(stmt)
-	}
-}
-
-func (st *funcTaintState) walkStmt(stmt ast.Stmt) {
-	if stmt == nil {
-		return
-	}
-	switch s := stmt.(type) {
-	case *ast.BlockStmt:
-		st.walkBlock(s)
-	case *ast.DeclStmt:
-		st.walkDeclStmt(s)
-	case *ast.AssignStmt:
-		st.walkAssignStmt(s)
-	case *ast.ExprStmt:
-		st.checkBarePredicateCallExpr(s.X)
-		st.scanCallsInExpr(s.X)
-	case *ast.ReturnStmt:
-		st.walkReturnStmt(s)
-	case *ast.IfStmt:
-		st.walkIfStmt(s)
-	case *ast.ForStmt:
-		if s.Init != nil {
-			st.walkStmt(s.Init)
-		}
-		st.scanCallsInExpr(s.Cond)
-		if s.Post != nil {
-			st.walkStmt(s.Post)
-		}
-		st.walkBlock(s.Body)
-	case *ast.RangeStmt:
-		st.scanCallsInExpr(s.X)
-		st.walkBlock(s.Body)
-	case *ast.SwitchStmt:
-		if s.Init != nil {
-			st.walkStmt(s.Init)
-		}
-		st.scanCallsInExpr(s.Tag)
-		st.walkBlock(s.Body)
-	case *ast.CaseClause:
-		for _, e := range s.List {
-			st.scanCallsInExpr(e)
-		}
-		for _, sub := range s.Body {
-			st.walkStmt(sub)
-		}
-	case *ast.DeferStmt:
-		st.scanCallsInExpr(s.Call)
-	case *ast.GoStmt:
-		st.scanCallsInExpr(s.Call)
-	}
-}
-
-func cloneErrMap(in map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(in))
-	maps.Copy(out, in)
-	return out
-}
-
-func (st *funcTaintState) walkIfStmt(s *ast.IfStmt) {
-	if s.Init != nil {
-		st.walkStmt(s.Init)
-	}
-	st.scanCallsInExpr(s.Cond)
-
-	preSQL, preArgs := st.snapshotVars()
-	preErrs := cloneErrMap(st.nonNilErrs)
-
-	thenErrs := cloneErrMap(preErrs)
-	if errVar, ok := condNonNilErrIdent(s.Cond, token.NEQ); ok {
-		thenErrs[errVar] = true
-	}
-	st.nonNilErrs = thenErrs
-	thenTerminates := blockAlwaysReturns(s.Body)
-	st.walkBlock(s.Body)
-	thenSQL, thenArgs := st.snapshotVars()
-
-	if s.Else == nil {
-		st.nonNilErrs = preErrs
-		if thenTerminates {
-			// Early return on `if`: subsequent execution stays on pre-branch state.
-			st.sqlVars, st.argsVars = preSQL, preArgs
-		} else {
-			st.sqlVars, st.argsVars = preSQL, preArgs
-			st.intersectVarMaps(thenSQL, thenArgs)
-		}
-		return
-	}
-
-	st.sqlVars, st.argsVars = preSQL, preArgs
-	elseErrs := cloneErrMap(preErrs)
-	if errVar, ok := condNonNilErrIdent(s.Cond, token.EQL); ok {
-		elseErrs[errVar] = true
-	}
-	st.nonNilErrs = elseErrs
-	elseTerminates := stmtAlwaysReturns(s.Else)
-	st.walkStmt(s.Else)
-	st.nonNilErrs = preErrs
-	if thenTerminates && !elseTerminates {
-		return
-	}
-	if !thenTerminates && elseTerminates {
-		st.sqlVars, st.argsVars = thenSQL, thenArgs
-		return
-	}
-	st.intersectVarMaps(thenSQL, thenArgs)
-}
-
-func condNonNilErrIdent(cond ast.Expr, op token.Token) (string, bool) {
-	bin, ok := cond.(*ast.BinaryExpr)
-	if !ok || bin.Op != op {
-		return "", false
-	}
-	if id, ok := bin.X.(*ast.Ident); ok && isNilIdent(bin.Y) {
-		return id.Name, true
-	}
-	if id, ok := bin.Y.(*ast.Ident); ok && isNilIdent(bin.X) {
-		return id.Name, true
-	}
-	return "", false
-}
-
-func isNilIdent(expr ast.Expr) bool {
-	id, ok := expr.(*ast.Ident)
-	return ok && id.Name == "nil"
-}
-
-func blockAlwaysReturns(b *ast.BlockStmt) bool {
-	if b == nil || len(b.List) == 0 {
-		return false
-	}
-	return stmtAlwaysReturns(b.List[len(b.List)-1])
-}
-
-func stmtAlwaysReturns(stmt ast.Stmt) bool {
-	switch s := stmt.(type) {
-	case *ast.ReturnStmt:
-		return true
-	case *ast.BlockStmt:
-		return blockAlwaysReturns(s)
-	case *ast.IfStmt:
-		return s.Else != nil && blockAlwaysReturns(s.Body) && stmtAlwaysReturns(s.Else)
-	}
-	return false
-}
-
-func (st *funcTaintState) walkDeclStmt(s *ast.DeclStmt) {
-	gen, ok := s.Decl.(*ast.GenDecl)
-	if !ok {
-		return
-	}
-	for _, spec := range gen.Specs {
-		vs, ok := spec.(*ast.ValueSpec)
-		if !ok {
-			continue
-		}
-		for i, name := range vs.Names {
-			delete(st.nonNilErrs, name.Name)
-			if i < len(vs.Values) {
-				st.scanCallsInExpr(vs.Values[i])
-				st.sqlVars[name.Name] = st.evalExprSQL(vs.Values[i])
-				st.argsVars[name.Name] = st.evalExprArgs(vs.Values[i])
-			} else {
-				delete(st.sqlVars, name.Name)
-				delete(st.argsVars, name.Name)
-			}
-		}
-	}
-}
-
-func (st *funcTaintState) walkAssignStmt(assign *ast.AssignStmt) {
-	for _, rhs := range assign.Rhs {
-		st.scanCallsInExpr(rhs)
-	}
-	for _, lhs := range assign.Lhs {
-		if ident, ok := lhs.(*ast.Ident); ok {
-			delete(st.nonNilErrs, ident.Name)
-		}
-	}
-
-	if len(assign.Rhs) == 1 {
-		if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-			if st.handleSpecialAssignCall(assign.Lhs, call) {
-				return
-			}
-		}
-	}
-
-	if len(assign.Rhs) == len(assign.Lhs) {
-		newSQL := make([]taintSet, len(assign.Lhs))
-		newArgs := make([]taintSet, len(assign.Lhs))
-		for i, rhs := range assign.Rhs {
-			newSQL[i] = st.evalExprSQL(rhs)
-			newArgs[i] = st.evalExprArgs(rhs)
-		}
-		for i, lhs := range assign.Lhs {
-			ident, ok := lhs.(*ast.Ident)
-			if !ok || ident.Name == "_" {
-				continue
-			}
-			if assign.Tok == token.ADD_ASSIGN {
-				st.sqlVars[ident.Name] = unionTaintSets(st.sqlVars[ident.Name], newSQL[i])
-				st.argsVars[ident.Name] = unionTaintSets(st.argsVars[ident.Name], newArgs[i])
-			} else {
-				st.sqlVars[ident.Name] = newSQL[i]
-				st.argsVars[ident.Name] = newArgs[i]
-			}
-		}
-		return
-	}
-
-	// Unmatched multi-return call: clear all assigned variables unless matched above.
-	for _, lhs := range assign.Lhs {
-		if ident, ok := lhs.(*ast.Ident); ok {
-			delete(st.sqlVars, ident.Name)
-			delete(st.argsVars, ident.Name)
-		}
-	}
-}
-
-func (st *funcTaintState) handleSpecialAssignCall(lhs []ast.Expr, call *ast.CallExpr) bool {
-	target := callTargetName(call.Fun)
-	if isPredicateOrFragTarget(target) {
-		if len(lhs) < 2 {
-			st.info.auditViolations = append(st.info.auditViolations,
-				fmt.Sprintf("%s does not capture error from %s", st.info.name, target))
-			return true
-		}
-		if errIdent, ok := lhs[len(lhs)-1].(*ast.Ident); ok && errIdent.Name == "_" {
-			st.info.auditViolations = append(st.info.auditViolations,
-				fmt.Sprintf("%s discards error from %s using _", st.info.name, target))
-		}
-		if predicateFragmentMethods[target] || target == "fragmentFn" {
-			fragIdent, ok := lhs[0].(*ast.Ident)
-			if !ok || fragIdent.Name == "_" {
-				st.info.auditViolations = append(st.info.auditViolations,
-					fmt.Sprintf("%s discards SQLFragment from %s using _", st.info.name, target))
-				return true
-			}
-			srcID := st.allocSourceID()
-			st.fragVarsSQL[fragIdent.Name] = srcID
-			st.fragVarsArgs[fragIdent.Name] = srcID
-		}
-		return true
-	}
-
-	callee := st.funcs[funcKey("", target)]
-	if callee == nil {
-		callee = st.funcs[funcKey("CatalogueRepository", target)]
-	}
-	if callee == nil {
-		return false
-	}
-
-	if callee.builderSig != nil {
-		if len(lhs) >= 2 {
-			if errIdent, ok := lhs[len(lhs)-1].(*ast.Ident); ok && errIdent.Name == "_" {
-				st.info.auditViolations = append(st.info.auditViolations,
-					fmt.Sprintf("%s discards error from %s using _", st.info.name, target))
-			}
-		}
-		srcID := st.allocSourceID()
-		for i, expr := range lhs {
-			ident, ok := expr.(*ast.Ident)
-			if !ok || ident.Name == "_" {
-				continue
-			}
-			delete(st.sqlVars, ident.Name)
-			delete(st.argsVars, ident.Name)
-			if i == callee.builderSig.sqlRetIdx {
-				st.sqlVars[ident.Name] = taintSet{srcID: true}
-			}
-			if i == callee.builderSig.argsRetIdx {
-				st.argsVars[ident.Name] = taintSet{srcID: true}
-			}
-		}
-		return true
-	}
-
-	if callee.passthroughSig != nil {
-		sqlOutputs := make(map[int]taintSet)
-		argsOutputs := make(map[int]taintSet)
-		for retIdx, pIdx := range callee.passthroughSig.sqlRetToParam {
-			if pIdx < len(call.Args) {
-				sqlOutputs[retIdx] = st.evalExprSQL(call.Args[pIdx])
-			}
-		}
-		for retIdx, pIdx := range callee.passthroughSig.argsRetToParam {
-			if pIdx < len(call.Args) {
-				argsOutputs[retIdx] = st.evalExprArgs(call.Args[pIdx])
-			}
-		}
-		for i, expr := range lhs {
-			ident, ok := expr.(*ast.Ident)
-			if !ok || ident.Name == "_" {
-				continue
-			}
-			st.sqlVars[ident.Name] = sqlOutputs[i]
-			st.argsVars[ident.Name] = argsOutputs[i]
-		}
-		return true
-	}
-
-	return false
-}
-
-func (st *funcTaintState) walkReturnStmt(ret *ast.ReturnStmt) {
-	for _, expr := range ret.Results {
-		st.scanCallsInExpr(expr)
-	}
-	if st.isPassthrough {
-		st.checkPassthroughReturn(ret.Results)
-		return
-	}
-	if !st.isBuilder {
-		return
-	}
-	if len(ret.Results) < 2 {
-		st.failBuilder("has return without expected (sql, args, err) tuple")
-		return
-	}
-	if isExplicitErrorExpr(ret.Results[len(ret.Results)-1], st.nonNilErrs) {
-		return
-	}
-
-	st.builderSuccessReturns++
-	sqlIdx, argsIdx, shared := st.inspectTupleTaint(ret.Results)
-	if sqlIdx < 0 || argsIdx < 0 || len(shared) == 0 {
-		st.failBuilder("has successful return path without matching SQLFragment SQL and Args")
-		return
-	}
-	if st.builderFailed {
-		return
-	}
-	if st.info.builderSig == nil {
-		st.info.builderSig = &builderReturnSig{
-			sqlRetIdx:  sqlIdx,
-			argsRetIdx: argsIdx,
-			hasErrRet:  true,
-		}
-		return
-	}
-	if st.info.builderSig.sqlRetIdx != sqlIdx || st.info.builderSig.argsRetIdx != argsIdx {
-		st.failBuilder("returns predicate SQL/Args at inconsistent tuple positions across branches")
-	}
-}
-
-func (st *funcTaintState) checkPassthroughReturn(results []ast.Expr) {
-	if len(results) < 2 {
-		st.passthroughFailed = true
-		return
-	}
-	if isExplicitErrorExpr(results[len(results)-1], st.nonNilErrs) {
-		return
-	}
-	st.passthroughSuccessReturns++
-	sqlIdx, argsIdx, shared := st.inspectTupleTaint(results)
-	if sqlIdx < 0 || argsIdx < 0 || len(shared) == 0 {
-		st.passthroughFailed = true
-		return
-	}
-	if st.passthroughSigCandidate == nil {
-		st.passthroughSigCandidate = &builderReturnSig{
-			sqlRetIdx:  sqlIdx,
-			argsRetIdx: argsIdx,
-			hasErrRet:  true,
-		}
-		return
-	}
-	if st.passthroughSigCandidate.sqlRetIdx != sqlIdx || st.passthroughSigCandidate.argsRetIdx != argsIdx {
-		st.passthroughFailed = true
-	}
-}
-
-func (st *funcTaintState) failBuilder(reason string) {
-	st.builderFailed = true
-	st.info.builderSig = nil
-	st.info.auditViolations = append(st.info.auditViolations, st.info.name+" "+reason)
-}
-
-func isExplicitErrorExpr(errExpr ast.Expr, nonNilErrs map[string]bool) bool {
-	if errExpr == nil || isNilIdent(errExpr) {
-		return false
-	}
-	if ident, ok := errExpr.(*ast.Ident); ok {
-		return nonNilErrs[ident.Name]
-	}
-	call, ok := errExpr.(*ast.CallExpr)
+func isLoadPredicateCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
 	}
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	pkg, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	return (pkg.Name == "fmt" && sel.Sel.Name == "Errorf") ||
-		(pkg.Name == "errors" && sel.Sel.Name == "New")
+	return ok && sel.Sel.Name == "loadPredicate"
 }
 
-func (st *funcTaintState) inspectTupleTaint(results []ast.Expr) (int, int, taintSet) {
-	sqlIdx, argsIdx := -1, -1
-	var sqlTaint, argsTaint taintSet
-	for i := range len(results) - 1 {
-		s := st.evalExprSQL(results[i])
-		a := st.evalExprArgs(results[i])
-		if len(s) > 0 {
-			if sqlIdx >= 0 {
-				return -1, -1, nil
-			}
-			sqlIdx = i
-			sqlTaint = s
-		}
-		if len(a) > 0 {
-			if argsIdx >= 0 {
-				return -1, -1, nil
-			}
-			argsIdx = i
-			argsTaint = a
-		}
-	}
-	return sqlIdx, argsIdx, intersectTaintSets(sqlTaint, argsTaint)
-}
-
-func (st *funcTaintState) checkBarePredicateCallExpr(expr ast.Expr) {
+func isCallToSelector(expr ast.Expr, name string) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
-		return
+		return false
 	}
-	if name := callTargetName(call.Fun); isPredicateOrFragTarget(name) {
-		st.info.auditViolations = append(st.info.auditViolations,
-			fmt.Sprintf("%s ignores return values of %s", st.info.name, name))
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		return fn.Sel.Name == name
+	case *ast.Ident:
+		return fn.Name == name
+	default:
+		return false
 	}
 }
 
-func (st *funcTaintState) scanCallsInExpr(expr ast.Expr) {
-	if expr == nil {
-		return
-	}
+func hasLenCallOn(expr ast.Expr, root, field string) bool {
+	found := false
 	ast.Inspect(expr, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok {
+		if !ok || !isIdentNamed(call.Fun, "len") || len(call.Args) != 1 {
 			return true
 		}
-		st.recordCall(call)
+		sel, ok := call.Args[0].(*ast.SelectorExpr)
+		if ok && isIdentNamed(sel.X, root) && sel.Sel.Name == field {
+			found = true
+			return false
+		}
 		return true
 	})
+	return found
 }
 
-func (st *funcTaintState) recordCall(call *ast.CallExpr) {
-	recordName := func(target string) {
-		if target == "" {
-			return
-		}
-		if target == "LoadLabelPredicate" {
-			st.info.callsLoadPred = true
-		}
-		if predicateFragmentMethods[target] {
-			st.info.fragmentCalls = append(st.info.fragmentCalls, target)
-		}
-		if target == "Query" || target == "QueryRow" {
-			st.info.callsDBQuery = true
-		}
-		st.info.directCalls = append(st.info.directCalls, target)
-	}
-
-	target := callTargetName(call.Fun)
-	recordName(target)
-	for _, arg := range call.Args {
-		if argTarget := exprTargetName(arg); argTarget != "" {
-			recordName(argTarget)
-		}
-	}
-
-	if target == "New" {
-		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "New" {
-			st.info.callsSQLCNew = true
-			st.info.auditViolations = append(st.info.auditViolations,
-				fmt.Sprintf("%s invokes sqlc New() directly instead of predicate-enforced queries", st.info.name))
-		}
-	}
-
-	if dbExecutionMethods[target] {
-		st.verifyDBCallSite(target, call)
-	}
+func isPredicateClauseSliceType(expr ast.Expr) bool {
+	arr, ok := expr.(*ast.ArrayType)
+	return ok && arr.Len == nil && isIdentNamed(arr.Elt, "predicateClause")
 }
 
-func (st *funcTaintState) verifyDBCallSite(target string, call *ast.CallExpr) {
-	// Skip LoadLabelPredicate itself; it loads user_label_policies as the predicate source.
-	if st.info.name == "LoadLabelPredicate" && st.info.receiverType == "" {
-		return
-	}
-	if target != "Query" && target != "QueryRow" {
-		st.info.auditViolations = append(st.info.auditViolations,
-			fmt.Sprintf("%s executes non-read DB call %s", st.info.name, target))
-		return
-	}
-	if len(call.Args) < 2 {
-		st.info.auditViolations = append(st.info.auditViolations,
-			fmt.Sprintf("%s executes malformed %s call", st.info.name, target))
-		return
-	}
-
-	sqlSources := st.evalExprSQL(call.Args[1])
-	var argSets []taintSet
-	for _, argExpr := range call.Args[2:] {
-		argSets = append(argSets, st.evalExprArgs(argExpr))
-	}
-	argsSources := unionTaintSets(argSets...)
-	shared := intersectTaintSets(sqlSources, argsSources)
-	if len(shared) == 0 {
-		st.info.auditViolations = append(st.info.auditViolations,
-			fmt.Sprintf("%s executes unguarded %s without matching predicate SQLFragment SQL and Args", st.info.name, target))
-		return
-	}
-	for id := range shared {
-		st.consumedByQuery[id] = true
-	}
+func isIdentNamed(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == name
 }
 
-func (st *funcTaintState) evalExprSQL(expr ast.Expr) taintSet {
-	if expr == nil {
-		return nil
-	}
-	switch e := expr.(type) {
-	case *ast.Ident:
-		return st.sqlVars[e.Name]
-	case *ast.ParenExpr:
-		return st.evalExprSQL(e.X)
-	case *ast.BinaryExpr:
-		return unionTaintSets(st.evalExprSQL(e.X), st.evalExprSQL(e.Y))
-	case *ast.SelectorExpr:
-		if ident, ok := e.X.(*ast.Ident); ok && e.Sel.Name == "SQL" {
-			if id, exists := st.fragVarsSQL[ident.Name]; exists {
-				return taintSet{id: true}
-			}
-		}
-		return nil
-	case *ast.CallExpr:
-		if isAllowedSQLCombineCall(e.Fun) {
-			sets := make([]taintSet, 0, len(e.Args))
-			for _, a := range e.Args {
-				sets = append(sets, st.evalExprSQL(a))
-			}
-			return unionTaintSets(sets...)
-		}
-		return nil
-	case *ast.CompositeLit:
-		sets := make([]taintSet, 0, len(e.Elts))
-		for _, elt := range e.Elts {
-			sets = append(sets, st.evalExprSQL(elt))
-		}
-		return unionTaintSets(sets...)
-	case *ast.SliceExpr:
-		return st.evalExprSQL(e.X)
-	}
-	return nil
-}
-
-func (st *funcTaintState) evalExprArgs(expr ast.Expr) taintSet {
-	if expr == nil {
-		return nil
-	}
-	switch e := expr.(type) {
-	case *ast.Ident:
-		return st.argsVars[e.Name]
-	case *ast.ParenExpr:
-		return st.evalExprArgs(e.X)
-	case *ast.SelectorExpr:
-		if ident, ok := e.X.(*ast.Ident); ok && e.Sel.Name == "Args" {
-			if id, exists := st.fragVarsArgs[ident.Name]; exists {
-				return taintSet{id: true}
-			}
-		}
-		return nil
-	case *ast.CallExpr:
-		if ident, ok := e.Fun.(*ast.Ident); ok && ident.Name == "append" {
-			sets := make([]taintSet, 0, len(e.Args))
-			for _, a := range e.Args {
-				sets = append(sets, st.evalExprArgs(a))
-			}
-			return unionTaintSets(sets...)
-		}
-		return nil
-	case *ast.CompositeLit:
-		sets := make([]taintSet, 0, len(e.Elts))
-		for _, elt := range e.Elts {
-			sets = append(sets, st.evalExprArgs(elt))
-		}
-		return unionTaintSets(sets...)
-	case *ast.SliceExpr:
-		return st.evalExprArgs(e.X)
-	}
-	return nil
-}
-
-func isAllowedSQLCombineCall(fun ast.Expr) bool {
-	if ident, ok := fun.(*ast.Ident); ok && ident.Name == "append" {
-		return true
-	}
-	sel, ok := fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	pkg, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	return (pkg.Name == "fmt" && sel.Sel.Name == "Sprintf") ||
-		(pkg.Name == "strings" && sel.Sel.Name == "Join")
-}
-
-func isPredicateOrFragTarget(name string) bool {
-	return name == "LoadLabelPredicate" || name == "loadPredicate" || name == "fragmentFn" || predicateFragmentMethods[name]
-}
-
-func callTargetName(fun ast.Expr) string {
-	switch e := fun.(type) {
-	case *ast.Ident:
-		return e.Name
-	case *ast.SelectorExpr:
-		return e.Sel.Name
-	case *ast.IndexExpr:
-		return callTargetName(e.X)
-	case *ast.IndexListExpr:
-		return callTargetName(e.X)
-	default:
-		return ""
-	}
-}
-
-func exprTargetName(expr ast.Expr) string {
-	switch e := expr.(type) {
-	case *ast.Ident:
-		return e.Name
-	case *ast.SelectorExpr:
-		return e.Sel.Name
-	default:
-		return ""
-	}
-}
-
-func verifyExportedMethodPredicate(methodName string, funcs map[string]*auditedFuncInfo) []string {
-	root := funcs[funcKey("CatalogueRepository", methodName)]
-	if root == nil {
-		return []string{fmt.Sprintf("method %s not found", methodName)}
-	}
-	var violations []string
-	if !root.hasCtxAndScope {
-		violations = append(violations, fmt.Sprintf("%s must take (context.Context, storage.CatalogueReadScope) as its first two parameters", methodName))
-	}
-
-	visited := make(map[string]bool)
-	queue := []string{funcKey("CatalogueRepository", methodName)}
-	sawLoadPred := false
-	sawFragment := false
-	sawDBQuery := false
-
-	for len(queue) > 0 {
-		currKey := queue[0]
-		queue = queue[1:]
-		if visited[currKey] {
-			continue
-		}
-		visited[currKey] = true
-
-		info := funcs[currKey]
-		if info == nil {
-			continue
-		}
-		if info.callsLoadPred {
-			sawLoadPred = true
-		}
-		if len(info.fragmentCalls) > 0 {
-			sawFragment = true
-		}
-		if info.callsDBQuery {
-			sawDBQuery = true
-		}
-		// Only record per-function violations if this is not LoadLabelPredicate itself.
-		if info.key != "LoadLabelPredicate" {
-			violations = append(violations, info.auditViolations...)
-		}
-
-		for _, callee := range info.directCalls {
-			if callee == "LoadLabelPredicate" {
-				// LoadLabelPredicate is verified separately by TestLabelPredicate_*; don't walk into sqlc New().
-				continue
-			}
-			if repoKey := funcKey("CatalogueRepository", callee); funcs[repoKey] != nil && !visited[repoKey] {
-				queue = append(queue, repoKey)
-			}
-			if pkgKey := funcKey("", callee); funcs[pkgKey] != nil && !visited[pkgKey] {
-				queue = append(queue, pkgKey)
-			}
-		}
-	}
-
-	if !sawLoadPred {
-		violations = append(violations, fmt.Sprintf("%s does not transitively call LoadLabelPredicate", methodName))
-	}
-	if !sawFragment {
-		violations = append(violations, fmt.Sprintf("%s does not transitively call any LabelPredicate fragment builder", methodName))
-	}
-	if !sawDBQuery {
-		violations = append(violations, fmt.Sprintf("%s does not transitively execute a database query", methodName))
-	}
-	return violations
+func isBlankIdent(expr ast.Expr) bool {
+	return isIdentNamed(expr, "_")
 }
