@@ -667,3 +667,36 @@ func TestBuiltInLabelDefinitions(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveLabelPolicy_LabelIDSlices(t *testing.T) {
+	var nilPolicy *domain.EffectiveLabelPolicy
+	if got := nilPolicy.AllowLabelIDs(); len(got) != 0 {
+		t.Errorf("nil AllowLabelIDs() = %v, want empty", got)
+	}
+	if got := nilPolicy.RestrictLabelIDs(); len(got) != 0 {
+		t.Errorf("nil RestrictLabelIDs() = %v, want empty", got)
+	}
+
+	policy := domain.NewEffectiveLabelPolicy(
+		[]domain.UserLabelPolicy{
+			{UserID: "u1", LabelID: "lbl_z", Effect: domain.PolicyEffectAllow},
+			{UserID: "u1", LabelID: "lbl_a", Effect: domain.PolicyEffectAllow},
+			{UserID: "u1", LabelID: "lbl_conflict", Effect: domain.PolicyEffectAllow},
+		},
+		[]domain.GroupLabelPolicy{
+			{GroupClaim: "g1", LabelID: "lbl_conflict", Effect: domain.PolicyEffectRestrict},
+			{GroupClaim: "g1", LabelID: "lbl_b", Effect: domain.PolicyEffectRestrict},
+		},
+		false,
+	)
+
+	wantAllow := []string{"lbl_a", "lbl_z"}
+	if got := policy.AllowLabelIDs(); !slices.Equal(got, wantAllow) {
+		t.Errorf("AllowLabelIDs() = %v, want %v", got, wantAllow)
+	}
+
+	wantRestrict := []string{"lbl_b", "lbl_conflict"}
+	if got := policy.RestrictLabelIDs(); !slices.Equal(got, wantRestrict) {
+		t.Errorf("RestrictLabelIDs() = %v, want %v", got, wantRestrict)
+	}
+}

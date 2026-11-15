@@ -270,6 +270,32 @@ func (p *EffectiveLabelPolicy) RestrictCount() int {
 	return len(p.restrictLabels)
 }
 
+// AllowLabelIDs returns the sorted slice of SERVER label IDs in the effective ALLOW set.
+func (p *EffectiveLabelPolicy) AllowLabelIDs() []string {
+	if p == nil || len(p.allowLabels) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(p.allowLabels))
+	for id := range p.allowLabels {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// RestrictLabelIDs returns the sorted slice of SERVER label IDs in the effective RESTRICT set.
+func (p *EffectiveLabelPolicy) RestrictLabelIDs() []string {
+	if p == nil || len(p.restrictLabels) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(p.restrictLabels))
+	for id := range p.restrictLabels {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 // HasAllowLabels reports whether there are any ALLOW policy rows.
 func (p *EffectiveLabelPolicy) HasAllowLabels() bool {
 	return len(p.allowLabels) > 0
