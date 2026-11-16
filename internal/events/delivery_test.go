@@ -1601,3 +1601,153 @@ func TestDelivery_CreatorDeletionDuringRunningJobAndRetainedExecutionStop(t *tes
 		t.Fatalf("total domain_events = %d, want 2 (no progress rows)", totalCount)
 	}
 }
+
+type blockingProgressLookupRepo struct {
+	storage.JobRepository
+	targetID      string
+	lookupEntered chan context.Context
+	releaseLookup <-chan struct{}
+	once          sync.Once
+}
+
+func (r *blockingProgressLookupRepo) GetJobByID(ctx context.Context, id string) (*domain.Job, error) {
+	if id == r.targetID {
+		var intercepted bool
+		r.once.Do(func() {
+			intercepted = true
+			r.lookupEntered <- ctx
+		})
+		if intercepted {
+			<-r.releaseLookup
+		}
+	}
+	return r.JobRepository.GetJobByID(ctx, id)
+}
+
+func TestDelivery_BlockedProgressLookupAtCompletionLeavesRateLimitCleared(t *testing.T) {
+	t.Parallel()
+	db, _, _, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 11, 16, 19, 32, 0, 0, time.UTC)
+	adminPrincipal := testPrincipalWithPerms("admin-reader", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
+
+	hub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: 100 * time.Millisecond,
+		Now:         func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+
+	chAdmin, unsubAdmin, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: adminPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe admin: %v", err)
+	}
+	defer unsubAdmin()
+
+	scanJob := &domain.Job{
+		Kind:      domain.JobKindScan,
+		CreatedAt: now,
+		RunAfter:  now,
+	}
+	if _, err := jobRepo.Enqueue(ctx, scanJob); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	lookupEntered := make(chan context.Context, 1)
+	releaseLookup := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseLookup:
+		default:
+			close(releaseLookup)
+		}
+	}()
+
+	wrappedRepo := &blockingProgressLookupRepo{
+		JobRepository: jobRepo,
+		targetID:      scanJob.ID,
+		lookupEntered: lookupEntered,
+		releaseLookup: releaseLookup,
+	}
+	runner := jobs.NewRunner(wrappedRepo, jobs.RunnerOptions{
+		Now:         func() time.Time { return now },
+		ProgressHub: hub,
+	})
+
+	reportDone := make(chan bool, 1)
+	var lookupCtx context.Context
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeCheckpoint,
+		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+			go func() {
+				reportDone <- exec.ReportProgress(context.Background(), 42, "/blocked.cbz")
+			}()
+			lookupCtx = <-lookupEntered
+			return nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	claimDone := make(chan error, 1)
+	go func() {
+		claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan)
+		if err == nil && !claimed {
+			err = errors.New("expected scanJob to be claimed")
+		}
+		claimDone <- err
+	}()
+
+	select {
+	case err := <-claimDone:
+		if err != nil {
+			t.Fatalf("ClaimAndRunNext: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ClaimAndRunNext blocked on in-flight ReportProgress lookup")
+	}
+
+	select {
+	case <-lookupCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected lookup context to cancel on handler return")
+	}
+	if hub.HasRateLimitState(scanJob.ID) {
+		t.Fatal("expected ProgressHub rate-limit state cleared after completion")
+	}
+
+	close(releaseLookup)
+	select {
+	case published := <-reportDone:
+		if published {
+			t.Fatal("expected stale ReportProgress result after completion to be suppressed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for released ReportProgress")
+	}
+
+	if hub.HasRateLimitState(scanJob.ID) {
+		t.Fatal("stale ReportProgress result recreated ProgressHub rate-limit state")
+	}
+	select {
+	case unexpected := <-chAdmin:
+		t.Fatalf("admin received late tick from stale lookup: %+v", unexpected)
+	default:
+	}
+
+	var totalCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events`).Scan(&totalCount); err != nil {
+		t.Fatalf("counting domain_events: %v", err)
+	}
+	if totalCount != 2 {
+		t.Fatalf("total domain_events = %d, want 2 (no progress rows)", totalCount)
+	}
+}

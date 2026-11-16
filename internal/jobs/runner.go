@@ -130,6 +130,7 @@ type Execution struct {
 	repo       storage.JobRepository
 	now        func() time.Time
 	startedAt  time.Time
+	execCtx    context.Context
 	progressMu sync.RWMutex
 	progress   ProgressPublisher
 	closed     bool
@@ -206,6 +207,18 @@ func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
 	return e.repo.IsCancelRequested(ctx, jobID)
 }
 
+func mergeExecutionContext(execCtx, callerCtx context.Context) (context.Context, context.CancelFunc) {
+	if execCtx == nil {
+		return callerCtx, func() {}
+	}
+	mergedCtx, cancel := context.WithCancel(callerCtx)
+	stop := context.AfterFunc(execCtx, cancel)
+	return mergedCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
 // ReportProgress publishes an ephemeral, rate-limited progress tick for this job
 // without persisting any outbox row or SSE ID (ADR-0017 §2, ADR-0018 S3).
 // It resolves current job ownership from persistence (failing closed on error or
@@ -217,9 +230,16 @@ func (e *Execution) ReportProgress(ctx context.Context, scannedCount int64, curr
 	}
 
 	e.progressMu.RLock()
-	defer e.progressMu.RUnlock()
+	closed := e.closed
+	progress := e.progress
+	repo := e.repo
+	execCtx := e.execCtx
+	e.progressMu.RUnlock()
 
-	if e.closed || e.progress == nil || e.repo == nil {
+	if closed || progress == nil || repo == nil {
+		return false
+	}
+	if execCtx != nil && execCtx.Err() != nil {
 		return false
 	}
 
@@ -233,11 +253,14 @@ func (e *Execution) ReportProgress(ctx context.Context, scannedCount int64, curr
 	if kind.IsInternal() {
 		return false
 	}
-	if preflight, ok := e.progress.(progressPreflighter); ok && !preflight.CanPublish(jobID) {
+	if preflight, ok := progress.(progressPreflighter); ok && !preflight.CanPublish(jobID) {
 		return false
 	}
 
-	current, err := e.repo.GetJobByID(ctx, jobID)
+	lookupCtx, cancelLookup := mergeExecutionContext(execCtx, ctx)
+	defer cancelLookup()
+
+	current, err := repo.GetJobByID(lookupCtx, jobID)
 	if err != nil || current == nil {
 		return false
 	}
@@ -256,6 +279,12 @@ func (e *Execution) ReportProgress(ctx context.Context, scannedCount int64, curr
 	if current.CreatedBy != nil {
 		v := *current.CreatedBy
 		createdBy = &v
+	}
+
+	e.progressMu.RLock()
+	defer e.progressMu.RUnlock()
+	if e.closed || e.progress == nil || lookupCtx.Err() != nil {
+		return false
 	}
 
 	return e.progress.Publish(domain.JobProgressTick{
@@ -764,6 +793,7 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 		repo:      r.repo,
 		now:       r.now,
 		startedAt: startedAt,
+		execCtx:   execCtx,
 		progress:  r.progress,
 	}
 	var cleanupOnce sync.Once

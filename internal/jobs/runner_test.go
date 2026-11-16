@@ -1044,3 +1044,237 @@ func TestRunner_LifecycleOutboxRetryAndExecutionProgress(t *testing.T) {
 		t.Fatalf("cleared progress jobs = %v, want [%s]", cleared, j.ID)
 	}
 }
+
+type blockingLookupJobRepo struct {
+	storage.JobRepository
+	targetID      string
+	lookupEntered chan context.Context
+	releaseLookup <-chan struct{}
+	once          sync.Once
+}
+
+func (r *blockingLookupJobRepo) GetJobByID(ctx context.Context, id string) (*domain.Job, error) {
+	if id == r.targetID {
+		var intercepted bool
+		r.once.Do(func() {
+			intercepted = true
+			r.lookupEntered <- ctx
+		})
+		if intercepted {
+			<-r.releaseLookup
+		}
+	}
+	return r.JobRepository.GetJobByID(ctx, id)
+}
+
+func TestRunner_BlockedProgressLookupDoesNotBlockCompletionOrShutdown(t *testing.T) {
+	t.Parallel()
+
+	t.Run("handler completion cancels lookup context and ignores late result", func(t *testing.T) {
+		t.Parallel()
+		_, baseRepo := setupRunnerTestDB(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		now := time.Date(2026, 11, 16, 19, 30, 0, 0, time.UTC)
+		j := &domain.Job{Kind: domain.JobKindScan, CreatedAt: now, RunAfter: now}
+		if _, err := baseRepo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		lookupEntered := make(chan context.Context, 1)
+		releaseLookup := make(chan struct{})
+		defer func() {
+			select {
+			case <-releaseLookup:
+			default:
+				close(releaseLookup)
+			}
+		}()
+
+		wrapped := &blockingLookupJobRepo{
+			JobRepository: baseRepo,
+			targetID:      j.ID,
+			lookupEntered: lookupEntered,
+			releaseLookup: releaseLookup,
+		}
+		pub := &spyProgressPublisher{}
+		runner := jobs.NewRunner(wrapped, jobs.RunnerOptions{
+			Now:         func() time.Time { return now },
+			ProgressHub: pub,
+		})
+
+		reportDone := make(chan bool, 1)
+		var capturedLookupCtx context.Context
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindScan,
+			ResumePolicy: domain.JobResumeCheckpoint,
+			Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+				go func() {
+					// Independent context that would never cancel on its own.
+					reportDone <- exec.ReportProgress(context.Background(), 5, "/slow.cbz")
+				}()
+				capturedLookupCtx = <-lookupEntered
+				return nil
+			}),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+
+		claimDone := make(chan error, 1)
+		go func() {
+			claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan)
+			if err == nil && !claimed {
+				err = errors.New("expected job to be claimed")
+			}
+			claimDone <- err
+		}()
+
+		select {
+		case err := <-claimDone:
+			if err != nil {
+				t.Fatalf("ClaimAndRunNext failed: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ClaimAndRunNext blocked waiting on hung ReportProgress lookup")
+		}
+
+		// Lookup context must have been cancelled when the handler ended despite independent caller ctx.
+		select {
+		case <-capturedLookupCtx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("expected lookup context to be cancelled when handler completed")
+		}
+
+		// Releasing the blocked lookup after completion must return false and publish nothing.
+		close(releaseLookup)
+		select {
+		case published := <-reportDone:
+			if published {
+				t.Fatal("expected late ReportProgress result after completion to be suppressed")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for released ReportProgress goroutine")
+		}
+
+		got, err := baseRepo.GetJobByID(ctx, j.ID)
+		if err != nil || got.State != domain.JobStateSucceeded {
+			t.Fatalf("job = (%+v, %v), want SUCCEEDED", got, err)
+		}
+		pub.mu.Lock()
+		tickCount := len(pub.ticks)
+		clearCount := len(pub.cleared)
+		pub.mu.Unlock()
+		if tickCount != 0 || clearCount != 1 {
+			t.Fatalf("ticks=%d cleared=%d, want ticks=0 cleared=1", tickCount, clearCount)
+		}
+	})
+
+	t.Run("worker pool shutdown joins cleanly while independent lookup is blocked", func(t *testing.T) {
+		t.Parallel()
+		_, baseRepo := setupRunnerTestDB(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		now := time.Date(2026, 11, 16, 19, 31, 0, 0, time.UTC)
+		j := &domain.Job{Kind: domain.JobKindScan, CreatedAt: now, RunAfter: now}
+		if _, err := baseRepo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		lookupEntered := make(chan context.Context, 1)
+		releaseLookup := make(chan struct{})
+		defer func() {
+			select {
+			case <-releaseLookup:
+			default:
+				close(releaseLookup)
+			}
+		}()
+
+		wrapped := &blockingLookupJobRepo{
+			JobRepository: baseRepo,
+			targetID:      j.ID,
+			lookupEntered: lookupEntered,
+			releaseLookup: releaseLookup,
+		}
+		pub := &spyProgressPublisher{}
+		runner := jobs.NewRunner(wrapped, jobs.RunnerOptions{
+			Now:             func() time.Time { return now },
+			DefaultPoolSize: 1,
+			PollInterval:    20 * time.Millisecond,
+			ProgressHub:     pub,
+		})
+
+		reportDone := make(chan bool, 1)
+		lookupReady := make(chan context.Context, 1)
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindScan,
+			ResumePolicy: domain.JobResumeCheckpoint,
+			Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
+				go func() {
+					reportDone <- exec.ReportProgress(context.Background(), 7, "/shutdown.cbz")
+				}()
+				lookupReady <- <-lookupEntered
+				<-execCtx.Done()
+				return execCtx.Err()
+			}),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if err := runner.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		var capturedLookupCtx context.Context
+		select {
+		case capturedLookupCtx = <-lookupReady:
+		case <-time.After(5 * time.Second):
+			runner.Stop()
+			t.Fatal("timed out waiting for ReportProgress lookup to start")
+		}
+
+		stopDone := make(chan struct{})
+		go func() {
+			runner.Stop()
+			close(stopDone)
+		}()
+
+		select {
+		case <-stopDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("runner.Stop blocked waiting on hung ReportProgress lookup")
+		}
+
+		select {
+		case <-capturedLookupCtx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("expected lookup context to be cancelled on shutdown")
+		}
+
+		close(releaseLookup)
+		select {
+		case published := <-reportDone:
+			if published {
+				t.Fatal("expected late ReportProgress result after shutdown to be suppressed")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for released ReportProgress goroutine")
+		}
+
+		pub.mu.Lock()
+		tickCount := len(pub.ticks)
+		pub.mu.Unlock()
+		if tickCount != 0 {
+			t.Fatalf("expected 0 published ticks after shutdown, got %d", tickCount)
+		}
+	})
+}
