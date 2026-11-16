@@ -34,6 +34,10 @@ var (
 	// ErrTransactionRequired is returned when an operation that requires an active
 	// caller transaction (such as outbox append) is called on a non-transactional handle.
 	ErrTransactionRequired = errors.New("active caller transaction required")
+
+	// ErrRootRepositoryRequired is returned when an operation that must own its own
+	// transaction (such as outbox publication sequencing) is called on a transaction-bound handle.
+	ErrRootRepositoryRequired = errors.New("non-transactional root repository required")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.

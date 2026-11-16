@@ -120,10 +120,15 @@ func (r *EventRepository) GetEventByID(ctx context.Context, id int64) (*domain.D
 // PublishUnsequencedEvents selects all committed domain_events rows where
 // published_sequence IS NULL regardless of raw id, assigns contiguous monotonic
 // published_sequence values and published_at in ascending order, and updates the
-// publication sequence watermark.
+// publication sequence watermark inside its own serialized transaction.
+// Transaction-bound repositories (InTx() == true) reject this call with
+// storage.ErrRootRepositoryRequired.
 func (r *EventRepository) PublishUnsequencedEvents(ctx context.Context, publishedAt time.Time) ([]domain.DomainEvent, error) {
 	if r == nil {
 		return nil, errors.New("event repository is required")
+	}
+	if r.InTx() {
+		return nil, storage.ErrRootRepositoryRequired
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -136,19 +141,23 @@ func (r *EventRepository) PublishUnsequencedEvents(ctx context.Context, publishe
 		ts = ts.UTC()
 	}
 
-	if !r.InTx() {
-		var published []domain.DomainEvent
-		err := r.WithTx(ctx, func(txRepo storage.EventRepository) error {
-			var err error
-			published, err = txRepo.PublishUnsequencedEvents(ctx, ts)
-			return err
-		})
-		if err != nil {
-			return nil, err
+	var published []domain.DomainEvent
+	err := r.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		pgTxRepo, ok := txRepo.(*EventRepository)
+		if !ok {
+			return errors.New("unexpected event repository implementation inside transaction")
 		}
-		return published, nil
+		var err error
+		published, err = pgTxRepo.publishUnsequencedInTx(ctx, ts)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
+	return published, nil
+}
 
+func (r *EventRepository) publishUnsequencedInTx(ctx context.Context, ts time.Time) ([]domain.DomainEvent, error) {
 	lastSeq, err := r.q.LockDomainEventSequence(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("locking domain_event_sequence: %w", err)

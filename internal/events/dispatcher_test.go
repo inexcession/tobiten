@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,7 +109,8 @@ func TestDispatcher_LowerRawIDCommittedLaterGetsLaterSequence(t *testing.T) {
 	}
 	defer func() { _ = txLow.Rollback(context.Background()) }()
 
-	evLow, err := outbox.AppendPayload(ctx, postgres.NewEventRepository(txLow),
+	txLowRepo := postgres.NewEventRepository(txLow)
+	evLow, err := outbox.AppendPayload(ctx, txLowRepo,
 		domain.EventJobStarted, domain.EventVersion1, domain.AggregateTypeJob, "job-lower-raw-id",
 		domain.JobEventPayloadV1{
 			JobID:    "job-lower-raw-id",
@@ -118,6 +120,22 @@ func TestDispatcher_LowerRawIDCommittedLaterGetsLaterSequence(t *testing.T) {
 		})
 	if err != nil {
 		t.Fatalf("append evLow: %v", err)
+	}
+
+	// Reject transaction-bound publication through both the repository and Dispatcher,
+	// and verify from inside the producer transaction that evLow stays unpublished.
+	if _, err := txLowRepo.PublishUnsequencedEvents(ctx, time.Now().UTC()); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+		t.Fatalf("expected ErrRootRepositoryRequired on txLowRepo.PublishUnsequencedEvents, got %v", err)
+	}
+	if _, err := events.NewDispatcher(txLowRepo).DispatchOnce(ctx); !errors.Is(err, events.ErrDispatcherRequiresRootPublisher) {
+		t.Fatalf("expected ErrDispatcherRequiresRootPublisher on txLowRepo dispatcher, got %v", err)
+	}
+	inTxLow, err := txLowRepo.GetEventByID(ctx, evLow.ID)
+	if err != nil {
+		t.Fatalf("GetEventByID inside txLow after rejected publish: %v", err)
+	}
+	if inTxLow.IsPublished() {
+		t.Fatalf("expected evLow inside txLow to stay unpublished after rejection, got %+v", inTxLow)
 	}
 
 	// Connection 2 inserts a higher raw ID and commits first.
@@ -363,6 +381,7 @@ type blockingCommitBeginner struct {
 	mu           sync.Mutex
 	calls        int
 	firstEntered chan struct{}
+	enterOnce    sync.Once
 	releaseFirst chan struct{}
 }
 
@@ -380,6 +399,7 @@ func (b *blockingCommitBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 		Tx:           tx,
 		callNum:      callNum,
 		firstEntered: b.firstEntered,
+		enterOnce:    &b.enterOnce,
 		releaseFirst: b.releaseFirst,
 	}, nil
 }
@@ -388,20 +408,109 @@ type blockingCommitTx struct {
 	pgx.Tx
 	callNum      int
 	firstEntered chan struct{}
+	enterOnce    *sync.Once
 	releaseFirst chan struct{}
 }
 
 func (t *blockingCommitTx) Commit(ctx context.Context) error {
 	if t.callNum == 1 {
-		close(t.firstEntered)
-		<-t.releaseFirst
+		t.enterOnce.Do(func() { close(t.firstEntered) })
+		select {
+		case <-t.releaseFirst:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return t.Tx.Commit(ctx)
 }
 
+type lockAttemptDB struct {
+	*testdb.TestDB
+	lockAttempted chan struct{}
+	attemptOnce   sync.Once
+}
+
+func (d *lockAttemptDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.TestDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &lockAttemptTx{Tx: tx, db: d}, nil
+}
+
+type lockAttemptTx struct {
+	pgx.Tx
+	db *lockAttemptDB
+}
+
+func (t *lockAttemptTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	sp, err := t.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &lockAttemptTx{Tx: sp, db: t.db}, nil
+}
+
+func (t *lockAttemptTx) QueryRow(ctx context.Context, sqlStr string, args ...any) pgx.Row {
+	if strings.Contains(sqlStr, "domain_event_sequence") && strings.Contains(sqlStr, "FOR UPDATE") {
+		t.db.attemptOnce.Do(func() { close(t.db.lockAttempted) })
+	}
+	return t.Tx.QueryRow(ctx, sqlStr, args...)
+}
+
+func waitForChanBounded(ctx context.Context, t *testing.T, ch <-chan struct{}, desc string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", desc, ctx.Err())
+	}
+}
+
+func waitForWaitGroupBounded(ctx context.Context, t *testing.T, wg *sync.WaitGroup, desc string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	waitForChanBounded(ctx, t, done, desc)
+}
+
+func waitForSequenceLockWait(ctx context.Context, t *testing.T, db *testdb.TestDB) {
+	t.Helper()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%domain_event_sequence%'
+			)
+		`).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("polling pg_stat_activity for lock wait: %v", err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for second publisher to block on domain_event_sequence lock: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 	t.Parallel()
-	db, transactor, eventRepo, _, _ := setupOutboxTestDB(t)
+	db, transactor, _, _, _ := setupOutboxTestDB(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -410,7 +519,7 @@ func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 
 	// Part 1: Deterministic overlap across two independent Dispatcher instances hitting PostgreSQL.
 	// Dispatcher 1 enters its sequencing transaction (holding the DB row lock) and pauses before Commit;
-	// while Dispatcher 2 is concurrently waiting in PostgreSQL, a producer commits another event.
+	// while Dispatcher 2 is concurrently waiting on the DB row lock, a producer commits another event.
 	// When Dispatcher 1 commits, Dispatcher 2 must wake up on a fresh snapshot, publish the new event
 	// at the next contiguous sequence, and never duplicate or skip sequences.
 	var evA, evB domain.DomainEvent
@@ -430,8 +539,12 @@ func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 		firstEntered: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
+	lockWaitDB := &lockAttemptDB{
+		TestDB:        db,
+		lockAttempted: make(chan struct{}),
+	}
 	d1 := events.NewDispatcher(postgres.NewEventRepository(blockingDB))
-	d2 := events.NewDispatcher(eventRepo)
+	d2 := events.NewDispatcher(postgres.NewEventRepository(lockWaitDB))
 
 	var (
 		wg   sync.WaitGroup
@@ -447,18 +560,19 @@ func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 		res1, err1 = d1.DispatchOnce(ctx)
 	}()
 
-	<-blockingDB.firstEntered
+	waitForChanBounded(ctx, t, blockingDB.firstEntered, "first dispatcher to reach commit")
 
-	// While d1 holds the PostgreSQL lock, launch d2 (blocks on FOR UPDATE in PostgreSQL)
-	// and commit evB from a producer.
+	// While d1 holds the PostgreSQL lock, launch d2 and synchronize on d2 reaching and
+	// blocking on LockDomainEventSequence in PostgreSQL before committing evB and releasing d1.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		res2, err2 = d2.DispatchOnce(ctx)
 	}()
 
-	// Give d2 a brief moment to block on LockDomainEventSequence, then commit evB and release d1.
-	time.Sleep(40 * time.Millisecond)
+	waitForChanBounded(ctx, t, lockWaitDB.lockAttempted, "second dispatcher to reach lock query")
+	waitForSequenceLockWait(ctx, t, db)
+
 	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
 		e, err := outbox.AppendPayload(ctx, tx.Events(), domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "overlap-B", nil)
 		if err != nil {
@@ -470,7 +584,7 @@ func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 		t.Fatalf("append evB: %v", err)
 	}
 	close(blockingDB.releaseFirst)
-	wg.Wait()
+	waitForWaitGroupBounded(ctx, t, &wg, "overlapping dispatchers to finish")
 
 	if err1 != nil || err2 != nil {
 		t.Fatalf("overlapping dispatch errors: err1=%v err2=%v", err1, err2)
@@ -556,7 +670,7 @@ func TestDispatcher_OverlappingCallsDeterministicAndConcurrent(t *testing.T) {
 		}()
 	}
 
-	stressWG.Wait()
+	waitForWaitGroupBounded(ctx, t, &stressWG, "concurrent stress producers and dispatchers")
 	close(stressErrs)
 	for e := range stressErrs {
 		t.Fatalf("stress error: %v", e)

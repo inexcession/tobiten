@@ -28,10 +28,8 @@ type EventRepository interface {
 	// PublishUnsequencedEvents selects all committed domain_events rows where
 	// published_sequence IS NULL regardless of raw id, assigns contiguous monotonic
 	// published_sequence values and published_at in ascending order, and updates the
-	// publication sequence watermark.
-	//
-	// When called on a non-transactional repository (InTx() == false), it runs in its
-	// own serialized transaction. When called on a transactional repository
-	// (InTx() == true), it executes inside the caller's active transaction.
+	// publication sequence watermark inside its own serialized transaction.
+	// Transaction-bound repositories (InTx() == true) reject this call with
+	// ErrRootRepositoryRequired.
 	PublishUnsequencedEvents(ctx context.Context, publishedAt time.Time) ([]domain.DomainEvent, error)
 }

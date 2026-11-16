@@ -2,12 +2,14 @@ package postgres_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"math"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1083,8 +1085,41 @@ func TestEventRepository_PublishUnsequenced_OutOfOrderCommitAcrossConnections(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := postgres.NewEventRepository(txLow).AppendEvent(ctx, &evLow); err != nil {
+	txLowRepo := postgres.NewEventRepository(txLow)
+	if err := txLowRepo.AppendEvent(ctx, &evLow); err != nil {
 		t.Fatalf("AppendEvent evLow: %v", err)
+	}
+
+	// Reject transaction-bound publication inside the producer transaction and verify from
+	// inside txLow that its lower raw ID remains unpublished.
+	if _, err := txLowRepo.PublishUnsequencedEvents(ctx, time.Now().UTC()); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+		t.Fatalf("expected ErrRootRepositoryRequired on txLowRepo.PublishUnsequencedEvents, got %v", err)
+	}
+	if err := poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		_, err := txRepo.PublishUnsequencedEvents(ctx, time.Now().UTC())
+		return err
+	}); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+		t.Fatalf("expected ErrRootRepositoryRequired on WithTx-bound PublishUnsequencedEvents, got %v", err)
+	}
+
+	inTxLow, err := txLowRepo.GetEventByID(ctx, evLow.ID)
+	if err != nil {
+		t.Fatalf("GetEventByID inside txLow after rejected publish: %v", err)
+	}
+	if inTxLow.PublishedSequence != nil || inTxLow.PublishedAt != nil || inTxLow.IsPublished() {
+		t.Fatalf("expected evLow inside producer txLow to stay unpublished after rejection, got seq=%v at=%v",
+			inTxLow.PublishedSequence, inTxLow.PublishedAt)
+	}
+	var rawSeq sql.NullInt64
+	var rawPubAt sql.NullTime
+	if err := txLow.QueryRow(ctx,
+		`SELECT published_sequence, published_at FROM domain_events WHERE id = $1`,
+		evLow.ID,
+	).Scan(&rawSeq, &rawPubAt); err != nil {
+		t.Fatalf("querying evLow inside txLow: %v", err)
+	}
+	if rawSeq.Valid || rawPubAt.Valid {
+		t.Fatalf("expected SQL published_sequence and published_at NULL inside txLow after rejection, got seq=%v at=%v", rawSeq, rawPubAt)
 	}
 
 	// Connection 2 starts a transaction, inserts an event that receives a higher raw ID,
@@ -1110,7 +1145,8 @@ func TestEventRepository_PublishUnsequenced_OutOfOrderCommitAcrossConnections(t 
 		t.Fatalf("expected evLow.ID (%d) < evHigh.ID (%d)", evLow.ID, evHigh.ID)
 	}
 
-	// First publish pass sees only the committed higher raw ID; lower raw ID stays invisible.
+	// Root publisher sequences only the committed higher raw ID; lower raw ID stays invisible
+	// to root and unpublished inside txLow.
 	t1 := time.Date(2026, 11, 16, 15, 0, 0, 0, time.UTC)
 	batch1, err := poolRepo.PublishUnsequencedEvents(ctx, t1)
 	if err != nil {
@@ -1128,14 +1164,21 @@ func TestEventRepository_PublishUnsequenced_OutOfOrderCommitAcrossConnections(t 
 	if _, err := poolRepo.GetEventByID(ctx, evLow.ID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected uncommitted evLow (%d) to remain invisible, got err=%v", evLow.ID, err)
 	}
+	stillUnpublishedInTx, err := txLowRepo.GetEventByID(ctx, evLow.ID)
+	if err != nil {
+		t.Fatalf("GetEventByID inside txLow after batch1: %v", err)
+	}
+	if stillUnpublishedInTx.IsPublished() {
+		t.Fatalf("expected evLow inside txLow to remain unpublished after batch1, got %+v", stillUnpublishedInTx)
+	}
 
 	// Now Connection 1 commits the lower raw ID.
 	if err := txLow.Commit(ctx); err != nil {
 		t.Fatalf("Commit txLow: %v", err)
 	}
 
-	// Second publish pass must scan all published_sequence IS NULL rows regardless of raw ID
-	// and assign the later sequence (2) to the lower raw ID.
+	// Second root publish pass scans all published_sequence IS NULL rows regardless of raw ID
+	// and assigns the later sequence (2) to the lower raw ID.
 	t2 := t1.Add(5 * time.Second)
 	batch2, err := poolRepo.PublishUnsequencedEvents(ctx, t2)
 	if err != nil {
@@ -1159,6 +1202,32 @@ func TestEventRepository_PublishUnsequenced_OutOfOrderCommitAcrossConnections(t 
 	if len(batch3) != 0 {
 		t.Fatalf("expected 0 events in batch3, got %d", len(batch3))
 	}
+}
+
+type repoFaultCommitDB struct {
+	*testdb.TestDB
+	failCommitsRemaining atomic.Int32
+	commitErr            error
+}
+
+func (f *repoFaultCommitDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := f.TestDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &repoFaultCommitTx{Tx: tx, db: f}, nil
+}
+
+type repoFaultCommitTx struct {
+	pgx.Tx
+	db *repoFaultCommitDB
+}
+
+func (t *repoFaultCommitTx) Commit(ctx context.Context) error {
+	if t.db.failCommitsRemaining.Add(-1) >= 0 {
+		return t.db.commitErr
+	}
+	return t.Tx.Commit(ctx)
 }
 
 func TestEventRepository_PublishUnsequenced_RollbackLeavesUnpublishedAndConsumesNoGap(t *testing.T) {
@@ -1208,21 +1277,20 @@ func TestEventRepository_PublishUnsequenced_RollbackLeavesUnpublishedAndConsumes
 		t.Fatalf("append ev2/ev3: %v", err)
 	}
 
-	// Run PublishUnsequencedEvents inside a transaction that rolls back.
-	rollbackSentinel := errors.New("abort publication assignment")
+	// Exercise rollback and gapless retry through the non-transactional root entry point.
+	faultDB := &repoFaultCommitDB{
+		TestDB:    db,
+		commitErr: errors.New("injected root publish commit failure"),
+	}
+	rootFaultRepo := postgres.NewEventRepository(faultDB)
+	if rootFaultRepo.InTx() {
+		t.Fatal("expected rootFaultRepo.InTx() == false")
+	}
+
+	faultDB.failCommitsRemaining.Store(1)
 	tRollback := t1.Add(time.Minute)
-	err = poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
-		assigned, err := txRepo.PublishUnsequencedEvents(ctx, tRollback)
-		if err != nil {
-			return err
-		}
-		if len(assigned) != 2 || *assigned[0].PublishedSequence != 2 || *assigned[1].PublishedSequence != 3 {
-			t.Fatalf("expected tentative sequences 2 and 3 before rollback, got %+v", assigned)
-		}
-		return rollbackSentinel
-	})
-	if !errors.Is(err, rollbackSentinel) {
-		t.Fatalf("expected rollbackSentinel, got %v", err)
+	if _, err := rootFaultRepo.PublishUnsequencedEvents(ctx, tRollback); !errors.Is(err, faultDB.commitErr) {
+		t.Fatalf("expected injected commit error, got %v", err)
 	}
 
 	// Both rows must remain unpublished and watermark must still be 1.
@@ -1243,9 +1311,9 @@ func TestEventRepository_PublishUnsequenced_RollbackLeavesUnpublishedAndConsumes
 		t.Fatalf("expected watermark 1 after rollback, got %d", watermark)
 	}
 
-	// Retry must assign 2 and 3 with no gap.
+	// Retry through the same root entry point must assign 2 and 3 with no gap.
 	tRetry := t1.Add(2 * time.Minute)
-	retried, err := poolRepo.PublishUnsequencedEvents(ctx, tRetry)
+	retried, err := rootFaultRepo.PublishUnsequencedEvents(ctx, tRetry)
 	if err != nil {
 		t.Fatalf("retry PublishUnsequencedEvents: %v", err)
 	}
@@ -1358,7 +1426,16 @@ func TestEventRepository_PublishUnsequenced_ConcurrentSerializesWithoutGapsOrDup
 		}()
 	}
 
-	wg.Wait()
+	wgDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(wgDone)
+	}()
+	select {
+	case <-wgDone:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for concurrent workers: %v", ctx.Err())
+	}
 	// One final drain in case a producer committed right as workers saw producersDone.
 	finalBatch, err := poolRepo.PublishUnsequencedEvents(ctx, time.Now().UTC())
 	if err != nil {
