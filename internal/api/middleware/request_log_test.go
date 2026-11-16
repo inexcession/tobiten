@@ -150,3 +150,110 @@ func TestRequestLogger_FlushForwarding(t *testing.T) {
 		t.Errorf("expected Flush() to be forwarded to underlying ResponseWriter")
 	}
 }
+
+func TestRequestLogger_FlushRecordsImplicit200AndIgnoresLateWriteHeader(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	handler := RequestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NewResponseController(w).Flush() //nolint:errcheck
+		// Late WriteHeader after Flush must not alter final recorded status.
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("event: ping\n\n"))
+		http.NewResponseController(w).Flush() //nolint:errcheck
+	}))
+
+	rec := &flusherRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	handler.ServeHTTP(rec, req)
+
+	if !rec.flushed {
+		t.Fatal("expected Flush() to be forwarded")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("underlying status = %d, want 200", rec.Code)
+	}
+
+	var logMap map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &logMap); err != nil {
+		t.Fatalf("invalid JSON log: %v", err)
+	}
+	if status, ok := logMap["status"].(float64); !ok || int(status) != http.StatusOK {
+		t.Errorf("logged status = %v, want 200", logMap["status"])
+	}
+	if b, ok := logMap["bytes"].(float64); !ok || int(b) != len("event: ping\n\n") {
+		t.Errorf("logged bytes = %v, want %d", logMap["bytes"], len("event: ping\n\n"))
+	}
+}
+
+type informationalStatusRecorder struct {
+	*httptest.ResponseRecorder
+	codes []int
+}
+
+func (r *informationalStatusRecorder) WriteHeader(code int) {
+	r.codes = append(r.codes, code)
+	if code >= 200 {
+		r.ResponseRecorder.WriteHeader(code)
+	}
+}
+
+func TestRequestLogger_Informational1xxNotFinal(t *testing.T) {
+	t.Run("103 followed by 201 records 201", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+		handler := RequestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusEarlyHints)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("created"))
+		}))
+
+		rec := &informationalStatusRecorder{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(http.MethodPost, "/items", nil)
+		handler.ServeHTTP(rec, req)
+
+		if len(rec.codes) != 2 || rec.codes[0] != http.StatusEarlyHints || rec.codes[1] != http.StatusCreated {
+			t.Fatalf("forwarded codes = %v, want [103 201]", rec.codes)
+		}
+
+		var logMap map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &logMap); err != nil {
+			t.Fatalf("invalid JSON log: %v", err)
+		}
+		if status, ok := logMap["status"].(float64); !ok || int(status) != http.StatusCreated {
+			t.Errorf("logged status = %v, want 201", logMap["status"])
+		}
+		if logMap["level"] != "INFO" {
+			t.Errorf("logged level = %v, want INFO", logMap["level"])
+		}
+	})
+
+	t.Run("100 followed by Write records 200", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+		handler := RequestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusContinue)
+			_, _ = w.Write([]byte("ok"))
+		}))
+
+		rec := &informationalStatusRecorder{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+		handler.ServeHTTP(rec, req)
+
+		if len(rec.codes) != 2 || rec.codes[0] != http.StatusContinue || rec.codes[1] != http.StatusOK {
+			t.Fatalf("forwarded codes = %v, want [100 200]", rec.codes)
+		}
+
+		var logMap map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &logMap); err != nil {
+			t.Fatalf("invalid JSON log: %v", err)
+		}
+		if status, ok := logMap["status"].(float64); !ok || int(status) != http.StatusOK {
+			t.Errorf("logged status = %v, want 200", logMap["status"])
+		}
+	})
+}

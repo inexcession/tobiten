@@ -806,3 +806,42 @@ func TestAuthorizingJobService_RequiresPrincipalAndDelegates(t *testing.T) {
 		t.Fatalf("CancelJob against nil delegate = %v, want ErrNotImplemented", err)
 	}
 }
+
+func TestAuthorizingEventService_RequiresPrincipalAndDelegates(t *testing.T) {
+	t.Parallel()
+
+	stub := NewStubEventService()
+	stub.Events = []StreamEvent{{ID: "1", Name: "job.started", Data: []byte(`{"sequence":1}`)}}
+	svcs := NewAuthorizingServices(&Services{Events: stub})
+	if svcs.Events == nil {
+		t.Fatal("expected Events decorator to be wired")
+	}
+
+	if err := svcs.Events.Stream(context.Background(), nil, EventStreamFilter{}, nil, nil); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Stream(nil) = %v, want ErrUnauthorized", err)
+	}
+
+	reader := domain.NewPrincipal(testUser("u-reader"), []domain.Role{builtInRoleByID(t, domain.RoleReaderID)}, domain.CredentialKindPassword, "cred-r", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	var got []StreamEvent
+	attached := false
+	err := svcs.Events.Stream(ctx, reader, EventStreamFilter{}, func() error {
+		attached = true
+		return nil
+	}, func(ev StreamEvent) error {
+		got = append(got, ev)
+		cancel()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream(reader) = %v, want nil", err)
+	}
+	if !attached || len(got) != 1 || got[0].ID != "1" {
+		t.Fatalf("Stream(reader) attached=%v got=%+v", attached, got)
+	}
+
+	nilEvents := NewAuthorizingEventService(nil)
+	if err := nilEvents.Stream(context.Background(), reader, EventStreamFilter{}, nil, nil); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("Stream against nil delegate = %v, want ErrNotImplemented", err)
+	}
+}

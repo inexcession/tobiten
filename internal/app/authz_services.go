@@ -22,6 +22,9 @@ func NewAuthorizingServices(next *Services) *Services {
 	if next.Jobs != nil {
 		out.Jobs = NewAuthorizingJobService(next.Jobs)
 	}
+	if next.Events != nil {
+		out.Events = NewAuthorizingEventService(next.Events)
+	}
 	if next.Library != nil {
 		out.Library = NewAuthorizingLibraryService(next.Library)
 	}
@@ -376,4 +379,30 @@ func (s *authorizingJobService) CancelJob(ctx context.Context, principal *domain
 		return nil, ErrNotImplemented
 	}
 	return s.next.CancelJob(ctx, principal, jobID)
+}
+
+type authorizingEventService struct {
+	next EventService
+}
+
+// NewAuthorizingEventService wraps next with authentication enforcement on EventService.Stream.
+// Per-event creator/jobs:read_all visibility filtering is enforced by the concrete service.
+func NewAuthorizingEventService(next EventService) EventService {
+	return &authorizingEventService{next: next}
+}
+
+func (s *authorizingEventService) Stream(
+	ctx context.Context,
+	principal *domain.Principal,
+	filter EventStreamFilter,
+	onAttached func() error,
+	emit func(StreamEvent) error,
+) error {
+	if err := requirePrincipal(principal); err != nil {
+		return err
+	}
+	if s.next == nil {
+		return ErrNotImplemented
+	}
+	return s.next.Stream(ctx, principal, filter, onAttached, emit)
 }

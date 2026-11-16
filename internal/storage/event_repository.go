@@ -37,6 +37,10 @@ type EventRepository interface {
 	// Returns ErrNotFound if no matching published row exists.
 	GetPublishedEventBySequence(ctx context.Context, seq int64) (*domain.DomainEvent, error)
 
+	// GetLatestPublishedSequence returns the latest committed published_sequence watermark
+	// (0 if no domain events have been published yet).
+	GetLatestPublishedSequence(ctx context.Context) (int64, error)
+
 	// GetNextPublishedEventAfter returns the earliest committed published domain event
 	// with published_sequence > afterSeq. Returns ErrNotFound if none exists.
 	GetNextPublishedEventAfter(ctx context.Context, afterSeq int64) (*domain.DomainEvent, error)

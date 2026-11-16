@@ -126,6 +126,20 @@ func (q *Queries) GetEventSubscriberByIDForUpdate(ctx context.Context, id string
 	return i, err
 }
 
+const getLatestPublishedSequence = `-- name: GetLatestPublishedSequence :one
+SELECT GREATEST(
+    COALESCE((SELECT last_sequence FROM domain_event_sequence WHERE id = TRUE), 0),
+    COALESCE((SELECT MAX(published_sequence) FROM domain_events WHERE published_sequence IS NOT NULL), 0)
+)::bigint AS latest_sequence
+`
+
+func (q *Queries) GetLatestPublishedSequence(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, getLatestPublishedSequence)
+	var latest_sequence int64
+	err := row.Scan(&latest_sequence)
+	return latest_sequence, err
+}
+
 const getNextPublishedDomainEventAfter = `-- name: GetNextPublishedDomainEventAfter :one
 SELECT id, published_sequence, published_at, kind, version, aggregate_type, aggregate_id, payload, created_at
 FROM domain_events

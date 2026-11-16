@@ -2062,3 +2062,66 @@ func TestEventRepository_RepeatableReadAndLockContentionPreserveRetryLimit(t *te
 		t.Fatalf("subscriber = (%+v, %v), want position 0", gotSub, err)
 	}
 }
+
+func TestEventRepository_GetLatestPublishedSequence(t *testing.T) {
+	t.Parallel()
+	_, repo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	seq, err := repo.GetLatestPublishedSequence(ctx)
+	if err != nil {
+		t.Fatalf("initial GetLatestPublishedSequence: %v", err)
+	}
+	if seq != 0 {
+		t.Fatalf("initial latest sequence = %d, want 0", seq)
+	}
+
+	// Unpublished outbox rows do not advance latest published sequence.
+	if err := repo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		ev, err := domain.NewDomainEvent(
+			domain.EventJobStarted,
+			domain.EventVersion1,
+			domain.AggregateTypeJob,
+			"job-seq-1",
+			domain.JobEventPayloadV1{
+				JobID:    "job-seq-1",
+				Kind:     domain.JobKindScan,
+				State:    domain.JobStateRunning,
+				Attempts: 1,
+			},
+			time.Now().UTC(),
+		)
+		if err != nil {
+			return err
+		}
+		return txRepo.AppendEvent(ctx, &ev)
+	}); err != nil {
+		t.Fatalf("append unpublished event: %v", err)
+	}
+
+	seq, err = repo.GetLatestPublishedSequence(ctx)
+	if err != nil {
+		t.Fatalf("GetLatestPublishedSequence with unpublished row: %v", err)
+	}
+	if seq != 0 {
+		t.Fatalf("latest sequence with unpublished row = %d, want 0", seq)
+	}
+
+	published, err := repo.PublishUnsequencedEvents(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("PublishUnsequencedEvents: %v", err)
+	}
+	if len(published) != 1 || *published[0].PublishedSequence != 1 {
+		t.Fatalf("published = %+v, want 1 event at sequence 1", published)
+	}
+
+	seq, err = repo.GetLatestPublishedSequence(ctx)
+	if err != nil {
+		t.Fatalf("GetLatestPublishedSequence after publish: %v", err)
+	}
+	if seq != 1 {
+		t.Fatalf("latest sequence after publish = %d, want 1", seq)
+	}
+}

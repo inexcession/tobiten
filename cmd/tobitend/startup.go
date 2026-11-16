@@ -491,8 +491,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	if err != nil {
 		return err
 	}
+	eventRepo := postgres.NewEventRepository(d.pool)
 	jobRepo := postgres.NewJobRepository(d.pool)
 	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{})
 	services := app.NewAuthorizingServices(&app.Services{
 		Setup:       setup,
 		BasicAuth:   basicAuth,
@@ -500,11 +502,14 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
 		Jobs:        jobService,
+		Events:      eventService,
 	})
 	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
 	if err != nil {
 		return err
 	}
+	eventService.SetProgressHub(workers.progressHub)
+	eventService.SetWakeSource(workers.dispatcher)
 	jobService.SetNotifier(workers.runner)
 	jobService.SetOnTransition(func(job domain.Job) {
 		if workers != nil && workers.dispatcher != nil && !job.Kind.IsInternal() {

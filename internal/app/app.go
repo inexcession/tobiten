@@ -26,6 +26,7 @@ type Services struct {
 	Session     SessionService
 	SessionAuth SessionAuthenticator
 	Jobs        JobService
+	Events      EventService
 	Library     LibraryService
 	Reading     ReadingService
 	Curation    CurationService

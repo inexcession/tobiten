@@ -10,6 +10,9 @@ import (
 
 func TestNewStubServices(t *testing.T) {
 	services := NewStubServices()
+	if services.Events == nil {
+		t.Fatal("EventService is nil")
+	}
 	if services.Library == nil {
 		t.Fatal("LibraryService is nil")
 	}

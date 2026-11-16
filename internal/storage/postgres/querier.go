@@ -42,6 +42,7 @@ type Querier interface {
 	GetJobByID(ctx context.Context, id string) (Job, error)
 	GetJobByIDForUpdate(ctx context.Context, id string) (Job, error)
 	GetLabelByID(ctx context.Context, id string) (Label, error)
+	GetLatestPublishedSequence(ctx context.Context) (int64, error)
 	GetNextPublishedDomainEventAfter(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)
 	GetNextRunnableJobIDForUpdate(ctx context.Context, arg GetNextRunnableJobIDForUpdateParams) (string, error)
 	GetPublishedDomainEventBySequence(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)

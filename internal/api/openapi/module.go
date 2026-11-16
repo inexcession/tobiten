@@ -53,6 +53,9 @@ func (m *Module) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs/{job_id}", m.handleGetJob)
 	mux.HandleFunc("POST /api/v1/jobs/{job_id}/cancel", m.handleCancelJob)
 
+	// Shared authenticated SSE event stream (ADR-0013 §3, ADR-0018 S3).
+	mux.HandleFunc("GET /api/v1/events", m.handleEvents)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path
 		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {

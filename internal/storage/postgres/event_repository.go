@@ -217,6 +217,19 @@ func (r *EventRepository) GetPublishedEventBySequence(ctx context.Context, seq i
 	return &out, nil
 }
 
+// GetLatestPublishedSequence returns the latest committed published_sequence watermark
+// (0 if no domain events have been published yet).
+func (r *EventRepository) GetLatestPublishedSequence(ctx context.Context) (int64, error) {
+	if r == nil {
+		return 0, errors.New("event repository is required")
+	}
+	seq, err := r.q.GetLatestPublishedSequence(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("getting latest published sequence: %w", err)
+	}
+	return seq, nil
+}
+
 // GetNextPublishedEventAfter returns the earliest committed published domain event
 // with published_sequence > afterSeq.
 func (r *EventRepository) GetNextPublishedEventAfter(ctx context.Context, afterSeq int64) (*domain.DomainEvent, error) {

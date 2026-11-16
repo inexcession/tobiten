@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1374,5 +1375,253 @@ func TestServer_DuplicatePatternComposition(t *testing.T) {
 	_ = respRoot.Body.Close()
 	if respRoot.StatusCode != http.StatusOK {
 		t.Errorf("root status = %d, want 200", respRoot.StatusCode)
+	}
+	if err := serverTestCleanupCheck(t, cancel, serverDone); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func serverTestCleanupCheck(t *testing.T, cancel context.CancelFunc, serverDone <-chan error) error {
+	t.Helper()
+	cancel()
+	select {
+	case err := <-serverDone:
+		return err
+	case <-time.After(3 * time.Second):
+		return context.DeadlineExceeded
+	}
+}
+
+type streamingStubEventService struct {
+	attached chan struct{}
+	sendCh   chan app.StreamEvent
+}
+
+func (s *streamingStubEventService) Stream(
+	ctx context.Context,
+	p *domain.Principal,
+	_ app.EventStreamFilter,
+	onAttached func() error,
+	emit func(app.StreamEvent) error,
+) error {
+	if p == nil {
+		return app.ErrUnauthorized
+	}
+	if onAttached != nil {
+		if err := onAttached(); err != nil {
+			return err
+		}
+	}
+	select {
+	case s.attached <- struct{}{}:
+	default:
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev := <-s.sendCh:
+			if err := emit(ev); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestServer_CompositeRouteCollision_StreamingSSEFlushAndLogging(t *testing.T) {
+	// Exercise colliding modules sharing the "/api/v1" pattern in both orders:
+	// 1) OpenAPI first, colliding module second (OpenAPI runs inside fallbackRecorder).
+	// 2) Colliding module returning 404 first, OpenAPI second (fallbackRecorder after 404).
+	for _, tc := range []struct {
+		name         string
+		openapiFirst bool
+	}{
+		{name: "openapi first under composite fallbackRecorder", openapiFirst: true},
+		{name: "colliding 404 module first then openapi", openapiFirst: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf syncLogBuffer
+			testLogger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			stubEvents := &streamingStubEventService{
+				attached: make(chan struct{}, 1),
+				sendCh:   make(chan app.StreamEvent, 4),
+			}
+			openapiMod := openapi.NewModule(&app.Services{
+				Events: stubEvents,
+			})
+
+			colliderMux := http.NewServeMux()
+			colliderMux.HandleFunc("GET /api/v1/collider", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("from-collider"))
+			})
+			colliderMod := module.NewSimpleModule("collider-api")
+			colliderMod.Mounts = []module.RouteMount{
+				{ModuleName: "collider-api", Prefix: "/api/v1", Handler: colliderMux},
+			}
+
+			reg := module.NewRegistry()
+			_ = reg.Register(NewSystemModule())
+			if tc.openapiFirst {
+				_ = reg.Register(openapiMod)
+				_ = reg.Register(colliderMod)
+			} else {
+				_ = reg.Register(colliderMod)
+				_ = reg.Register(openapiMod)
+			}
+
+			cfg := &config.Config{
+				Host:    "127.0.0.1",
+				Port:    0,
+				BaseURL: "http://localhost:8080",
+			}
+			srv, err := NewServer(ServerOptions{
+				Config:         cfg,
+				Logger:         testLogger,
+				Registry:       reg,
+				Authenticators: []module.Authenticator{passthroughAuth{}},
+			})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			serverDone := make(chan error, 1)
+			go func() {
+				serverDone <- srv.Run(ctx)
+			}()
+			defer func() {
+				_ = serverTestCleanupCheck(t, cancel, serverDone)
+			}()
+
+			baseURL := srv.URL()
+			client := &http.Client{Timeout: 5 * time.Second}
+
+			// Verify fallback routing still reaches collider endpoint.
+			respCol, err := client.Get(baseURL + "/api/v1/collider")
+			if err != nil {
+				t.Fatalf("GET /api/v1/collider: %v", err)
+			}
+			colBody, _ := io.ReadAll(respCol.Body)
+			_ = respCol.Body.Close()
+			if respCol.StatusCode != http.StatusOK || string(colBody) != "from-collider" {
+				t.Fatalf("collider response = (%d, %q), want (200, from-collider)", respCol.StatusCode, string(colBody))
+			}
+
+			// Open SSE stream over real TCP connection without timeout on body reads.
+			streamCtx, cancelStream := context.WithCancel(context.Background())
+			defer cancelStream()
+			req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, baseURL+"/api/v1/events", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			streamClient := &http.Client{}
+			resp, err := streamClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET /api/v1/events: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				_ = resp.Body.Close()
+				t.Fatalf("SSE status = %d, want 200", resp.StatusCode)
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+				_ = resp.Body.Close()
+				t.Fatalf("SSE Content-Type = %q, want text/event-stream", ct)
+			}
+
+			select {
+			case <-stubEvents.attached:
+			case <-time.After(2 * time.Second):
+				_ = resp.Body.Close()
+				t.Fatal("timed out waiting for SSE handler attach")
+			}
+
+			// Send an event while the stream remains open and verify the frame flushes immediately.
+			stubEvents.sendCh <- app.StreamEvent{
+				ID:   "7",
+				Name: "job.started",
+				Data: json.RawMessage(`{"sequence":7}`),
+			}
+
+			lineCh := make(chan string, 16)
+			readErrCh := make(chan error, 1)
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					n, rErr := resp.Body.Read(buf)
+					if n > 0 {
+						lineCh <- string(buf[:n])
+					}
+					if rErr != nil {
+						readErrCh <- rErr
+						return
+					}
+				}
+			}()
+
+			var received strings.Builder
+			deadline := time.After(2 * time.Second)
+			for !strings.Contains(received.String(), "\n\n") {
+				select {
+				case chunk := <-lineCh:
+					received.WriteString(chunk)
+				case rErr := <-readErrCh:
+					t.Fatalf("SSE stream ended early (%v) with partial data %q", rErr, received.String())
+				case <-deadline:
+					t.Fatalf("timed out waiting for flushed SSE frame while stream open; got %q", received.String())
+				}
+			}
+			gotFrame := received.String()
+			if !strings.Contains(gotFrame, "id: 7\n") || !strings.Contains(gotFrame, "event: job.started\n") || !strings.Contains(gotFrame, `data: {"sequence":7}`) {
+				t.Fatalf("unexpected flushed SSE frame: %q", gotFrame)
+			}
+
+			// Close client stream and verify RequestLogger records final status 200 and bytes > 0.
+			cancelStream()
+			_ = resp.Body.Close()
+
+			logDeadline := time.Now().Add(2 * time.Second)
+			var foundEventsLog map[string]any
+			for time.Now().Before(logDeadline) {
+				for line := range strings.SplitSeq(strings.TrimSpace(logBuf.String()), "\n") {
+					var m map[string]any
+					if err := json.Unmarshal([]byte(line), &m); err == nil && m["msg"] == "http request" && m["path"] == "/api/v1/events" {
+						foundEventsLog = m
+						break
+					}
+				}
+				if foundEventsLog != nil {
+					break
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			if foundEventsLog == nil {
+				t.Fatalf("expected RequestLogger entry for /api/v1/events, got logs:\n%s", logBuf.String())
+			}
+			if st, ok := foundEventsLog["status"].(float64); !ok || int(st) != http.StatusOK {
+				t.Errorf("logged status = %v, want 200", foundEventsLog["status"])
+			}
+			if b, ok := foundEventsLog["bytes"].(float64); !ok || int(b) < len(gotFrame) {
+				t.Errorf("logged bytes = %v, want >= %d", foundEventsLog["bytes"], len(gotFrame))
+			}
+		})
 	}
 }

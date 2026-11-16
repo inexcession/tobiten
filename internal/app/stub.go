@@ -12,6 +12,7 @@ import (
 // NewStubServices constructs a full Services set backed by stub implementations.
 func NewStubServices() *Services {
 	return &Services{
+		Events:   NewStubEventService(),
 		Library:  NewStubLibraryService(),
 		Reading:  NewStubReadingService(),
 		Curation: NewStubCurationService(),
@@ -514,4 +515,46 @@ func (s *StubAdminService) CancelJob(_ context.Context, p *domain.Principal, job
 		return &cp, nil
 	}
 	return nil, ErrNotFound
+}
+
+// StubEventService implements EventService for testing and bootstrap composition.
+type StubEventService struct {
+	mu     sync.RWMutex
+	Events []StreamEvent
+}
+
+// NewStubEventService creates a new StubEventService.
+func NewStubEventService() *StubEventService {
+	return &StubEventService{}
+}
+
+// Stream emits any pre-configured stub events and waits until ctx is cancelled.
+func (s *StubEventService) Stream(
+	ctx context.Context,
+	p *domain.Principal,
+	_ EventStreamFilter,
+	onAttached func() error,
+	emit func(StreamEvent) error,
+) error {
+	if err := requirePrincipal(p); err != nil {
+		return err
+	}
+	if onAttached != nil {
+		if err := onAttached(); err != nil {
+			return err
+		}
+	}
+	s.mu.RLock()
+	snapshot := make([]StreamEvent, len(s.Events))
+	copy(snapshot, s.Events)
+	s.mu.RUnlock()
+	for _, ev := range snapshot {
+		if emit != nil {
+			if err := emit(ev); err != nil {
+				return err
+			}
+		}
+	}
+	<-ctx.Done()
+	return nil
 }

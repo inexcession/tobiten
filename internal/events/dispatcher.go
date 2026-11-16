@@ -91,6 +91,10 @@ type Dispatcher struct {
 
 	dispatchMu sync.Mutex
 	loop       wakeLoop
+
+	subMu     sync.Mutex
+	nextSubID uint64
+	subs      map[uint64]chan struct{}
 }
 
 // NewDispatcher constructs a Dispatcher backed by publisher.
@@ -142,12 +146,54 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) ([]domain.DomainEvent, er
 		return nil, nil
 	}
 
+	d.notifySubscribers()
+
 	if d.onPublished != nil {
 		if err := d.onPublished(ctx, slices.Clone(published)); err != nil {
 			return published, err
 		}
 	}
 	return published, nil
+}
+
+// Subscribe registers a wake channel notified after each sequencing transaction commits
+// one or more published events. The returned function unregisters the listener.
+func (d *Dispatcher) Subscribe() (<-chan struct{}, func()) {
+	if d == nil {
+		return nil, func() {}
+	}
+	ch := make(chan struct{}, 1)
+	d.subMu.Lock()
+	if d.subs == nil {
+		d.subs = make(map[uint64]chan struct{})
+	}
+	d.nextSubID++
+	id := d.nextSubID
+	d.subs[id] = ch
+	d.subMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			d.subMu.Lock()
+			delete(d.subs, id)
+			d.subMu.Unlock()
+		})
+	}
+}
+
+func (d *Dispatcher) notifySubscribers() {
+	if d == nil {
+		return
+	}
+	d.subMu.Lock()
+	for _, ch := range d.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	d.subMu.Unlock()
 }
 
 // Start launches the serialized background dispatcher goroutine.

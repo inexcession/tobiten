@@ -183,18 +183,8 @@ func (c *compositeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var first404 *fallbackRecorder
 
 	for i, h := range c.handlers {
-		if i == len(c.handlers)-1 {
-			rec := newFallbackRecorder(w)
-			h.ServeHTTP(rec, r)
-			if !rec.is404 {
-				rec.flush()
-				return
-			}
-			if first404 != nil {
-				first404.flush()
-			} else {
-				rec.flush()
-			}
+		if i == len(c.handlers)-1 && first404 == nil {
+			h.ServeHTTP(w, r)
 			return
 		}
 
@@ -208,15 +198,20 @@ func (c *compositeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			first404 = rec
 		}
 	}
+
+	if first404 != nil {
+		first404.flush()
+	}
 }
 
 type fallbackRecorder struct {
-	underlying http.ResponseWriter
-	header     http.Header
-	buf        bytes.Buffer
-	statusCode int
-	is404      bool
-	written    bool
+	underlying    http.ResponseWriter
+	header        http.Header
+	buf           bytes.Buffer
+	statusCode    int
+	is404         bool
+	written       bool
+	passedThrough bool
 }
 
 func newFallbackRecorder(w http.ResponseWriter) *fallbackRecorder {
@@ -228,35 +223,79 @@ func newFallbackRecorder(w http.ResponseWriter) *fallbackRecorder {
 }
 
 func (r *fallbackRecorder) Header() http.Header {
+	if r.passedThrough {
+		return r.underlying.Header()
+	}
 	return r.header
+}
+
+func (r *fallbackRecorder) copyHeadersToUnderlying() {
+	dst := r.underlying.Header()
+	for k, vv := range r.header {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+	clear(r.header)
 }
 
 func (r *fallbackRecorder) WriteHeader(statusCode int) {
 	if r.written {
 		return
 	}
+	if statusCode >= 100 && statusCode <= 199 {
+		if !r.passedThrough {
+			r.copyHeadersToUnderlying()
+			r.passedThrough = true
+		}
+		r.underlying.WriteHeader(statusCode)
+		return
+	}
 	r.written = true
 	r.statusCode = statusCode
-	if statusCode == http.StatusNotFound {
+	if statusCode == http.StatusNotFound && !r.passedThrough {
 		r.is404 = true
+		return
 	}
+	if !r.passedThrough {
+		r.copyHeadersToUnderlying()
+		r.passedThrough = true
+	}
+	r.underlying.WriteHeader(statusCode)
 }
 
 func (r *fallbackRecorder) Write(b []byte) (int, error) {
 	if !r.written {
 		r.WriteHeader(http.StatusOK)
 	}
+	if r.passedThrough {
+		return r.underlying.Write(b)
+	}
 	return r.buf.Write(b)
 }
 
-func (r *fallbackRecorder) flush() {
-	for k, vv := range r.header {
-		for _, v := range vv {
-			r.underlying.Header().Add(k, v)
-		}
+func (r *fallbackRecorder) Flush() {
+	if !r.written {
+		r.WriteHeader(http.StatusOK)
 	}
+	if r.passedThrough {
+		_ = http.NewResponseController(r.underlying).Flush()
+	}
+}
+
+func (r *fallbackRecorder) Unwrap() http.ResponseWriter {
+	return r.underlying
+}
+
+func (r *fallbackRecorder) flush() {
+	if r.passedThrough {
+		return
+	}
+	r.copyHeadersToUnderlying()
 	r.underlying.WriteHeader(r.statusCode)
-	_, _ = r.underlying.Write(r.buf.Bytes())
+	if r.buf.Len() > 0 {
+		_, _ = r.underlying.Write(r.buf.Bytes())
+	}
 }
 
 // mountModuleRoutes registers routes from enabled modules in the registry onto mux.

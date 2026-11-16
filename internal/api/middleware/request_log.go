@@ -21,11 +21,16 @@ type responseRecorder struct {
 }
 
 func (rw *responseRecorder) WriteHeader(code int) {
-	if !rw.wroteHeader {
-		rw.statusCode = code
-		rw.wroteHeader = true
-		rw.ResponseWriter.WriteHeader(code)
+	if rw.wroteHeader {
+		return
 	}
+	if code >= 100 && code <= 199 {
+		rw.ResponseWriter.WriteHeader(code)
+		return
+	}
+	rw.statusCode = code
+	rw.wroteHeader = true
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 func (rw *responseRecorder) Write(b []byte) (int, error) {
@@ -38,9 +43,10 @@ func (rw *responseRecorder) Write(b []byte) (int, error) {
 }
 
 func (rw *responseRecorder) Flush() {
-	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
 	}
+	_ = http.NewResponseController(rw.ResponseWriter).Flush()
 }
 
 func (rw *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
