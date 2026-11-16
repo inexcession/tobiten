@@ -42,17 +42,35 @@ type sseClientStream struct {
 
 func openSSEStream(t *testing.T, url, user, pass, bearerToken string) *sseClientStream {
 	t.Helper()
+	return openSSEStreamWithRequest(t, url, func(req *http.Request) {
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		if bearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+		}
+	})
+}
+
+func openSSEStreamWithCookie(t *testing.T, url string, cookie *http.Cookie) *sseClientStream {
+	t.Helper()
+	return openSSEStreamWithRequest(t, url, func(req *http.Request) {
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+	})
+}
+
+func openSSEStreamWithRequest(t *testing.T, url string, configureReq func(*http.Request)) *sseClientStream {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		cancel()
 		t.Fatalf("NewRequest(%s): %v", url, err)
 	}
-	if user != "" {
-		req.SetBasicAuth(user, pass)
-	}
-	if bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	if configureReq != nil {
+		configureReq(req)
 	}
 
 	client := &http.Client{}
@@ -80,54 +98,56 @@ func openSSEStream(t *testing.T, url, user, pass, bearerToken string) *sseClient
 		errCh:  make(chan error, 1),
 	}
 
-	go func() {
-		defer close(s.frames)
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		var cur sseFrame
-		var dataLines []string
-		hasFields := false
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				if hasFields {
-					cur.Data = strings.Join(dataLines, "\n")
-					s.frames <- cur
-					cur = sseFrame{}
-					dataLines = nil
-					hasFields = false
-				}
-				continue
-			}
-			if strings.HasPrefix(line, ":") {
-				continue
-			}
-			field, val, hasColon := strings.Cut(line, ":")
-			if hasColon {
-				val = strings.TrimPrefix(val, " ")
-			}
-			switch field {
-			case "id":
-				cur.ID = val
-				hasFields = true
-			case "event":
-				cur.Event = val
-				hasFields = true
-			case "data":
-				dataLines = append(dataLines, val)
-				hasFields = true
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			s.errCh <- err
-		}
-	}()
+	go s.readFrames()
 
 	t.Cleanup(func() {
 		s.close()
 	})
 	return s
+}
+
+func (s *sseClientStream) readFrames() {
+	defer close(s.frames)
+	scanner := bufio.NewScanner(s.resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var cur sseFrame
+	var dataLines []string
+	hasFields := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if hasFields {
+				cur.Data = strings.Join(dataLines, "\n")
+				s.frames <- cur
+				cur = sseFrame{}
+				dataLines = nil
+				hasFields = false
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, val, hasColon := strings.Cut(line, ":")
+		if hasColon {
+			val = strings.TrimPrefix(val, " ")
+		}
+		switch field {
+		case "id":
+			cur.ID = val
+			hasFields = true
+		case "event":
+			cur.Event = val
+			hasFields = true
+		case "data":
+			dataLines = append(dataLines, val)
+			hasFields = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		s.errCh <- err
+	}
 }
 
 func (s *sseClientStream) close() {
@@ -562,85 +582,6 @@ func TestDaemonEventsSSE_RealStreamOrderVisibilityAndLogging(t *testing.T) {
 	if err := runDaemon(context.Background(), cfg, startServer); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("runDaemon failed: %v", err)
 	}
-}
-
-func openSSEStreamWithCookie(t *testing.T, url string, cookie *http.Cookie) *sseClientStream {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		cancel()
-		t.Fatalf("NewRequest(%s): %v", url, err)
-	}
-	if cookie != nil {
-		req.AddCookie(cookie)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		cancel()
-		t.Fatalf("GET %s: %v", url, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		cancel()
-		t.Fatalf("GET %s status = %d, want 200 (body: %s)", url, resp.StatusCode, string(body))
-	}
-
-	s := &sseClientStream{
-		resp:   resp,
-		cancel: cancel,
-		frames: make(chan sseFrame, 64),
-		errCh:  make(chan error, 1),
-	}
-	go func() {
-		defer close(s.frames)
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		var cur sseFrame
-		var dataLines []string
-		hasFields := false
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				if hasFields {
-					cur.Data = strings.Join(dataLines, "\n")
-					s.frames <- cur
-					cur = sseFrame{}
-					dataLines = nil
-					hasFields = false
-				}
-				continue
-			}
-			if strings.HasPrefix(line, ":") {
-				continue
-			}
-			field, val, hasColon := strings.Cut(line, ":")
-			if hasColon {
-				val = strings.TrimPrefix(val, " ")
-			}
-			switch field {
-			case "id":
-				cur.ID = val
-				hasFields = true
-			case "event":
-				cur.Event = val
-				hasFields = true
-			case "data":
-				dataLines = append(dataLines, val)
-				hasFields = true
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			s.errCh <- err
-		}
-	}()
-	t.Cleanup(func() {
-		s.close()
-	})
-	return s
 }
 
 func (s *sseClientStream) waitClosed(t *testing.T, timeout time.Duration) {
