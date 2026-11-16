@@ -12,6 +12,7 @@ import (
 type Querier interface {
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
+	ClaimJobByID(ctx context.Context, arg ClaimJobByIDParams) (Job, error)
 	CountUsers(ctx context.Context) (int64, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
 	CreateLabel(ctx context.Context, arg CreateLabelParams) error
@@ -24,12 +25,17 @@ type Querier interface {
 	DeleteSessionsByCredentialID(ctx context.Context, credentialID string) (int64, error)
 	DeleteSystemSetting(ctx context.Context, key string) error
 	DeleteUser(ctx context.Context, id string) (int64, error)
+	EnqueueJob(ctx context.Context, arg EnqueueJobParams) (Job, error)
 	EnsureUserBuiltInLabel(ctx context.Context, arg EnsureUserBuiltInLabelParams) error
+	GetActiveJobByDedupeKey(ctx context.Context, dedupeKey *string) (Job, error)
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error)
+	GetJobByID(ctx context.Context, id string) (Job, error)
+	GetJobByIDForUpdate(ctx context.Context, id string) (Job, error)
 	GetLabelByID(ctx context.Context, id string) (Label, error)
+	GetNextRunnableJobIDForUpdate(ctx context.Context, arg GetNextRunnableJobIDForUpdateParams) (string, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
 	GetServerLabelByName(ctx context.Context, name string) (Label, error)
@@ -38,11 +44,13 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	GetUserLabelByName(ctx context.Context, arg GetUserLabelByNameParams) (Label, error)
+	IsJobCancelRequested(ctx context.Context, id string) (bool, error)
 	ListAllItemLabelsForMaintenance(ctx context.Context, arg ListAllItemLabelsForMaintenanceParams) ([]Label, error)
 	ListAllRolePermissions(ctx context.Context) ([]RolePermission, error)
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
 	ListItemIDsByLabel(ctx context.Context, arg ListItemIDsByLabelParams) ([]string, error)
 	ListItemLabels(ctx context.Context, arg ListItemLabelsParams) ([]Label, error)
+	ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, error)
 	ListLabelPoliciesByLabel(ctx context.Context, labelID string) ([]UserLabelPolicy, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
 	ListRoles(ctx context.Context) ([]Role, error)
@@ -53,14 +61,19 @@ type Querier interface {
 	ListUserLabels(ctx context.Context, ownerID *string) ([]Label, error)
 	ListUserRoles(ctx context.Context, userID string) ([]ListUserRolesRow, error)
 	ListUsers(ctx context.Context) ([]User, error)
+	MarkJobCancelled(ctx context.Context, arg MarkJobCancelledParams) (Job, error)
+	MarkJobFailed(ctx context.Context, arg MarkJobFailedParams) (Job, error)
+	MarkJobSucceeded(ctx context.Context, arg MarkJobSucceededParams) (Job, error)
 	RemoveAllItemLabelsForItem(ctx context.Context, arg RemoveAllItemLabelsForItemParams) error
 	RemoveItemLabel(ctx context.Context, arg RemoveItemLabelParams) (int64, error)
 	RemoveUserLabelPolicy(ctx context.Context, arg RemoveUserLabelPolicyParams) (int64, error)
 	RemoveUserRole(ctx context.Context, arg RemoveUserRoleParams) (int64, error)
 	RenameLabel(ctx context.Context, arg RenameLabelParams) (Label, error)
+	RequeueJobForRetry(ctx context.Context, arg RequeueJobForRetryParams) (Job, error)
 	RevokeCredential(ctx context.Context, arg RevokeCredentialParams) (int64, error)
 	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
 	RevokeSessionsByCredentialID(ctx context.Context, arg RevokeSessionsByCredentialIDParams) (int64, error)
+	SetJobCancelRequested(ctx context.Context, arg SetJobCancelRequestedParams) (Job, error)
 	SetUserLabelPolicy(ctx context.Context, arg SetUserLabelPolicyParams) error
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)

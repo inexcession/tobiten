@@ -14,7 +14,9 @@ var (
 	ErrEmptyJobID             = errors.New("job ID cannot be empty")
 	ErrEmptyJobKind           = errors.New("job kind cannot be empty")
 	ErrInvalidJobState        = errors.New("invalid job state")
+	ErrInvalidJobTransition   = errors.New("invalid job state transition")
 	ErrInvalidJobAttempts     = errors.New("job attempts must be non-negative and max_attempts must be positive")
+	ErrInvalidJobJSON         = errors.New("job payload and checkpoint must be valid JSON")
 	ErrEmptyDedupeKey         = errors.New("job dedupe_key cannot be empty when present")
 	ErrEmptyEventKind         = errors.New("domain event kind cannot be empty")
 	ErrInvalidEventVersion    = errors.New("domain event version must be >= 1")
@@ -27,6 +29,9 @@ var (
 	ErrInvalidSubscriberState = errors.New("invalid event subscriber state")
 	ErrInvalidStalledPair     = errors.New("subscriber state STALLED and stalled_at must be set together")
 )
+
+// DefaultJobMaxAttempts is the default maximum execution attempts for a durable job.
+const DefaultJobMaxAttempts = 3
 
 // JobKind identifies a durable background job handler kind (ADR-0017).
 type JobKind string
@@ -82,6 +87,37 @@ func (s JobState) IsActive() bool {
 // IsTerminal reports whether s is a completed state (SUCCEEDED, FAILED, or CANCELLED).
 func (s JobState) IsTerminal() bool {
 	return s == JobStateSucceeded || s == JobStateFailed || s == JobStateCancelled
+}
+
+// CanTransitionTo reports whether a job in state s may transition directly to next.
+func (s JobState) CanTransitionTo(next JobState) bool {
+	switch s {
+	case JobStateQueued:
+		return next == JobStateRunning || next == JobStateCancelled
+	case JobStateRunning:
+		return next == JobStateQueued || next == JobStateSucceeded || next == JobStateFailed || next == JobStateCancelled
+	case JobStateSucceeded, JobStateFailed, JobStateCancelled:
+		return false
+	default:
+		return false
+	}
+}
+
+// JobRetryBackoff returns the default exponential retry backoff delay for a failed attempt.
+func JobRetryBackoff(attempt int) time.Duration {
+	const (
+		baseDelay = 5 * time.Second
+		maxDelay  = 5 * time.Minute
+	)
+	if attempt <= 1 {
+		return baseDelay
+	}
+	shift := min(attempt-1, 10)
+	delay := baseDelay << shift
+	if delay > maxDelay || delay <= 0 {
+		return maxDelay
+	}
+	return delay
 }
 
 // Job represents a durable background job stored in PostgreSQL (ADR-0017).

@@ -75,6 +75,37 @@ func TestJobValidationAndHelpers(t *testing.T) {
 	if !errors.Is(badState.Validate(), ErrInvalidJobState) {
 		t.Fatalf("expected ErrInvalidJobState, got %v", badState.Validate())
 	}
+
+	// State transitions.
+	if !JobStateQueued.CanTransitionTo(JobStateRunning) || !JobStateQueued.CanTransitionTo(JobStateCancelled) {
+		t.Error("QUEUED must allow transition to RUNNING and CANCELLED")
+	}
+	if JobStateQueued.CanTransitionTo(JobStateSucceeded) || JobStateQueued.CanTransitionTo(JobStateFailed) {
+		t.Error("QUEUED must not transition directly to SUCCEEDED or FAILED")
+	}
+	for _, next := range []JobState{JobStateQueued, JobStateSucceeded, JobStateFailed, JobStateCancelled} {
+		if !JobStateRunning.CanTransitionTo(next) {
+			t.Errorf("RUNNING must allow transition to %s", next)
+		}
+	}
+	for _, term := range []JobState{JobStateSucceeded, JobStateFailed, JobStateCancelled} {
+		for _, next := range ValidJobStates() {
+			if term.CanTransitionTo(next) {
+				t.Errorf("terminal state %s must not transition to %s", term, next)
+			}
+		}
+	}
+
+	// Exponential retry backoff with cap.
+	if got := JobRetryBackoff(1); got != 5*time.Second {
+		t.Errorf("JobRetryBackoff(1) = %v, want 5s", got)
+	}
+	if got := JobRetryBackoff(2); got != 10*time.Second {
+		t.Errorf("JobRetryBackoff(2) = %v, want 10s", got)
+	}
+	if got := JobRetryBackoff(100); got != 5*time.Minute {
+		t.Errorf("JobRetryBackoff(100) = %v, want 5m cap", got)
+	}
 }
 
 func TestDomainEventAndSubscriber(t *testing.T) {
