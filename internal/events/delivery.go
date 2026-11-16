@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -135,12 +136,20 @@ func NewDeliveryCoordinator(
 	}
 }
 
+func isNilPointerInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
+}
+
 // RegisterSubscriber registers a durable subscriber handler.
 func (d *DeliveryCoordinator) RegisterSubscriber(sub Subscriber) error {
 	if d == nil {
 		return ErrNilDeliveryDependencies
 	}
-	if sub == nil {
+	if isNilPointerInterface(sub) {
 		return fmt.Errorf("%w: nil subscriber", ErrInvalidSubscriber)
 	}
 	id := strings.TrimSpace(sub.ID())
@@ -203,7 +212,7 @@ func (d *DeliveryCoordinator) RegisterModuleSubscribers(reg module.Registry) err
 
 	seenInRegistry := make(map[string]struct{})
 	for _, es := range reg.EventSubscribers() {
-		if es == nil {
+		if isNilPointerInterface(es) {
 			return fmt.Errorf("%w: nil module event subscriber", ErrInvalidSubscriber)
 		}
 		id := strings.TrimSpace(es.Name())
@@ -336,6 +345,9 @@ func (d *DeliveryCoordinator) RegisterJobs(r *jobs.Runner) error {
 func (d *DeliveryCoordinator) DrainOnce(ctx context.Context) (int, error) {
 	if d == nil || d.events == nil || d.jobs == nil {
 		return 0, ErrNilDeliveryDependencies
+	}
+	if d.events.InTx() {
+		return 0, storage.ErrRootRepositoryRequired
 	}
 	if d.maxAttempts < 1 {
 		return 0, ErrInvalidDeliveryMaxAttempts
@@ -519,6 +531,9 @@ func (d *DeliveryCoordinator) reconcileDeliveryJob(ctx context.Context, job doma
 func (d *DeliveryCoordinator) Start(ctx context.Context) error {
 	if d == nil || d.events == nil || d.jobs == nil {
 		return ErrNilDeliveryDependencies
+	}
+	if d.events.InTx() {
+		return storage.ErrRootRepositoryRequired
 	}
 	if ctx == nil {
 		return errors.New("lifecycle context is required")

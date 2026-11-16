@@ -22,10 +22,15 @@ type JobRepository interface {
 	// WithTx executes fn inside a transaction (or savepoint when already inside one).
 	WithTx(ctx context.Context, fn func(repo JobRepository) error) error
 
+	// InTx reports whether this repository handle is bound to an active caller transaction.
+	InTx() bool
+
 	// Enqueue inserts a new QUEUED job, or returns the existing active (QUEUED or RUNNING) job
 	// when a non-nil dedupe_key collides with idx_jobs_active_dedupe.
 	// It populates *job with the persisted row and reports created=true when newly inserted
 	// or created=false when deduplicated to an active job.
+	// Direct EVENT_DELIVERY enqueues require a root repository (InTx() == false) and reject
+	// transaction-bound handles with ErrRootRepositoryRequired so scheduling cannot use a stale snapshot.
 	Enqueue(ctx context.Context, job *domain.Job) (created bool, err error)
 
 	// GetJobByID retrieves a job by its ID. Returns ErrNotFound if no such job exists.

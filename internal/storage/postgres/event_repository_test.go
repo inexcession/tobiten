@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func setupEventTestDB(t *testing.T) (*testdb.TestDB, *postgres.EventRepository) {
@@ -1688,5 +1690,375 @@ func TestEventRepository_ConcurrentAdvanceCursorCannotSkip(t *testing.T) {
 	}
 	if seq2Successes.Load() > 0 && got.Position != 2 {
 		t.Fatalf("unexpected position %d after seq2 succeeded", got.Position)
+	}
+}
+
+type blockingSubCommitDB struct {
+	*testdb.TestDB
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingSubCommitDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TestDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &blockingSubCommitTx{Tx: tx, db: b}, nil
+}
+
+type blockingSubCommitTx struct {
+	pgx.Tx
+	db *blockingSubCommitDB
+}
+
+func (t *blockingSubCommitTx) Commit(ctx context.Context) error {
+	t.db.once.Do(func() { close(t.db.entered) })
+	select {
+	case <-t.db.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return t.Tx.Commit(ctx)
+}
+
+func (t *blockingSubCommitTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	sp, err := t.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &blockingSubCommitTx{Tx: sp, db: t.db}, nil
+}
+
+type subLockAttemptDB struct {
+	*testdb.TestDB
+	attempted chan struct{}
+	once      sync.Once
+}
+
+func (d *subLockAttemptDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.TestDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &subLockAttemptTx{Tx: tx, db: d}, nil
+}
+
+func (d *subLockAttemptDB) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := d.Pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &subLockAttemptTx{Tx: tx, db: d}, nil
+}
+
+type subLockAttemptTx struct {
+	pgx.Tx
+	db *subLockAttemptDB
+}
+
+func (t *subLockAttemptTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	sp, err := t.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &subLockAttemptTx{Tx: sp, db: t.db}, nil
+}
+
+func (t *subLockAttemptTx) QueryRow(ctx context.Context, sqlStr string, args ...any) pgx.Row {
+	if strings.Contains(sqlStr, "event_subscribers") && strings.Contains(sqlStr, "FOR UPDATE") {
+		t.db.once.Do(func() { close(t.db.attempted) })
+	}
+	return t.Tx.QueryRow(ctx, sqlStr, args...)
+}
+
+func (t *subLockAttemptTx) Exec(ctx context.Context, sqlStr string, args ...any) (pgconn.CommandTag, error) {
+	return t.Tx.Exec(ctx, sqlStr, args...)
+}
+
+func waitForSubscriberLockWaiters(ctx context.Context, t *testing.T, db *testdb.TestDB, minWaiters int) {
+	t.Helper()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var count int
+		err := db.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%event_subscribers%'
+		`).Scan(&count)
+		if err != nil {
+			t.Fatalf("polling pg_stat_activity for event_subscribers lock wait: %v", err)
+		}
+		if count >= minWaiters {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %d waiters on event_subscribers lock (last=%d): %v", minWaiters, count, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestEventRepository_RepeatableReadAndLockContentionPreserveRetryLimit(t *testing.T) {
+	t.Parallel()
+	db, repo := setupEventTestDB(t)
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 18, 0, 0, 0, time.UTC)
+
+	// Seed two published events and one active subscriber.
+	if err := repo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		for _, id := range []string{"rr-1", "rr-2"} {
+			ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, id, nil, t0)
+			if err != nil {
+				return err
+			}
+			if err := txRepo.AppendEvent(ctx, &ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+	if _, err := repo.PublishUnsequencedEvents(ctx, t0); err != nil {
+		t.Fatalf("PublishUnsequencedEvents: %v", err)
+	}
+	if _, err := repo.EnsureEventSubscriber(ctx, domain.EventSubscriber{
+		ID:        "sub:rr",
+		Kind:      "webhook",
+		State:     domain.SubscriberStateActive,
+		UpdatedAt: t0,
+	}); err != nil {
+		t.Fatalf("EnsureEventSubscriber: %v", err)
+	}
+
+	// Part 1: Pin a REPEATABLE READ transaction BEFORE the first EVENT_DELIVERY job exists.
+	connRR, err := pgx.Connect(ctx, db.URL)
+	if err != nil {
+		t.Fatalf("pgx.Connect connRR: %v", err)
+	}
+	defer func() { _ = connRR.Close(context.Background()) }()
+
+	rrTx, err := connRR.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatalf("BeginTx RepeatableRead: %v", err)
+	}
+	defer func() { _ = rrTx.Rollback(context.Background()) }()
+
+	var pinnedPos int64
+	if err := rrTx.QueryRow(ctx, `SELECT position FROM event_subscribers WHERE id = $1`, "sub:rr").Scan(&pinnedPos); err != nil {
+		t.Fatalf("pinning REPEATABLE READ snapshot: %v", err)
+	}
+
+	// Now on the root connection: schedule the first job (maxAttempts=1), claim it, and commit FAILED
+	// without modifying event_subscribers.
+	firstJob, created, err := repo.ScheduleNextEventDelivery(ctx, "sub:rr", 1, t0)
+	if err != nil || !created || firstJob == nil {
+		t.Fatalf("ScheduleNextEventDelivery first = (%+v, %v, %v)", firstJob, created, err)
+	}
+	claimed, err := jobRepo.ClaimNext(ctx, domain.JobKindEventDelivery, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext: %v", err)
+	}
+	if _, err := jobRepo.FailOrRetry(ctx, claimed.ID, claimed.Attempts, "terminal fail", time.Time{}, t0.Add(time.Second)); err != nil {
+		t.Fatalf("FailOrRetry terminal: %v", err)
+	}
+
+	// Attempt both scheduling paths inside the stale REPEATABLE READ transaction (and via Transactor.WithTx):
+	// both must reject transaction-bound execution with storage.ErrRootRepositoryRequired.
+	canonPayload, _ := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:rr",
+		PublishedSequence: 1,
+	})
+	canonKey, _ := domain.EventDeliveryDedupeKey("sub:rr")
+	if _, _, err := postgres.NewEventRepository(rrTx).ScheduleNextEventDelivery(ctx, "sub:rr", 1, t0.Add(2*time.Second)); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+		t.Fatalf("tx-bound ScheduleNextEventDelivery err = %v, want ErrRootRepositoryRequired", err)
+	}
+	if _, err := postgres.NewJobRepository(rrTx).Enqueue(ctx, &domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     canonPayload,
+		DedupeKey:   &canonKey,
+		MaxAttempts: 1,
+		CreatedAt:   t0.Add(2 * time.Second),
+		RunAfter:    t0.Add(2 * time.Second),
+	}); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+		t.Fatalf("tx-bound Enqueue(EVENT_DELIVERY) err = %v, want ErrRootRepositoryRequired", err)
+	}
+	if err := postgres.NewTransactor(rrTx).WithTx(ctx, func(stx storage.Tx) error {
+		if _, _, err := stx.Events().ScheduleNextEventDelivery(ctx, "sub:rr", 1, t0.Add(2*time.Second)); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+			return fmt.Errorf("stx.Events().ScheduleNextEventDelivery = %v, want ErrRootRepositoryRequired", err)
+		}
+		if _, err := stx.Jobs().Enqueue(ctx, &domain.Job{
+			Kind:        domain.JobKindEventDelivery,
+			Payload:     canonPayload,
+			DedupeKey:   &canonKey,
+			MaxAttempts: 1,
+			CreatedAt:   t0.Add(2 * time.Second),
+			RunAfter:    t0.Add(2 * time.Second),
+		}); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+			return fmt.Errorf("stx.Jobs().Enqueue = %v, want ErrRootRepositoryRequired", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Transactor.WithTx stale-snapshot check: %v", err)
+	}
+	if err := rrTx.Commit(ctx); err != nil {
+		t.Fatalf("commit rrTx: %v", err)
+	}
+
+	// Even a root connection whose session default is REPEATABLE READ must start a fresh READ COMMITTED
+	// transaction on both scheduling paths and observe the committed FAILED job.
+	connSessionRR, err := pgx.Connect(ctx, db.URL)
+	if err != nil {
+		t.Fatalf("pgx.Connect connSessionRR: %v", err)
+	}
+	defer func() { _ = connSessionRR.Close(context.Background()) }()
+	if _, err := connSessionRR.Exec(ctx, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		t.Fatalf("set session repeatable read: %v", err)
+	}
+	if job, created, err := postgres.NewEventRepository(connSessionRR).ScheduleNextEventDelivery(ctx, "sub:rr", 1, t0.Add(3*time.Second)); err != nil || created || job != nil {
+		t.Fatalf("session-RR ScheduleNextEventDelivery = (%+v, %v, %v), want (nil, false, nil)", job, created, err)
+	}
+	if created, err := postgres.NewJobRepository(connSessionRR).Enqueue(ctx, &domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     canonPayload,
+		DedupeKey:   &canonKey,
+		MaxAttempts: 1,
+		CreatedAt:   t0.Add(3 * time.Second),
+		RunAfter:    t0.Add(3 * time.Second),
+	}); created || !errors.Is(err, domain.ErrEventDeliveryBlocked) {
+		t.Fatalf("session-RR Enqueue = (%v, %v), want (false, ErrEventDeliveryBlocked)", created, err)
+	}
+
+	// Part 2: Reset subscriber, claim a fresh attempt, pause FailOrRetry commit while holding
+	// event_subscribers FOR UPDATE, and force BOTH ScheduleNextEventDelivery and Enqueue to
+	// contend on the PostgreSQL event_subscribers row lock before FailOrRetry commits FAILED.
+	tReset := t0.Add(10 * time.Second)
+	if _, err := repo.UpdateEventSubscriberState(ctx, "sub:rr", domain.SubscriberStateActive, nil, tReset); err != nil {
+		t.Fatalf("UpdateEventSubscriberState reset: %v", err)
+	}
+	secondJob, created, err := repo.ScheduleNextEventDelivery(ctx, "sub:rr", 1, tReset)
+	if err != nil || !created || secondJob == nil {
+		t.Fatalf("ScheduleNextEventDelivery after reset = (%+v, %v, %v)", secondJob, created, err)
+	}
+	claimed2, err := jobRepo.ClaimNext(ctx, domain.JobKindEventDelivery, tReset)
+	if err != nil {
+		t.Fatalf("ClaimNext second: %v", err)
+	}
+
+	blockingDB := &blockingSubCommitDB{
+		TestDB:  db,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	schedLockDB := &subLockAttemptDB{TestDB: db, attempted: make(chan struct{})}
+	enqLockDB := &subLockAttemptDB{TestDB: db, attempted: make(chan struct{})}
+
+	var wg sync.WaitGroup
+	var failErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, failErr = postgres.NewJobRepository(blockingDB).FailOrRetry(
+			ctx, claimed2.ID, claimed2.Attempts, "final failure at lock", time.Time{}, tReset.Add(time.Second),
+		)
+	}()
+
+	select {
+	case <-blockingDB.entered:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for FailOrRetry to reach commit: %v", ctx.Err())
+	}
+
+	var (
+		schedJob     *domain.Job
+		schedCreated bool
+		schedErr     error
+		enqCreated   bool
+		enqErr       error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		schedJob, schedCreated, schedErr = postgres.NewEventRepository(schedLockDB).ScheduleNextEventDelivery(
+			ctx, "sub:rr", 1, tReset.Add(2*time.Second),
+		)
+	}()
+	go func() {
+		defer wg.Done()
+		enqCreated, enqErr = postgres.NewJobRepository(enqLockDB).Enqueue(ctx, &domain.Job{
+			Kind:        domain.JobKindEventDelivery,
+			Payload:     canonPayload,
+			DedupeKey:   &canonKey,
+			MaxAttempts: 1,
+			CreatedAt:   tReset.Add(2 * time.Second),
+			RunAfter:    tReset.Add(2 * time.Second),
+		})
+	}()
+
+	select {
+	case <-schedLockDB.attempted:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for ScheduleNextEventDelivery lock query: %v", ctx.Err())
+	}
+	select {
+	case <-enqLockDB.attempted:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for Enqueue lock query: %v", ctx.Err())
+	}
+	waitForSubscriberLockWaiters(ctx, t, db, 2)
+
+	// Release FailOrRetry commit and verify both waiters observe the terminal FAILED outcome.
+	close(blockingDB.release)
+	wgDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(wgDone)
+	}()
+	select {
+	case <-wgDone:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for lock-contending goroutines: %v", ctx.Err())
+	}
+
+	if failErr != nil {
+		t.Fatalf("FailOrRetry err = %v", failErr)
+	}
+	if schedErr != nil || schedCreated || schedJob != nil {
+		t.Fatalf("contending ScheduleNextEventDelivery = (%+v, %v, %v), want (nil, false, nil)", schedJob, schedCreated, schedErr)
+	}
+	if enqCreated || !errors.Is(enqErr, domain.ErrEventDeliveryBlocked) {
+		t.Fatalf("contending Enqueue = (%v, %v), want (false, ErrEventDeliveryBlocked)", enqCreated, enqErr)
+	}
+
+	// Verify final PostgreSQL rows: exactly the 2 FAILED jobs (first + post-reset), zero new QUEUED/RUNNING jobs,
+	// and subscriber cursor unchanged at position 0.
+	kindFilter := domain.JobKindEventDelivery
+	allDeliveryJobs, err := jobRepo.ListJobs(ctx, storage.JobFilter{Kind: &kindFilter})
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(allDeliveryJobs) != 2 {
+		t.Fatalf("expected exactly 2 EVENT_DELIVERY jobs (first FAILED + post-reset FAILED), got %d: %+v", len(allDeliveryJobs), allDeliveryJobs)
+	}
+	for _, j := range allDeliveryJobs {
+		if j.State != domain.JobStateFailed || j.Attempts != 1 {
+			t.Fatalf("expected FAILED job with attempts=1, got %+v", j)
+		}
+	}
+	gotSub, err := repo.GetEventSubscriber(ctx, "sub:rr")
+	if err != nil || gotSub.Position != 0 {
+		t.Fatalf("subscriber = (%+v, %v), want position 0", gotSub, err)
 	}
 }

@@ -22,8 +22,9 @@ const maxDedupeEnqueueAttempts = 5
 
 // JobRepository implements storage.JobRepository backed by PostgreSQL and sqlc.
 type JobRepository struct {
-	q  *Queries
-	tx TxBeginner
+	q    *Queries
+	tx   TxBeginner
+	inTx bool
 }
 
 // NewJobRepository creates a new JobRepository using the provided database handle.
@@ -32,16 +33,23 @@ func NewJobRepository(db DBTX) *JobRepository {
 	if b, ok := db.(TxBeginner); ok {
 		beginner = b
 	}
+	_, inTx := db.(pgx.Tx)
 	return &JobRepository{
-		q:  New(db),
-		tx: beginner,
+		q:    New(db),
+		tx:   beginner,
+		inTx: inTx,
 	}
+}
+
+// InTx reports whether this repository handle is bound to an active PostgreSQL transaction.
+func (r *JobRepository) InTx() bool {
+	return r != nil && r.inTx
 }
 
 // WithTx executes fn inside a transaction (or nested savepoint when already inside one).
 func (r *JobRepository) WithTx(ctx context.Context, fn func(repo storage.JobRepository) error) error {
 	_, err := runInJobTx(ctx, r, func(tx pgx.Tx, q *Queries) (struct{}, error) {
-		return struct{}{}, fn(&JobRepository{q: q, tx: tx})
+		return struct{}{}, fn(&JobRepository{q: q, tx: tx, inTx: true})
 	})
 	return err
 }
@@ -189,7 +197,10 @@ func (r *JobRepository) Enqueue(ctx context.Context, job *domain.Job) (bool, err
 		UpdatedAt:   candidate.UpdatedAt,
 	}
 
-	if candidate.Kind == domain.JobKindEventDelivery && r.tx != nil {
+	if candidate.Kind == domain.JobKindEventDelivery {
+		if r.InTx() {
+			return false, storage.ErrRootRepositoryRequired
+		}
 		return r.enqueueEventDeliverySerialized(ctx, job, candidate, params)
 	}
 
@@ -233,18 +244,20 @@ func (r *JobRepository) enqueueEventDeliverySerialized(
 		persisted domain.Job
 		created   bool
 	}
-	res, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (enqueueRes, error) {
+	var res enqueueRes
+	if err := runReadCommittedTx(ctx, r.tx, "event delivery enqueue", func(_ pgx.Tx, q *Queries) error {
 		subRow, subErr := q.GetEventSubscriberByIDForUpdate(ctx, ep.SubscriberID)
 		if subErr != nil && !errors.Is(subErr, pgx.ErrNoRows) {
-			return enqueueRes{}, fmt.Errorf("locking event subscriber %q: %w", ep.SubscriberID, subErr)
+			return fmt.Errorf("locking event subscriber %q: %w", ep.SubscriberID, subErr)
 		}
 
 		existing, activeErr := q.GetActiveJobByDedupeKey(ctx, candidate.DedupeKey)
 		if activeErr == nil {
-			return enqueueRes{persisted: JobToDomain(existing), created: false}, nil
+			res = enqueueRes{persisted: JobToDomain(existing), created: false}
+			return nil
 		}
 		if !errors.Is(activeErr, pgx.ErrNoRows) {
-			return enqueueRes{}, fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
+			return fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
 		}
 
 		if subErr == nil {
@@ -254,32 +267,33 @@ func (r *JobRepository) enqueueEventDeliverySerialized(
 				Since:             subRow.UpdatedAt.UTC(),
 			})
 			if failErr != nil {
-				return enqueueRes{}, fmt.Errorf("checking failed event delivery for subscriber %q sequence %d: %w",
+				return fmt.Errorf("checking failed event delivery for subscriber %q sequence %d: %w",
 					ep.SubscriberID, ep.PublishedSequence, failErr)
 			}
 			if failed {
-				return enqueueRes{}, domain.ErrEventDeliveryBlocked
+				return domain.ErrEventDeliveryBlocked
 			}
 		}
 
 		row, insertErr := q.EnqueueJob(ctx, params)
 		if insertErr == nil {
-			return enqueueRes{persisted: JobToDomain(row), created: true}, nil
+			res = enqueueRes{persisted: JobToDomain(row), created: true}
+			return nil
 		}
 		if !errors.Is(insertErr, pgx.ErrNoRows) {
-			return enqueueRes{}, mapJobWriteError(insertErr)
+			return mapJobWriteError(insertErr)
 		}
 
 		existing, activeErr = q.GetActiveJobByDedupeKey(ctx, candidate.DedupeKey)
 		if activeErr == nil {
-			return enqueueRes{persisted: JobToDomain(existing), created: false}, nil
+			res = enqueueRes{persisted: JobToDomain(existing), created: false}
+			return nil
 		}
 		if errors.Is(activeErr, pgx.ErrNoRows) {
-			return enqueueRes{}, errors.New("active EVENT_DELIVERY job disappeared during enqueue")
+			return errors.New("active EVENT_DELIVERY job disappeared during enqueue")
 		}
-		return enqueueRes{}, fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
-	})
-	if err != nil {
+		return fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
+	}); err != nil {
 		return false, err
 	}
 	*job = res.persisted

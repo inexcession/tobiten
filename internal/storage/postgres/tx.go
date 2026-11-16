@@ -174,6 +174,62 @@ func runTx(ctx context.Context, db TxBeginner, parentScope *txScope, label strin
 	return nil
 }
 
+type readCommittedTxBeginner interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+}
+
+func runReadCommittedTx(ctx context.Context, db TxBeginner, label string, fn func(tx pgx.Tx, q *Queries) error) error {
+	if db == nil {
+		return errors.New("db connection does not support transactions")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var (
+		tx  pgx.Tx
+		err error
+	)
+	if bt, ok := db.(readCommittedTxBeginner); ok {
+		tx, err = bt.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	} else {
+		tx, err = db.Begin(ctx)
+		if err == nil {
+			if _, isoErr := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); isoErr != nil {
+				rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txRollbackTimeout)
+				_ = tx.Rollback(rollbackCtx)
+				cancel()
+				return fmt.Errorf("setting READ COMMITTED isolation for %s transaction: %w", label, isoErr)
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("beginning %s transaction: %w", label, err)
+	}
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txRollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+
+	if err := fn(tx, New(tx)); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing %s transaction: %w", label, err)
+	}
+	committed = true
+	return nil
+}
+
 type pgTx struct {
 	scope *txScope
 	q     *Queries
@@ -193,7 +249,7 @@ func (s *pgTx) Events() storage.EventRepository {
 }
 
 func (s *pgTx) Jobs() storage.JobRepository {
-	return &JobRepository{q: s.q, tx: s.scope.tx}
+	return &JobRepository{q: s.q, tx: s.scope.tx, inTx: true}
 }
 
 func (s *pgTx) Users() storage.UserRepository {

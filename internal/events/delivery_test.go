@@ -1160,6 +1160,35 @@ func TestDeliveryCoordinator_UnsetModuleCallbackRejectedAndNamedPreserved(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// 0. Typed nil *module.EventSubscriberSpec and *events.SubscriberSpec held in interfaces
+	// must be rejected cleanly without panicking on value-receiver method calls.
+	var nilModulePtr *module.EventSubscriberSpec
+	nilModReg := module.NewRegistry()
+	_ = nilModReg.Register(&module.SimpleModule{
+		ModuleName:  "typed-nil-mod",
+		Subscribers: []module.EventSubscriber{nilModulePtr},
+	})
+	nilCheckCoord := events.NewDeliveryCoordinator(eventRepo, jobRepo, nil, events.DeliveryOptions{})
+	if err := nilCheckCoord.RegisterModuleSubscribers(nilModReg); !errors.Is(err, events.ErrInvalidSubscriber) {
+		t.Fatalf("typed nil *module.EventSubscriberSpec err = %v, want ErrInvalidSubscriber", err)
+	}
+	var nilEventSubPtr *events.SubscriberSpec
+	if err := nilCheckCoord.RegisterSubscriber(nilEventSubPtr); !errors.Is(err, events.ErrInvalidSubscriber) {
+		t.Fatalf("typed nil *events.SubscriberSpec err = %v, want ErrInvalidSubscriber", err)
+	}
+	if err := eventRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		txCoord := events.NewDeliveryCoordinator(txRepo, jobRepo, nil, events.DeliveryOptions{})
+		if _, err := txCoord.DrainOnce(ctx); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+			return fmt.Errorf("tx-bound DrainOnce = %v, want ErrRootRepositoryRequired", err)
+		}
+		if err := txCoord.Start(ctx); !errors.Is(err, storage.ErrRootRepositoryRequired) {
+			return fmt.Errorf("tx-bound Start = %v, want ErrRootRepositoryRequired", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tx-bound DeliveryCoordinator guard: %v", err)
+	}
+
 	// 1. Value and pointer EventSubscriberSpec with nil DeliverFunc are rejected at registration.
 	for _, tc := range []struct {
 		name string

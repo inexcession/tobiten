@@ -439,12 +439,17 @@ func (r *EventRepository) UpdateEventSubscriberState(ctx context.Context, id str
 	return &out, nil
 }
 
-// ScheduleNextEventDelivery atomically locks subscriberID's row FOR UPDATE, reads the
-// next committed published event after its cursor, checks for a terminal failure since
-// subscriber.updated_at, and enqueues at most one active EVENT_DELIVERY job.
+// ScheduleNextEventDelivery atomically locks subscriberID's row FOR UPDATE in its own
+// READ COMMITTED transaction, reads the next committed published event after its cursor,
+// checks for a terminal failure since subscriber.updated_at, and enqueues at most one active
+// EVENT_DELIVERY job. Transaction-bound repositories (InTx() == true) reject this call with
+// storage.ErrRootRepositoryRequired.
 func (r *EventRepository) ScheduleNextEventDelivery(ctx context.Context, subscriberID string, maxAttempts int, now time.Time) (*domain.Job, bool, error) {
 	if r == nil {
 		return nil, false, errors.New("event repository is required")
+	}
+	if r.InTx() {
+		return nil, false, storage.ErrRootRepositoryRequired
 	}
 	if strings.TrimSpace(subscriberID) == "" {
 		return nil, false, domain.ErrEmptySubscriberID
@@ -452,27 +457,18 @@ func (r *EventRepository) ScheduleNextEventDelivery(ctx context.Context, subscri
 	if maxAttempts < 1 || maxAttempts > math.MaxInt32 {
 		return nil, false, domain.ErrInvalidJobAttempts
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	ts := normalizeEventTime(now)
 
 	var scheduled *domain.Job
 	var created bool
-	run := func(txRepo *EventRepository) error {
+	if err := runReadCommittedTx(ctx, r.tx, "event delivery schedule", func(tx pgx.Tx, q *Queries) error {
+		txRepo := &EventRepository{q: q, tx: tx, inTx: true}
 		var err error
 		scheduled, created, err = txRepo.scheduleNextEventDeliveryInTx(ctx, subscriberID, maxAttempts, ts)
 		return err
-	}
-	if r.InTx() {
-		if err := run(r); err != nil {
-			return nil, false, err
-		}
-		return scheduled, created, nil
-	}
-	if err := r.WithTx(ctx, func(repo storage.EventRepository) error {
-		pgTxRepo, ok := repo.(*EventRepository)
-		if !ok {
-			return errors.New("unexpected event repository implementation inside transaction")
-		}
-		return run(pgTxRepo)
 	}); err != nil {
 		return nil, false, err
 	}
