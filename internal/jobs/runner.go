@@ -96,6 +96,10 @@ type progressJobCleaner interface {
 	ClearJob(jobID string)
 }
 
+type progressPreflighter interface {
+	CanPublish(jobID string) bool
+}
+
 // RunnerOptions configures a durable job Runner and its bounded per-kind worker pools.
 type RunnerOptions struct {
 	Logger          *slog.Logger
@@ -121,12 +125,14 @@ type RecoveryReport struct {
 // Execution provides a running job handler with checkpoint persistence, cancellation checks,
 // and ephemeral progress reporting bound to the claimed attempt.
 type Execution struct {
-	mu        sync.RWMutex
-	job       domain.Job
-	repo      storage.JobRepository
-	now       func() time.Time
-	startedAt time.Time
-	progress  ProgressPublisher
+	mu         sync.RWMutex
+	job        domain.Job
+	repo       storage.JobRepository
+	now        func() time.Time
+	startedAt  time.Time
+	progressMu sync.RWMutex
+	progress   ProgressPublisher
+	closed     bool
 }
 
 // Job returns a snapshot of the claimed job, including its latest saved checkpoint.
@@ -202,19 +208,43 @@ func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
 
 // ReportProgress publishes an ephemeral, rate-limited progress tick for this job
 // without persisting any outbox row or SSE ID (ADR-0017 §2, ADR-0018 S3).
+// It resolves current job ownership from persistence (failing closed on error or
+// non-running state) and stops accepting reports once the handler execution ends.
 // Internal EVENT_DELIVERY jobs suppress progress ticks.
-func (e *Execution) ReportProgress(scannedCount int64, currentPath string) bool {
-	if e == nil || e.progress == nil {
+func (e *Execution) ReportProgress(ctx context.Context, scannedCount int64, currentPath string) bool {
+	if e == nil || ctx == nil || ctx.Err() != nil {
 		return false
 	}
+
+	e.progressMu.RLock()
+	defer e.progressMu.RUnlock()
+
+	if e.closed || e.progress == nil || e.repo == nil {
+		return false
+	}
+
 	e.mu.RLock()
-	job := e.job
+	jobID := e.job.ID
+	kind := e.job.Kind
+	attempt := e.job.Attempts
 	startedAt := e.startedAt
 	e.mu.RUnlock()
 
-	if job.Kind.IsInternal() {
+	if kind.IsInternal() {
 		return false
 	}
+	if preflight, ok := e.progress.(progressPreflighter); ok && !preflight.CanPublish(jobID) {
+		return false
+	}
+
+	current, err := e.repo.GetJobByID(ctx, jobID)
+	if err != nil || current == nil {
+		return false
+	}
+	if current.State != domain.JobStateRunning || current.Attempts != attempt {
+		return false
+	}
+
 	nowFn := time.Now
 	if e.now != nil {
 		nowFn = e.now
@@ -223,19 +253,29 @@ func (e *Execution) ReportProgress(scannedCount int64, currentPath string) bool 
 	durationMS := max(int64(0), now.Sub(startedAt).Milliseconds())
 
 	var createdBy *string
-	if job.CreatedBy != nil {
-		v := *job.CreatedBy
+	if current.CreatedBy != nil {
+		v := *current.CreatedBy
 		createdBy = &v
 	}
 
 	return e.progress.Publish(domain.JobProgressTick{
-		JobID:        job.ID,
-		Kind:         job.Kind,
+		JobID:        current.ID,
+		Kind:         current.Kind,
 		CreatedBy:    createdBy,
 		ScannedCount: scannedCount,
 		CurrentPath:  currentPath,
 		DurationMS:   durationMS,
 	})
+}
+
+func (e *Execution) finish() {
+	if e == nil {
+		return
+	}
+	e.progressMu.Lock()
+	e.closed = true
+	e.progress = nil
+	e.progressMu.Unlock()
 }
 
 // Runner coordinates job-kind registration, startup recovery under daemon ownership,
@@ -711,7 +751,9 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer r.clearProgressJob(job.ID)
+
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
 
 	startedAt := r.now().UTC()
 	if job.StartedAt != nil && !job.StartedAt.IsZero() && !job.StartedAt.After(startedAt) {
@@ -724,8 +766,21 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 		startedAt: startedAt,
 		progress:  r.progress,
 	}
+	var cleanupOnce sync.Once
+	cleanupProgress := func() {
+		cleanupOnce.Do(func() {
+			cancelExec()
+			exec.finish()
+			r.clearProgressJob(job.ID)
+		})
+	}
+	defer cleanupProgress()
 
-	runErr := cfg.Handler.Run(ctx, exec)
+	runErr := cfg.Handler.Run(execCtx, exec)
+
+	// End progress reporting as soon as the handler returns so a retained Execution
+	// cannot emit late ticks or recreate rate-limit state after ClearJob.
+	cleanupProgress()
 
 	// If the runner context was cancelled (shutdown or ownership loss), stop writing to DB
 	// so the interrupted RUNNING job is left cleanly for startup recovery on next boot.

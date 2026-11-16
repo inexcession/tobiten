@@ -256,3 +256,113 @@ func TestProgressHub_ValidationRateLimitVisibilityAndCleanup(t *testing.T) {
 		t.Fatalf("slow buffer len = %d, want 1", len(chSlow))
 	}
 }
+
+func TestProgressHub_IndependentListenerTicksAndPrivateAuthorization(t *testing.T) {
+	t.Parallel()
+	hub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+
+	creatorID := "user-creator"
+	otherID := "user-other"
+	creatorPrincipal := testPrincipalWithPerms(creatorID, domain.PermissionLibraryRead)
+	otherPrincipal := testPrincipalWithPerms(otherID, domain.PermissionLibraryRead)
+	adminPrincipal := testPrincipalWithPerms("user-admin", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
+
+	chCreator1, unsubCreator1, err := hub.Subscribe(context.Background(), events.ProgressSubscribeOptions{
+		Principal: creatorPrincipal,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe creator1: %v", err)
+	}
+	defer unsubCreator1()
+
+	chCreator2, unsubCreator2, err := hub.Subscribe(context.Background(), events.ProgressSubscribeOptions{
+		Principal: creatorPrincipal,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe creator2: %v", err)
+	}
+	defer unsubCreator2()
+
+	chOther, unsubOther, err := hub.Subscribe(context.Background(), events.ProgressSubscribeOptions{
+		Principal: otherPrincipal,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe other: %v", err)
+	}
+	defer unsubOther()
+
+	chAdmin, unsubAdmin, err := hub.Subscribe(context.Background(), events.ProgressSubscribeOptions{
+		Principal: adminPrincipal,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe admin: %v", err)
+	}
+	defer unsubAdmin()
+
+	// Mutating caller-owned Principal after Subscribe must not grant otherPrincipal access
+	// or strip adminPrincipal's jobs:read_all authorization.
+	otherPrincipal.Permissions[0] = domain.PermissionJobsReadAll
+	otherPrincipal.User.ID = creatorID
+	adminPrincipal.Permissions[1] = domain.PermissionLibraryRead
+
+	// Mutating a tick's CreatedBy pointer concurrently on listener 1 must not race or affect
+	// listener 2, admin, or fanout visibility for unauthorized listeners.
+	const rounds = 25
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range rounds {
+			got := <-chCreator1
+			if got.CreatedBy != nil {
+				*got.CreatedBy = otherID
+			}
+			got.JobID = "tampered-job"
+			got.CurrentPath = "/tampered"
+		}
+	}()
+
+	for i := range rounds {
+		owner := creatorID
+		tick := domain.JobProgressTick{
+			JobID:        "job-isolation",
+			Kind:         domain.JobKindScan,
+			CreatedBy:    &owner,
+			ScannedCount: int64(i + 1),
+			CurrentPath:  "/comics/v01.cbz",
+			DurationMS:   int64(i + 1),
+		}
+		if !hub.Publish(tick) {
+			t.Fatalf("Publish round %d returned false", i)
+		}
+		// Mutate caller's pointer immediately after Publish too.
+		owner = "caller-mutated"
+		hub.ClearJob("job-isolation")
+	}
+	wg.Wait()
+
+	for i := range rounds {
+		gotC2 := <-chCreator2
+		gotA := <-chAdmin
+		if gotC2.JobID != "job-isolation" || gotC2.CurrentPath != "/comics/v01.cbz" || gotC2.CreatedBy == nil || *gotC2.CreatedBy != creatorID {
+			t.Fatalf("creator2 round %d mutated: %+v (createdBy=%v)", i, gotC2, gotC2.CreatedBy)
+		}
+		if gotA.JobID != "job-isolation" || gotA.CurrentPath != "/comics/v01.cbz" || gotA.CreatedBy == nil || *gotA.CreatedBy != creatorID {
+			t.Fatalf("admin round %d mutated: %+v (createdBy=%v)", i, gotA, gotA.CreatedBy)
+		}
+		if gotC2.CreatedBy == gotA.CreatedBy {
+			t.Fatalf("round %d: creator2 and admin share the same CreatedBy pointer", i)
+		}
+	}
+
+	select {
+	case unexpected := <-chOther:
+		t.Fatalf("unauthorized listener received tick after caller/listener mutations: %+v", unexpected)
+	default:
+	}
+}

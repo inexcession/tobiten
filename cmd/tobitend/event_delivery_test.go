@@ -179,9 +179,9 @@ func TestRunDaemonRegularJobPositiveControlAndEventDeliverySuppression(t *testin
 		return r.RegisterKind(jobs.KindConfig{
 			Kind:         domain.JobKindScan,
 			ResumePolicy: domain.JobResumeCheckpoint,
-			Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
-				exec.ReportProgress(1, "/library/vol1.cbz")
-				exec.ReportProgress(2, "/library/vol2.cbz")
+			Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
+				exec.ReportProgress(execCtx, 1, "/library/vol1.cbz")
+				exec.ReportProgress(execCtx, 2, "/library/vol2.cbz")
 				return nil
 			}),
 		})

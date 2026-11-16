@@ -947,6 +947,7 @@ func TestRunner_LifecycleOutboxRetryAndExecutionProgress(t *testing.T) {
 	})
 
 	pub := &spyProgressPublisher{}
+	var retainedExec *jobs.Execution
 	var transitions []domain.JobState
 	runner := jobs.NewRunner(repo, jobs.RunnerOptions{
 		Now:         nowFn,
@@ -959,13 +960,14 @@ func TestRunner_LifecycleOutboxRetryAndExecutionProgress(t *testing.T) {
 	if err := runner.RegisterKind(jobs.KindConfig{
 		Kind:         domain.JobKindScan,
 		ResumePolicy: domain.JobResumeCheckpoint,
-		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+		Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
+			retainedExec = exec
 			advance(120 * time.Millisecond)
-			if !exec.ReportProgress(10, "/comics/a.cbz") {
+			if !exec.ReportProgress(execCtx, 10, "/comics/a.cbz") {
 				return errors.New("expected ReportProgress to publish")
 			}
 			advance(80 * time.Millisecond)
-			if !exec.ReportProgress(25, "/comics/b.cbz") {
+			if !exec.ReportProgress(execCtx, 25, "/comics/b.cbz") {
 				return errors.New("expected second ReportProgress to publish")
 			}
 			return nil
@@ -991,6 +993,14 @@ func TestRunner_LifecycleOutboxRetryAndExecutionProgress(t *testing.T) {
 	claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan)
 	if err != nil || !claimed {
 		t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+	}
+
+	// Retained execution must refuse late progress ticks after handler execution ends.
+	if retainedExec == nil {
+		t.Fatal("expected retainedExec to be captured")
+	}
+	if retainedExec.ReportProgress(context.Background(), 99, "/comics/late.cbz") {
+		t.Fatal("expected retained Execution.ReportProgress after completion to return false")
 	}
 
 	got, err := repo.GetJobByID(ctx, j.ID)

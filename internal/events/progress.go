@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -106,23 +107,57 @@ func (h *ProgressHub) Publish(tick domain.JobProgressTick) bool {
 	}
 	h.lastSent[tick.JobID] = now
 
-	cloned := tick.Clone()
+	authTick := tick.Clone()
 	for _, sub := range h.subscribers {
 		if sub.closed {
 			continue
 		}
-		if sub.jobID != "" && sub.jobID != cloned.JobID {
+		if sub.jobID != "" && sub.jobID != authTick.JobID {
 			continue
 		}
-		if !cloned.VisibleTo(sub.principal) {
+		if !authTick.VisibleTo(sub.principal) {
 			continue
 		}
+		delivery := authTick.Clone()
 		select {
-		case sub.ch <- cloned:
+		case sub.ch <- delivery:
 		default:
 		}
 	}
 	return true
+}
+
+// CanPublish reports whether a tick for jobID would currently be allowed by the
+// per-job rate limiter without mutating rate-limit state.
+func (h *ProgressHub) CanPublish(jobID string) bool {
+	if h == nil || strings.TrimSpace(jobID) == "" {
+		return false
+	}
+	nowFn := time.Now
+	if h.now != nil {
+		nowFn = h.now
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	last, ok := h.lastSent[jobID]
+	if !ok {
+		return true
+	}
+	now := nowFn().UTC()
+	return now.Before(last) || now.Sub(last) >= h.minInterval
+}
+
+// HasRateLimitState reports whether per-job rate-limit state is currently retained for jobID.
+func (h *ProgressHub) HasRateLimitState(jobID string) bool {
+	if h == nil || strings.TrimSpace(jobID) == "" {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.lastSent[jobID]
+	return ok
 }
 
 // ClearJob releases per-job rate-limit state once a job finishes executing.
@@ -133,6 +168,23 @@ func (h *ProgressHub) ClearJob(jobID string) {
 	h.mu.Lock()
 	delete(h.lastSent, jobID)
 	h.mu.Unlock()
+}
+
+func clonePrincipal(p *domain.Principal) *domain.Principal {
+	if p == nil {
+		return nil
+	}
+	copied := *p
+	copied.Permissions = slices.Clone(p.Permissions)
+	copied.Scopes = slices.Clone(p.Scopes)
+	if len(p.Roles) > 0 {
+		copied.Roles = make([]domain.Role, len(p.Roles))
+		for i, role := range p.Roles {
+			copied.Roles[i] = role
+			copied.Roles[i].Permissions = slices.Clone(role.Permissions)
+		}
+	}
+	return &copied
 }
 
 // Subscribe registers a live listener filtered by opts.Principal's job visibility rules
@@ -164,7 +216,7 @@ func (h *ProgressHub) Subscribe(ctx context.Context, opts ProgressSubscribeOptio
 	h.nextID++
 	sub := &progressSubscriber{
 		id:        h.nextID,
-		principal: opts.Principal,
+		principal: clonePrincipal(opts.Principal),
 		jobID:     strings.TrimSpace(opts.JobID),
 		ch:        make(chan domain.JobProgressTick, bufSize),
 	}

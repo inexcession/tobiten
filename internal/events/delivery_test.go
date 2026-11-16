@@ -1356,19 +1356,19 @@ func TestDelivery_RegularJobPositiveControlAndProgressHubNoRows(t *testing.T) {
 	if err := runner.RegisterKind(jobs.KindConfig{
 		Kind:         domain.JobKindScan,
 		ResumePolicy: domain.JobResumeCheckpoint,
-		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+		Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
 			// Tick 1 at t0: delivered.
-			if !exec.ReportProgress(1, "/manga/v01.cbz") {
+			if !exec.ReportProgress(execCtx, 1, "/manga/v01.cbz") {
 				return errors.New("expected tick 1 to publish")
 			}
 			// Tick 2 at +40ms: rate-limited.
 			advance(40 * time.Millisecond)
-			if exec.ReportProgress(2, "/manga/v02.cbz") {
+			if exec.ReportProgress(execCtx, 2, "/manga/v02.cbz") {
 				return errors.New("expected tick 2 to be rate-limited")
 			}
 			// Tick 3 at +120ms: delivered.
 			advance(80 * time.Millisecond)
-			if !exec.ReportProgress(3, "/manga/v03.cbz") {
+			if !exec.ReportProgress(execCtx, 3, "/manga/v03.cbz") {
 				return errors.New("expected tick 3 to publish")
 			}
 			return nil
@@ -1441,5 +1441,163 @@ func TestDelivery_RegularJobPositiveControlAndProgressHubNoRows(t *testing.T) {
 	}
 	if totalCount != 2 {
 		t.Fatalf("total domain_events = %d, want 2 (only SCAN job.started + job.finished)", totalCount)
+	}
+}
+
+func TestDelivery_CreatorDeletionDuringRunningJobAndRetainedExecutionStop(t *testing.T) {
+	t.Parallel()
+	db, _, _, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, 11, 16, 19, 25, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	userRepo := postgres.NewUserRepository(db.Pool)
+	creator := &domain.User{ID: domain.MustNewID(), Username: "ephemeral-creator"}
+	if err := userRepo.CreateUser(ctx, creator); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	creatorPrincipal := testPrincipalWithPerms(creator.ID, domain.PermissionLibraryRead)
+	adminPrincipal := testPrincipalWithPerms("admin-reader", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
+
+	hub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: 100 * time.Millisecond,
+		Now:         nowFn,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+
+	chCreator, unsubCreator, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: creatorPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe creator: %v", err)
+	}
+	defer unsubCreator()
+
+	chAdmin, unsubAdmin, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: adminPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe admin: %v", err)
+	}
+	defer unsubAdmin()
+
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{
+		Now:         nowFn,
+		ProgressHub: hub,
+	})
+
+	var retainedExec *jobs.Execution
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeCheckpoint,
+		Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
+			retainedExec = exec
+
+			// Tick 1 while creator still exists: reaches both creator and admin.
+			if !exec.ReportProgress(execCtx, 1, "/manga/before-delete.cbz") {
+				return errors.New("expected tick 1 before creator deletion to publish")
+			}
+			if !hub.HasRateLimitState(exec.Job().ID) {
+				return errors.New("expected ProgressHub rate-limit state during active execution")
+			}
+
+			// Delete creator while the job is RUNNING; ON DELETE SET NULL clears jobs.created_by.
+			if err := userRepo.DeleteUser(execCtx, creator.ID); err != nil {
+				return fmt.Errorf("DeleteUser: %w", err)
+			}
+
+			// Advance past MinInterval and emit tick 2: must reach admin only, not former creator.
+			advance(150 * time.Millisecond)
+			if !exec.ReportProgress(execCtx, 2, "/manga/after-delete.cbz") {
+				return errors.New("expected tick 2 after creator deletion to publish to admin")
+			}
+			return nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind SCAN: %v", err)
+	}
+
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	scanJob := &domain.Job{
+		Kind:      domain.JobKindScan,
+		CreatedBy: &creator.ID,
+		CreatedAt: nowFn(),
+		RunAfter:  nowFn(),
+	}
+	if _, err := jobRepo.Enqueue(ctx, scanJob); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+	}
+
+	// Creator receives only tick 1 (before deletion), never tick 2.
+	select {
+	case got := <-chCreator:
+		if got.ScannedCount != 1 || got.CurrentPath != "/manga/before-delete.cbz" {
+			t.Fatalf("creator tick 1 = %+v, want count=1 before-delete", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for creator tick 1")
+	}
+	select {
+	case unexpected := <-chCreator:
+		t.Fatalf("former creator received tick after deletion: %+v", unexpected)
+	default:
+	}
+
+	// Admin receives both tick 1 (with creator) and tick 2 (CreatedBy == nil after creator deletion).
+	adminTick1 := <-chAdmin
+	adminTick2 := <-chAdmin
+	if adminTick1.ScannedCount != 1 || adminTick1.CreatedBy == nil || *adminTick1.CreatedBy != creator.ID {
+		t.Fatalf("admin tick 1 = %+v, want count=1 created_by=%s", adminTick1, creator.ID)
+	}
+	if adminTick2.ScannedCount != 2 || adminTick2.CurrentPath != "/manga/after-delete.cbz" || adminTick2.CreatedBy != nil {
+		t.Fatalf("admin tick 2 = %+v, want count=2 after-delete CreatedBy=nil", adminTick2)
+	}
+
+	// After handler completion, ClearJob removed rate-limit state and a retained Execution
+	// cannot emit late ticks or recreate rate-limit state.
+	if hub.HasRateLimitState(scanJob.ID) {
+		t.Fatal("expected ProgressHub rate-limit state cleared after completion")
+	}
+	advance(200 * time.Millisecond)
+	if retainedExec == nil {
+		t.Fatal("expected retainedExec to be captured")
+	}
+	if retainedExec.ReportProgress(context.Background(), 99, "/manga/late-after-finish.cbz") {
+		t.Fatal("expected retained Execution.ReportProgress after completion to return false")
+	}
+	if hub.HasRateLimitState(scanJob.ID) {
+		t.Fatal("retained Execution recreated rate-limit state after completion")
+	}
+	select {
+	case unexpected := <-chAdmin:
+		t.Fatalf("admin received late tick after completion: %+v", unexpected)
+	default:
+	}
+
+	// Only the two lifecycle rows (job.started + job.finished) exist in domain_events; zero progress rows.
+	var totalCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events`).Scan(&totalCount); err != nil {
+		t.Fatalf("counting domain_events: %v", err)
+	}
+	if totalCount != 2 {
+		t.Fatalf("total domain_events = %d, want 2 (no progress rows)", totalCount)
 	}
 }
