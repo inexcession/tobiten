@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Lint, Test & Build
@@ -40,7 +43,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Set up sqlc
-        uses: sqlc-dev/setup-sqlc@v5
+        uses: sqlc-dev/setup-sqlc@bac53b7fb28c039a6c7f5736fd1e89744021bdd6 # v5.0.0
         with:
           sqlc-version: '1.31.1'
 
