@@ -25,6 +25,7 @@ var (
 	ErrInvalidPoolSize          = errors.New("invalid worker pool size")
 	ErrPoolsAlreadyRunning      = errors.New("worker pools already running")
 	ErrDirectClaimInProgress    = errors.New("direct job claim is currently in progress")
+	ErrClaimFailed              = errors.New("failed to claim job")
 	ErrOutcomePersistenceFailed = errors.New("failed to persist job outcome")
 	ErrMissingJobHandler        = errors.New("job kind has no execution handler")
 	ErrMissingJobReconciler     = errors.New("job kind requires a reconciliation hook")

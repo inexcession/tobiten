@@ -314,8 +314,27 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 		t.Fatal("timed out waiting for runDaemon to finish after worker exit")
 	}
 
-	if pids := queryDaemonLockPIDs(t, db); len(pids) != 0 {
-		t.Fatalf("daemonLockID still held after runDaemon exit: pids=%v", pids)
+	// pgx Close sends Terminate and closes the client socket without waiting for PostgreSQL
+	// to finish backend teardown; wait boundedly for server-side lock release and confirm
+	// a successor can acquire daemon ownership.
+	var lockPIDs []int32
+	releaseDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(releaseDeadline) {
+		lockPIDs = queryDaemonLockPIDs(t, db)
+		if len(lockPIDs) == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(lockPIDs) != 0 {
+		t.Fatalf("daemonLockID still held after runDaemon exit: pids=%v", lockPIDs)
+	}
+	successor, err := openDaemonStorage(ctx, hostedConfig(t, db.URL))
+	if err != nil {
+		t.Fatalf("successor openDaemonStorage after shutdown failed: %v", err)
+	}
+	if err := successor.close(); err != nil {
+		t.Fatalf("successor close failed: %v", err)
 	}
 
 	if seenScanPoolSize != 2 || seenRepackPoolSize != 1 {

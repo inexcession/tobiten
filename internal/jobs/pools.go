@@ -289,7 +289,7 @@ func (r *Runner) Stop() {
 }
 
 func (r *Runner) failPoolGeneration(gen *poolGeneration, err error) {
-	r.logger.Error("job worker outcome persistence failed; stopping worker pools",
+	r.logger.Error("job worker failed; stopping worker pools",
 		logging.Err(err),
 	)
 
@@ -329,10 +329,8 @@ func (r *Runner) runPoolWorker(ctx context.Context, gen *poolGeneration, cfg Kin
 		}
 
 		if err != nil {
-			r.logger.Error("job worker claim failed",
-				slog.String("job_kind", string(cfg.Kind)),
-				logging.Err(err),
-			)
+			r.failPoolGeneration(gen, fmt.Errorf("%w: %w", ErrClaimFailed, err))
+			return
 		}
 		if !waitForNextPoll(ctx, interval, pool.wake) {
 			return

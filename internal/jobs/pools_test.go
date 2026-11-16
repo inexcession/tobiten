@@ -913,3 +913,175 @@ func TestRunner_StopCancelsAndJoinsSameGeneration(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+type flakyClaimRepo struct {
+	storage.JobRepository
+	claimCalls atomic.Int32
+	dropAck    atomic.Bool
+}
+
+func (f *flakyClaimRepo) ClaimNext(ctx context.Context, kind domain.JobKind, now time.Time) (*domain.Job, error) {
+	f.claimCalls.Add(1)
+	job, err := f.JobRepository.ClaimNext(ctx, kind, now)
+	if err != nil {
+		return nil, err
+	}
+	if f.dropAck.Swap(false) {
+		// Simulate a committed ClaimNext transaction whose acknowledgement was lost.
+		return nil, errors.New("connection reset after claim commit")
+	}
+	return job, nil
+}
+
+func TestRunner_AmbiguousClaimCommitEntersFailStopBeforeClaimingMore(t *testing.T) {
+	t.Parallel()
+	_, baseRepo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	// 1. Verify known no-claim (ErrNotFound on empty queue) keeps pools healthy without fail-stop,
+	// and a subsequent job completes normally.
+	t.Run("empty queue ErrNotFound continues polling without fail-stop", func(t *testing.T) {
+		var fatalCalls atomic.Int32
+		runner := jobs.NewRunner(baseRepo, jobs.RunnerOptions{
+			PollInterval: 15 * time.Millisecond,
+			OnFatal:      func(error) { fatalCalls.Add(1) },
+		})
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindRepack,
+			ResumePolicy: domain.JobResumeRestart,
+			PoolSize:     1,
+			Handler:      jobs.HandlerFunc(func(context.Context, *jobs.Execution) error { return nil }),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if err := runner.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer runner.Stop()
+
+		time.Sleep(50 * time.Millisecond)
+		if fatalCalls.Load() != 0 || runner.Err() != nil {
+			t.Fatalf("unexpected fatal on empty queue: calls=%d err=%v", fatalCalls.Load(), runner.Err())
+		}
+
+		now := time.Now().UTC()
+		j := &domain.Job{Kind: domain.JobKindRepack, MaxAttempts: 3, CreatedAt: now, RunAfter: now}
+		if _, err := baseRepo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		waitForJobSucceeded(ctx, t, baseRepo, j.ID)
+	})
+
+	// 2. Simulate a committed ClaimNext with a lost acknowledgement: worker must enter fail-stop
+	// immediately without claiming more jobs, leaving the committed RUNNING job for startup recovery.
+	t.Run("committed claim with lost ack enters fail-stop and recovers cleanly on restart", func(t *testing.T) {
+		repo := &flakyClaimRepo{JobRepository: baseRepo}
+		repo.dropAck.Store(true)
+
+		var handlerRuns atomic.Int32
+		var fatalCalls atomic.Int32
+		fatalCh := make(chan error, 2)
+
+		runner := jobs.NewRunner(repo, jobs.RunnerOptions{
+			PollInterval: 15 * time.Millisecond,
+			OnFatal: func(err error) {
+				fatalCalls.Add(1)
+				fatalCh <- err
+			},
+		})
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindScan,
+			ResumePolicy: domain.JobResumeCheckpoint,
+			PoolSize:     1,
+			Handler: jobs.HandlerFunc(func(context.Context, *jobs.Execution) error {
+				handlerRuns.Add(1)
+				return nil
+			}),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+
+		now := time.Now().UTC()
+		dedupe := "SCAN:ambiguous-claim-key"
+		j1 := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, DedupeKey: &dedupe, CreatedAt: now, RunAfter: now}
+		j2 := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, CreatedAt: now.Add(time.Millisecond), RunAfter: now}
+		if _, err := baseRepo.Enqueue(ctx, j1); err != nil {
+			t.Fatalf("Enqueue j1: %v", err)
+		}
+		if _, err := baseRepo.Enqueue(ctx, j2); err != nil {
+			t.Fatalf("Enqueue j2: %v", err)
+		}
+
+		if err := runner.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		select {
+		case fatalErr := <-fatalCh:
+			if !errors.Is(fatalErr, jobs.ErrClaimFailed) {
+				t.Fatalf("fatalErr = %v, want ErrClaimFailed", fatalErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for OnFatal on ambiguous claim")
+		}
+
+		runner.Wait()
+		if !errors.Is(runner.Err(), jobs.ErrClaimFailed) {
+			t.Fatalf("runner.Err() = %v, want ErrClaimFailed", runner.Err())
+		}
+		if fatalCalls.Load() != 1 {
+			t.Fatalf("fatalCalls = %d, want 1", fatalCalls.Load())
+		}
+		if repo.claimCalls.Load() != 1 {
+			t.Fatalf("claimCalls = %d, want 1 (must fail-stop before claiming more)", repo.claimCalls.Load())
+		}
+		if handlerRuns.Load() != 0 {
+			t.Fatalf("handlerRuns = %d, want 0", handlerRuns.Load())
+		}
+
+		got1, err := baseRepo.GetJobByID(ctx, j1.ID)
+		if err != nil || got1.State != domain.JobStateRunning || got1.Attempts != 1 {
+			t.Fatalf("j1 = (%+v, %v), want RUNNING attempts=1", got1, err)
+		}
+		got2, err := baseRepo.GetJobByID(ctx, j2.ID)
+		if err != nil || got2.State != domain.JobStateQueued || got2.Attempts != 0 {
+			t.Fatalf("j2 = (%+v, %v), want QUEUED attempts=0", got2, err)
+		}
+
+		// Simulate daemon restart: startup recovery reconciles the stranded RUNNING row and runs both jobs.
+		restarted := jobs.NewRunner(baseRepo, jobs.RunnerOptions{PollInterval: 15 * time.Millisecond})
+		if err := restarted.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindScan,
+			ResumePolicy: domain.JobResumeCheckpoint,
+			PoolSize:     1,
+			Handler:      jobs.HandlerFunc(func(context.Context, *jobs.Execution) error { return nil }),
+		}); err != nil {
+			t.Fatalf("restarted RegisterKind: %v", err)
+		}
+		report, err := restarted.Recover(ctx)
+		if err != nil {
+			t.Fatalf("restarted Recover: %v", err)
+		}
+		if report.TotalRunning != 1 || report.RequeuedCheckpoint != 1 {
+			t.Fatalf("unexpected recovery report: %+v", report)
+		}
+		if err := restarted.Start(ctx); err != nil {
+			t.Fatalf("restarted Start: %v", err)
+		}
+		defer restarted.Stop()
+
+		waitForJobSucceeded(ctx, t, baseRepo, j1.ID)
+		waitForJobSucceeded(ctx, t, baseRepo, j2.ID)
+		if created, err := baseRepo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindScan, DedupeKey: &dedupe, CreatedAt: now}); err != nil || !created {
+			t.Fatalf("dedupe key %q not released after recovery completion: created=%v err=%v", dedupe, created, err)
+		}
+	})
+}
