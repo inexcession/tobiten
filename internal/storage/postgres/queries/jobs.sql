@@ -164,3 +164,66 @@ RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
 SELECT cancel_requested
 FROM jobs
 WHERE id = $1;
+
+-- name: SaveJobCheckpoint :one
+UPDATE jobs
+SET checkpoint = $2,
+    updated_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: ListRunningJobs :many
+SELECT id, kind, state, payload, checkpoint, attempts, max_attempts,
+       cancel_requested, last_error, created_by, dedupe_key,
+       run_after, created_at, started_at, updated_at, finished_at
+FROM jobs
+WHERE state = 'RUNNING'
+ORDER BY created_at ASC, id ASC;
+
+-- name: RequeueInterruptedJob :one
+UPDATE jobs
+SET state = 'QUEUED',
+    checkpoint = $2,
+    last_error = COALESCE(sqlc.narg(last_error)::text, last_error),
+    run_after = $3,
+    updated_at = $4,
+    finished_at = NULL
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $5
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: RecoverJobCancelled :one
+UPDATE jobs
+SET state = 'CANCELLED',
+    cancel_requested = TRUE,
+    checkpoint = $2,
+    last_error = COALESCE(sqlc.narg(last_error)::text, last_error),
+    updated_at = $3,
+    finished_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: RecoverJobFailed :one
+UPDATE jobs
+SET state = 'FAILED',
+    checkpoint = $2,
+    last_error = $3,
+    updated_at = $4,
+    finished_at = $4
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $5
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;

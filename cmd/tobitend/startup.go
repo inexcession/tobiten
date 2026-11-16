@@ -12,6 +12,7 @@ import (
 	"github.com/inexcession/tobiten/internal/auth"
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
@@ -145,6 +146,22 @@ func (d *daemonStorage) open(ctx context.Context, cfg *config.Config) (err error
 	return applyStartupSettings(cfg, settings, frozen)
 }
 
+var buildDaemonRegistry = BuildRegistryWithServices
+
+func recoverDaemonJobs(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, services *app.Services) error {
+	reg := buildDaemonRegistry(cfg, services)
+	runner := jobs.NewRunner(postgres.NewJobRepository(pool), jobs.RunnerOptions{
+		Logger: slog.Default(),
+	})
+	if err := runner.RegisterModuleKinds(reg); err != nil {
+		return fmt.Errorf("registering module job kinds: %w", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		return fmt.Errorf("recovering interrupted jobs: %w", err)
+	}
+	return nil
+}
+
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
 // connection is monitored independently; loss cancels application operations.
 func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Context, *config.Config, *slog.Logger, *app.Services) error) (err error) {
@@ -214,6 +231,9 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
 	})
+	if err := recoverDaemonJobs(ctx, d.pool, cfg, services); err != nil {
+		return err
+	}
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {

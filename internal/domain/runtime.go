@@ -15,6 +15,7 @@ var (
 	ErrEmptyJobID             = errors.New("job ID cannot be empty")
 	ErrEmptyJobKind           = errors.New("job kind cannot be empty")
 	ErrInvalidJobState        = errors.New("invalid job state")
+	ErrInvalidJobResumePolicy = errors.New("invalid job resume policy")
 	ErrInvalidJobTransition   = errors.New("invalid job state transition")
 	ErrStaleJobAttempt        = errors.New("stale job attempt")
 	ErrInvalidJobAttempts     = errors.New("job attempts must be non-negative and max_attempts must be positive within 32-bit integer bounds")
@@ -52,6 +53,22 @@ const (
 // its own lifecycle outbox events to avoid recursive delivery (ADR-0018 S3).
 func (k JobKind) IsInternal() bool {
 	return k == JobKindEventDelivery
+}
+
+// JobResumePolicy declares how an interrupted RUNNING job of a given kind
+// is handled during startup recovery (ADR-0017 §1, §7).
+type JobResumePolicy string
+
+const (
+	// JobResumeRestart discards partial checkpoint progress and restarts the job from the beginning on recovery.
+	JobResumeRestart JobResumePolicy = "RESTART"
+	// JobResumeCheckpoint preserves the persisted checkpoint so the job resumes from it on recovery.
+	JobResumeCheckpoint JobResumePolicy = "RESUME_FROM_CHECKPOINT"
+)
+
+// IsValid reports whether p is a recognized JobResumePolicy.
+func (p JobResumePolicy) IsValid() bool {
+	return p == JobResumeRestart || p == JobResumeCheckpoint
 }
 
 // JobState represents the execution state of a durable job (ADR-0017, 0001_init.sql).

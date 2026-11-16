@@ -372,6 +372,52 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, erro
 	return items, nil
 }
 
+const listRunningJobs = `-- name: ListRunningJobs :many
+SELECT id, kind, state, payload, checkpoint, attempts, max_attempts,
+       cancel_requested, last_error, created_by, dedupe_key,
+       run_after, created_at, started_at, updated_at, finished_at
+FROM jobs
+WHERE state = 'RUNNING'
+ORDER BY created_at ASC, id ASC
+`
+
+func (q *Queries) ListRunningJobs(ctx context.Context) ([]Job, error) {
+	rows, err := q.db.Query(ctx, listRunningJobs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Job
+	for rows.Next() {
+		var i Job
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.State,
+			&i.Payload,
+			&i.Checkpoint,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.CancelRequested,
+			&i.LastError,
+			&i.CreatedBy,
+			&i.DedupeKey,
+			&i.RunAfter,
+			&i.CreatedAt,
+			&i.StartedAt,
+			&i.UpdatedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markJobCancelled = `-- name: MarkJobCancelled :one
 UPDATE jobs
 SET state = 'CANCELLED',
@@ -517,6 +563,169 @@ func (q *Queries) MarkJobSucceeded(ctx context.Context, arg MarkJobSucceededPara
 	return i, err
 }
 
+const recoverJobCancelled = `-- name: RecoverJobCancelled :one
+UPDATE jobs
+SET state = 'CANCELLED',
+    cancel_requested = TRUE,
+    checkpoint = $2,
+    last_error = COALESCE($5::text, last_error),
+    updated_at = $3,
+    finished_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type RecoverJobCancelledParams struct {
+	ID         string
+	Checkpoint []byte
+	UpdatedAt  time.Time
+	Attempts   int32
+	LastError  *string
+}
+
+func (q *Queries) RecoverJobCancelled(ctx context.Context, arg RecoverJobCancelledParams) (Job, error) {
+	row := q.db.QueryRow(ctx, recoverJobCancelled,
+		arg.ID,
+		arg.Checkpoint,
+		arg.UpdatedAt,
+		arg.Attempts,
+		arg.LastError,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
+const recoverJobFailed = `-- name: RecoverJobFailed :one
+UPDATE jobs
+SET state = 'FAILED',
+    checkpoint = $2,
+    last_error = $3,
+    updated_at = $4,
+    finished_at = $4
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $5
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type RecoverJobFailedParams struct {
+	ID         string
+	Checkpoint []byte
+	LastError  *string
+	UpdatedAt  time.Time
+	Attempts   int32
+}
+
+func (q *Queries) RecoverJobFailed(ctx context.Context, arg RecoverJobFailedParams) (Job, error) {
+	row := q.db.QueryRow(ctx, recoverJobFailed,
+		arg.ID,
+		arg.Checkpoint,
+		arg.LastError,
+		arg.UpdatedAt,
+		arg.Attempts,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
+const requeueInterruptedJob = `-- name: RequeueInterruptedJob :one
+UPDATE jobs
+SET state = 'QUEUED',
+    checkpoint = $2,
+    last_error = COALESCE($6::text, last_error),
+    run_after = $3,
+    updated_at = $4,
+    finished_at = NULL
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $5
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type RequeueInterruptedJobParams struct {
+	ID         string
+	Checkpoint []byte
+	RunAfter   time.Time
+	UpdatedAt  time.Time
+	Attempts   int32
+	LastError  *string
+}
+
+func (q *Queries) RequeueInterruptedJob(ctx context.Context, arg RequeueInterruptedJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, requeueInterruptedJob,
+		arg.ID,
+		arg.Checkpoint,
+		arg.RunAfter,
+		arg.UpdatedAt,
+		arg.Attempts,
+		arg.LastError,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const requeueJobForRetry = `-- name: RequeueJobForRetry :one
 UPDATE jobs
 SET state = 'QUEUED',
@@ -545,6 +754,54 @@ func (q *Queries) RequeueJobForRetry(ctx context.Context, arg RequeueJobForRetry
 		arg.ID,
 		arg.LastError,
 		arg.RunAfter,
+		arg.UpdatedAt,
+		arg.Attempts,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
+const saveJobCheckpoint = `-- name: SaveJobCheckpoint :one
+UPDATE jobs
+SET checkpoint = $2,
+    updated_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type SaveJobCheckpointParams struct {
+	ID         string
+	Checkpoint []byte
+	UpdatedAt  time.Time
+	Attempts   int32
+}
+
+func (q *Queries) SaveJobCheckpoint(ctx context.Context, arg SaveJobCheckpointParams) (Job, error) {
+	row := q.db.QueryRow(ctx, saveJobCheckpoint,
+		arg.ID,
+		arg.Checkpoint,
 		arg.UpdatedAt,
 		arg.Attempts,
 	)

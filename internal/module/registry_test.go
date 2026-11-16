@@ -9,6 +9,7 @@ import (
 	"testing/fstest"
 
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
 )
@@ -122,7 +123,7 @@ func TestRegistry_SeamsCollection(t *testing.T) {
 			NamedAuthenticator("auth-a"),
 		},
 		Jobs: []JobKind{
-			NamedJobKind("job-a"),
+			JobKindSpec{Kind: domain.JobKind("job-a"), Policy: domain.JobResumeCheckpoint},
 		},
 		Subscribers: []EventSubscriber{
 			NamedEventSubscriber("sub-a"),
@@ -175,6 +176,13 @@ func TestRegistry_SeamsCollection(t *testing.T) {
 	}
 	if jobs := reg.JobKinds(); len(jobs) != 2 {
 		t.Errorf("JobKinds() len = %d, want 2", len(jobs))
+	} else {
+		if jobs[0].Name() != "job-a" || jobs[0].ResumePolicy() != domain.JobResumeCheckpoint {
+			t.Errorf("jobs[0] = (%q, %q), want (job-a, RESUME_FROM_CHECKPOINT)", jobs[0].Name(), jobs[0].ResumePolicy())
+		}
+		if jobs[1].Name() != "job-b" || jobs[1].ResumePolicy() != domain.JobResumeRestart {
+			t.Errorf("jobs[1] = (%q, %q), want (job-b, RESTART)", jobs[1].Name(), jobs[1].ResumePolicy())
+		}
 	}
 	if subs := reg.EventSubscribers(); len(subs) != 2 {
 		t.Errorf("EventSubscribers() len = %d, want 2", len(subs))

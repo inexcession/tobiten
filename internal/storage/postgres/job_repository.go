@@ -493,3 +493,186 @@ func (r *JobRepository) IsCancelRequested(ctx context.Context, id string) (bool,
 	}
 	return requested, nil
 }
+
+// SaveCheckpoint persists an updated checkpoint for a RUNNING job at the claimed attempt.
+func (r *JobRepository) SaveCheckpoint(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
+	}
+	cp, err := normalizeJobJSON(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	ts := normalizeJobTime(now)
+
+	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
+		current, err := q.GetJobByIDForUpdate(ctx, id)
+		if err != nil {
+			return domain.Job{}, mapPgError(err)
+		}
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
+		}
+		row, err := q.SaveJobCheckpoint(ctx, SaveJobCheckpointParams{
+			ID:         id,
+			Checkpoint: []byte(cp),
+			UpdatedAt:  ts,
+			Attempts:   int32(attempt),
+		})
+		if err != nil {
+			return domain.Job{}, fmt.Errorf("saving checkpoint for job %q: %w", id, err)
+		}
+		return JobToDomain(row), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// ListRunningJobs returns all jobs currently in the RUNNING state ordered oldest-first.
+func (r *JobRepository) ListRunningJobs(ctx context.Context) ([]domain.Job, error) {
+	rows, err := r.q.ListRunningJobs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing running jobs: %w", err)
+	}
+	out := make([]domain.Job, len(rows))
+	for i, row := range rows {
+		out[i] = JobToDomain(row)
+	}
+	return out, nil
+}
+
+// RequeueInterrupted reconciles an interrupted RUNNING job at attempt for startup recovery.
+// Cancellation and exhausted attempts are resolved directly to terminal states so they never
+// remain as unclaimable QUEUED rows holding active dedupe keys.
+func (r *JobRepository) RequeueInterrupted(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg *string, runAfter time.Time, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
+	}
+	cp, err := normalizeJobJSON(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	ts := normalizeJobTime(now)
+	nextRun := ts
+	if !runAfter.IsZero() {
+		nextRun = runAfter.UTC()
+	}
+
+	var cleanErrPtr *string
+	if errMsg != nil && *errMsg != "" {
+		msg := *errMsg
+		cleanErrPtr = &msg
+	}
+
+	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
+		current, err := q.GetJobByIDForUpdate(ctx, id)
+		if err != nil {
+			return domain.Job{}, mapPgError(err)
+		}
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
+		}
+
+		if current.CancelRequested {
+			row, err := q.RecoverJobCancelled(ctx, RecoverJobCancelledParams{
+				ID:         id,
+				Checkpoint: []byte(cp),
+				UpdatedAt:  ts,
+				Attempts:   int32(attempt),
+				LastError:  cleanErrPtr,
+			})
+			if err != nil {
+				return domain.Job{}, fmt.Errorf("cancelling interrupted job %q: %w", id, err)
+			}
+			return JobToDomain(row), nil
+		}
+
+		if int(current.Attempts) >= int(current.MaxAttempts) {
+			failMsg := "interrupted by daemon restart after exhausting max_attempts"
+			if cleanErrPtr != nil {
+				failMsg = *cleanErrPtr
+			}
+			row, err := q.RecoverJobFailed(ctx, RecoverJobFailedParams{
+				ID:         id,
+				Checkpoint: []byte(cp),
+				LastError:  &failMsg,
+				UpdatedAt:  ts,
+				Attempts:   int32(attempt),
+			})
+			if err != nil {
+				return domain.Job{}, fmt.Errorf("failing exhausted interrupted job %q: %w", id, err)
+			}
+			return JobToDomain(row), nil
+		}
+
+		row, err := q.RequeueInterruptedJob(ctx, RequeueInterruptedJobParams{
+			ID:         id,
+			Checkpoint: []byte(cp),
+			RunAfter:   nextRun,
+			UpdatedAt:  ts,
+			Attempts:   int32(attempt),
+			LastError:  cleanErrPtr,
+		})
+		if err != nil {
+			return domain.Job{}, fmt.Errorf("requeueing interrupted job %q: %w", id, err)
+		}
+		return JobToDomain(row), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// MarkFailed transitions a RUNNING job at the claimed attempt directly to FAILED
+// (or CANCELLED if cancel_requested is true), regardless of remaining attempts.
+func (r *JobRepository) MarkFailed(ctx context.Context, id string, attempt int, errMsg string, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
+	}
+	ts := normalizeJobTime(now)
+
+	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
+		current, err := q.GetJobByIDForUpdate(ctx, id)
+		if err != nil {
+			return domain.Job{}, mapPgError(err)
+		}
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
+		}
+
+		var errPtr *string
+		if errMsg != "" {
+			errPtr = &errMsg
+		}
+		if current.CancelRequested {
+			row, err := q.MarkJobCancelled(ctx, MarkJobCancelledParams{
+				ID:        id,
+				UpdatedAt: ts,
+				Attempts:  int32(attempt),
+				LastError: errPtr,
+			})
+			if err != nil {
+				return domain.Job{}, fmt.Errorf("cancelling job %q: %w", id, err)
+			}
+			return JobToDomain(row), nil
+		}
+
+		row, err := q.MarkJobFailed(ctx, MarkJobFailedParams{
+			ID:        id,
+			LastError: errPtr,
+			UpdatedAt: ts,
+			Attempts:  int32(attempt),
+		})
+		if err != nil {
+			return domain.Job{}, fmt.Errorf("marking job %q failed: %w", id, err)
+		}
+		return JobToDomain(row), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}

@@ -1,0 +1,553 @@
+package jobs
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/module"
+	"github.com/inexcession/tobiten/internal/storage"
+)
+
+// Sentinel errors returned by the durable job runner and kind registry.
+var (
+	ErrRecoveryNotCompleted = errors.New("startup recovery must complete before claiming jobs")
+	ErrUnknownJobKind       = errors.New("unregistered job kind")
+	ErrDuplicateJobKind     = errors.New("duplicate or conflicting job kind registration")
+	ErrInvalidJobKind       = errors.New("invalid job kind registration")
+	ErrMissingJobHandler    = errors.New("job kind has no execution handler")
+	ErrJobCancelled         = errors.New("job cancelled")
+	ErrPermanentFailure     = errors.New("permanent job failure")
+)
+
+// ReconcileAction describes the state transition chosen during startup recovery
+// for an interrupted RUNNING job (ADR-0017 §7).
+type ReconcileAction int
+
+const (
+	// ReconcileRequeue returns an interrupted job to QUEUED (unless cancelled or exhausted).
+	ReconcileRequeue ReconcileAction = iota
+	// ReconcileSucceeded records that the interrupted job completed its final step before shutdown.
+	ReconcileSucceeded
+	// ReconcileFailed marks the interrupted job as permanently FAILED.
+	ReconcileFailed
+	// ReconcileCancelled marks the interrupted job as CANCELLED.
+	ReconcileCancelled
+)
+
+// ReconcileOutcome describes the reconciliation decision for an interrupted RUNNING job.
+type ReconcileOutcome struct {
+	Action     ReconcileAction
+	Checkpoint json.RawMessage
+	Error      string
+}
+
+// Reconciler inspects an interrupted RUNNING job before startup recovery updates its state.
+type Reconciler interface {
+	Reconcile(ctx context.Context, job domain.Job) (ReconcileOutcome, error)
+}
+
+// ReconcileFunc adapts a function to the Reconciler interface.
+type ReconcileFunc func(ctx context.Context, job domain.Job) (ReconcileOutcome, error)
+
+// Reconcile implements Reconciler.
+func (f ReconcileFunc) Reconcile(ctx context.Context, job domain.Job) (ReconcileOutcome, error) {
+	return f(ctx, job)
+}
+
+// Handler executes one claimed attempt of a durable background job.
+type Handler interface {
+	Run(ctx context.Context, exec *Execution) error
+}
+
+// HandlerFunc adapts a function to the Handler interface.
+type HandlerFunc func(ctx context.Context, exec *Execution) error
+
+// Run implements Handler.
+func (f HandlerFunc) Run(ctx context.Context, exec *Execution) error {
+	return f(ctx, exec)
+}
+
+// KindConfig registers a job kind's startup recovery policy and execution hooks.
+type KindConfig struct {
+	Kind         domain.JobKind
+	ResumePolicy domain.JobResumePolicy
+	Handler      Handler
+	Reconciler   Reconciler
+}
+
+// RunnerOptions configures a durable job Runner.
+type RunnerOptions struct {
+	Logger *slog.Logger
+	Now    func() time.Time
+}
+
+// RecoveryReport summarizes the interrupted RUNNING jobs reconciled at startup.
+type RecoveryReport struct {
+	TotalRunning       int
+	RequeuedCheckpoint int
+	RequeuedRestart    int
+	Succeeded          int
+	Failed             int
+	Cancelled          int
+	UnregisteredFailed int
+}
+
+// Execution provides a running job handler with checkpoint persistence and cancellation checks
+// bound to the claimed attempt.
+type Execution struct {
+	mu   sync.RWMutex
+	job  domain.Job
+	repo storage.JobRepository
+	now  func() time.Time
+}
+
+// Job returns a snapshot of the claimed job, including its latest saved checkpoint.
+func (e *Execution) Job() domain.Job {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cp := make([]byte, len(e.job.Checkpoint))
+	copy(cp, e.job.Checkpoint)
+	out := e.job
+	out.Checkpoint = cp
+	return out
+}
+
+// Checkpoint returns a copy of the job's current checkpoint JSON.
+func (e *Execution) Checkpoint() json.RawMessage {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cp := make([]byte, len(e.job.Checkpoint))
+	copy(cp, e.job.Checkpoint)
+	return cp
+}
+
+// DecodeCheckpoint unmarshals the current checkpoint into dst when non-empty.
+func (e *Execution) DecodeCheckpoint(dst any) error {
+	cp := e.Checkpoint()
+	if len(cp) == 0 {
+		return nil
+	}
+	return json.Unmarshal(cp, dst)
+}
+
+// SaveCheckpoint persists checkpoint for the current RUNNING attempt.
+// If ctx is already cancelled (for example due to ownership loss), it refuses to write.
+func (e *Execution) SaveCheckpoint(ctx context.Context, checkpoint json.RawMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.mu.RLock()
+	jobID := e.job.ID
+	attempt := e.job.Attempts
+	e.mu.RUnlock()
+
+	updated, err := e.repo.SaveCheckpoint(ctx, jobID, attempt, checkpoint, e.now())
+	if err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	e.job = *updated
+	e.mu.Unlock()
+	return nil
+}
+
+// SaveCheckpointValue marshals v as JSON and persists it via SaveCheckpoint.
+func (e *Execution) SaveCheckpointValue(ctx context.Context, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshaling job checkpoint: %w", err)
+	}
+	return e.SaveCheckpoint(ctx, raw)
+}
+
+// CheckCancelled reports whether cancellation has been requested for this job or ctx is cancelled.
+func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	e.mu.RLock()
+	jobID := e.job.ID
+	e.mu.RUnlock()
+	return e.repo.IsCancelRequested(ctx, jobID)
+}
+
+// Runner coordinates job-kind registration, startup recovery under daemon ownership,
+// and attempt-safe job execution over storage.JobRepository (ADR-0017).
+type Runner struct {
+	repo      storage.JobRepository
+	logger    *slog.Logger
+	now       func() time.Time
+	mu        sync.RWMutex
+	kinds     map[domain.JobKind]KindConfig
+	recovered atomic.Bool
+}
+
+// NewRunner constructs a Runner over repo.
+func NewRunner(repo storage.JobRepository, opts RunnerOptions) *Runner {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return &Runner{
+		repo:   repo,
+		logger: logger,
+		now:    nowFn,
+		kinds:  make(map[domain.JobKind]KindConfig),
+	}
+}
+
+// RegisterKind registers a job kind's recovery policy and optional handler/reconciler.
+func (r *Runner) RegisterKind(cfg KindConfig) error {
+	if strings.TrimSpace(string(cfg.Kind)) == "" {
+		return fmt.Errorf("%w: empty job kind", ErrInvalidJobKind)
+	}
+	if !cfg.ResumePolicy.IsValid() {
+		return fmt.Errorf("%w: kind %q has invalid resume policy %q", ErrInvalidJobKind, cfg.Kind, cfg.ResumePolicy)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	existing, exists := r.kinds[cfg.Kind]
+	if !exists {
+		r.kinds[cfg.Kind] = cfg
+		return nil
+	}
+
+	if existing.ResumePolicy != cfg.ResumePolicy {
+		return fmt.Errorf("%w: kind %q policy %s conflicts with %s",
+			ErrDuplicateJobKind, cfg.Kind, cfg.ResumePolicy, existing.ResumePolicy)
+	}
+	if existing.Handler != nil && cfg.Handler != nil {
+		return fmt.Errorf("%w: kind %q already has a handler", ErrDuplicateJobKind, cfg.Kind)
+	}
+	if existing.Reconciler != nil && cfg.Reconciler != nil {
+		return fmt.Errorf("%w: kind %q already has a reconciler", ErrDuplicateJobKind, cfg.Kind)
+	}
+
+	if existing.Handler == nil {
+		existing.Handler = cfg.Handler
+	}
+	if existing.Reconciler == nil {
+		existing.Reconciler = cfg.Reconciler
+	}
+	r.kinds[cfg.Kind] = existing
+	return nil
+}
+
+// RegisterModuleKinds imports all enabled job kinds and their declared resume policies
+// from reg into the runner's job-kind registry.
+func (r *Runner) RegisterModuleKinds(reg module.Registry) error {
+	if reg == nil {
+		return nil
+	}
+	seenInRegistry := make(map[domain.JobKind]struct{})
+	for _, jk := range reg.JobKinds() {
+		if jk == nil {
+			return fmt.Errorf("%w: nil module job kind", ErrInvalidJobKind)
+		}
+		name := strings.TrimSpace(jk.Name())
+		if name == "" {
+			return fmt.Errorf("%w: empty module job kind name", ErrInvalidJobKind)
+		}
+		kind := domain.JobKind(name)
+		if _, dup := seenInRegistry[kind]; dup {
+			return fmt.Errorf("%w: module registry declares duplicate job kind %q", ErrDuplicateJobKind, kind)
+		}
+		seenInRegistry[kind] = struct{}{}
+
+		if err := r.RegisterKind(KindConfig{
+			Kind:         kind,
+			ResumePolicy: jk.ResumePolicy(),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// KindPolicy returns the registered resume policy for kind.
+func (r *Runner) KindPolicy(kind domain.JobKind) (domain.JobResumePolicy, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.kinds[kind]
+	if !ok {
+		return "", false
+	}
+	return cfg.ResumePolicy, true
+}
+
+func (r *Runner) lookupKind(kind domain.JobKind) (KindConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.kinds[kind]
+	return cfg, ok
+}
+
+// HasRecovered reports whether startup recovery has completed.
+func (r *Runner) HasRecovered() bool {
+	return r.recovered.Load()
+}
+
+// Recover reconciles every existing RUNNING job before normal claims begin (ADR-0017 §7).
+// Callers must hold exclusive daemon ownership on the database before invoking Recover.
+func (r *Runner) Recover(ctx context.Context) (RecoveryReport, error) {
+	var report RecoveryReport
+	if r.repo == nil {
+		return report, errors.New("job repository is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+
+	runningJobs, err := r.repo.ListRunningJobs(ctx)
+	if err != nil {
+		return report, fmt.Errorf("listing interrupted running jobs: %w", err)
+	}
+	report.TotalRunning = len(runningJobs)
+
+	for _, job := range runningJobs {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		if err := r.recoverOne(ctx, job, &report); err != nil {
+			return report, err
+		}
+	}
+
+	r.recovered.Store(true)
+	if report.TotalRunning > 0 {
+		r.logger.Info("startup job recovery completed",
+			slog.Int("total_running", report.TotalRunning),
+			slog.Int("requeued_checkpoint", report.RequeuedCheckpoint),
+			slog.Int("requeued_restart", report.RequeuedRestart),
+			slog.Int("succeeded", report.Succeeded),
+			slog.Int("failed", report.Failed),
+			slog.Int("cancelled", report.Cancelled),
+			slog.Int("unregistered_failed", report.UnregisteredFailed),
+		)
+	}
+	return report, nil
+}
+
+func (r *Runner) recoverOne(ctx context.Context, job domain.Job, report *RecoveryReport) error {
+	now := r.now().UTC()
+	cfg, ok := r.lookupKind(job.Kind)
+	if !ok {
+		return r.recoverUnregistered(ctx, job, now, report)
+	}
+
+	outcome := ReconcileOutcome{Action: ReconcileRequeue}
+	if cfg.Reconciler != nil {
+		var err error
+		outcome, err = cfg.Reconciler.Reconcile(ctx, job)
+		if err != nil {
+			return fmt.Errorf("reconciling interrupted job %q (%s): %w", job.ID, job.Kind, err)
+		}
+	}
+
+	targetCheckpoint := resolveRecoveredCheckpoint(job, cfg.ResumePolicy, outcome.Checkpoint)
+	return r.applyReconcileOutcome(ctx, job, cfg.ResumePolicy, outcome, targetCheckpoint, now, report)
+}
+
+func (r *Runner) recoverUnregistered(ctx context.Context, job domain.Job, now time.Time, report *RecoveryReport) error {
+	msg := fmt.Sprintf("interrupted by daemon restart: unregistered job kind %q", job.Kind)
+	updated, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, msg, now)
+	if err != nil {
+		return fmt.Errorf("failing unregistered interrupted job %q (%s): %w", job.ID, job.Kind, err)
+	}
+	report.UnregisteredFailed++
+	if updated.State == domain.JobStateCancelled {
+		report.Cancelled++
+	} else {
+		report.Failed++
+	}
+	return nil
+}
+
+func (r *Runner) persistReconciledCheckpoint(ctx context.Context, job domain.Job, override, target json.RawMessage, now time.Time) error {
+	if len(override) == 0 {
+		return nil
+	}
+	if _, err := r.repo.SaveCheckpoint(ctx, job.ID, job.Attempts, target, now); err != nil {
+		return fmt.Errorf("saving reconciled checkpoint for job %q: %w", job.ID, err)
+	}
+	return nil
+}
+
+func (r *Runner) applyReconcileOutcome(
+	ctx context.Context,
+	job domain.Job,
+	policy domain.JobResumePolicy,
+	outcome ReconcileOutcome,
+	targetCheckpoint json.RawMessage,
+	now time.Time,
+	report *RecoveryReport,
+) error {
+	switch outcome.Action {
+	case ReconcileSucceeded:
+		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
+			return err
+		}
+		if _, err := r.repo.MarkSucceeded(ctx, job.ID, job.Attempts, now); err != nil {
+			return fmt.Errorf("marking reconciled job %q succeeded: %w", job.ID, err)
+		}
+		report.Succeeded++
+		return nil
+
+	case ReconcileCancelled:
+		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
+			return err
+		}
+		var errPtr *string
+		if outcome.Error != "" {
+			errPtr = &outcome.Error
+		}
+		if _, err := r.repo.MarkCancelled(ctx, job.ID, job.Attempts, errPtr, now); err != nil {
+			return fmt.Errorf("marking reconciled job %q cancelled: %w", job.ID, err)
+		}
+		report.Cancelled++
+		return nil
+
+	case ReconcileFailed:
+		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
+			return err
+		}
+		errMsg := outcome.Error
+		if errMsg == "" {
+			errMsg = "interrupted job marked failed during reconciliation"
+		}
+		updated, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, errMsg, now)
+		if err != nil {
+			return fmt.Errorf("marking reconciled job %q failed: %w", job.ID, err)
+		}
+		if updated.State == domain.JobStateCancelled {
+			report.Cancelled++
+		} else {
+			report.Failed++
+		}
+		return nil
+
+	case ReconcileRequeue:
+		reason := outcome.Error
+		if reason == "" {
+			reason = "interrupted by daemon restart"
+		}
+		updated, err := r.repo.RequeueInterrupted(ctx, job.ID, job.Attempts, targetCheckpoint, &reason, now, now)
+		if err != nil {
+			return fmt.Errorf("requeueing interrupted job %q (%s): %w", job.ID, job.Kind, err)
+		}
+		switch updated.State {
+		case domain.JobStateCancelled:
+			report.Cancelled++
+		case domain.JobStateFailed:
+			report.Failed++
+		case domain.JobStateQueued:
+			if policy == domain.JobResumeCheckpoint {
+				report.RequeuedCheckpoint++
+			} else {
+				report.RequeuedRestart++
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported reconcile action %d for job %q", outcome.Action, job.ID)
+	}
+}
+
+func resolveRecoveredCheckpoint(job domain.Job, policy domain.JobResumePolicy, override json.RawMessage) json.RawMessage {
+	if len(override) > 0 {
+		return override
+	}
+	if policy == domain.JobResumeCheckpoint {
+		if len(job.Checkpoint) > 0 {
+			return job.Checkpoint
+		}
+		return json.RawMessage("{}")
+	}
+	return json.RawMessage("{}")
+}
+
+// ClaimAndRunNext claims the next runnable job of kind and executes its registered handler.
+// It refuses to claim until startup recovery has completed.
+// Returns claimed=false, err=nil when no runnable job of kind is available.
+func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool, error) {
+	if !r.recovered.Load() {
+		return false, ErrRecoveryNotCompleted
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	cfg, ok := r.lookupKind(kind)
+	if !ok {
+		return false, fmt.Errorf("%w: %q", ErrUnknownJobKind, kind)
+	}
+	if cfg.Handler == nil {
+		return false, fmt.Errorf("%w: %q", ErrMissingJobHandler, kind)
+	}
+
+	job, err := r.repo.ClaimNext(ctx, kind, r.now())
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	exec := &Execution{
+		job:  *job,
+		repo: r.repo,
+		now:  r.now,
+	}
+
+	runErr := cfg.Handler.Run(ctx, exec)
+
+	// If the runner context was cancelled (shutdown or ownership loss), stop writing to DB
+	// so the interrupted RUNNING job is left cleanly for startup recovery on next boot.
+	if ctx.Err() != nil {
+		return true, ctx.Err()
+	}
+
+	now := r.now().UTC()
+	if runErr == nil {
+		if _, err := r.repo.MarkSucceeded(ctx, job.ID, job.Attempts, now); err != nil {
+			return true, fmt.Errorf("marking job %q succeeded: %w", job.ID, err)
+		}
+		return true, nil
+	}
+
+	if errors.Is(runErr, ErrJobCancelled) {
+		msg := runErr.Error()
+		if _, err := r.repo.MarkCancelled(ctx, job.ID, job.Attempts, &msg, now); err != nil {
+			return true, fmt.Errorf("marking job %q cancelled: %w", job.ID, err)
+		}
+		return true, nil
+	}
+
+	if errors.Is(runErr, ErrPermanentFailure) {
+		if _, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, runErr.Error(), now); err != nil {
+			return true, fmt.Errorf("marking job %q permanently failed: %w", job.ID, err)
+		}
+		return true, nil
+	}
+
+	if _, err := r.repo.FailOrRetry(ctx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now); err != nil {
+		return true, fmt.Errorf("recording failure for job %q: %w", job.ID, err)
+	}
+	return true, nil
+}

@@ -850,3 +850,153 @@ func TestJobRepository_StaleWorkerOutcomePreservesNewerClaim(t *testing.T) {
 		t.Fatalf("unexpected SUCCEEDED job: %+v", done)
 	}
 }
+
+func TestJobRepository_CheckpointsAndRecoveryPrimitives(t *testing.T) {
+	t.Parallel()
+	_, repo, _ := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+
+	// 1. Enqueue and claim a resumable job.
+	dedupeResume := "SCAN:recover-resume"
+	jResume := &domain.Job{
+		Kind:        domain.JobKindScan,
+		MaxAttempts: 3,
+		DedupeKey:   &dedupeResume,
+		CreatedAt:   t0,
+	}
+	if _, err := repo.Enqueue(ctx, jResume); err != nil {
+		t.Fatalf("Enqueue jResume: %v", err)
+	}
+	// SaveCheckpoint on QUEUED job fails.
+	if _, err := repo.SaveCheckpoint(ctx, jResume.ID, 1, json.RawMessage(`{"step":1}`), t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("SaveCheckpoint on QUEUED = %v, want ErrInvalidJobTransition", err)
+	}
+
+	claim1, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext jResume: %v", err)
+	}
+	// Invalid JSON checkpoint rejected.
+	if _, err := repo.SaveCheckpoint(ctx, jResume.ID, claim1.Attempts, json.RawMessage(`{bad`), t0); !errors.Is(err, domain.ErrInvalidJobJSON) {
+		t.Fatalf("SaveCheckpoint invalid JSON = %v, want ErrInvalidJobJSON", err)
+	}
+	// Stale attempt checkpoint rejected.
+	if _, err := repo.SaveCheckpoint(ctx, jResume.ID, claim1.Attempts+1, json.RawMessage(`{"step":99}`), t0); !errors.Is(err, domain.ErrStaleJobAttempt) {
+		t.Fatalf("SaveCheckpoint stale attempt = %v, want ErrStaleJobAttempt", err)
+	}
+
+	cpSaved := json.RawMessage(`{"cursor":"series/002","progress_pct":55}`)
+	updated, err := repo.SaveCheckpoint(ctx, jResume.ID, claim1.Attempts, cpSaved, t0.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("SaveCheckpoint valid: %v", err)
+	}
+	var cpMap map[string]any
+	if err := json.Unmarshal(updated.Checkpoint, &cpMap); err != nil || cpMap["cursor"] != "series/002" {
+		t.Fatalf("unexpected saved checkpoint: %s (err=%v)", updated.Checkpoint, err)
+	}
+
+	// 2. Cancelled RUNNING job + exhausted RUNNING job + MarkFailed job.
+	dedupeCancel := "SCAN:recover-cancel"
+	jCancel := &domain.Job{
+		Kind:        domain.JobKindScan,
+		MaxAttempts: 3,
+		DedupeKey:   &dedupeCancel,
+		CreatedAt:   t0.Add(3 * time.Second),
+	}
+	if _, err := repo.Enqueue(ctx, jCancel); err != nil {
+		t.Fatalf("Enqueue jCancel: %v", err)
+	}
+	claimCancel, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext jCancel: %v", err)
+	}
+	if _, err := repo.RequestCancel(ctx, jCancel.ID, t0.Add(5*time.Second)); err != nil {
+		t.Fatalf("RequestCancel jCancel: %v", err)
+	}
+
+	dedupeExhausted := "SCAN:recover-exhausted"
+	jExhausted := &domain.Job{
+		Kind:        domain.JobKindScan,
+		MaxAttempts: 1,
+		DedupeKey:   &dedupeExhausted,
+		CreatedAt:   t0.Add(6 * time.Second),
+	}
+	if _, err := repo.Enqueue(ctx, jExhausted); err != nil {
+		t.Fatalf("Enqueue jExhausted: %v", err)
+	}
+	claimExhausted, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(7*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext jExhausted: %v", err)
+	}
+
+	// ListRunningJobs returns all three in deterministic order.
+	running, err := repo.ListRunningJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListRunningJobs: %v", err)
+	}
+	if len(running) != 3 || running[0].ID != jResume.ID || running[1].ID != jCancel.ID || running[2].ID != jExhausted.ID {
+		t.Fatalf("ListRunningJobs = %+v, want [%s, %s, %s]", running, jResume.ID, jCancel.ID, jExhausted.ID)
+	}
+
+	// Stale RequeueInterrupted rejected.
+	if _, err := repo.RequeueInterrupted(ctx, jResume.ID, claim1.Attempts+1, cpSaved, nil, t0.Add(8*time.Second), t0.Add(8*time.Second)); !errors.Is(err, domain.ErrStaleJobAttempt) {
+		t.Fatalf("stale RequeueInterrupted = %v, want ErrStaleJobAttempt", err)
+	}
+
+	// RequeueInterrupted preserves monotonic attempts and checkpoint for resumable job.
+	requeued, err := repo.RequeueInterrupted(ctx, jResume.ID, claim1.Attempts, cpSaved, nil, t0.Add(8*time.Second), t0.Add(8*time.Second))
+	if err != nil {
+		t.Fatalf("RequeueInterrupted jResume: %v", err)
+	}
+	if requeued.State != domain.JobStateQueued || requeued.Attempts != 1 || requeued.FinishedAt != nil {
+		t.Fatalf("unexpected requeued jResume: %+v", requeued)
+	}
+
+	// RequeueInterrupted resolves cancel_requested=true to CANCELLED and releases dedupe_key.
+	cancelled, err := repo.RequeueInterrupted(ctx, jCancel.ID, claimCancel.Attempts, json.RawMessage(`{"partial":true}`), nil, t0.Add(8*time.Second), t0.Add(8*time.Second))
+	if err != nil {
+		t.Fatalf("RequeueInterrupted jCancel: %v", err)
+	}
+	if cancelled.State != domain.JobStateCancelled || !cancelled.CancelRequested || cancelled.FinishedAt == nil {
+		t.Fatalf("expected CANCELLED for jCancel, got %+v", cancelled)
+	}
+	if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindScan, DedupeKey: &dedupeCancel, CreatedAt: t0.Add(9 * time.Second)}); err != nil || !created {
+		t.Fatalf("expected dedupe key %s released after recovery cancel, got created=%v err=%v", dedupeCancel, created, err)
+	}
+
+	// RequeueInterrupted resolves attempts>=max_attempts to FAILED and releases dedupe_key.
+	failed, err := repo.RequeueInterrupted(ctx, jExhausted.ID, claimExhausted.Attempts, nil, nil, t0.Add(8*time.Second), t0.Add(8*time.Second))
+	if err != nil {
+		t.Fatalf("RequeueInterrupted jExhausted: %v", err)
+	}
+	if failed.State != domain.JobStateFailed || failed.FinishedAt == nil || failed.LastError == nil {
+		t.Fatalf("expected FAILED for jExhausted, got %+v", failed)
+	}
+	if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindScan, DedupeKey: &dedupeExhausted, CreatedAt: t0.Add(10 * time.Second)}); err != nil || !created {
+		t.Fatalf("expected dedupe key %s released after recovery fail, got created=%v err=%v", dedupeExhausted, created, err)
+	}
+
+	// MarkFailed transitions directly to FAILED even when attempts < max_attempts.
+	jDirectFail := &domain.Job{Kind: domain.JobKindIntake, MaxAttempts: 3, CreatedAt: t0.Add(11 * time.Second)}
+	if _, err := repo.Enqueue(ctx, jDirectFail); err != nil {
+		t.Fatalf("Enqueue jDirectFail: %v", err)
+	}
+	claimDF, err := repo.ClaimNext(ctx, domain.JobKindIntake, t0.Add(12*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext jDirectFail: %v", err)
+	}
+	if _, err := repo.MarkFailed(ctx, jDirectFail.ID, claimDF.Attempts+1, "stale", t0.Add(13*time.Second)); !errors.Is(err, domain.ErrStaleJobAttempt) {
+		t.Fatalf("stale MarkFailed = %v, want ErrStaleJobAttempt", err)
+	}
+	df, err := repo.MarkFailed(ctx, jDirectFail.ID, claimDF.Attempts, "unregistered kind", t0.Add(13*time.Second))
+	if err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	if df.State != domain.JobStateFailed || df.Attempts != 1 || df.LastError == nil || *df.LastError != "unregistered kind" {
+		t.Fatalf("unexpected MarkFailed result: %+v", df)
+	}
+}

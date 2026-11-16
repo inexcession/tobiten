@@ -119,6 +119,13 @@ func TestJobValidationAndHelpers(t *testing.T) {
 	if got := JobRetryBackoff(100); got != 5*time.Minute {
 		t.Errorf("JobRetryBackoff(100) = %v, want 5m cap", got)
 	}
+
+	if !JobResumeRestart.IsValid() || !JobResumeCheckpoint.IsValid() {
+		t.Error("expected both JobResumeRestart and JobResumeCheckpoint to be valid")
+	}
+	if JobResumePolicy("").IsValid() || JobResumePolicy("UNKNOWN").IsValid() {
+		t.Error("expected empty or unknown JobResumePolicy to be invalid")
+	}
 }
 
 func TestDomainEventAndSubscriber(t *testing.T) {

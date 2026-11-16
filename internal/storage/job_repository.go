@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
@@ -67,4 +68,23 @@ type JobRepository interface {
 	// IsCancelRequested reports whether cancel_requested is set on the job.
 	// Returns ErrNotFound if no such job exists.
 	IsCancelRequested(ctx context.Context, id string) (bool, error)
+
+	// SaveCheckpoint persists an updated checkpoint for a RUNNING job at the claimed attempt.
+	// Returns ErrNotFound if missing, domain.ErrStaleJobAttempt if the job is at a different attempt,
+	// domain.ErrInvalidJobTransition if the job is not RUNNING, or domain.ErrInvalidJobJSON if invalid.
+	SaveCheckpoint(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error)
+
+	// ListRunningJobs returns all jobs currently in the RUNNING state ordered oldest-first.
+	ListRunningJobs(ctx context.Context) ([]domain.Job, error)
+
+	// RequeueInterrupted reconciles an interrupted RUNNING job at attempt for startup recovery.
+	// If cancel_requested is true, it transitions to CANCELLED (releasing dedupe_key).
+	// If attempts >= max_attempts, it transitions to FAILED (releasing dedupe_key).
+	// Otherwise it returns the job to QUEUED with checkpoint and runAfter (or now if zero)
+	// while preserving attempts monotonically.
+	RequeueInterrupted(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg *string, runAfter time.Time, now time.Time) (*domain.Job, error)
+
+	// MarkFailed transitions a RUNNING job at the claimed attempt directly to FAILED
+	// (or CANCELLED if cancel_requested is true), regardless of remaining attempts.
+	MarkFailed(ctx context.Context, id string, attempt int, errMsg string, now time.Time) (*domain.Job, error)
 }

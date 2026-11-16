@@ -150,9 +150,10 @@ type JobKindProvider interface {
 	JobKinds() []JobKind
 }
 
-// JobKind represents a declared background job kind.
+// JobKind represents a declared background job kind and its startup recovery policy (ADR-0017).
 type JobKind interface {
 	Name() string
+	ResumePolicy() domain.JobResumePolicy
 }
 
 // EventSubscriberProvider indicates a module provides domain event subscribers (ADR-0018 S3).
@@ -544,10 +545,20 @@ func (n NamedAuthenticator) Authenticate(r *http.Request) (AuthResult, error) {
 	return AuthPass(), nil
 }
 
-// NamedJobKind is a simple string-backed JobKind descriptor.
+// NamedJobKind is a simple string-backed JobKind descriptor with restart recovery semantics.
 type NamedJobKind string
 
-func (n NamedJobKind) Name() string { return string(n) }
+func (n NamedJobKind) Name() string                         { return string(n) }
+func (n NamedJobKind) ResumePolicy() domain.JobResumePolicy { return domain.JobResumeRestart }
+
+// JobKindSpec is a JobKind descriptor pairing a canonical kind name with its declared resume policy.
+type JobKindSpec struct {
+	Kind   domain.JobKind
+	Policy domain.JobResumePolicy
+}
+
+func (s JobKindSpec) Name() string                         { return string(s.Kind) }
+func (s JobKindSpec) ResumePolicy() domain.JobResumePolicy { return s.Policy }
 
 // NamedEventSubscriber is a simple string-backed EventSubscriber descriptor.
 type NamedEventSubscriber string
