@@ -283,12 +283,19 @@ func (r *fallbackRecorder) Write(b []byte) (int, error) {
 }
 
 func (r *fallbackRecorder) Flush() {
+	_ = r.FlushError()
+}
+
+// FlushError forwards flushes after pass-through so http.ResponseController
+// observes real underlying flush errors.
+func (r *fallbackRecorder) FlushError() error {
 	if !r.written {
 		r.WriteHeader(http.StatusOK)
 	}
-	if r.passedThrough {
-		_ = http.NewResponseController(r.underlying).Flush()
+	if !r.passedThrough {
+		return nil
 	}
+	return http.NewResponseController(r.underlying).Flush()
 }
 
 func (r *fallbackRecorder) Unwrap() http.ResponseWriter {
@@ -459,6 +466,9 @@ func (s *Server) Close() error {
 // Run serves incoming requests until ctx is cancelled, at which point it initiates
 // graceful shutdown with DefaultShutdownTimeout.
 func (s *Server) Run(ctx context.Context) error {
+	if s.cancelShutdown != nil {
+		defer s.cancelShutdown()
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		s.logger.Info("starting http server",

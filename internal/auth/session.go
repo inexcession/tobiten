@@ -304,6 +304,7 @@ func (a *SessionAuthenticator) AuthenticateSession(ctx context.Context, token st
 
 	principal := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
 	principal.SessionID = session.ID
+	principal.CredentialHashDigest = session.CredentialHashDigest
 	return principal, session.CSRFTokenHash, nil
 }
 

@@ -374,13 +374,14 @@ func CalculateEffectivePermissions(rolePermissions []Permission, scopes []PATSco
 // Principal represents the resolved identity and authorization context for an authenticated request
 // (ADR-0006 §3, ADR-0018 S1). Core application services only ever see the Principal.
 type Principal struct {
-	User           User           `json:"user"`
-	Roles          []Role         `json:"roles"`
-	CredentialID   string         `json:"credential_id"`
-	CredentialKind CredentialKind `json:"credential_kind"`
-	SessionID      string         `json:"session_id,omitempty"`
-	Scopes         []PATScope     `json:"scopes"`
-	Permissions    []Permission   `json:"permissions"`
+	User                 User           `json:"user"`
+	Roles                []Role         `json:"roles"`
+	CredentialID         string         `json:"credential_id"`
+	CredentialKind       CredentialKind `json:"credential_kind"`
+	CredentialHashDigest string         `json:"-"`
+	SessionID            string         `json:"session_id,omitempty"`
+	Scopes               []PATScope     `json:"scopes"`
+	Permissions          []Permission   `json:"permissions"`
 }
 
 // NewPrincipal constructs a Principal and computes effective permissions via scope-cap arithmetic.

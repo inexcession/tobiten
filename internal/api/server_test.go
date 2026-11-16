@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1756,5 +1759,260 @@ func TestServer_GracefulShutdown_EndsIdleSSEWhileOrdinaryInFlightCompletes(t *te
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for srv.Run to return cleanly")
+	}
+}
+
+type failingFlushWriter struct {
+	*httptest.ResponseRecorder
+	flushErr error
+}
+
+func (f *failingFlushWriter) FlushError() error {
+	f.Flush()
+	return f.flushErr
+}
+
+func TestFallbackRecorder_FlushErrorPropagation(t *testing.T) {
+	wantErr := errors.New("underlying flush failure")
+	underlying := &failingFlushWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		flushErr:         wantErr,
+	}
+	bufferedRec := &fallbackRecorder{underlying: underlying}
+
+	// Buffered 404 responses stay un-passed-through so Flush() is a no-op before fallback.
+	bufferedRec.WriteHeader(http.StatusNotFound)
+	if err := http.NewResponseController(bufferedRec).Flush(); err != nil {
+		t.Fatalf("buffered 404 Flush() error = %v, want nil", err)
+	}
+	if bufferedRec.statusCode != http.StatusNotFound || !bufferedRec.written || bufferedRec.passedThrough {
+		t.Fatalf("status=%d written=%v passedThrough=%v, want 404/true/false", bufferedRec.statusCode, bufferedRec.written, bufferedRec.passedThrough)
+	}
+
+	// Once passed through (e.g. 200 streaming response), FlushError propagates underlying FlushError error.
+	streamRec := &fallbackRecorder{underlying: underlying}
+	if err := http.NewResponseController(streamRec).Flush(); !errors.Is(err, wantErr) {
+		t.Fatalf("stream Flush() error = %v, want %v", err, wantErr)
+	}
+}
+
+type blockingServerSSEWriter struct {
+	http.ResponseWriter
+	mu            sync.Mutex
+	deadline      time.Time
+	deadlineSetCh chan time.Time
+	blockingCh    chan struct{}
+	flushCount    int
+}
+
+func newBlockingServerSSEWriter(w http.ResponseWriter) *blockingServerSSEWriter {
+	return &blockingServerSSEWriter{
+		ResponseWriter: w,
+		deadlineSetCh:  make(chan time.Time, 8),
+		blockingCh:     make(chan struct{}, 1),
+	}
+}
+
+func (w *blockingServerSSEWriter) SetWriteDeadline(d time.Time) error {
+	w.mu.Lock()
+	w.deadline = d
+	w.mu.Unlock()
+	select {
+	case w.deadlineSetCh <- d:
+	default:
+	}
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(d)
+}
+
+func (w *blockingServerSSEWriter) FlushError() error {
+	w.mu.Lock()
+	w.flushCount++
+	count := w.flushCount
+	w.mu.Unlock()
+	if count == 1 {
+		// Header flush completes immediately so the SSE client sees 200 OK.
+		return http.NewResponseController(w.ResponseWriter).Flush()
+	}
+	// Block subsequent frame flush deterministically until SetWriteDeadline expires.
+	select {
+	case w.blockingCh <- struct{}{}:
+	default:
+	}
+	for {
+		w.mu.Lock()
+		d := w.deadline
+		w.mu.Unlock()
+		if !d.IsZero() {
+			wait := time.Until(d)
+			if wait <= 0 {
+				return os.ErrDeadlineExceeded
+			}
+			select {
+			case <-time.After(wait):
+			case d = <-w.deadlineSetCh:
+				if !d.IsZero() && !d.After(time.Now()) {
+					return os.ErrDeadlineExceeded
+				}
+			}
+			continue
+		}
+		d = <-w.deadlineSetCh
+		if !d.IsZero() && !d.After(time.Now()) {
+			return os.ErrDeadlineExceeded
+		}
+	}
+}
+
+func TestServer_GracefulShutdown_AbortsBlockedSSEWriteWhileOrdinaryInFlightCompletes(t *testing.T) {
+	stubEvents := &streamingStubEventService{
+		attached: make(chan struct{}, 1),
+		sendCh:   make(chan app.StreamEvent, 1),
+	}
+	reg := module.NewRegistry()
+	_ = reg.Register(NewSystemModule())
+	_ = reg.Register(openapi.NewModule(&app.Services{Events: stubEvents}))
+
+	cfg := &config.Config{
+		Host:    "127.0.0.1",
+		Port:    0,
+		BaseURL: "http://localhost:8080",
+	}
+	srv, err := NewServer(ServerOptions{
+		Config:         cfg,
+		Registry:       reg,
+		Authenticators: []module.Authenticator{passthroughAuth{}},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sseBlocked := make(chan struct{})
+	var sseBlockedOnce sync.Once
+	baseHandler := srv.httpServer.Handler
+	srv.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/events" && r.Method == http.MethodGet {
+			bw := newBlockingServerSSEWriter(w)
+			go func() {
+				<-bw.blockingCh
+				sseBlockedOnce.Do(func() { close(sseBlocked) })
+			}()
+			baseHandler.ServeHTTP(bw, r)
+			return
+		}
+		baseHandler.ServeHTTP(w, r)
+	})
+
+	slowStarted := make(chan struct{})
+	allowSlowFinish := make(chan struct{})
+	srv.Mux().HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
+		close(slowStarted)
+		select {
+		case <-allowSlowFinish:
+		case <-r.Context().Done():
+			http.Error(w, "unexpected request cancellation", http.StatusRequestTimeout)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ordinary request finished"))
+	})
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(serverCtx)
+	}()
+
+	baseURL := srv.URL()
+
+	// 1. Open SSE stream and emit an event whose flush blocks mid-write.
+	sseResp, err := http.Get(baseURL + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("GET /api/v1/events: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE status = %d, want 200", sseResp.StatusCode)
+	}
+	select {
+	case <-stubEvents.attached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE attach")
+	}
+
+	stubEvents.sendCh <- app.StreamEvent{
+		ID:   "99",
+		Name: "job.started",
+		Data: json.RawMessage(`{"sequence":99}`),
+	}
+	select {
+	case <-sseBlocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE flush to enter blocked state")
+	}
+
+	sseEOF := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(sseResp.Body)
+		sseEOF <- readErr
+	}()
+
+	// 2. Start an ordinary in-flight request that must survive shutdown cancellation until released.
+	type slowResult struct {
+		status int
+		body   string
+		err    error
+	}
+	slowCh := make(chan slowResult, 1)
+	go func() {
+		resp, reqErr := http.Get(baseURL + "/slow")
+		if reqErr != nil {
+			slowCh <- slowResult{err: reqErr}
+			return
+		}
+		defer resp.Body.Close()
+		b, readErr := io.ReadAll(resp.Body)
+		slowCh <- slowResult{status: resp.StatusCode, body: string(b), err: readErr}
+	}()
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for /slow to start")
+	}
+
+	// 3. Cancel serverCtx; blocked SSE write must abort immediately while /slow keeps running.
+	cancelServer()
+	select {
+	case readErr := <-sseEOF:
+		if readErr != nil && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+			t.Fatalf("aborted SSE ReadAll error = %v, want nil or unexpected EOF", readErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocked SSE stream to finish during shutdown")
+	}
+	select {
+	case res := <-slowCh:
+		t.Fatalf("/slow finished prematurely during shutdown: %+v", res)
+	case srvErr := <-serverDone:
+		t.Fatalf("srv.Run exited before /slow finished: %v", srvErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 4. Release /slow and verify clean completion.
+	close(allowSlowFinish)
+	select {
+	case res := <-slowCh:
+		if res.err != nil || res.status != http.StatusOK || res.body != "ordinary request finished" {
+			t.Fatalf("/slow result = %+v, want 200 'ordinary request finished'", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for /slow response")
+	}
+	select {
+	case srvErr := <-serverDone:
+		if srvErr != nil {
+			t.Fatalf("srv.Run returned error: %v, want nil", srvErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for srv.Run to finish cleanly")
 	}
 }

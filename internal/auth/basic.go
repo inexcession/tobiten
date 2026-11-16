@@ -211,7 +211,9 @@ func (a *BasicAuthenticator) authenticateBasicWithDigest(ctx context.Context, us
 		return nil, "", err
 	}
 
-	return domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes), verifiedDigest, nil
+	principal := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
+	principal.CredentialHashDigest = verifiedDigest
+	return principal, verifiedDigest, nil
 }
 
 // ClearCache removes all cached password verification entries.

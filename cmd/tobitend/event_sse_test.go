@@ -18,6 +18,7 @@ import (
 	"github.com/inexcession/tobiten/internal/api"
 	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
+	"github.com/inexcession/tobiten/internal/auth"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
@@ -914,11 +915,90 @@ func TestDaemonEventsSSE_OpenStreamRoleDowngradeRevocationAndGracefulShutdown(t 
 			staySeen[pub.AggregateID]++
 		}
 
-		// Close active test streams before opening the dedicated unclosed-SSE shutdown probe.
+		// Close active test streams before running live grant / secret-replacement checks.
 		demotedStream.close()
+		stayAdminStream.close()
 
-		// 3. Leave stayAdminStream's underlying HTTP connection open? Even clearer: open a fresh raw http.Get SSE client
-		//    that is NEVER closed by the test before cancelDaemon(), alongside an in-flight /slow request!
+		// 2.5 Same-ID Basic secret replacement + live visibility grant (including progress ticks).
+		rotatedAdmin := createTestUserWithPassword(ctx, t, userRepo, "rotated-sse-admin", "rot-old-pass-123", domain.RoleAdminID)
+		promotedReader := createTestUserWithPassword(ctx, t, userRepo, "promoted-sse-reader", "reader-pass-123", domain.RoleReaderID)
+
+		rotatedOldStream := openSSEStream(t, baseURL+"/api/v1/events", rotatedAdmin.Username, "rot-old-pass-123", "")
+		promotedReaderStream := openSSEStream(t, baseURL+"/api/v1/events", promotedReader.Username, "reader-pass-123", "")
+
+		// Replace PASSWORD secret_hash in place on the exact same credential row.
+		newRotatedHash, err := auth.HashPassword("rot-new-pass-456")
+		if err != nil {
+			t.Fatalf("HashPassword(new): %v", err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = $1 WHERE user_id = $2 AND kind = 'PASSWORD'`, newRotatedHash, rotatedAdmin.ID); err != nil {
+			t.Fatalf("replace rotatedAdmin secret_hash: %v", err)
+		}
+
+		// Freshly authenticated Basic stream using the replacement secret must succeed.
+		rotatedNewStream := openSSEStream(t, baseURL+"/api/v1/events", rotatedAdmin.Username, "rot-new-pass-456", "")
+
+		// Grant jobs:read_all live by promoting promotedReader to Admin while its stream stays open.
+		if err := userRepo.AssignUserRole(ctx, promotedReader.ID, domain.RoleAdminID); err != nil {
+			t.Fatalf("AssignUserRole(Admin): %v", err)
+		}
+
+		// Trigger first automatic job to wake the stream dispatcher so rotatedOldStream terminates
+		// and promotedReaderStream syncs its ProgressHub visibility principal to Admin.
+		warmupAutoJobID := trigger(rotatedAdmin.Username, "rot-new-pass-456", true)
+		rotatedOldStream.waitClosed(t, 4*time.Second)
+
+		waitForJobLifecycle := func(name string, s *sseClientStream, targetJobID string) {
+			for {
+				f := s.nextFrame(t)
+				if f.Event == domain.ProgressTickEventName {
+					continue
+				}
+				var pub app.PublicEvent
+				if err := json.Unmarshal([]byte(f.Data), &pub); err != nil {
+					t.Fatalf("unmarshal %s frame: %v", name, err)
+				}
+				if pub.AggregateID == targetJobID && f.Event == string(domain.EventJobFinished) {
+					return
+				}
+			}
+		}
+		waitForJobLifecycle("promotedReaderStream warmup", promotedReaderStream, warmupAutoJobID)
+		waitForJobLifecycle("rotatedNewStream warmup", rotatedNewStream, warmupAutoJobID)
+
+		// Trigger a second automatic job: promotedReaderStream and rotatedNewStream MUST receive
+		// BOTH its lifecycle event and its live job.progress tick.
+		grantedAutoJobID := trigger(rotatedAdmin.Username, "rot-new-pass-456", true)
+		waitForLifecycleAndProgress := func(name string, s *sseClientStream, targetJobID string) {
+			gotFinished := false
+			gotProgress := false
+			for !gotFinished || !gotProgress {
+				f := s.nextFrame(t)
+				if f.Event == domain.ProgressTickEventName {
+					var tick domain.JobProgressTick
+					if err := json.Unmarshal([]byte(f.Data), &tick); err != nil {
+						t.Fatalf("unmarshal %s progress tick: %v", name, err)
+					}
+					if tick.JobID == targetJobID {
+						gotProgress = true
+					}
+					continue
+				}
+				var pub app.PublicEvent
+				if err := json.Unmarshal([]byte(f.Data), &pub); err != nil {
+					t.Fatalf("unmarshal %s lifecycle frame: %v", name, err)
+				}
+				if pub.AggregateID == targetJobID && f.Event == string(domain.EventJobFinished) {
+					gotFinished = true
+				}
+			}
+		}
+		waitForLifecycleAndProgress("promotedReaderStream", promotedReaderStream, grantedAutoJobID)
+		waitForLifecycleAndProgress("rotatedNewStream", rotatedNewStream, grantedAutoJobID)
+		promotedReaderStream.close()
+		rotatedNewStream.close()
+
+		// 3. Open a fresh raw http.Get SSE client that stays unclosed until daemon shutdown, alongside an in-flight /slow request!
 		idleReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/events", nil)
 		if err != nil {
 			t.Fatalf("NewRequest idle SSE: %v", err)

@@ -76,6 +76,7 @@ func createStreamTestUserWithCred(
 		t.Fatalf("ListUserRoles(%s): %v", username, err)
 	}
 	p := domain.NewPrincipal(*u, roles, cred.Kind, cred.ID, cred.Scopes)
+	p.CredentialHashDigest = domain.HashSHA256Hex(*cred.SecretHash)
 	return *u, p
 }
 
@@ -423,6 +424,7 @@ func TestStreamService_LiveCredentialRevocationExpirySessionAndDemotion(t *testi
 	}
 	sessPrincipal := domain.NewPrincipal(sessUser, sessBasePrincipal.Roles, credObj.Kind, credObj.ID, nil)
 	sessPrincipal.SessionID = sessID
+	sessPrincipal.CredentialHashDigest = sessBasePrincipal.CredentialHashDigest
 
 	// 2. Role downgrade user (Admin -> Reader) + positive control Admin.
 	demoteUser, demotePrincipal := createStreamTestUserWithCred(
@@ -677,4 +679,215 @@ checkedBuffered:
 			t.Fatalf("timed out waiting for positive-control admin events, saw: %+v", seenStay)
 		}
 	}
+}
+
+func TestStreamServiceCredentialRevisionAndLiveGrant(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	db, eventRepo, jobRepo, userRepo, sessionRepo := setupStreamTestDB(t)
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: 10 * time.Millisecond,
+		Now:         nowFn,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+	dispatcher := events.NewDispatcher(eventRepo, events.WithDispatcherPollInterval(10*time.Second))
+	if err := dispatcher.Start(ctx); err != nil {
+		t.Fatalf("dispatcher.Start: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	svc := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
+		Users:        userRepo,
+		Sessions:     sessionRepo,
+		ProgressHub:  progressHub,
+		WakeSource:   dispatcher,
+		PollInterval: 25 * time.Millisecond,
+		Now:          nowFn,
+	})
+
+	openStream := func(principal *domain.Principal) (<-chan app.StreamEvent, <-chan error, context.CancelFunc) {
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		ch := make(chan app.StreamEvent, 64)
+		attached := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- svc.Stream(
+				streamCtx,
+				principal,
+				app.EventStreamFilter{},
+				func() error {
+					close(attached)
+					return nil
+				},
+				func(ev app.StreamEvent) error {
+					ch <- ev
+					return nil
+				},
+			)
+		}()
+		select {
+		case <-attached:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for stream attach")
+		}
+		return ch, done, cancelStream
+	}
+
+	// Open Basic (PASSWORD) and PAT admin streams, plus a Reader stream that will be promoted live.
+	_, basicPrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "basic-rotator", domain.RoleAdminID, domain.CredentialKindPassword, nil, nil,
+	)
+	_, patPrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "pat-rotator", domain.RoleAdminID, domain.CredentialKindPAT, []domain.PATScope{domain.ScopeAdmin}, nil,
+	)
+	readerUser, readerPrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "promoted-reader", domain.RoleReaderID, domain.CredentialKindPassword, nil, nil,
+	)
+
+	basicOldCh, basicOldDone, cancelBasicOld := openStream(basicPrincipal)
+	defer cancelBasicOld()
+	patOldCh, patOldDone, cancelPATOld := openStream(patPrincipal)
+	defer cancelPATOld()
+	readerCh, readerDone, cancelReader := openStream(readerPrincipal)
+	defer cancelReader()
+	_ = readerDone
+
+	// Replace both PASSWORD and PAT secret_hash values in place (preserving credential ID, user, and kind).
+	newBasicHash := "replaced-basic-argon2id-hash"
+	if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = $1 WHERE id = $2`, newBasicHash, basicPrincipal.CredentialID); err != nil {
+		t.Fatalf("replace basic secret_hash: %v", err)
+	}
+	newPATHash := "replaced-pat-argon2id-hash"
+	if _, err := db.Exec(ctx, `UPDATE credentials SET secret_hash = $1 WHERE id = $2`, newPATHash, patPrincipal.CredentialID); err != nil {
+		t.Fatalf("replace pat secret_hash: %v", err)
+	}
+
+	// Open fresh streams bound to the replacement credential revisions.
+	basicNewPrincipal := *basicPrincipal
+	basicNewPrincipal.CredentialHashDigest = domain.HashSHA256Hex(newBasicHash)
+	basicNewCh, basicNewDone, cancelBasicNew := openStream(&basicNewPrincipal)
+	defer cancelBasicNew()
+	_ = basicNewDone
+
+	patNewPrincipal := *patPrincipal
+	patNewPrincipal.CredentialHashDigest = domain.HashSHA256Hex(newPATHash)
+	patNewCh, patNewDone, cancelPATNew := openStream(&patNewPrincipal)
+	defer cancelPATNew()
+	_ = patNewDone
+
+	// Promote readerUser to Admin live while already streaming.
+	if err := userRepo.AssignUserRole(ctx, readerUser.ID, domain.RoleAdminID); err != nil {
+		t.Fatalf("AssignUserRole(admin): %v", err)
+	}
+
+	// Enqueue + start an automatic job (CreatedBy=nil). Both old streams must terminate cleanly
+	// without emitting it, while the new Basic/PAT streams and the newly promoted Reader receive
+	// BOTH its lifecycle event AND a subsequent live progress tick.
+	autoJob := &domain.Job{Kind: domain.JobKindRepack, CreatedBy: nil, RunAfter: nowFn(), CreatedAt: nowFn()}
+	if _, err := jobRepo.Enqueue(ctx, autoJob); err != nil {
+		t.Fatalf("Enqueue autoJob: %v", err)
+	}
+	if _, err := jobRepo.ClaimNext(ctx, domain.JobKindRepack, nowFn()); err != nil {
+		t.Fatalf("ClaimNext autoJob: %v", err)
+	}
+	dispatcher.Notify()
+
+	for name, done := range map[string]<-chan error{
+		"old Basic": basicOldDone,
+		"old PAT":   patOldDone,
+	} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s Stream returned err = %v, want nil", name, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s Stream to terminate after in-place secret replacement", name)
+		}
+	}
+	for name, ch := range map[string]<-chan app.StreamEvent{
+		"old Basic": basicOldCh,
+		"old PAT":   patOldCh,
+	} {
+		for len(ch) > 0 {
+			ev := <-ch
+			var pub app.PublicEvent
+			if err := json.Unmarshal(ev.Data, &pub); err == nil && pub.AggregateID == autoJob.ID {
+				t.Fatalf("%s emitted post-replacement event %+v", name, ev)
+			}
+		}
+	}
+
+	// Wait for the promoted reader to receive job.started (proving live principal + ProgressHub sync ran).
+	waitForLifecycle := func(name string, ch <-chan app.StreamEvent) {
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-ch:
+				if ev.Name == string(domain.EventJobStarted) {
+					var pub app.PublicEvent
+					if err := json.Unmarshal(ev.Data, &pub); err == nil && pub.AggregateID == autoJob.ID {
+						return
+					}
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for job.started on %s", name)
+			}
+		}
+	}
+	waitForLifecycle("new Basic", basicNewCh)
+	waitForLifecycle("new PAT", patNewCh)
+	waitForLifecycle("promoted Reader", readerCh)
+
+	// Publish a live progress tick for autoJob; promoted Reader MUST now receive it!
+	advanceClock(50 * time.Millisecond)
+	if !progressHub.Publish(domain.JobProgressTick{
+		JobID:        autoJob.ID,
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    nil,
+		ScannedCount: 4,
+		CurrentPath:  "/promoted.cbz",
+		DurationMS:   12,
+	}) {
+		t.Fatal("ProgressHub.Publish returned false")
+	}
+
+	waitForProgress := func(name string, ch <-chan app.StreamEvent) {
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-ch:
+				if ev.Name == domain.ProgressTickEventName {
+					var tick domain.JobProgressTick
+					if err := json.Unmarshal(ev.Data, &tick); err == nil && tick.JobID == autoJob.ID {
+						return
+					}
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for job.progress on %s", name)
+			}
+		}
+	}
+	waitForProgress("new Basic", basicNewCh)
+	waitForProgress("new PAT", patNewCh)
+	waitForProgress("promoted Reader", readerCh)
 }

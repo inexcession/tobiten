@@ -205,16 +205,20 @@ func (s *StreamService) Stream(
 
 	var progressCh <-chan domain.JobProgressTick
 	unsubProgress := func() {}
+	updateProgress := func(*domain.Principal) {}
 	if progress != nil {
-		ch, cancelProgress, subErr := progress.Subscribe(ctx, ProgressSubscribeOptions{
+		sub, subErr := progress.SubscribeControlled(ctx, ProgressSubscribeOptions{
 			Principal: livePrincipal,
 			JobID:     strings.TrimSpace(filter.JobID),
 		})
 		if subErr != nil {
 			return subErr
 		}
-		progressCh = ch
-		unsubProgress = cancelProgress
+		progressCh = sub.Ticks
+		unsubProgress = sub.Cancel
+		if sub.UpdatePrincipal != nil {
+			updateProgress = sub.UpdatePrincipal
+		}
 	}
 	defer unsubProgress()
 
@@ -225,7 +229,7 @@ func (s *StreamService) Stream(
 	}
 
 	jobIDFilter := strings.TrimSpace(filter.JobID)
-	keepOpen, err := s.drainCommitted(ctx, principal, jobIDFilter, &cursor, emit)
+	keepOpen, err := s.drainCommitted(ctx, principal, jobIDFilter, &cursor, updateProgress, emit)
 	if err != nil {
 		if ctx.Err() == nil {
 			return err
@@ -236,7 +240,7 @@ func (s *StreamService) Stream(
 		return nil
 	}
 
-	err = s.runLoop(ctx, principal, jobIDFilter, &cursor, wakeCh, manualCh, progressCh, emit)
+	err = s.runLoop(ctx, principal, jobIDFilter, &cursor, wakeCh, manualCh, progressCh, updateProgress, emit)
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -251,6 +255,7 @@ func (s *StreamService) runLoop(
 	wakeCh <-chan struct{},
 	manualCh <-chan struct{},
 	progressCh <-chan domain.JobProgressTick,
+	updateProgress func(*domain.Principal),
 	emit func(app.StreamEvent) error,
 ) error {
 	var pollCh <-chan time.Time
@@ -265,17 +270,17 @@ func (s *StreamService) runLoop(
 		case <-ctx.Done():
 			return nil
 		case <-wakeCh:
-			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, updateProgress, emit)
 			if err != nil || !keepOpen {
 				return err
 			}
 		case <-manualCh:
-			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, updateProgress, emit)
 			if err != nil || !keepOpen {
 				return err
 			}
 		case <-pollCh:
-			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, updateProgress, emit)
 			if err != nil || !keepOpen {
 				return err
 			}
@@ -284,7 +289,7 @@ func (s *StreamService) runLoop(
 				progressCh = nil
 				continue
 			}
-			keepOpen, err := s.handleProgressTick(ctx, origin, jobIDFilter, tick, emit)
+			keepOpen, err := s.handleProgressTick(ctx, origin, jobIDFilter, tick, updateProgress, emit)
 			if err != nil || !keepOpen {
 				return err
 			}
@@ -297,12 +302,18 @@ func (s *StreamService) drainCommitted(
 	origin *domain.Principal,
 	jobIDFilter string,
 	cursor *int64,
+	updateProgress func(*domain.Principal),
 	emit func(app.StreamEvent) error,
 ) (bool, error) {
-	if _, valid, err := s.resolveLivePrincipal(ctx, origin); err != nil {
+	live, valid, err := s.resolveLivePrincipal(ctx, origin)
+	if err != nil {
 		return false, err
-	} else if !valid {
+	}
+	if !valid {
 		return false, nil
+	}
+	if updateProgress != nil {
+		updateProgress(live)
 	}
 
 	for {
@@ -325,7 +336,7 @@ func (s *StreamService) drainCommitted(
 			if seq > *cursor {
 				*cursor = seq
 			}
-			streamEv, visible, keepOpen, err := s.projectJobEvent(ctx, origin, jobIDFilter, ev, seq)
+			streamEv, visible, keepOpen, err := s.projectJobEvent(ctx, origin, jobIDFilter, ev, seq, updateProgress)
 			if err != nil {
 				return false, err
 			}
@@ -409,6 +420,9 @@ func isUsableStreamCredential(cred *domain.Credential, origin *domain.Principal,
 	if cred.IsRevoked() || cred.IsExpired(now) {
 		return false
 	}
+	if !domain.MatchesCredentialSecretDigest(cred.Kind, cred.SecretHash, origin.CredentialHashDigest) {
+		return false
+	}
 	return cred.Validate() == nil
 }
 
@@ -461,6 +475,7 @@ func (s *StreamService) resolveLivePrincipal(ctx context.Context, origin *domain
 
 	live := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
 	live.SessionID = origin.SessionID
+	live.CredentialHashDigest = origin.CredentialHashDigest
 	return live, true, nil
 }
 
@@ -478,6 +493,7 @@ func (s *StreamService) projectJobEvent(
 	jobIDFilter string,
 	ev domain.DomainEvent,
 	seq int64,
+	updateProgress func(*domain.Principal),
 ) (app.StreamEvent, bool, bool, error) {
 	if !isJobLifecycleEventKind(ev.Kind) {
 		return app.StreamEvent{}, false, true, nil
@@ -496,6 +512,9 @@ func (s *StreamService) projectJobEvent(
 	}
 	if !valid {
 		return app.StreamEvent{}, false, false, nil
+	}
+	if updateProgress != nil {
+		updateProgress(live)
 	}
 
 	job, err := s.lookupJob(ctx, payload.JobID)
@@ -536,6 +555,7 @@ func (s *StreamService) handleProgressTick(
 	origin *domain.Principal,
 	jobIDFilter string,
 	tick domain.JobProgressTick,
+	updateProgress func(*domain.Principal),
 	emit func(app.StreamEvent) error,
 ) (bool, error) {
 	if tick.Kind.IsInternal() {
@@ -551,6 +571,9 @@ func (s *StreamService) handleProgressTick(
 	}
 	if !valid {
 		return false, nil
+	}
+	if updateProgress != nil {
+		updateProgress(live)
 	}
 
 	job, err := s.lookupJob(ctx, tick.JobID)

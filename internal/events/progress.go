@@ -187,24 +187,42 @@ func clonePrincipal(p *domain.Principal) *domain.Principal {
 	return &copied
 }
 
+// ProgressSubscription holds a live ProgressHub listener channel, cancellation
+// callback, and live principal updater.
+type ProgressSubscription struct {
+	Ticks           <-chan domain.JobProgressTick
+	Cancel          func()
+	UpdatePrincipal func(*domain.Principal)
+}
+
 // Subscribe registers a live listener filtered by opts.Principal's job visibility rules
 // and optional opts.JobID. The returned channel closes when ctx is cancelled or the
 // returned unsubscribe function is called.
 func (h *ProgressHub) Subscribe(ctx context.Context, opts ProgressSubscribeOptions) (<-chan domain.JobProgressTick, func(), error) {
-	if h == nil {
-		return nil, nil, ErrNilProgressHub
-	}
-	if ctx == nil {
-		return nil, nil, errors.New("subscription context is required")
-	}
-	if err := ctx.Err(); err != nil {
+	sub, err := h.SubscribeControlled(ctx, opts)
+	if err != nil {
 		return nil, nil, err
 	}
+	return sub.Ticks, sub.Cancel, nil
+}
+
+// SubscribeControlled registers a live progress listener whose visibility principal
+// can be refreshed safely via UpdatePrincipal as live role/credential grants change.
+func (h *ProgressHub) SubscribeControlled(ctx context.Context, opts ProgressSubscribeOptions) (*ProgressSubscription, error) {
+	if h == nil {
+		return nil, ErrNilProgressHub
+	}
+	if ctx == nil {
+		return nil, errors.New("subscription context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if opts.Principal == nil {
-		return nil, nil, ErrPrincipalRequired
+		return nil, ErrPrincipalRequired
 	}
 	if opts.BufferSize < 0 {
-		return nil, nil, ErrInvalidProgressBuffer
+		return nil, ErrInvalidProgressBuffer
 	}
 
 	bufSize := opts.BufferSize
@@ -241,7 +259,23 @@ func (h *ProgressHub) Subscribe(ctx context.Context, opts ProgressSubscribeOptio
 		unsub()
 	}
 
-	return sub.ch, cancel, nil
+	updatePrincipal := func(p *domain.Principal) {
+		if p == nil {
+			return
+		}
+		cloned := clonePrincipal(p)
+		h.mu.Lock()
+		if !sub.closed {
+			sub.principal = cloned
+		}
+		h.mu.Unlock()
+	}
+
+	return &ProgressSubscription{
+		Ticks:           sub.ch,
+		Cancel:          cancel,
+		UpdatePrincipal: updatePrincipal,
+	}, nil
 }
 
 // SubscriberCount returns the number of currently active live progress listeners.

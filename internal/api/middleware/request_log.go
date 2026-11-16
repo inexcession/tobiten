@@ -43,10 +43,16 @@ func (rw *responseRecorder) Write(b []byte) (int, error) {
 }
 
 func (rw *responseRecorder) Flush() {
+	_ = rw.FlushError()
+}
+
+// FlushError forwards flushes to the underlying ResponseWriter and preserves
+// any flush or write-deadline error for http.ResponseController.
+func (rw *responseRecorder) FlushError() error {
 	if !rw.wroteHeader {
 		rw.WriteHeader(http.StatusOK)
 	}
-	_ = http.NewResponseController(rw.ResponseWriter).Flush()
+	return http.NewResponseController(rw.ResponseWriter).Flush()
 }
 
 func (rw *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {

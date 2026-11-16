@@ -226,7 +226,9 @@ func (a *PATAuthenticator) AuthenticatePAT(ctx context.Context, token, clientIP 
 		return nil, err
 	}
 
-	return domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes), nil
+	principal := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
+	principal.CredentialHashDigest = domain.HashSHA256Hex(*cred.SecretHash)
+	return principal, nil
 }
 
 // ClearCache removes all cached PAT verification entries.

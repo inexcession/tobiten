@@ -366,3 +366,83 @@ func TestProgressHub_IndependentListenerTicksAndPrivateAuthorization(t *testing.
 	default:
 	}
 }
+
+func TestProgressHubSubscribeControlledUpdatePrincipal(t *testing.T) {
+	t.Parallel()
+
+	hub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+
+	reader := testPrincipalWithPerms("u-reader", domain.PermissionLibraryRead)
+	sub, err := hub.SubscribeControlled(t.Context(), events.ProgressSubscribeOptions{
+		Principal: reader,
+	})
+	if err != nil {
+		t.Fatalf("SubscribeControlled: %v", err)
+	}
+	defer sub.Cancel()
+
+	// Automatic job tick is initially invisible to Reader.
+	if !hub.Publish(domain.JobProgressTick{
+		JobID:        "job-auto",
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    nil,
+		ScannedCount: 1,
+		CurrentPath:  "/a.cbz",
+		DurationMS:   5,
+	}) {
+		t.Fatal("initial Publish returned false")
+	}
+	select {
+	case tick := <-sub.Ticks:
+		t.Fatalf("Reader unexpectedly received automatic tick before promotion: %+v", tick)
+	default:
+	}
+
+	// Promote to Admin via UpdatePrincipal; next tick IS delivered.
+	admin := testPrincipalWithPerms("u-reader", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
+	sub.UpdatePrincipal(admin)
+
+	time.Sleep(15 * time.Millisecond)
+	if !hub.Publish(domain.JobProgressTick{
+		JobID:        "job-auto",
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    nil,
+		ScannedCount: 2,
+		CurrentPath:  "/b.cbz",
+		DurationMS:   6,
+	}) {
+		t.Fatal("post-grant Publish returned false")
+	}
+	select {
+	case tick := <-sub.Ticks:
+		if tick.ScannedCount != 2 || tick.CurrentPath != "/b.cbz" {
+			t.Fatalf("unexpected promoted tick: %+v", tick)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for promoted automatic tick")
+	}
+
+	// Downgrade back to Reader; next tick is dropped again.
+	sub.UpdatePrincipal(reader)
+	time.Sleep(15 * time.Millisecond)
+	if !hub.Publish(domain.JobProgressTick{
+		JobID:        "job-auto",
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    nil,
+		ScannedCount: 3,
+		CurrentPath:  "/c.cbz",
+		DurationMS:   7,
+	}) {
+		t.Fatal("post-downgrade Publish returned false")
+	}
+	select {
+	case tick := <-sub.Ticks:
+		t.Fatalf("downgraded listener received automatic tick: %+v", tick)
+	default:
+	}
+}

@@ -3,15 +3,20 @@ package openapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 )
+
+const defaultSSEWriteTimeout = 5 * time.Second
 
 func (m *Module) eventService() app.EventService {
 	if m.services == nil {
@@ -73,6 +78,108 @@ func mergeStreamContext(reqCtx, shutdownCtx context.Context) (context.Context, c
 	}
 }
 
+type sseWriter struct {
+	w         http.ResponseWriter
+	rc        *http.ResponseController
+	streamCtx context.Context
+	timeout   time.Duration
+
+	mu      sync.Mutex
+	writing bool
+	closed  bool
+}
+
+func newSSEWriter(streamCtx context.Context, w http.ResponseWriter, timeout time.Duration) *sseWriter {
+	if timeout <= 0 {
+		timeout = defaultSSEWriteTimeout
+	}
+	return &sseWriter{
+		w:         w,
+		rc:        http.NewResponseController(w),
+		streamCtx: streamCtx,
+		timeout:   timeout,
+	}
+}
+
+func ignoreUnsupportedErr(err error) error {
+	switch {
+	case err == nil, errors.Is(err, http.ErrNotSupported):
+		return nil
+	default:
+		return err
+	}
+}
+
+func (s *sseWriter) setDeadline(deadline time.Time) error {
+	return ignoreUnsupportedErr(s.rc.SetWriteDeadline(deadline))
+}
+
+func (s *sseWriter) beginWrite() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return context.Canceled
+	}
+	if err := s.streamCtx.Err(); err != nil {
+		return err
+	}
+	if err := s.setDeadline(time.Now().Add(s.timeout)); err != nil {
+		return err
+	}
+	s.writing = true
+	return nil
+}
+
+func (s *sseWriter) endWrite() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writing = false
+	if s.closed || s.streamCtx.Err() != nil {
+		return
+	}
+	_ = s.setDeadline(time.Time{})
+}
+
+func (s *sseWriter) abortBlockedWrite() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	if s.writing {
+		_ = s.setDeadline(time.Unix(1, 0))
+	}
+}
+
+func (s *sseWriter) flush() error {
+	return ignoreUnsupportedErr(s.rc.Flush())
+}
+
+func (s *sseWriter) writeHeaders(onWrite func()) error {
+	if err := s.beginWrite(); err != nil {
+		return err
+	}
+	defer s.endWrite()
+
+	onWrite()
+	setSSEHeaders(s.w)
+	s.w.WriteHeader(http.StatusOK)
+	return s.flush()
+}
+
+func (s *sseWriter) writeEvent(ev app.StreamEvent) error {
+	if err := s.beginWrite(); err != nil {
+		return err
+	}
+	defer s.endWrite()
+
+	if err := writeSSEFrame(s.w, ev); err != nil {
+		return err
+	}
+	return s.flush()
+}
+
 func (m *Module) handleEvents(w http.ResponseWriter, r *http.Request) {
 	p, ok := domain.PrincipalFromContext(r.Context())
 	if !ok || p == nil {
@@ -95,9 +202,12 @@ func (m *Module) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jobID := strings.TrimSpace(r.URL.Query().Get("job_id"))
-	rc := http.NewResponseController(w)
 	streamCtx, cancelStream := mergeStreamContext(r.Context(), middleware.ShutdownContextFromContext(r.Context()))
 	defer cancelStream()
+
+	sw := newSSEWriter(streamCtx, w, defaultSSEWriteTimeout)
+	stopAbort := context.AfterFunc(streamCtx, sw.abortBlockedWrite)
+	defer stopAbort()
 
 	attached := false
 	err := svc.Stream(
@@ -105,21 +215,13 @@ func (m *Module) handleEvents(w http.ResponseWriter, r *http.Request) {
 		p,
 		app.EventStreamFilter{JobID: jobID},
 		func() error {
-			attached = true
-			setSSEHeaders(w)
-			w.WriteHeader(http.StatusOK)
-			_ = rc.Flush()
-			return nil
+			return sw.writeHeaders(func() {
+				attached = true
+			})
 		},
-		func(ev app.StreamEvent) error {
-			if err := writeSSEFrame(w, ev); err != nil {
-				return err
-			}
-			_ = rc.Flush()
-			return nil
-		},
+		sw.writeEvent,
 	)
-	if err != nil && !attached {
+	if err != nil && !attached && streamCtx.Err() == nil {
 		w.Header().Set("Cache-Control", "no-store")
 		middleware.WriteAppError(w, r, err)
 	}

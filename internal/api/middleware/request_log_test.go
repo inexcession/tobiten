@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -285,4 +286,39 @@ func TestRequestLogger_Informational1xxNotFinal(t *testing.T) {
 			t.Errorf("logged level = %v, want INFO", logMap["level"])
 		}
 	})
+}
+
+type failingFlushRecorder struct {
+	*httptest.ResponseRecorder
+	flushErr error
+}
+
+func (f *failingFlushRecorder) FlushError() error {
+	f.Flush()
+	return f.flushErr
+}
+
+func TestRequestLogger_ResponseRecorderFlushErrorPropagation(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	wantErr := errors.New("flush failed")
+	var gotFlushErr error
+	handler := RequestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFlushErr = http.NewResponseController(w).Flush()
+	}))
+
+	rec := &failingFlushRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		flushErr:         wantErr,
+	}
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	handler.ServeHTTP(rec, req)
+
+	if !errors.Is(gotFlushErr, wantErr) {
+		t.Fatalf("ResponseController.Flush() error = %v, want %v", gotFlushErr, wantErr)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("implicit status = %d, want 200", rec.Code)
+	}
 }
