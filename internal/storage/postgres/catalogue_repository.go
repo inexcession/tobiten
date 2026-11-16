@@ -185,6 +185,20 @@ func queryOne[T any](
 	return scanFn(row)
 }
 
+func queryScopedOne[T any](
+	ctx context.Context,
+	r *CatalogueRepository,
+	scope storage.CatalogueReadScope,
+	spec guardedQuerySpec,
+	scanFn func(pgx.Row) (*T, error),
+) (*T, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	return queryOne(ctx, &r.guard, pred, spec, scanFn)
+}
+
 func queryList[T any](
 	ctx context.Context,
 	g *guardedCatalogueDB,
@@ -245,11 +259,7 @@ func (r *CatalogueRepository) loadPredicate(ctx context.Context, scope storage.C
 
 // GetSeriesByID retrieves a single series if visible under the principal's label predicate.
 func (r *CatalogueRepository) GetSeriesByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Series, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+	return queryScopedOne(ctx, r, scope, guardedQuerySpec{
 		selectFrom: selectSeriesColumns,
 		whereParts: []string{"s.id = $1"},
 		args:       []any{id},
@@ -446,11 +456,7 @@ func (r *CatalogueRepository) CountVolumes(ctx context.Context, scope storage.Ca
 
 // GetAssetByID retrieves a single media asset if visible under the principal's label predicate.
 func (r *CatalogueRepository) GetAssetByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.MediaAsset, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+	return queryScopedOne(ctx, r, scope, guardedQuerySpec{
 		selectFrom: selectAssetColumns,
 		whereParts: []string{"a.id = $1"},
 		args:       []any{id},
@@ -490,11 +496,7 @@ func (r *CatalogueRepository) CountAssetsByVolume(ctx context.Context, scope sto
 // GetAuthorizedAssetFile retrieves the root and asset path projection for assetID
 // only when the asset, its parent volume, and its series satisfy the label predicate.
 func (r *CatalogueRepository) GetAuthorizedAssetFile(ctx context.Context, scope storage.CatalogueReadScope, assetID string) (*storage.AuthorizedAssetFile, error) {
-	pred, err := r.loadPredicate(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+	return queryScopedOne(ctx, r, scope, guardedQuerySpec{
 		selectFrom: selectAuthorizedAssetFileColumns,
 		whereParts: []string{"a.id = $1"},
 		args:       []any{assetID},
