@@ -158,6 +158,17 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			).Scan(&assignedCount); err != nil || assignedCount != 1 {
 				t.Fatalf("alice pre-existing item_labels assignment did not survive upgrade: count=%d err=%v", assignedCount, err)
 			}
+
+			// Verify 0006_domain_event_sequence.sql initialized last_sequence from seeded domain_events.
+			var lastEventSeq int64
+			if err := db.QueryRow(ctx,
+				`SELECT last_sequence FROM domain_event_sequence WHERE id = TRUE`,
+			).Scan(&lastEventSeq); err != nil {
+				t.Fatalf("verify domain_event_sequence after upgrade: %v", err)
+			}
+			if lastEventSeq != 1 {
+				t.Fatalf("expected domain_event_sequence.last_sequence = 1 after upgrade, got %d", lastEventSeq)
+			}
 		})
 	}
 }

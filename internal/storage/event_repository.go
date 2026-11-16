@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
 )
@@ -23,4 +24,14 @@ type EventRepository interface {
 	// GetEventByID retrieves a domain event by its internal BIGSERIAL row ID.
 	// Returns ErrNotFound if no matching row exists.
 	GetEventByID(ctx context.Context, id int64) (*domain.DomainEvent, error)
+
+	// PublishUnsequencedEvents selects all committed domain_events rows where
+	// published_sequence IS NULL regardless of raw id, assigns contiguous monotonic
+	// published_sequence values and published_at in ascending order, and updates the
+	// publication sequence watermark.
+	//
+	// When called on a non-transactional repository (InTx() == false), it runs in its
+	// own serialized transaction. When called on a transactional repository
+	// (InTx() == true), it executes inside the caller's active transaction.
+	PublishUnsequencedEvents(ctx context.Context, publishedAt time.Time) ([]domain.DomainEvent, error)
 }

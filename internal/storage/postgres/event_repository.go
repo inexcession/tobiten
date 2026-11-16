@@ -116,3 +116,71 @@ func (r *EventRepository) GetEventByID(ctx context.Context, id int64) (*domain.D
 	out := DomainEventToDomain(row)
 	return &out, nil
 }
+
+// PublishUnsequencedEvents selects all committed domain_events rows where
+// published_sequence IS NULL regardless of raw id, assigns contiguous monotonic
+// published_sequence values and published_at in ascending order, and updates the
+// publication sequence watermark.
+func (r *EventRepository) PublishUnsequencedEvents(ctx context.Context, publishedAt time.Time) ([]domain.DomainEvent, error) {
+	if r == nil {
+		return nil, errors.New("event repository is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	ts := publishedAt
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	} else {
+		ts = ts.UTC()
+	}
+
+	if !r.InTx() {
+		var published []domain.DomainEvent
+		err := r.WithTx(ctx, func(txRepo storage.EventRepository) error {
+			var err error
+			published, err = txRepo.PublishUnsequencedEvents(ctx, ts)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return published, nil
+	}
+
+	lastSeq, err := r.q.LockDomainEventSequence(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("locking domain_event_sequence: %w", err)
+	}
+
+	rows, err := r.q.PublishUnsequencedDomainEvents(ctx, PublishUnsequencedDomainEventsParams{
+		BaseSequence: lastSeq,
+		PublishedAt:  ts,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("publishing unsequenced domain events: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	published := make([]domain.DomainEvent, 0, len(rows))
+	var maxSeq int64
+	for _, row := range rows {
+		ev := DomainEventToDomain(DomainEvent(row))
+		if !ev.IsPublished() {
+			return nil, fmt.Errorf("published domain event %d missing publication metadata", ev.ID)
+		}
+		if *ev.PublishedSequence > maxSeq {
+			maxSeq = *ev.PublishedSequence
+		}
+		published = append(published, ev)
+	}
+
+	if err := r.q.UpdateDomainEventSequence(ctx, maxSeq); err != nil {
+		return nil, fmt.Errorf("updating domain_event_sequence watermark to %d: %w", maxSeq, err)
+	}
+
+	return published, nil
+}

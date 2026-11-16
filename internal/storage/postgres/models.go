@@ -56,6 +56,11 @@ type DomainEvent struct {
 	CreatedAt         time.Time
 }
 
+type DomainEventSequence struct {
+	ID           bool
+	LastSequence int64
+}
+
 type Entity struct {
 	ID           string
 	Kind         string

@@ -65,9 +65,11 @@ type Querier interface {
 	ListUserLabels(ctx context.Context, ownerID *string) ([]Label, error)
 	ListUserRoles(ctx context.Context, userID string) ([]ListUserRolesRow, error)
 	ListUsers(ctx context.Context) ([]User, error)
+	LockDomainEventSequence(ctx context.Context) (int64, error)
 	MarkJobCancelled(ctx context.Context, arg MarkJobCancelledParams) (Job, error)
 	MarkJobFailed(ctx context.Context, arg MarkJobFailedParams) (Job, error)
 	MarkJobSucceeded(ctx context.Context, arg MarkJobSucceededParams) (Job, error)
+	PublishUnsequencedDomainEvents(ctx context.Context, arg PublishUnsequencedDomainEventsParams) ([]PublishUnsequencedDomainEventsRow, error)
 	RecoverJobCancelled(ctx context.Context, arg RecoverJobCancelledParams) (Job, error)
 	RecoverJobFailed(ctx context.Context, arg RecoverJobFailedParams) (Job, error)
 	RecoverJobSucceeded(ctx context.Context, arg RecoverJobSucceededParams) (Job, error)
@@ -85,6 +87,7 @@ type Querier interface {
 	SetJobCancelRequested(ctx context.Context, arg SetJobCancelRequestedParams) (Job, error)
 	SetUserLabelPolicy(ctx context.Context, arg SetUserLabelPolicyParams) error
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
+	UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
 	UpsertBuiltInServerLabel(ctx context.Context, arg UpsertBuiltInServerLabelParams) error

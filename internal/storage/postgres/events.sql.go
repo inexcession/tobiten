@@ -8,6 +8,8 @@ package postgres
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const appendDomainEvent = `-- name: AppendDomainEvent :one
@@ -81,4 +83,124 @@ func (q *Queries) GetDomainEventByID(ctx context.Context, id int64) (DomainEvent
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const lockDomainEventSequence = `-- name: LockDomainEventSequence :one
+SELECT last_sequence
+FROM domain_event_sequence
+WHERE id = TRUE
+FOR UPDATE
+`
+
+func (q *Queries) LockDomainEventSequence(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, lockDomainEventSequence)
+	var last_sequence int64
+	err := row.Scan(&last_sequence)
+	return last_sequence, err
+}
+
+const publishUnsequencedDomainEvents = `-- name: PublishUnsequencedDomainEvents :many
+WITH base AS (
+    SELECT GREATEST(
+        $1::bigint,
+        COALESCE((SELECT MAX(published_sequence) FROM domain_events WHERE published_sequence IS NOT NULL), 0)
+    ) AS seq
+),
+numbered AS (
+    SELECT
+        e.id,
+        (SELECT seq FROM base) + ROW_NUMBER() OVER (ORDER BY e.id ASC) AS next_seq
+    FROM domain_events e
+    WHERE e.published_sequence IS NULL
+    ORDER BY e.id ASC
+),
+updated AS (
+    UPDATE domain_events d
+    SET
+        published_sequence = n.next_seq,
+        published_at = $2::timestamptz
+    FROM numbered n
+    WHERE d.id = n.id
+      AND d.published_sequence IS NULL
+    RETURNING
+        d.id,
+        d.published_sequence,
+        d.published_at,
+        d.kind,
+        d.version,
+        d.aggregate_type,
+        d.aggregate_id,
+        d.payload,
+        d.created_at
+)
+SELECT
+    id,
+    published_sequence,
+    published_at,
+    kind,
+    version,
+    aggregate_type,
+    aggregate_id,
+    payload,
+    created_at
+FROM updated
+ORDER BY published_sequence ASC
+`
+
+type PublishUnsequencedDomainEventsParams struct {
+	BaseSequence int64
+	PublishedAt  time.Time
+}
+
+type PublishUnsequencedDomainEventsRow struct {
+	ID                int64
+	PublishedSequence pgtype.Int8
+	PublishedAt       *time.Time
+	Kind              string
+	Version           int32
+	AggregateType     string
+	AggregateID       string
+	Payload           []byte
+	CreatedAt         time.Time
+}
+
+func (q *Queries) PublishUnsequencedDomainEvents(ctx context.Context, arg PublishUnsequencedDomainEventsParams) ([]PublishUnsequencedDomainEventsRow, error) {
+	rows, err := q.db.Query(ctx, publishUnsequencedDomainEvents, arg.BaseSequence, arg.PublishedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublishUnsequencedDomainEventsRow
+	for rows.Next() {
+		var i PublishUnsequencedDomainEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublishedSequence,
+			&i.PublishedAt,
+			&i.Kind,
+			&i.Version,
+			&i.AggregateType,
+			&i.AggregateID,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateDomainEventSequence = `-- name: UpdateDomainEventSequence :exec
+UPDATE domain_event_sequence
+SET last_sequence = $1
+WHERE id = TRUE
+`
+
+func (q *Queries) UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error {
+	_, err := q.db.Exec(ctx, updateDomainEventSequence, lastSequence)
+	return err
 }

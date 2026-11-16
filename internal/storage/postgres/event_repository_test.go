@@ -1050,3 +1050,350 @@ func TestEventRepository_Guards(t *testing.T) {
 		t.Fatalf("WithTx guards err: %v", err)
 	}
 }
+
+func TestEventRepository_PublishUnsequenced_OutOfOrderCommitAcrossConnections(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Open two completely separate PostgreSQL connections to model concurrent producers.
+	connLow, err := pgx.Connect(ctx, db.URL)
+	if err != nil {
+		t.Fatalf("connect connLow: %v", err)
+	}
+	defer func() { _ = connLow.Close(context.Background()) }()
+
+	connHigh, err := pgx.Connect(ctx, db.URL)
+	if err != nil {
+		t.Fatalf("connect connHigh: %v", err)
+	}
+	defer func() { _ = connHigh.Close(context.Background()) }()
+
+	// Connection 1 starts a transaction and inserts an event that receives the lower raw ID,
+	// leaving it uncommitted.
+	txLow, err := connLow.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin txLow: %v", err)
+	}
+	defer func() { _ = txLow.Rollback(context.Background()) }()
+
+	evLow, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "asset-low-raw", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewEventRepository(txLow).AppendEvent(ctx, &evLow); err != nil {
+		t.Fatalf("AppendEvent evLow: %v", err)
+	}
+
+	// Connection 2 starts a transaction, inserts an event that receives a higher raw ID,
+	// and commits first.
+	txHigh, err := connHigh.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin txHigh: %v", err)
+	}
+	defer func() { _ = txHigh.Rollback(context.Background()) }()
+
+	evHigh, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "asset-high-raw", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewEventRepository(txHigh).AppendEvent(ctx, &evHigh); err != nil {
+		t.Fatalf("AppendEvent evHigh: %v", err)
+	}
+	if err := txHigh.Commit(ctx); err != nil {
+		t.Fatalf("Commit txHigh: %v", err)
+	}
+
+	if evLow.ID >= evHigh.ID {
+		t.Fatalf("expected evLow.ID (%d) < evHigh.ID (%d)", evLow.ID, evHigh.ID)
+	}
+
+	// First publish pass sees only the committed higher raw ID; lower raw ID stays invisible.
+	t1 := time.Date(2026, 11, 16, 15, 0, 0, 0, time.UTC)
+	batch1, err := poolRepo.PublishUnsequencedEvents(ctx, t1)
+	if err != nil {
+		t.Fatalf("PublishUnsequencedEvents batch1: %v", err)
+	}
+	if len(batch1) != 1 || batch1[0].ID != evHigh.ID {
+		t.Fatalf("expected only evHigh (%d) in batch1, got %+v", evHigh.ID, batch1)
+	}
+	if batch1[0].PublishedSequence == nil || *batch1[0].PublishedSequence != 1 {
+		t.Fatalf("expected evHigh published_sequence = 1, got %v", batch1[0].PublishedSequence)
+	}
+	if batch1[0].PublishedAt == nil || !batch1[0].PublishedAt.Equal(t1) {
+		t.Fatalf("expected evHigh published_at = %v, got %v", t1, batch1[0].PublishedAt)
+	}
+	if _, err := poolRepo.GetEventByID(ctx, evLow.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected uncommitted evLow (%d) to remain invisible, got err=%v", evLow.ID, err)
+	}
+
+	// Now Connection 1 commits the lower raw ID.
+	if err := txLow.Commit(ctx); err != nil {
+		t.Fatalf("Commit txLow: %v", err)
+	}
+
+	// Second publish pass must scan all published_sequence IS NULL rows regardless of raw ID
+	// and assign the later sequence (2) to the lower raw ID.
+	t2 := t1.Add(5 * time.Second)
+	batch2, err := poolRepo.PublishUnsequencedEvents(ctx, t2)
+	if err != nil {
+		t.Fatalf("PublishUnsequencedEvents batch2: %v", err)
+	}
+	if len(batch2) != 1 || batch2[0].ID != evLow.ID {
+		t.Fatalf("expected evLow (%d) in batch2, got %+v", evLow.ID, batch2)
+	}
+	if batch2[0].PublishedSequence == nil || *batch2[0].PublishedSequence != 2 {
+		t.Fatalf("expected evLow published_sequence = 2, got %v", batch2[0].PublishedSequence)
+	}
+	if batch2[0].PublishedAt == nil || !batch2[0].PublishedAt.Equal(t2) {
+		t.Fatalf("expected evLow published_at = %v, got %v", t2, batch2[0].PublishedAt)
+	}
+
+	// Idempotent empty pass.
+	batch3, err := poolRepo.PublishUnsequencedEvents(ctx, t2.Add(time.Second))
+	if err != nil {
+		t.Fatalf("PublishUnsequencedEvents batch3: %v", err)
+	}
+	if len(batch3) != 0 {
+		t.Fatalf("expected 0 events in batch3, got %d", len(batch3))
+	}
+}
+
+func TestEventRepository_PublishUnsequenced_RollbackLeavesUnpublishedAndConsumesNoGap(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Seed 1 committed event and publish it -> published_sequence = 1.
+	var ev1, ev2, ev3 domain.DomainEvent
+	err := poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		var err error
+		ev1, err = domain.NewDomainEvent(domain.EventJobStarted, 1, domain.AggregateTypeJob, "job-seq-1", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return txRepo.AppendEvent(ctx, &ev1)
+	})
+	if err != nil {
+		t.Fatalf("append ev1: %v", err)
+	}
+
+	t1 := time.Date(2026, 11, 16, 15, 10, 0, 0, time.UTC)
+	firstBatch, err := poolRepo.PublishUnsequencedEvents(ctx, t1)
+	if err != nil || len(firstBatch) != 1 || *firstBatch[0].PublishedSequence != 1 {
+		t.Fatalf("initial publish failed: batch=%+v err=%v", firstBatch, err)
+	}
+
+	// Append two more unsequenced events.
+	err = poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		var err error
+		ev2, err = domain.NewDomainEvent(domain.EventJobFinished, 1, domain.AggregateTypeJob, "job-seq-2", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := txRepo.AppendEvent(ctx, &ev2); err != nil {
+			return err
+		}
+		ev3, err = domain.NewDomainEvent(domain.EventJobFailed, 1, domain.AggregateTypeJob, "job-seq-3", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return txRepo.AppendEvent(ctx, &ev3)
+	})
+	if err != nil {
+		t.Fatalf("append ev2/ev3: %v", err)
+	}
+
+	// Run PublishUnsequencedEvents inside a transaction that rolls back.
+	rollbackSentinel := errors.New("abort publication assignment")
+	tRollback := t1.Add(time.Minute)
+	err = poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		assigned, err := txRepo.PublishUnsequencedEvents(ctx, tRollback)
+		if err != nil {
+			return err
+		}
+		if len(assigned) != 2 || *assigned[0].PublishedSequence != 2 || *assigned[1].PublishedSequence != 3 {
+			t.Fatalf("expected tentative sequences 2 and 3 before rollback, got %+v", assigned)
+		}
+		return rollbackSentinel
+	})
+	if !errors.Is(err, rollbackSentinel) {
+		t.Fatalf("expected rollbackSentinel, got %v", err)
+	}
+
+	// Both rows must remain unpublished and watermark must still be 1.
+	for _, id := range []int64{ev2.ID, ev3.ID} {
+		got, err := poolRepo.GetEventByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEventByID(%d): %v", id, err)
+		}
+		if got.PublishedSequence != nil || got.PublishedAt != nil {
+			t.Fatalf("expected event %d unpublished after rollback, got seq=%v at=%v", id, got.PublishedSequence, got.PublishedAt)
+		}
+	}
+	var watermark int64
+	if err := db.QueryRow(ctx, `SELECT last_sequence FROM domain_event_sequence WHERE id = TRUE`).Scan(&watermark); err != nil {
+		t.Fatalf("querying domain_event_sequence: %v", err)
+	}
+	if watermark != 1 {
+		t.Fatalf("expected watermark 1 after rollback, got %d", watermark)
+	}
+
+	// Retry must assign 2 and 3 with no gap.
+	tRetry := t1.Add(2 * time.Minute)
+	retried, err := poolRepo.PublishUnsequencedEvents(ctx, tRetry)
+	if err != nil {
+		t.Fatalf("retry PublishUnsequencedEvents: %v", err)
+	}
+	if len(retried) != 2 {
+		t.Fatalf("expected 2 retried events, got %d", len(retried))
+	}
+	if retried[0].ID != ev2.ID || *retried[0].PublishedSequence != 2 || !retried[0].PublishedAt.Equal(tRetry) {
+		t.Fatalf("unexpected retried[0]: %+v", retried[0])
+	}
+	if retried[1].ID != ev3.ID || *retried[1].PublishedSequence != 3 || !retried[1].PublishedAt.Equal(tRetry) {
+		t.Fatalf("unexpected retried[1]: %+v", retried[1])
+	}
+}
+
+func TestEventRepository_PublishUnsequenced_ConcurrentSerializesWithoutGapsOrDuplicates(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const (
+		producerCount    = 6
+		eventsPerProd    = 15
+		publisherWorkers = 4
+	)
+	const totalEvents = producerCount * eventsPerProd
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, producerCount+publisherWorkers)
+	producersDone := make(chan struct{})
+
+	var prodWG sync.WaitGroup
+	for p := range producerCount {
+		prodWG.Add(1)
+		go func(pid int) {
+			defer prodWG.Done()
+			for i := range eventsPerProd {
+				err := poolRepo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+					ev, err := domain.NewDomainEvent(
+						domain.EventAssetAdded,
+						1,
+						domain.AggregateTypeAsset,
+						"concurrent-asset",
+						domain.AssetEventPayloadV1{
+							AssetID:       "a",
+							VolumeID:      "v",
+							LibraryID:     "l",
+							LibraryRootID: "r",
+							PathDisplay:   string(rune('a'+pid)) + "/" + string(rune('a'+i)),
+						},
+						time.Now().UTC(),
+					)
+					if err != nil {
+						return err
+					}
+					return txRepo.AppendEvent(ctx, &ev)
+				})
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(p)
+	}
+
+	go func() {
+		prodWG.Wait()
+		close(producersDone)
+	}()
+
+	var (
+		mu         sync.Mutex
+		allBatches []domain.DomainEvent
+	)
+	for range publisherWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each worker uses its own EventRepository over db.Pool to trigger real SQL lock contention.
+			workerRepo := postgres.NewEventRepository(db.Pool)
+			for {
+				select {
+				case <-producersDone:
+					batch, err := workerRepo.PublishUnsequencedEvents(ctx, time.Now().UTC())
+					if err != nil {
+						errCh <- err
+						return
+					}
+					if len(batch) > 0 {
+						mu.Lock()
+						allBatches = append(allBatches, batch...)
+						mu.Unlock()
+					}
+					return
+				default:
+					batch, err := workerRepo.PublishUnsequencedEvents(ctx, time.Now().UTC())
+					if err != nil {
+						errCh <- err
+						return
+					}
+					if len(batch) > 0 {
+						mu.Lock()
+						allBatches = append(allBatches, batch...)
+						mu.Unlock()
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	// One final drain in case a producer committed right as workers saw producersDone.
+	finalBatch, err := poolRepo.PublishUnsequencedEvents(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("final drain: %v", err)
+	}
+	allBatches = append(allBatches, finalBatch...)
+
+	close(errCh)
+	for e := range errCh {
+		t.Fatalf("concurrent error: %v", e)
+	}
+
+	if len(allBatches) != totalEvents {
+		t.Fatalf("expected %d total published events across workers, got %d", totalEvents, len(allBatches))
+	}
+
+	seenSeq := make(map[int64]bool, totalEvents)
+	seenID := make(map[int64]bool, totalEvents)
+	for _, ev := range allBatches {
+		if !ev.IsPublished() {
+			t.Fatalf("event %d returned without publication metadata", ev.ID)
+		}
+		if seenID[ev.ID] {
+			t.Fatalf("duplicate event ID %d returned by concurrent publishers", ev.ID)
+		}
+		seenID[ev.ID] = true
+		seq := *ev.PublishedSequence
+		if seenSeq[seq] {
+			t.Fatalf("duplicate published_sequence %d", seq)
+		}
+		seenSeq[seq] = true
+	}
+	for expected := int64(1); expected <= totalEvents; expected++ {
+		if !seenSeq[expected] {
+			t.Fatalf("missing published_sequence %d (gap detected)", expected)
+		}
+	}
+}
