@@ -199,13 +199,16 @@ func TestDaemonOwnershipConflictAndLoss(t *testing.T) {
 
 func TestRunDaemonOwnershipLossStopsServing(t *testing.T) {
 	db := testdb.New(t)
+	otherPID, verifyOtherHeld := holdSameKeyLockInSeparateDB(t)
 	original := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(original) })
 	err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(ctx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
-		// Identify the dedicated owner by its granted advisory lock, not the application pool.
-		if _, err := db.Exec(ctx, "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND granted AND classid=$1::oid AND objid=$2::oid", daemonLockID>>32, daemonLockID&0xffffffff); err != nil {
-			t.Fatal(err)
+		// Identify and terminate only this fixture DB's dedicated owner lock session.
+		pids := queryDaemonLockPIDs(t, db)
+		if len(pids) != 1 || pids[0] == otherPID {
+			t.Fatalf("expected 1 owner lock session distinct from other db pid=%d, got %v", otherPID, pids)
 		}
+		terminateDaemonLockSession(t, db, pids[0])
 		select {
 		case <-ctx.Done():
 			return nil
@@ -216,6 +219,7 @@ func TestRunDaemonOwnershipLossStopsServing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ownership connection lost") {
 		t.Fatalf("ownership failure=%v", err)
 	}
+	verifyOtherHeld()
 }
 
 func TestMonitorOwnershipDetectsLockUnlock(t *testing.T) {

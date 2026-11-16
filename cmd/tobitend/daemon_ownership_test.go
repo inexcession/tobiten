@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5"
 )
 
 type syncBuffer struct {
@@ -200,13 +201,15 @@ func queryDaemonLockPIDs(t *testing.T, db *testdb.TestDB) []int32 {
 	defer cancel()
 	rows, err := db.Query(
 		ctx,
-		`SELECT pid
-		 FROM pg_locks
-		 WHERE locktype = 'advisory'
-		   AND granted
-		   AND classid = $1::oid
-		   AND objid = $2::oid
-		   AND objsubid = 1`,
+		`SELECT l.pid
+		 FROM pg_locks l
+		 JOIN pg_database d ON d.oid = l.database
+		 WHERE d.datname = current_database()
+		   AND l.locktype = 'advisory'
+		   AND l.granted
+		   AND l.classid = $1::oid
+		   AND l.objid = $2::oid
+		   AND l.objsubid = 1`,
 		int64(uint32(daemonLockID>>32)),
 		int64(uint32(daemonLockID&0xffffffff)),
 	)
@@ -228,6 +231,86 @@ func queryDaemonLockPIDs(t *testing.T, db *testdb.TestDB) []int32 {
 	return pids
 }
 
+func terminateDaemonLockSession(t *testing.T, db *testdb.TestDB, expectedPID int32) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := db.Query(
+		ctx,
+		`SELECT pg_terminate_backend(l.pid)
+		 FROM pg_locks l
+		 JOIN pg_database d ON d.oid = l.database
+		 WHERE d.datname = current_database()
+		   AND l.pid = $1
+		   AND l.locktype = 'advisory'
+		   AND l.granted
+		   AND l.classid = $2::oid
+		   AND l.objid = $3::oid
+		   AND l.objsubid = 1`,
+		expectedPID,
+		int64(uint32(daemonLockID>>32)),
+		int64(uint32(daemonLockID&0xffffffff)),
+	)
+	if err != nil {
+		t.Fatalf("terminate owner dedicated lock session pid=%d: %v", expectedPID, err)
+	}
+	defer rows.Close()
+	var results []bool
+	for rows.Next() {
+		var terminated bool
+		if err := rows.Scan(&terminated); err != nil {
+			t.Fatalf("scan termination result: %v", err)
+		}
+		results = append(results, terminated)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate termination results: %v", err)
+	}
+	if len(results) != 1 || !results[0] {
+		t.Fatalf("expected exactly 1 terminated owner session for pid=%d, got %v", expectedPID, results)
+	}
+}
+
+func holdSameKeyLockInSeparateDB(t *testing.T) (int32, func()) {
+	t.Helper()
+	otherDB := testdb.New(t)
+	conn, err := pgx.Connect(t.Context(), otherDB.URL)
+	if err != nil {
+		t.Fatalf("connect to second fixture db: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	})
+	var owned bool
+	if err := conn.QueryRow(t.Context(), "SELECT pg_try_advisory_lock($1)", daemonLockID).Scan(&owned); err != nil {
+		t.Fatalf("acquire same-key lock in second fixture db: %v", err)
+	}
+	if !owned {
+		t.Fatal("failed to acquire same-key lock in second fixture db")
+	}
+	otherPID := int32(conn.PgConn().PID())
+	verifyHeld := func() {
+		t.Helper()
+		pids := queryDaemonLockPIDs(t, otherDB)
+		if len(pids) != 1 || pids[0] != otherPID {
+			t.Fatalf("same-key lock in second fixture db lost or changed: got %v, want [%d]", pids, otherPID)
+		}
+		var stillOwned bool
+		if err := conn.QueryRow(
+			t.Context(),
+			checkDaemonOwnershipSQL,
+			int64(uint32(daemonLockID>>32)),
+			int64(uint32(daemonLockID&0xffffffff)),
+		).Scan(&stillOwned); err != nil || !stillOwned {
+			t.Fatalf("same-key connection/lock in second fixture db failed: stillOwned=%t err=%v", stillOwned, err)
+		}
+	}
+	verifyHeld()
+	return otherPID, verifyHeld
+}
+
 func assertExitCode(t *testing.T, err error, want int, output string) {
 	t.Helper()
 	if want == 0 {
@@ -247,6 +330,7 @@ func assertExitCode(t *testing.T, err error, want int, output string) {
 
 func TestTwoActualDaemonsOwnershipConflictLossAndSuccessor(t *testing.T) {
 	db := testdb.New(t)
+	otherPID, verifyOtherHeld := holdSameKeyLockInSeparateDB(t)
 	binPath := buildDaemonBinary(t)
 
 	// 1. Start the first actual daemon against an unmigrated hosted DB and wait for it to serve.
@@ -254,8 +338,8 @@ func TestTwoActualDaemonsOwnershipConflictLossAndSuccessor(t *testing.T) {
 	waitForDaemonServing(t, owner)
 
 	ownerPIDs := queryDaemonLockPIDs(t, db)
-	if len(ownerPIDs) != 1 {
-		t.Fatalf("expected 1 daemon lock session, got %v", ownerPIDs)
+	if len(ownerPIDs) != 1 || ownerPIDs[0] == otherPID {
+		t.Fatalf("expected 1 daemon lock session distinct from other db pid=%d, got %v", otherPID, ownerPIDs)
 	}
 	ownerLockPID := ownerPIDs[0]
 
@@ -287,10 +371,8 @@ func TestTwoActualDaemonsOwnershipConflictLossAndSuccessor(t *testing.T) {
 		t.Fatalf("owner /healthz status = %d, want 200", resp.StatusCode)
 	}
 
-	// 3. Terminate ONLY the owner's dedicated advisory-lock session (not its application pool).
-	if _, err := db.Exec(t.Context(), "SELECT pg_terminate_backend($1)", ownerLockPID); err != nil {
-		t.Fatalf("terminate owner dedicated lock session: %v", err)
-	}
+	// 3. Terminate ONLY the owner's dedicated advisory-lock session in this fixture DB.
+	terminateDaemonLockSession(t, db, ownerLockPID)
 	ownerErr := waitForDaemonExit(t, owner, 10*time.Second, "owner daemon")
 	ownerOut := owner.output.String()
 	assertExitCode(t, ownerErr, 1, ownerOut)
@@ -301,15 +383,17 @@ func TestTwoActualDaemonsOwnershipConflictLossAndSuccessor(t *testing.T) {
 		_ = resp.Body.Close()
 		t.Fatalf("owner still serving /healthz after exit (status=%d)", resp.StatusCode)
 	}
+	verifyOtherHeld()
 
 	// 4. A successor daemon can now acquire ownership and serve cleanly.
 	successor := startDaemonProcess(t, binPath, db.URL)
 	waitForDaemonServing(t, successor)
 
 	successorPIDs := queryDaemonLockPIDs(t, db)
-	if len(successorPIDs) != 1 || successorPIDs[0] == ownerLockPID {
-		t.Fatalf("expected successor to hold new lock session (old=%d), got %v", ownerLockPID, successorPIDs)
+	if len(successorPIDs) != 1 || successorPIDs[0] == ownerLockPID || successorPIDs[0] == otherPID {
+		t.Fatalf("expected successor to hold new lock session (old=%d, other=%d), got %v", ownerLockPID, otherPID, successorPIDs)
 	}
+	verifyOtherHeld()
 
 	if err := successor.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("signal successor SIGTERM: %v", err)
