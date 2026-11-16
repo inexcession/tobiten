@@ -68,6 +68,7 @@ type Querier interface {
 	MarkJobSucceeded(ctx context.Context, arg MarkJobSucceededParams) (Job, error)
 	RecoverJobCancelled(ctx context.Context, arg RecoverJobCancelledParams) (Job, error)
 	RecoverJobFailed(ctx context.Context, arg RecoverJobFailedParams) (Job, error)
+	RecoverJobSucceeded(ctx context.Context, arg RecoverJobSucceededParams) (Job, error)
 	RemoveAllItemLabelsForItem(ctx context.Context, arg RemoveAllItemLabelsForItemParams) error
 	RemoveItemLabel(ctx context.Context, arg RemoveItemLabelParams) (int64, error)
 	RemoveUserLabelPolicy(ctx context.Context, arg RemoveUserLabelPolicyParams) (int64, error)

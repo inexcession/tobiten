@@ -23,44 +23,34 @@ var (
 	ErrDuplicateJobKind     = errors.New("duplicate or conflicting job kind registration")
 	ErrInvalidJobKind       = errors.New("invalid job kind registration")
 	ErrMissingJobHandler    = errors.New("job kind has no execution handler")
+	ErrMissingJobReconciler = errors.New("job kind requires a reconciliation hook")
 	ErrJobCancelled         = errors.New("job cancelled")
 	ErrPermanentFailure     = errors.New("permanent job failure")
 )
 
 // ReconcileAction describes the state transition chosen during startup recovery
 // for an interrupted RUNNING job (ADR-0017 §7).
-type ReconcileAction int
+type ReconcileAction = domain.JobReconcileAction
 
 const (
 	// ReconcileRequeue returns an interrupted job to QUEUED (unless cancelled or exhausted).
-	ReconcileRequeue ReconcileAction = iota
+	ReconcileRequeue = domain.JobReconcileRequeue
 	// ReconcileSucceeded records that the interrupted job completed its final step before shutdown.
-	ReconcileSucceeded
+	ReconcileSucceeded = domain.JobReconcileSucceeded
 	// ReconcileFailed marks the interrupted job as permanently FAILED.
-	ReconcileFailed
+	ReconcileFailed = domain.JobReconcileFailed
 	// ReconcileCancelled marks the interrupted job as CANCELLED.
-	ReconcileCancelled
+	ReconcileCancelled = domain.JobReconcileCancelled
 )
 
 // ReconcileOutcome describes the reconciliation decision for an interrupted RUNNING job.
-type ReconcileOutcome struct {
-	Action     ReconcileAction
-	Checkpoint json.RawMessage
-	Error      string
-}
+type ReconcileOutcome = domain.JobReconcileOutcome
 
 // Reconciler inspects an interrupted RUNNING job before startup recovery updates its state.
-type Reconciler interface {
-	Reconcile(ctx context.Context, job domain.Job) (ReconcileOutcome, error)
-}
+type Reconciler = domain.JobReconciler
 
 // ReconcileFunc adapts a function to the Reconciler interface.
-type ReconcileFunc func(ctx context.Context, job domain.Job) (ReconcileOutcome, error)
-
-// Reconcile implements Reconciler.
-func (f ReconcileFunc) Reconcile(ctx context.Context, job domain.Job) (ReconcileOutcome, error) {
-	return f(ctx, job)
-}
+type ReconcileFunc = domain.JobReconcileFunc
 
 // Handler executes one claimed attempt of a durable background job.
 type Handler interface {
@@ -77,10 +67,11 @@ func (f HandlerFunc) Run(ctx context.Context, exec *Execution) error {
 
 // KindConfig registers a job kind's startup recovery policy and execution hooks.
 type KindConfig struct {
-	Kind         domain.JobKind
-	ResumePolicy domain.JobResumePolicy
-	Handler      Handler
-	Reconciler   Reconciler
+	Kind               domain.JobKind
+	ResumePolicy       domain.JobResumePolicy
+	Handler            Handler
+	Reconciler         Reconciler
+	RequiresReconciler bool
 }
 
 // RunnerOptions configures a durable job Runner.
@@ -97,7 +88,6 @@ type RecoveryReport struct {
 	Succeeded          int
 	Failed             int
 	Cancelled          int
-	UnregisteredFailed int
 }
 
 // Execution provides a running job handler with checkpoint persistence and cancellation checks
@@ -244,12 +234,13 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if existing.Reconciler == nil {
 		existing.Reconciler = cfg.Reconciler
 	}
+	existing.RequiresReconciler = existing.RequiresReconciler || cfg.RequiresReconciler
 	r.kinds[cfg.Kind] = existing
 	return nil
 }
 
-// RegisterModuleKinds imports all enabled job kinds and their declared resume policies
-// from reg into the runner's job-kind registry.
+// RegisterModuleKinds imports all enabled job kinds, their declared resume policies,
+// and any declared reconciliation hooks from reg into the runner's job-kind registry.
 func (r *Runner) RegisterModuleKinds(reg module.Registry) error {
 	if reg == nil {
 		return nil
@@ -269,9 +260,20 @@ func (r *Runner) RegisterModuleKinds(reg module.Registry) error {
 		}
 		seenInRegistry[kind] = struct{}{}
 
+		var reconciler Reconciler
+		if recKind, ok := jk.(module.ReconcilableJobKind); ok {
+			reconciler = recKind.Reconciler()
+		}
+		var requiresReconciler bool
+		if reqKind, ok := jk.(module.ReconcilerRequirement); ok {
+			requiresReconciler = reqKind.RequiresReconciler()
+		}
+
 		if err := r.RegisterKind(KindConfig{
-			Kind:         kind,
-			ResumePolicy: jk.ResumePolicy(),
+			Kind:               kind,
+			ResumePolicy:       jk.ResumePolicy(),
+			Reconciler:         reconciler,
+			RequiresReconciler: requiresReconciler,
 		}); err != nil {
 			return err
 		}
@@ -337,7 +339,6 @@ func (r *Runner) Recover(ctx context.Context) (RecoveryReport, error) {
 			slog.Int("succeeded", report.Succeeded),
 			slog.Int("failed", report.Failed),
 			slog.Int("cancelled", report.Cancelled),
-			slog.Int("unregistered_failed", report.UnregisteredFailed),
 		)
 	}
 	return report, nil
@@ -347,7 +348,10 @@ func (r *Runner) recoverOne(ctx context.Context, job domain.Job, report *Recover
 	now := r.now().UTC()
 	cfg, ok := r.lookupKind(job.Kind)
 	if !ok {
-		return r.recoverUnregistered(ctx, job, now, report)
+		return fmt.Errorf("%w: interrupted job %q has unavailable kind %q", ErrUnknownJobKind, job.ID, job.Kind)
+	}
+	if cfg.RequiresReconciler && cfg.Reconciler == nil {
+		return fmt.Errorf("%w: interrupted job %q (%s) cannot recover without reconciliation hook", ErrMissingJobReconciler, job.ID, job.Kind)
 	}
 
 	outcome := ReconcileOutcome{Action: ReconcileRequeue}
@@ -359,33 +363,7 @@ func (r *Runner) recoverOne(ctx context.Context, job domain.Job, report *Recover
 		}
 	}
 
-	targetCheckpoint := resolveRecoveredCheckpoint(job, cfg.ResumePolicy, outcome.Checkpoint)
-	return r.applyReconcileOutcome(ctx, job, cfg.ResumePolicy, outcome, targetCheckpoint, now, report)
-}
-
-func (r *Runner) recoverUnregistered(ctx context.Context, job domain.Job, now time.Time, report *RecoveryReport) error {
-	msg := fmt.Sprintf("interrupted by daemon restart: unregistered job kind %q", job.Kind)
-	updated, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, msg, now)
-	if err != nil {
-		return fmt.Errorf("failing unregistered interrupted job %q (%s): %w", job.ID, job.Kind, err)
-	}
-	report.UnregisteredFailed++
-	if updated.State == domain.JobStateCancelled {
-		report.Cancelled++
-	} else {
-		report.Failed++
-	}
-	return nil
-}
-
-func (r *Runner) persistReconciledCheckpoint(ctx context.Context, job domain.Job, override, target json.RawMessage, now time.Time) error {
-	if len(override) == 0 {
-		return nil
-	}
-	if _, err := r.repo.SaveCheckpoint(ctx, job.ID, job.Attempts, target, now); err != nil {
-		return fmt.Errorf("saving reconciled checkpoint for job %q: %w", job.ID, err)
-	}
-	return nil
+	return r.applyReconcileOutcome(ctx, job, cfg.ResumePolicy, outcome, now, report)
 }
 
 func (r *Runner) applyReconcileOutcome(
@@ -393,46 +371,36 @@ func (r *Runner) applyReconcileOutcome(
 	job domain.Job,
 	policy domain.JobResumePolicy,
 	outcome ReconcileOutcome,
-	targetCheckpoint json.RawMessage,
 	now time.Time,
 	report *RecoveryReport,
 ) error {
 	switch outcome.Action {
 	case ReconcileSucceeded:
-		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
-			return err
-		}
-		if _, err := r.repo.MarkSucceeded(ctx, job.ID, job.Attempts, now); err != nil {
-			return fmt.Errorf("marking reconciled job %q succeeded: %w", job.ID, err)
+		if _, err := r.repo.RecoverSucceeded(ctx, job.ID, job.Attempts, outcome.Checkpoint, now); err != nil {
+			return fmt.Errorf("recovering reconciled job %q as succeeded: %w", job.ID, err)
 		}
 		report.Succeeded++
 		return nil
 
 	case ReconcileCancelled:
-		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
-			return err
-		}
 		var errPtr *string
 		if outcome.Error != "" {
 			errPtr = &outcome.Error
 		}
-		if _, err := r.repo.MarkCancelled(ctx, job.ID, job.Attempts, errPtr, now); err != nil {
-			return fmt.Errorf("marking reconciled job %q cancelled: %w", job.ID, err)
+		if _, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, errPtr, now); err != nil {
+			return fmt.Errorf("recovering reconciled job %q as cancelled: %w", job.ID, err)
 		}
 		report.Cancelled++
 		return nil
 
 	case ReconcileFailed:
-		if err := r.persistReconciledCheckpoint(ctx, job, outcome.Checkpoint, targetCheckpoint, now); err != nil {
-			return err
-		}
 		errMsg := outcome.Error
 		if errMsg == "" {
 			errMsg = "interrupted job marked failed during reconciliation"
 		}
-		updated, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, errMsg, now)
+		updated, err := r.repo.RecoverFailed(ctx, job.ID, job.Attempts, outcome.Checkpoint, errMsg, now)
 		if err != nil {
-			return fmt.Errorf("marking reconciled job %q failed: %w", job.ID, err)
+			return fmt.Errorf("recovering reconciled job %q as failed: %w", job.ID, err)
 		}
 		if updated.State == domain.JobStateCancelled {
 			report.Cancelled++
@@ -442,6 +410,35 @@ func (r *Runner) applyReconcileOutcome(
 		return nil
 
 	case ReconcileRequeue:
+		if job.CancelRequested {
+			var errPtr *string
+			if outcome.Error != "" {
+				errPtr = &outcome.Error
+			}
+			if _, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, errPtr, now); err != nil {
+				return fmt.Errorf("cancelling interrupted job %q (%s): %w", job.ID, job.Kind, err)
+			}
+			report.Cancelled++
+			return nil
+		}
+		if job.Attempts >= job.MaxAttempts {
+			failMsg := outcome.Error
+			if failMsg == "" {
+				failMsg = "interrupted by daemon restart after exhausting max_attempts"
+			}
+			updated, err := r.repo.RecoverFailed(ctx, job.ID, job.Attempts, outcome.Checkpoint, failMsg, now)
+			if err != nil {
+				return fmt.Errorf("failing exhausted interrupted job %q (%s): %w", job.ID, job.Kind, err)
+			}
+			if updated.State == domain.JobStateCancelled {
+				report.Cancelled++
+			} else {
+				report.Failed++
+			}
+			return nil
+		}
+
+		targetCheckpoint := resolveRequeueCheckpoint(job, policy, outcome.Checkpoint)
 		reason := outcome.Error
 		if reason == "" {
 			reason = "interrupted by daemon restart"
@@ -469,15 +466,15 @@ func (r *Runner) applyReconcileOutcome(
 	}
 }
 
-func resolveRecoveredCheckpoint(job domain.Job, policy domain.JobResumePolicy, override json.RawMessage) json.RawMessage {
+func resolveRequeueCheckpoint(job domain.Job, policy domain.JobResumePolicy, override json.RawMessage) json.RawMessage {
+	if policy == domain.JobResumeRestart {
+		return json.RawMessage("{}")
+	}
 	if len(override) > 0 {
 		return override
 	}
-	if policy == domain.JobResumeCheckpoint {
-		if len(job.Checkpoint) > 0 {
-			return job.Checkpoint
-		}
-		return json.RawMessage("{}")
+	if len(job.Checkpoint) > 0 {
+		return job.Checkpoint
 	}
 	return json.RawMessage("{}")
 }

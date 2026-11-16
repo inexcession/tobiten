@@ -12,6 +12,7 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/module"
+	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
@@ -260,7 +261,6 @@ func TestRunner_RecoveryCheckpointResumeRestartCancelAndExhaustion(t *testing.T)
 	// Also create:
 	// - an interrupted RUNNING job with cancel_requested=true and a dedupe_key
 	// - an interrupted RUNNING job with attempts=max_attempts and a dedupe_key
-	// - an interrupted RUNNING job with an unregistered kind and a dedupe_key
 	dedupeCancel := "SCAN:cancelled-mid-run"
 	jCancel := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, DedupeKey: &dedupeCancel, CreatedAt: now.Add(3 * time.Second), RunAfter: now}
 	if _, err := repo.Enqueue(ctx, jCancel); err != nil {
@@ -280,15 +280,6 @@ func TestRunner_RecoveryCheckpointResumeRestartCancelAndExhaustion(t *testing.T)
 	}
 	if _, err := repo.ClaimNext(ctx, domain.JobKindScan, now); err != nil {
 		t.Fatalf("ClaimNext jExhaust: %v", err)
-	}
-
-	dedupeUnreg := "CUSTOM:unregistered"
-	jUnreg := &domain.Job{Kind: domain.JobKind("CUSTOM_UNREGISTERED"), MaxAttempts: 3, DedupeKey: &dedupeUnreg, CreatedAt: now.Add(5 * time.Second), RunAfter: now}
-	if _, err := repo.Enqueue(ctx, jUnreg); err != nil {
-		t.Fatalf("Enqueue jUnreg: %v", err)
-	}
-	if _, err := repo.ClaimNext(ctx, domain.JobKind("CUSTOM_UNREGISTERED"), now); err != nil {
-		t.Fatalf("ClaimNext jUnreg: %v", err)
 	}
 
 	// Step 2: Restarted runner recovers all RUNNING rows BEFORE normal claims.
@@ -340,13 +331,12 @@ func TestRunner_RecoveryCheckpointResumeRestartCancelAndExhaustion(t *testing.T)
 	if err != nil {
 		t.Fatalf("restarted.Recover: %v", err)
 	}
-	if report.TotalRunning != 6 ||
+	if report.TotalRunning != 5 ||
 		report.RequeuedCheckpoint != 1 ||
 		report.RequeuedRestart != 1 ||
 		report.Succeeded != 1 ||
 		report.Cancelled != 1 ||
-		report.Failed != 2 ||
-		report.UnregisteredFailed != 1 {
+		report.Failed != 1 {
 		t.Fatalf("unexpected RecoveryReport: %+v", report)
 	}
 	if !intakeReconcilerCalled.Load() {
@@ -371,7 +361,7 @@ func TestRunner_RecoveryCheckpointResumeRestartCancelAndExhaustion(t *testing.T)
 		t.Fatalf("scanJob after recover = %+v, want QUEUED attempts=1", gotScanAfterRecover)
 	}
 
-	// Cancelled, exhausted, and unregistered rows must NOT be QUEUED and must release their dedupe keys.
+	// Cancelled and exhausted rows must NOT be QUEUED and must release their dedupe keys.
 	for _, tc := range []struct {
 		id     string
 		dedupe string
@@ -379,7 +369,6 @@ func TestRunner_RecoveryCheckpointResumeRestartCancelAndExhaustion(t *testing.T)
 	}{
 		{id: jCancel.ID, dedupe: dedupeCancel, state: domain.JobStateCancelled},
 		{id: jExhaust.ID, dedupe: dedupeExhaust, state: domain.JobStateFailed},
-		{id: jUnreg.ID, dedupe: dedupeUnreg, state: domain.JobStateFailed},
 	} {
 		got, err := repo.GetJobByID(ctx, tc.id)
 		if err != nil {
@@ -555,5 +544,279 @@ func TestRunner_ReconcilerFailureAbortsRecoveryAndHandlerOutcomePaths(t *testing
 	}
 	if !errors.Is(saveErr, context.Canceled) {
 		t.Fatalf("SaveCheckpoint with cancelled ctx = %v, want context.Canceled", saveErr)
+	}
+}
+
+func TestRunner_PreservesUnresolvedJobsWhenKindOrHookUnavailable(t *testing.T) {
+	t.Parallel()
+	_, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 11, 16, 13, 30, 0, 0, time.UTC)
+
+	// 1. Interrupted RUNNING job with unavailable kind must be preserved and fail recovery.
+	unavailDedupe := "CUSTOM:preserve-unavail"
+	jUnavail := &domain.Job{
+		Kind:        domain.JobKind("UNAVAILABLE_KIND"),
+		MaxAttempts: 3,
+		DedupeKey:   &unavailDedupe,
+		CreatedAt:   now,
+		RunAfter:    now,
+	}
+	if _, err := repo.Enqueue(ctx, jUnavail); err != nil {
+		t.Fatalf("Enqueue jUnavail: %v", err)
+	}
+	cUnavail, err := repo.ClaimNext(ctx, domain.JobKind("UNAVAILABLE_KIND"), now)
+	if err != nil {
+		t.Fatalf("ClaimNext jUnavail: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, jUnavail.ID, cUnavail.Attempts, json.RawMessage(`{"keep":"me"}`), now); err != nil {
+		t.Fatalf("SaveCheckpoint jUnavail: %v", err)
+	}
+
+	r1 := jobs.NewRunner(repo, jobs.RunnerOptions{Now: func() time.Time { return now }})
+	if _, err := r1.Recover(ctx); !errors.Is(err, jobs.ErrUnknownJobKind) {
+		t.Fatalf("Recover with unavailable kind = %v, want ErrUnknownJobKind", err)
+	}
+	if r1.HasRecovered() {
+		t.Fatal("HasRecovered() must be false when Recover fails on unavailable kind")
+	}
+
+	gotUnavail, err := repo.GetJobByID(ctx, jUnavail.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID jUnavail: %v", err)
+	}
+	var cp map[string]any
+	if gotUnavail.State != domain.JobStateRunning || gotUnavail.Attempts != 1 || json.Unmarshal(gotUnavail.Checkpoint, &cp) != nil || cp["keep"] != "me" {
+		t.Fatalf("jUnavail was mutated despite failed recovery: %+v", gotUnavail)
+	}
+	// Active dedupe key must still hold.
+	if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKind("UNAVAILABLE_KIND"), DedupeKey: &unavailDedupe}); err != nil || created {
+		t.Fatalf("dedupe key %q was unexpectedly released: created=%v err=%v", unavailDedupe, created, err)
+	}
+
+	// Clean up jUnavail so we can test missing required reconciler hook independently.
+	if _, err := repo.MarkFailed(ctx, jUnavail.ID, cUnavail.Attempts, "test cleanup", now); err != nil {
+		t.Fatalf("cleanup jUnavail: %v", err)
+	}
+
+	// 2. Module-declared kind requiring a reconciler hook without one available must preserve job and fail recovery.
+	reqDedupe := "INTAKE:missing-hook"
+	jReq := &domain.Job{
+		Kind:        domain.JobKindIntake,
+		MaxAttempts: 3,
+		DedupeKey:   &reqDedupe,
+		CreatedAt:   now,
+		RunAfter:    now,
+	}
+	if _, err := repo.Enqueue(ctx, jReq); err != nil {
+		t.Fatalf("Enqueue jReq: %v", err)
+	}
+	cReq, err := repo.ClaimNext(ctx, domain.JobKindIntake, now)
+	if err != nil {
+		t.Fatalf("ClaimNext jReq: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, jReq.ID, cReq.Attempts, json.RawMessage(`{"tmp":"file"}`), now); err != nil {
+		t.Fatalf("SaveCheckpoint jReq: %v", err)
+	}
+
+	reg := module.NewRegistry()
+	if err := reg.Register(&module.SimpleModule{
+		ModuleName: "intake-no-hook",
+		Jobs: []module.JobKind{
+			module.JobKindSpec{
+				Kind:             domain.JobKindIntake,
+				Policy:           domain.JobResumeCheckpoint,
+				RequireReconcile: true,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("reg.Register: %v", err)
+	}
+
+	r2 := jobs.NewRunner(repo, jobs.RunnerOptions{Now: func() time.Time { return now }})
+	if err := r2.RegisterModuleKinds(reg); err != nil {
+		t.Fatalf("RegisterModuleKinds: %v", err)
+	}
+	if _, err := r2.Recover(ctx); !errors.Is(err, jobs.ErrMissingJobReconciler) {
+		t.Fatalf("Recover with missing required hook = %v, want ErrMissingJobReconciler", err)
+	}
+	if r2.HasRecovered() {
+		t.Fatal("HasRecovered() must be false when required reconciler is missing")
+	}
+
+	gotReq, err := repo.GetJobByID(ctx, jReq.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID jReq: %v", err)
+	}
+	if gotReq.State != domain.JobStateRunning || gotReq.Attempts != 1 || json.Unmarshal(gotReq.Checkpoint, &cp) != nil || cp["tmp"] != "file" {
+		t.Fatalf("jReq was mutated despite missing hook: %+v", gotReq)
+	}
+	if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindIntake, DedupeKey: &reqDedupe}); err != nil || created {
+		t.Fatalf("dedupe key %q was unexpectedly released: created=%v err=%v", reqDedupe, created, err)
+	}
+}
+
+func TestRunner_RestartRequeueClearsCheckpointOverrideAndPreservesTerminalEvidence(t *testing.T) {
+	t.Parallel()
+	_, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 11, 16, 13, 45, 0, 0, time.UTC)
+
+	// 1. RESTART kind requeued with a nonempty checkpoint override from reconciler must clear progress to {}.
+	jRequeue := &domain.Job{Kind: domain.JobKindRepack, MaxAttempts: 3, CreatedAt: now, RunAfter: now}
+	if _, err := repo.Enqueue(ctx, jRequeue); err != nil {
+		t.Fatalf("Enqueue jRequeue: %v", err)
+	}
+	cRequeue, err := repo.ClaimNext(ctx, domain.JobKindRepack, now)
+	if err != nil {
+		t.Fatalf("ClaimNext jRequeue: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, jRequeue.ID, cRequeue.Attempts, json.RawMessage(`{"prior":"progress"}`), now); err != nil {
+		t.Fatalf("SaveCheckpoint jRequeue: %v", err)
+	}
+
+	// 2. RESTART kind resolved terminally with nonempty checkpoint evidence preserves that evidence.
+	jTerminal := &domain.Job{Kind: domain.JobKindWriteBack, MaxAttempts: 3, CreatedAt: now, RunAfter: now}
+	if _, err := repo.Enqueue(ctx, jTerminal); err != nil {
+		t.Fatalf("Enqueue jTerminal: %v", err)
+	}
+	cTerminal, err := repo.ClaimNext(ctx, domain.JobKindWriteBack, now)
+	if err != nil {
+		t.Fatalf("ClaimNext jTerminal: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, jTerminal.ID, cTerminal.Attempts, json.RawMessage(`{"prior":"writeback"}`), now); err != nil {
+		t.Fatalf("SaveCheckpoint jTerminal: %v", err)
+	}
+
+	reg := module.NewRegistry()
+	if err := reg.Register(&module.SimpleModule{
+		ModuleName: "restart-reconcilers",
+		Jobs: []module.JobKind{
+			module.JobKindSpec{
+				Kind:   domain.JobKindRepack,
+				Policy: domain.JobResumeRestart,
+				ReconcileHook: domain.JobReconcileFunc(func(_ context.Context, _ domain.Job) (domain.JobReconcileOutcome, error) {
+					return domain.JobReconcileOutcome{
+						Action:     domain.JobReconcileRequeue,
+						Checkpoint: json.RawMessage(`{"stale":"override"}`),
+					}, nil
+				}),
+			},
+			module.JobKindSpec{
+				Kind:   domain.JobKindWriteBack,
+				Policy: domain.JobResumeRestart,
+				ReconcileHook: domain.JobReconcileFunc(func(_ context.Context, _ domain.Job) (domain.JobReconcileOutcome, error) {
+					return domain.JobReconcileOutcome{
+						Action:     domain.JobReconcileSucceeded,
+						Checkpoint: json.RawMessage(`{"evidence":"rename-verified"}`),
+					}, nil
+				}),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("reg.Register: %v", err)
+	}
+
+	runner := jobs.NewRunner(repo, jobs.RunnerOptions{Now: func() time.Time { return now }})
+	if err := runner.RegisterModuleKinds(reg); err != nil {
+		t.Fatalf("RegisterModuleKinds: %v", err)
+	}
+	report, err := runner.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if report.RequeuedRestart != 1 || report.Succeeded != 1 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+
+	gotRequeue, err := repo.GetJobByID(ctx, jRequeue.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID jRequeue: %v", err)
+	}
+	if gotRequeue.State != domain.JobStateQueued || string(gotRequeue.Checkpoint) != "{}" {
+		t.Fatalf("RESTART requeue did not clear checkpoint override: state=%s cp=%s", gotRequeue.State, gotRequeue.Checkpoint)
+	}
+
+	gotTerminal, err := repo.GetJobByID(ctx, jTerminal.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID jTerminal: %v", err)
+	}
+	var cp map[string]any
+	if gotTerminal.State != domain.JobStateSucceeded || json.Unmarshal(gotTerminal.Checkpoint, &cp) != nil || cp["evidence"] != "rename-verified" {
+		t.Fatalf("terminal recovery lost evidence checkpoint: state=%s cp=%s", gotTerminal.State, gotTerminal.Checkpoint)
+	}
+}
+
+type failTerminalRecoveryRepo struct {
+	storage.JobRepository
+	saveCheckpointCalls atomic.Int32
+	failErr             error
+}
+
+func (f *failTerminalRecoveryRepo) SaveCheckpoint(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error) {
+	f.saveCheckpointCalls.Add(1)
+	return f.JobRepository.SaveCheckpoint(ctx, id, attempt, checkpoint, now)
+}
+
+func (f *failTerminalRecoveryRepo) RecoverSucceeded(_ context.Context, _ string, _ int, _ json.RawMessage, _ time.Time) (*domain.Job, error) {
+	return nil, f.failErr
+}
+
+func TestRunner_TerminalRecoveryDoesNotPreCommitCheckpointOnTransitionFailure(t *testing.T) {
+	t.Parallel()
+	_, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 11, 16, 13, 55, 0, 0, time.UTC)
+	j := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, CreatedAt: now, RunAfter: now}
+	if _, err := repo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	c, err := repo.ClaimNext(ctx, domain.JobKindScan, now)
+	if err != nil {
+		t.Fatalf("ClaimNext: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, j.ID, c.Attempts, json.RawMessage(`{"orig":true}`), now); err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+
+	failErr := errors.New("terminal commit aborted")
+	wrapped := &failTerminalRecoveryRepo{JobRepository: repo, failErr: failErr}
+	runner := jobs.NewRunner(wrapped, jobs.RunnerOptions{Now: func() time.Time { return now }})
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeCheckpoint,
+		Reconciler: jobs.ReconcileFunc(func(_ context.Context, _ domain.Job) (jobs.ReconcileOutcome, error) {
+			return jobs.ReconcileOutcome{
+				Action:     jobs.ReconcileSucceeded,
+				Checkpoint: json.RawMessage(`{"replaced":true}`),
+			}, nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind: %v", err)
+	}
+
+	if _, err := runner.Recover(ctx); !errors.Is(err, failErr) {
+		t.Fatalf("Recover = %v, want %v", err, failErr)
+	}
+	if wrapped.saveCheckpointCalls.Load() != 0 {
+		t.Fatalf("SaveCheckpoint called %d times during terminal recovery, want 0 (must commit atomically)", wrapped.saveCheckpointCalls.Load())
+	}
+
+	got, err := repo.GetJobByID(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	var cp map[string]any
+	if got.State != domain.JobStateRunning || json.Unmarshal(got.Checkpoint, &cp) != nil || cp["orig"] != true {
+		t.Fatalf("job mutated despite failed terminal transition: state=%s cp=%s", got.State, got.Checkpoint)
 	}
 }

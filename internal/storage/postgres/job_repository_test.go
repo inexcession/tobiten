@@ -1000,3 +1000,119 @@ func TestJobRepository_CheckpointsAndRecoveryPrimitives(t *testing.T) {
 		t.Fatalf("unexpected MarkFailed result: %+v", df)
 	}
 }
+
+func TestJobRepository_AtomicTerminalRecoveryAndRollback(t *testing.T) {
+	t.Parallel()
+	db, repo, _ := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 13, 0, 0, 0, time.UTC)
+
+	// 1. RecoverSucceeded commits checkpoint and SUCCEEDED atomically; failed transition rolls back checkpoint.
+	jSucc := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, jSucc); err != nil {
+		t.Fatalf("Enqueue jSucc: %v", err)
+	}
+	cSucc, err := repo.ClaimNext(ctx, domain.JobKindScan, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext jSucc: %v", err)
+	}
+	origCP := json.RawMessage(`{"step":1,"note":"original"}`)
+	if _, err := repo.SaveCheckpoint(ctx, jSucc.ID, cSucc.Attempts, origCP, t0); err != nil {
+		t.Fatalf("SaveCheckpoint jSucc: %v", err)
+	}
+
+	// Stale attempt failure leaves original checkpoint and RUNNING state intact.
+	if _, err := repo.RecoverSucceeded(ctx, jSucc.ID, cSucc.Attempts+1, json.RawMessage(`{"step":999}`), t0); !errors.Is(err, domain.ErrStaleJobAttempt) {
+		t.Fatalf("stale RecoverSucceeded = %v, want ErrStaleJobAttempt", err)
+	}
+	afterStale, err := repo.GetJobByID(ctx, jSucc.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID after stale: %v", err)
+	}
+	var cpCheck map[string]any
+	if err := json.Unmarshal(afterStale.Checkpoint, &cpCheck); err != nil || cpCheck["note"] != "original" || afterStale.State != domain.JobStateRunning {
+		t.Fatalf("checkpoint/state mutated on failed transition: state=%s cp=%s", afterStale.State, afterStale.Checkpoint)
+	}
+
+	// Simulate an aborted transaction on a terminal transition (e.g. DB trigger / constraint error).
+	if _, err := db.Exec(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION test_abort_job_terminal_update() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.state = 'SUCCEEDED' AND NEW.id = '%s' THEN
+				RAISE EXCEPTION 'simulated terminal commit failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_test_abort_job_terminal_update
+		BEFORE UPDATE ON jobs
+		FOR EACH ROW EXECUTE FUNCTION test_abort_job_terminal_update();
+	`, jSucc.ID)); err != nil {
+		t.Fatalf("create test abort trigger: %v", err)
+	}
+
+	if _, err := repo.RecoverSucceeded(ctx, jSucc.ID, cSucc.Attempts, json.RawMessage(`{"step":2,"note":"reconciled"}`), t0.Add(time.Second)); err == nil {
+		t.Fatal("expected RecoverSucceeded to fail under simulated DB trigger error")
+	}
+	afterTriggerFail, err := repo.GetJobByID(ctx, jSucc.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID after trigger failure: %v", err)
+	}
+	if err := json.Unmarshal(afterTriggerFail.Checkpoint, &cpCheck); err != nil || cpCheck["note"] != "original" || afterTriggerFail.State != domain.JobStateRunning {
+		t.Fatalf("failed terminal transition leaked checkpoint: state=%s cp=%s", afterTriggerFail.State, afterTriggerFail.Checkpoint)
+	}
+
+	if _, err := db.Exec(ctx, `DROP TRIGGER trg_test_abort_job_terminal_update ON jobs; DROP FUNCTION test_abort_job_terminal_update();`); err != nil {
+		t.Fatalf("cleanup test trigger: %v", err)
+	}
+
+	// Now RecoverSucceeded succeeds atomically with the reconciled checkpoint.
+	doneSucc, err := repo.RecoverSucceeded(ctx, jSucc.ID, cSucc.Attempts, json.RawMessage(`{"step":2,"note":"reconciled"}`), t0.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("RecoverSucceeded: %v", err)
+	}
+	if err := json.Unmarshal(doneSucc.Checkpoint, &cpCheck); err != nil || cpCheck["note"] != "reconciled" || doneSucc.State != domain.JobStateSucceeded {
+		t.Fatalf("doneSucc = (%+v, cp=%s), want SUCCEEDED with reconciled checkpoint", doneSucc, doneSucc.Checkpoint)
+	}
+
+	// 2. RecoverCancelled preserves existing checkpoint when override is nil, and commits override when provided.
+	jCanc := &domain.Job{Kind: domain.JobKindRepack, MaxAttempts: 3, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, jCanc); err != nil {
+		t.Fatalf("Enqueue jCanc: %v", err)
+	}
+	cCanc, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext jCanc: %v", err)
+	}
+	if _, err := repo.SaveCheckpoint(ctx, jCanc.ID, cCanc.Attempts, json.RawMessage(`{"kept":true}`), t0); err != nil {
+		t.Fatalf("SaveCheckpoint jCanc: %v", err)
+	}
+	reason := "cancelled in recovery"
+	doneCanc, err := repo.RecoverCancelled(ctx, jCanc.ID, cCanc.Attempts, nil, &reason, t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("RecoverCancelled: %v", err)
+	}
+	if err := json.Unmarshal(doneCanc.Checkpoint, &cpCheck); err != nil || cpCheck["kept"] != true || doneCanc.State != domain.JobStateCancelled {
+		t.Fatalf("doneCanc = (%+v, cp=%s), want CANCELLED preserving checkpoint", doneCanc, doneCanc.Checkpoint)
+	}
+
+	// 3. RecoverFailed commits override checkpoint and FAILED atomically.
+	jFail := &domain.Job{Kind: domain.JobKindRepack, MaxAttempts: 3, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, jFail); err != nil {
+		t.Fatalf("Enqueue jFail: %v", err)
+	}
+	cFail, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext jFail: %v", err)
+	}
+	doneFail, err := repo.RecoverFailed(ctx, jFail.ID, cFail.Attempts, json.RawMessage(`{"evidence":"corrupt-tail"}`), "corrupt", t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("RecoverFailed: %v", err)
+	}
+	if err := json.Unmarshal(doneFail.Checkpoint, &cpCheck); err != nil || cpCheck["evidence"] != "corrupt-tail" || doneFail.State != domain.JobStateFailed {
+		t.Fatalf("doneFail = (%+v, cp=%s), want FAILED with evidence checkpoint", doneFail, doneFail.Checkpoint)
+	}
+}

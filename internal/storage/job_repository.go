@@ -87,4 +87,19 @@ type JobRepository interface {
 	// MarkFailed transitions a RUNNING job at the claimed attempt directly to FAILED
 	// (or CANCELLED if cancel_requested is true), regardless of remaining attempts.
 	MarkFailed(ctx context.Context, id string, attempt int, errMsg string, now time.Time) (*domain.Job, error)
+
+	// RecoverSucceeded atomically commits an optional reconciled checkpoint and transitions
+	// an interrupted RUNNING job at attempt to SUCCEEDED. When checkpoint is empty, the existing
+	// checkpoint is preserved.
+	RecoverSucceeded(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error)
+
+	// RecoverCancelled atomically commits an optional reconciled checkpoint and transitions
+	// an interrupted RUNNING job at attempt to CANCELLED. When checkpoint is empty, the existing
+	// checkpoint is preserved.
+	RecoverCancelled(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg *string, now time.Time) (*domain.Job, error)
+
+	// RecoverFailed atomically commits an optional reconciled checkpoint and transitions
+	// an interrupted RUNNING job at attempt to FAILED (or CANCELLED if cancel_requested is true).
+	// When checkpoint is empty, the existing checkpoint is preserved.
+	RecoverFailed(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg string, now time.Time) (*domain.Job, error)
 }

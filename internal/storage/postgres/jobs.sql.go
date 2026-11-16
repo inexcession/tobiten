@@ -670,6 +670,57 @@ func (q *Queries) RecoverJobFailed(ctx context.Context, arg RecoverJobFailedPara
 	return i, err
 }
 
+const recoverJobSucceeded = `-- name: RecoverJobSucceeded :one
+UPDATE jobs
+SET state = 'SUCCEEDED',
+    checkpoint = $2,
+    last_error = NULL,
+    updated_at = $3,
+    finished_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type RecoverJobSucceededParams struct {
+	ID         string
+	Checkpoint []byte
+	UpdatedAt  time.Time
+	Attempts   int32
+}
+
+func (q *Queries) RecoverJobSucceeded(ctx context.Context, arg RecoverJobSucceededParams) (Job, error) {
+	row := q.db.QueryRow(ctx, recoverJobSucceeded,
+		arg.ID,
+		arg.Checkpoint,
+		arg.UpdatedAt,
+		arg.Attempts,
+	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const requeueInterruptedJob = `-- name: RequeueInterruptedJob :one
 UPDATE jobs
 SET state = 'QUEUED',

@@ -227,3 +227,17 @@ WHERE id = $1
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: RecoverJobSucceeded :one
+UPDATE jobs
+SET state = 'SUCCEEDED',
+    checkpoint = $2,
+    last_error = NULL,
+    updated_at = $3,
+    finished_at = $3
+WHERE id = $1
+  AND state = 'RUNNING'
+  AND attempts = $4
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;

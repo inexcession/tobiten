@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,41 @@ const (
 // IsValid reports whether p is a recognized JobResumePolicy.
 func (p JobResumePolicy) IsValid() bool {
 	return p == JobResumeRestart || p == JobResumeCheckpoint
+}
+
+// JobReconcileAction describes the state transition chosen during startup recovery
+// for an interrupted RUNNING job (ADR-0017 §7).
+type JobReconcileAction int
+
+const (
+	// JobReconcileRequeue returns an interrupted job to QUEUED (unless cancelled or exhausted).
+	JobReconcileRequeue JobReconcileAction = iota
+	// JobReconcileSucceeded records that the interrupted job completed its final step before shutdown.
+	JobReconcileSucceeded
+	// JobReconcileFailed marks the interrupted job as permanently FAILED.
+	JobReconcileFailed
+	// JobReconcileCancelled marks the interrupted job as CANCELLED.
+	JobReconcileCancelled
+)
+
+// JobReconcileOutcome describes the reconciliation decision for an interrupted RUNNING job.
+type JobReconcileOutcome struct {
+	Action     JobReconcileAction
+	Checkpoint json.RawMessage
+	Error      string
+}
+
+// JobReconciler inspects an interrupted RUNNING job before startup recovery updates its state.
+type JobReconciler interface {
+	Reconcile(ctx context.Context, job Job) (JobReconcileOutcome, error)
+}
+
+// JobReconcileFunc adapts a function to the JobReconciler interface.
+type JobReconcileFunc func(ctx context.Context, job Job) (JobReconcileOutcome, error)
+
+// Reconcile implements JobReconciler.
+func (f JobReconcileFunc) Reconcile(ctx context.Context, job Job) (JobReconcileOutcome, error) {
+	return f(ctx, job)
 }
 
 // JobState represents the execution state of a durable job (ADR-0017, 0001_init.sql).

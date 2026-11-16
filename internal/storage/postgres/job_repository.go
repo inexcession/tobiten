@@ -676,3 +676,129 @@ func (r *JobRepository) MarkFailed(ctx context.Context, id string, attempt int, 
 	}
 	return &updated, nil
 }
+
+func validateOptionalCheckpoint(override json.RawMessage) ([]byte, bool, error) {
+	if len(override) == 0 {
+		return nil, false, nil
+	}
+	if !json.Valid(override) {
+		return nil, false, domain.ErrInvalidJobJSON
+	}
+	return []byte(override), true, nil
+}
+
+func (r *JobRepository) runTerminalRecoveryTx(
+	ctx context.Context,
+	id string,
+	attempt int,
+	checkpoint json.RawMessage,
+	now time.Time,
+	apply func(q *Queries, current Job, resolvedCheckpoint []byte, ts time.Time) (Job, error),
+) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
+	}
+	overrideBytes, hasOverride, err := validateOptionalCheckpoint(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	ts := normalizeJobTime(now)
+
+	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
+		current, err := q.GetJobByIDForUpdate(ctx, id)
+		if err != nil {
+			return domain.Job{}, mapPgError(err)
+		}
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
+		}
+		resolved := current.Checkpoint
+		if hasOverride {
+			resolved = overrideBytes
+		}
+		row, err := apply(q, current, resolved, ts)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		return JobToDomain(row), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// RecoverSucceeded atomically commits an optional reconciled checkpoint and transitions
+// an interrupted RUNNING job at attempt to SUCCEEDED.
+func (r *JobRepository) RecoverSucceeded(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error) {
+	return r.runTerminalRecoveryTx(ctx, id, attempt, checkpoint, now, func(q *Queries, _ Job, resolvedCheckpoint []byte, ts time.Time) (Job, error) {
+		row, err := q.RecoverJobSucceeded(ctx, RecoverJobSucceededParams{
+			ID:         id,
+			Checkpoint: resolvedCheckpoint,
+			UpdatedAt:  ts,
+			Attempts:   int32(attempt),
+		})
+		if err != nil {
+			return Job{}, fmt.Errorf("recovering job %q as succeeded: %w", id, err)
+		}
+		return row, nil
+	})
+}
+
+// RecoverCancelled atomically commits an optional reconciled checkpoint and transitions
+// an interrupted RUNNING job at attempt to CANCELLED.
+func (r *JobRepository) RecoverCancelled(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg *string, now time.Time) (*domain.Job, error) {
+	var cleanErrPtr *string
+	if errMsg != nil && *errMsg != "" {
+		msg := *errMsg
+		cleanErrPtr = &msg
+	}
+	return r.runTerminalRecoveryTx(ctx, id, attempt, checkpoint, now, func(q *Queries, _ Job, resolvedCheckpoint []byte, ts time.Time) (Job, error) {
+		row, err := q.RecoverJobCancelled(ctx, RecoverJobCancelledParams{
+			ID:         id,
+			Checkpoint: resolvedCheckpoint,
+			UpdatedAt:  ts,
+			Attempts:   int32(attempt),
+			LastError:  cleanErrPtr,
+		})
+		if err != nil {
+			return Job{}, fmt.Errorf("recovering job %q as cancelled: %w", id, err)
+		}
+		return row, nil
+	})
+}
+
+// RecoverFailed atomically commits an optional reconciled checkpoint and transitions
+// an interrupted RUNNING job at attempt to FAILED (or CANCELLED if cancel_requested is true).
+func (r *JobRepository) RecoverFailed(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg string, now time.Time) (*domain.Job, error) {
+	var errPtr *string
+	if errMsg != "" {
+		errPtr = &errMsg
+	}
+	return r.runTerminalRecoveryTx(ctx, id, attempt, checkpoint, now, func(q *Queries, current Job, resolvedCheckpoint []byte, ts time.Time) (Job, error) {
+		if current.CancelRequested {
+			row, err := q.RecoverJobCancelled(ctx, RecoverJobCancelledParams{
+				ID:         id,
+				Checkpoint: resolvedCheckpoint,
+				UpdatedAt:  ts,
+				Attempts:   int32(attempt),
+				LastError:  errPtr,
+			})
+			if err != nil {
+				return Job{}, fmt.Errorf("recovering cancelled job %q: %w", id, err)
+			}
+			return row, nil
+		}
+		row, err := q.RecoverJobFailed(ctx, RecoverJobFailedParams{
+			ID:         id,
+			Checkpoint: resolvedCheckpoint,
+			LastError:  errPtr,
+			UpdatedAt:  ts,
+			Attempts:   int32(attempt),
+		})
+		if err != nil {
+			return Job{}, fmt.Errorf("recovering job %q as failed: %w", id, err)
+		}
+		return row, nil
+	})
+}

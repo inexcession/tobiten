@@ -156,6 +156,20 @@ type JobKind interface {
 	ResumePolicy() domain.JobResumePolicy
 }
 
+// ReconcilableJobKind is an optional interface implemented by a JobKind to declare
+// a startup reconciliation hook executed under daemon ownership before recovery transitions (ADR-0017 §7).
+type ReconcilableJobKind interface {
+	JobKind
+	Reconciler() domain.JobReconciler
+}
+
+// ReconcilerRequirement is an optional interface implemented by a JobKind to declare
+// whether startup recovery must fail if no reconciliation hook is available.
+type ReconcilerRequirement interface {
+	JobKind
+	RequiresReconciler() bool
+}
+
 // EventSubscriberProvider indicates a module provides domain event subscribers (ADR-0018 S3).
 type EventSubscriberProvider interface {
 	EventSubscribers() []EventSubscriber
@@ -551,14 +565,19 @@ type NamedJobKind string
 func (n NamedJobKind) Name() string                         { return string(n) }
 func (n NamedJobKind) ResumePolicy() domain.JobResumePolicy { return domain.JobResumeRestart }
 
-// JobKindSpec is a JobKind descriptor pairing a canonical kind name with its declared resume policy.
+// JobKindSpec is a JobKind descriptor pairing a canonical kind name with its declared
+// resume policy and optional startup reconciliation hook.
 type JobKindSpec struct {
-	Kind   domain.JobKind
-	Policy domain.JobResumePolicy
+	Kind             domain.JobKind
+	Policy           domain.JobResumePolicy
+	ReconcileHook    domain.JobReconciler
+	RequireReconcile bool
 }
 
 func (s JobKindSpec) Name() string                         { return string(s.Kind) }
 func (s JobKindSpec) ResumePolicy() domain.JobResumePolicy { return s.Policy }
+func (s JobKindSpec) Reconciler() domain.JobReconciler     { return s.ReconcileHook }
+func (s JobKindSpec) RequiresReconciler() bool             { return s.RequireReconcile }
 
 // NamedEventSubscriber is a simple string-backed EventSubscriber descriptor.
 type NamedEventSubscriber string

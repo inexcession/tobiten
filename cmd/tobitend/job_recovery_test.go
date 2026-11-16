@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -43,14 +44,63 @@ func TestRunDaemonRecoversInterruptedJobsUnderOwnershipBeforeServing(t *testing.
 		slog.SetDefault(originalLogger)
 	})
 
+	repo := postgres.NewJobRepository(db.Pool)
+	var scanHookCalls, repackHookCalls int
+	var serveCalled bool
+
 	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
-		registerTestJobKindsModule(reg)
+		_ = reg.Register(&module.SimpleModule{
+			ModuleName: "test-job-recovery",
+			Jobs: []module.JobKind{
+				module.JobKindSpec{
+					Kind:             domain.JobKindScan,
+					Policy:           domain.JobResumeCheckpoint,
+					RequireReconcile: true,
+					ReconcileHook: domain.JobReconcileFunc(func(hookCtx context.Context, job domain.Job) (domain.JobReconcileOutcome, error) {
+						scanHookCalls++
+						if serveCalled {
+							return domain.JobReconcileOutcome{}, errors.New("reconciler hook ran after serve")
+						}
+						if pids := queryDaemonLockPIDs(t, db); len(pids) != 1 {
+							return domain.JobReconcileOutcome{}, fmt.Errorf("expected 1 daemon lock during hook, got %v", pids)
+						}
+						// Verify the row is still RUNNING in PostgreSQL before any mutation occurs.
+						liveRow, err := repo.GetJobByID(hookCtx, job.ID)
+						if err != nil {
+							return domain.JobReconcileOutcome{}, err
+						}
+						if liveRow.State != domain.JobStateRunning {
+							return domain.JobReconcileOutcome{}, fmt.Errorf("expected RUNNING row before mutation in hook, got %s", liveRow.State)
+						}
+						return domain.JobReconcileOutcome{Action: domain.JobReconcileRequeue}, nil
+					}),
+				},
+				module.JobKindSpec{
+					Kind:   domain.JobKindRepack,
+					Policy: domain.JobResumeRestart,
+					ReconcileHook: domain.JobReconcileFunc(func(hookCtx context.Context, job domain.Job) (domain.JobReconcileOutcome, error) {
+						repackHookCalls++
+						liveRow, err := repo.GetJobByID(hookCtx, job.ID)
+						if err != nil {
+							return domain.JobReconcileOutcome{}, err
+						}
+						if liveRow.State != domain.JobStateRunning {
+							return domain.JobReconcileOutcome{}, fmt.Errorf("expected RUNNING row before mutation in repack hook, got %s", liveRow.State)
+						}
+						// Even if a RESTART reconciler supplies a checkpoint override, requeue must clear it.
+						return domain.JobReconcileOutcome{
+							Action:     domain.JobReconcileRequeue,
+							Checkpoint: json.RawMessage(`{"stale":"override"}`),
+						}, nil
+					}),
+				},
+			},
+		})
 		return reg
 	}
 
 	ctx := t.Context()
-	repo := postgres.NewJobRepository(db.Pool)
 	t0 := time.Date(2026, 11, 16, 14, 0, 0, 0, time.UTC)
 
 	// Seed four interrupted RUNNING jobs before daemon startup:
@@ -101,7 +151,6 @@ func TestRunDaemonRecoversInterruptedJobsUnderOwnershipBeforeServing(t *testing.
 		t.Fatalf("ClaimNext exhausted: %v", err)
 	}
 
-	serveCalled := false
 	err = runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
 		serveCalled = true
 
@@ -165,6 +214,125 @@ func TestRunDaemonRecoversInterruptedJobsUnderOwnershipBeforeServing(t *testing.
 	if !serveCalled {
 		t.Fatal("expected serve callback to run after recovery")
 	}
+	if scanHookCalls != 3 || repackHookCalls != 1 {
+		t.Fatalf("unexpected hook invocation counts: scan=%d repack=%d, want scan=3 repack=1", scanHookCalls, repackHookCalls)
+	}
+}
+
+func TestRunDaemonFailsStartupAndPreservesUnresolvedJobs(t *testing.T) {
+	originalRegistryBuilder := buildDaemonRegistry
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		buildDaemonRegistry = originalRegistryBuilder
+		slog.SetDefault(originalLogger)
+	})
+
+	t.Run("unavailable job kind fails startup and preserves RUNNING job", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		ctx := t.Context()
+		repo := postgres.NewJobRepository(db.Pool)
+		t0 := time.Date(2026, 11, 16, 14, 15, 0, 0, time.UTC)
+
+		dedupe := "SCAN:unavailable-on-boot"
+		j := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: 3, DedupeKey: &dedupe, CreatedAt: t0, RunAfter: t0}
+		if _, err := repo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		claimed, err := repo.ClaimNext(ctx, domain.JobKindScan, t0)
+		if err != nil {
+			t.Fatalf("ClaimNext: %v", err)
+		}
+		if _, err := repo.SaveCheckpoint(ctx, j.ID, claimed.Attempts, json.RawMessage(`{"cursor":"v2"}`), t0); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+
+		// Default compiled-in registry declares no job kinds.
+		buildDaemonRegistry = BuildRegistryWithServices
+		served := false
+		err = runDaemon(ctx, hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
+			served = true
+			return nil
+		})
+		if !errors.Is(err, jobs.ErrUnknownJobKind) {
+			t.Fatalf("runDaemon err = %v, want ErrUnknownJobKind", err)
+		}
+		if served {
+			t.Fatal("serve must not run when startup recovery fails")
+		}
+
+		got, err := repo.GetJobByID(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		var cp map[string]any
+		if got.State != domain.JobStateRunning || got.Attempts != 1 || json.Unmarshal(got.Checkpoint, &cp) != nil || cp["cursor"] != "v2" {
+			t.Fatalf("unresolved job mutated on failed startup: %+v", got)
+		}
+		if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindScan, DedupeKey: &dedupe}); err != nil || created {
+			t.Fatalf("dedupe key %q was unexpectedly released: created=%v err=%v", dedupe, created, err)
+		}
+	})
+
+	t.Run("missing required reconciler hook fails startup and preserves RUNNING job", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		ctx := t.Context()
+		repo := postgres.NewJobRepository(db.Pool)
+		t0 := time.Date(2026, 11, 16, 14, 20, 0, 0, time.UTC)
+
+		dedupe := "INTAKE:missing-hook-on-boot"
+		j := &domain.Job{Kind: domain.JobKindIntake, MaxAttempts: 3, DedupeKey: &dedupe, CreatedAt: t0, RunAfter: t0}
+		if _, err := repo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		claimed, err := repo.ClaimNext(ctx, domain.JobKindIntake, t0)
+		if err != nil {
+			t.Fatalf("ClaimNext: %v", err)
+		}
+		if _, err := repo.SaveCheckpoint(ctx, j.ID, claimed.Attempts, json.RawMessage(`{"tmp":".tobiten-tmp-1"}`), t0); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+			reg := BuildRegistryWithServices(cfg, services)
+			_ = reg.Register(&module.SimpleModule{
+				ModuleName: "intake-missing-hook",
+				Jobs: []module.JobKind{
+					module.JobKindSpec{
+						Kind:             domain.JobKindIntake,
+						Policy:           domain.JobResumeCheckpoint,
+						RequireReconcile: true,
+					},
+				},
+			})
+			return reg
+		}
+
+		served := false
+		err = runDaemon(ctx, hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
+			served = true
+			return nil
+		})
+		if !errors.Is(err, jobs.ErrMissingJobReconciler) {
+			t.Fatalf("runDaemon err = %v, want ErrMissingJobReconciler", err)
+		}
+		if served {
+			t.Fatal("serve must not run when required reconciler hook is missing")
+		}
+
+		got, err := repo.GetJobByID(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		var cp map[string]any
+		if got.State != domain.JobStateRunning || got.Attempts != 1 || json.Unmarshal(got.Checkpoint, &cp) != nil || cp["tmp"] != ".tobiten-tmp-1" {
+			t.Fatalf("unresolved job mutated on missing hook: %+v", got)
+		}
+		if created, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindIntake, DedupeKey: &dedupe}); err != nil || created {
+			t.Fatalf("dedupe key %q was unexpectedly released: created=%v err=%v", dedupe, created, err)
+		}
+	})
 }
 
 // TestJobRecoveryHelperProcess is a subprocess entrypoint used by
