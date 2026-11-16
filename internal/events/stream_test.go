@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +17,13 @@ import (
 	"github.com/inexcession/tobiten/internal/testdb"
 )
 
-func setupStreamTestDB(t *testing.T) (*testdb.TestDB, *postgres.EventRepository, *postgres.JobRepository, *postgres.UserRepository) {
+func setupStreamTestDB(t *testing.T) (
+	*testdb.TestDB,
+	*postgres.EventRepository,
+	*postgres.JobRepository,
+	*postgres.UserRepository,
+	*postgres.SessionRepository,
+) {
 	t.Helper()
 	db := testdb.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -24,7 +31,52 @@ func setupStreamTestDB(t *testing.T) (*testdb.TestDB, *postgres.EventRepository,
 	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
 		t.Fatalf("applying core migrations: %v", err)
 	}
-	return db, postgres.NewEventRepository(db.Pool), postgres.NewJobRepository(db.Pool), postgres.NewUserRepository(db.Pool)
+	return db,
+		postgres.NewEventRepository(db.Pool),
+		postgres.NewJobRepository(db.Pool),
+		postgres.NewUserRepository(db.Pool),
+		postgres.NewSessionRepository(db.Pool)
+}
+
+func createStreamTestUserWithCred(
+	ctx context.Context,
+	t *testing.T,
+	userRepo *postgres.UserRepository,
+	username, roleID string,
+	credKind domain.CredentialKind,
+	scopes []domain.PATScope,
+	expiresAt *time.Time,
+) (domain.User, *domain.Principal) {
+	t.Helper()
+	u := &domain.User{ID: domain.MustNewID(), Username: username}
+	if err := userRepo.CreateUser(ctx, u); err != nil {
+		t.Fatalf("CreateUser(%s): %v", username, err)
+	}
+	if roleID != "" {
+		if err := userRepo.AssignUserRole(ctx, u.ID, roleID); err != nil {
+			t.Fatalf("AssignUserRole(%s): %v", username, err)
+		}
+	}
+	secret := "hash-" + username
+	scheme := "argon2id"
+	cred := &domain.Credential{
+		ID:         domain.MustNewID(),
+		UserID:     u.ID,
+		Kind:       credKind,
+		Scopes:     scopes,
+		SecretHash: &secret,
+		HashScheme: &scheme,
+		ExpiresAt:  expiresAt,
+	}
+	if err := userRepo.CreateCredential(ctx, cred); err != nil {
+		t.Fatalf("CreateCredential(%s): %v", username, err)
+	}
+	roles, err := userRepo.ListUserRoles(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("ListUserRoles(%s): %v", username, err)
+	}
+	p := domain.NewPrincipal(*u, roles, cred.Kind, cred.ID, cred.Scopes)
+	return *u, p
 }
 
 func TestStreamService_ValidationGuards(t *testing.T) {
@@ -42,24 +94,18 @@ func TestStreamService_ValidationGuards(t *testing.T) {
 
 func TestStreamService_OrderedDrainVisibilityCatchupAndProgress(t *testing.T) {
 	t.Parallel()
-	db, eventRepo, jobRepo, userRepo := setupStreamTestDB(t)
+	db, eventRepo, jobRepo, userRepo, sessionRepo := setupStreamTestDB(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Create real users so jobs.created_by FK constraints and ON DELETE SET NULL work cleanly.
-	alice := &domain.User{ID: domain.MustNewID(), Username: "stream-alice"}
-	bob := &domain.User{ID: domain.MustNewID(), Username: "stream-bob"}
+	alice, alicePrincipal := createStreamTestUserWithCred(ctx, t, userRepo, "stream-alice", domain.RoleReaderID, domain.CredentialKindPassword, nil, nil)
+	bob, bobPrincipal := createStreamTestUserWithCred(ctx, t, userRepo, "stream-bob", domain.RoleReaderID, domain.CredentialKindPassword, nil, nil)
+	_, readAllPrincipal := createStreamTestUserWithCred(ctx, t, userRepo, "stream-admin", domain.RoleAdminID, domain.CredentialKindPassword, nil, nil)
 	tempCreator := &domain.User{ID: domain.MustNewID(), Username: "stream-temp"}
-	for _, u := range []*domain.User{alice, bob, tempCreator} {
-		if err := userRepo.CreateUser(ctx, u); err != nil {
-			t.Fatalf("CreateUser(%s): %v", u.Username, err)
-		}
+	if err := userRepo.CreateUser(ctx, tempCreator); err != nil {
+		t.Fatalf("CreateUser(temp): %v", err)
 	}
-
-	alicePrincipal := testPrincipalWithPerms(alice.ID, domain.PermissionLibraryRead)
-	bobPrincipal := testPrincipalWithPerms(bob.ID, domain.PermissionLibraryRead)
-	readAllPrincipal := testPrincipalWithPerms("u-admin", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
 
 	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{MinInterval: time.Nanosecond})
 	if err != nil {
@@ -73,6 +119,8 @@ func TestStreamService_OrderedDrainVisibilityCatchupAndProgress(t *testing.T) {
 
 	// Use a very long fallback PollInterval so the test proves dispatcher wake signals drive the drain.
 	svc := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
+		Users:        userRepo,
+		Sessions:     sessionRepo,
 		ProgressHub:  progressHub,
 		WakeSource:   dispatcher,
 		PollInterval: 30 * time.Second,
@@ -277,5 +325,356 @@ func TestStreamService_OrderedDrainVisibilityCatchupAndProgress(t *testing.T) {
 	}
 	if len(seenByAdmin[delivJob.ID]) != 0 {
 		t.Fatalf("admin saw internal EVENT_DELIVERY lifecycle events: %v", seenByAdmin[delivJob.ID])
+	}
+}
+
+func TestStreamService_LiveCredentialRevocationExpirySessionAndDemotion(t *testing.T) {
+	t.Parallel()
+	_, eventRepo, jobRepo, userRepo, sessionRepo := setupStreamTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var clockMu sync.Mutex
+	now := time.Now().UTC()
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: time.Nanosecond,
+		Now:         nowFn,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+	dispatcher := events.NewDispatcher(eventRepo, events.WithDispatcherPollInterval(10*time.Second))
+	if err := dispatcher.Start(ctx); err != nil {
+		t.Fatalf("dispatcher.Start: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	svc := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
+		Users:        userRepo,
+		Sessions:     sessionRepo,
+		ProgressHub:  progressHub,
+		WakeSource:   dispatcher,
+		PollInterval: 30 * time.Second,
+		Now:          nowFn,
+	})
+
+	startStream := func(p *domain.Principal) (<-chan app.StreamEvent, <-chan error, context.CancelFunc) {
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		ch := make(chan app.StreamEvent, 32)
+		done := make(chan error, 1)
+		attached := make(chan struct{})
+		go func() {
+			done <- svc.Stream(streamCtx, p, app.EventStreamFilter{}, func() error {
+				close(attached)
+				return nil
+			}, func(ev app.StreamEvent) error {
+				ch <- ev
+				return nil
+			})
+		}()
+		select {
+		case <-attached:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for stream attach")
+		}
+		return ch, done, cancelStream
+	}
+
+	// 1. PAT revocation and PAT expiry terminate open streams and drop buffered progress frames.
+	revokedUser, revokedPAT := createStreamTestUserWithCred(
+		ctx, t, userRepo, "pat-revoked", domain.RoleAdminID, domain.CredentialKindPAT, []domain.PATScope{domain.ScopeAdmin}, nil,
+	)
+	expAt := nowFn().Add(5 * time.Minute)
+	_, expiringPAT := createStreamTestUserWithCred(
+		ctx, t, userRepo, "pat-expiring", domain.RoleAdminID, domain.CredentialKindPAT, []domain.PATScope{domain.ScopeAdmin}, &expAt,
+	)
+	sessUser, sessBasePrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "sess-revoked", domain.RoleAdminID, domain.CredentialKindPassword, nil, nil,
+	)
+	sessID := domain.MustNewID()
+	credObj, err := userRepo.GetCredentialByID(ctx, sessBasePrincipal.CredentialID)
+	if err != nil {
+		t.Fatalf("GetCredentialByID: %v", err)
+	}
+	if err := sessionRepo.CreateSession(ctx, &domain.Session{
+		ID:                   sessID,
+		UserID:               sessUser.ID,
+		CredentialID:         credObj.ID,
+		Kind:                 domain.SessionKindNative,
+		TokenHash:            domain.HashSHA256Hex("tok-" + sessID),
+		CSRFTokenHash:        domain.HashSHA256Hex("csrf-" + sessID),
+		CredentialHashDigest: domain.HashSHA256Hex(*credObj.SecretHash),
+		CreatedAt:            nowFn(),
+		ExpiresAt:            nowFn().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	sessPrincipal := domain.NewPrincipal(sessUser, sessBasePrincipal.Roles, credObj.Kind, credObj.ID, nil)
+	sessPrincipal.SessionID = sessID
+
+	// 2. Role downgrade user (Admin -> Reader) + positive control Admin.
+	demoteUser, demotePrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "demote-admin", domain.RoleAdminID, domain.CredentialKindPassword, nil, nil,
+	)
+	_, stayAdminPrincipal := createStreamTestUserWithCred(
+		ctx, t, userRepo, "stay-admin", domain.RoleAdminID, domain.CredentialKindPassword, nil, nil,
+	)
+
+	revokedCh, revokedDone, cancelRevoked := startStream(revokedPAT)
+	defer cancelRevoked()
+	expiringCh, expiringDone, cancelExpiring := startStream(expiringPAT)
+	defer cancelExpiring()
+	sessCh, sessDone, cancelSess := startStream(sessPrincipal)
+	defer cancelSess()
+	demoteCh, _, cancelDemote := startStream(demotePrincipal)
+	defer cancelDemote()
+	stayAdminCh, _, cancelStay := startStream(stayAdminPrincipal)
+	defer cancelStay()
+
+	// Pause emission for demoteCh? Even simpler: revoke/expire/demote BEFORE emitting new progress/lifecycle events,
+	// AND test buffered progress by blocking emit on a test channel for demotePrincipal so progressCh buffers a tick
+	// while demotePrincipal is still Admin, then downgrade demoteUser's role before unblocking emit!
+	bufferedGate := make(chan struct{})
+	bufferedEntered := make(chan struct{})
+	bufferedEvents := make(chan app.StreamEvent, 8)
+	bufCtx, cancelBuf := context.WithCancel(ctx)
+	defer cancelBuf()
+	bufAttached := make(chan struct{})
+	var gateOnce sync.Once
+	go func() {
+		_ = svc.Stream(bufCtx, demotePrincipal, app.EventStreamFilter{}, func() error {
+			close(bufAttached)
+			return nil
+		}, func(ev app.StreamEvent) error {
+			gateOnce.Do(func() {
+				close(bufferedEntered)
+				<-bufferedGate
+			})
+			bufferedEvents <- ev
+			return nil
+		})
+	}()
+	select {
+	case <-bufAttached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for buffered test stream attach")
+	}
+
+	// Enqueue an automatic (creatorless) job to trigger the first emit (blocking bufferedGate) and buffer a progress tick.
+	gateJob := &domain.Job{Kind: domain.JobKindScan, CreatedBy: nil, RunAfter: nowFn(), CreatedAt: nowFn()}
+	if _, err := jobRepo.Enqueue(ctx, gateJob); err != nil {
+		t.Fatalf("Enqueue gateJob: %v", err)
+	}
+	if _, err := jobRepo.ClaimNext(ctx, domain.JobKindScan, nowFn()); err != nil {
+		t.Fatalf("ClaimNext gateJob: %v", err)
+	}
+	dispatcher.Notify()
+	select {
+	case <-bufferedEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for buffered stream first emit")
+	}
+
+	// Publish a progress tick for gateJob into ProgressHub while demoteUser is still Admin (it sits buffered in progressCh).
+	if !progressHub.Publish(domain.JobProgressTick{
+		JobID:        gateJob.ID,
+		Kind:         domain.JobKindScan,
+		CreatedBy:    nil,
+		ScannedCount: 99,
+		CurrentPath:  "/secret-auto.cbz",
+		DurationMS:   15,
+	}) {
+		t.Fatal("expected buffered progress Publish to succeed")
+	}
+
+	// Now revoke PAT, expire expiringPAT via clock advance, revoke session, and downgrade demoteUser -> Reader!
+	if err := userRepo.RevokeCredential(ctx, revokedPAT.CredentialID, nowFn()); err != nil {
+		t.Fatalf("RevokeCredential: %v", err)
+	}
+	advanceClock(10 * time.Minute)
+	if err := sessionRepo.RevokeSession(ctx, sessID, nowFn()); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+	if err := userRepo.RemoveUserRole(ctx, demoteUser.ID, domain.RoleAdminID); err != nil {
+		t.Fatalf("RemoveUserRole(demoteUser, Admin): %v", err)
+	}
+	if err := userRepo.AssignUserRole(ctx, demoteUser.ID, domain.RoleReaderID); err != nil {
+		t.Fatalf("AssignUserRole(demoteUser, Reader): %v", err)
+	}
+
+	// Release the buffered stream and verify the buffered automatic-job progress tick is DROPPED!
+	close(bufferedGate)
+
+	// Trigger a new automatic job + a demoteUser-owned job after revocation/expiry/downgrade.
+	autoAfter := &domain.Job{Kind: domain.JobKindRepack, CreatedBy: nil, RunAfter: nowFn(), CreatedAt: nowFn()}
+	if _, err := jobRepo.Enqueue(ctx, autoAfter); err != nil {
+		t.Fatalf("Enqueue autoAfter: %v", err)
+	}
+	if _, err := jobRepo.ClaimNext(ctx, domain.JobKindRepack, nowFn()); err != nil {
+		t.Fatalf("ClaimNext autoAfter: %v", err)
+	}
+	_ = progressHub.Publish(domain.JobProgressTick{
+		JobID:        autoAfter.ID,
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    nil,
+		ScannedCount: 1,
+		CurrentPath:  "/auto-after.cbz",
+		DurationMS:   5,
+	})
+
+	// Trigger a job created by revokedUser (must NOT be received on revokedCh because credential was revoked!).
+	revokedOwnJob := &domain.Job{Kind: domain.JobKindRepack, CreatedBy: &revokedUser.ID, RunAfter: nowFn(), CreatedAt: nowFn()}
+	if _, err := jobRepo.Enqueue(ctx, revokedOwnJob); err != nil {
+		t.Fatalf("Enqueue revokedOwnJob: %v", err)
+	}
+	if _, err := jobRepo.ClaimNext(ctx, domain.JobKindRepack, nowFn()); err != nil {
+		t.Fatalf("ClaimNext revokedOwnJob: %v", err)
+	}
+
+	// Trigger a job created by demoteUser (demoteUser lost jobs:read_all, so they must NOT see gateJob/autoAfter,
+	// ONLY demoteOwnJob!).
+	demoteOwnJob := &domain.Job{Kind: domain.JobKindRepack, CreatedBy: &demoteUser.ID, RunAfter: nowFn(), CreatedAt: nowFn()}
+	if _, err := jobRepo.Enqueue(ctx, demoteOwnJob); err != nil {
+		t.Fatalf("Enqueue demoteOwnJob: %v", err)
+	}
+	if _, err := jobRepo.ClaimNext(ctx, domain.JobKindRepack, nowFn()); err != nil {
+		t.Fatalf("ClaimNext demoteOwnJob: %v", err)
+	}
+	_ = progressHub.Publish(domain.JobProgressTick{
+		JobID:        demoteOwnJob.ID,
+		Kind:         domain.JobKindRepack,
+		CreatedBy:    &demoteUser.ID,
+		ScannedCount: 2,
+		CurrentPath:  "/own.cbz",
+		DurationMS:   7,
+	})
+	dispatcher.Notify()
+
+	// Revoked PAT, expired PAT, and revoked session streams must terminate cleanly without delivering post-revocation events.
+	for name, done := range map[string]<-chan error{
+		"revoked PAT":     revokedDone,
+		"expiring PAT":    expiringDone,
+		"revoked session": sessDone,
+	} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s Stream returned err = %v, want nil", name, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s Stream to terminate", name)
+		}
+	}
+	for name, ch := range map[string]<-chan app.StreamEvent{
+		"revoked PAT":     revokedCh,
+		"expiring PAT":    expiringCh,
+		"revoked session": sessCh,
+	} {
+		for len(ch) > 0 {
+			ev := <-ch
+			var pub app.PublicEvent
+			if err := json.Unmarshal(ev.Data, &pub); err == nil && (pub.AggregateID == autoAfter.ID || pub.AggregateID == revokedOwnJob.ID || pub.AggregateID == demoteOwnJob.ID) {
+				t.Fatalf("%s received post-invalidation event %+v", name, ev)
+			}
+		}
+	}
+
+	// Verify demoteCh receives ONLY demoteOwnJob (never autoAfter or revokedOwnJob), and bufferedEvents drops gateJob's buffered tick!
+	gotOwnLifecycle := false
+	gotOwnProgress := false
+	demoteDeadline := time.After(5 * time.Second)
+	for !gotOwnLifecycle || !gotOwnProgress {
+		select {
+		case ev := <-demoteCh:
+			if ev.Name == domain.ProgressTickEventName {
+				var tick domain.JobProgressTick
+				if err := json.Unmarshal(ev.Data, &tick); err != nil {
+					t.Fatalf("unmarshal demote tick: %v", err)
+				}
+				if tick.JobID != demoteOwnJob.ID && tick.JobID != gateJob.ID {
+					t.Fatalf("demoted user leaked progress tick for %q", tick.JobID)
+				}
+				if tick.JobID == gateJob.ID {
+					// gateJob tick was published before demotion; let's check bufferedEvents too.
+					continue
+				}
+				gotOwnProgress = true
+				continue
+			}
+			var pub app.PublicEvent
+			if err := json.Unmarshal(ev.Data, &pub); err != nil {
+				t.Fatalf("unmarshal demote lifecycle: %v", err)
+			}
+			if pub.AggregateID == autoAfter.ID || pub.AggregateID == revokedOwnJob.ID {
+				t.Fatalf("demoted user received unauthorized post-demotion event for %q", pub.AggregateID)
+			}
+			if pub.AggregateID == demoteOwnJob.ID {
+				gotOwnLifecycle = true
+			}
+		case <-demoteDeadline:
+			t.Fatalf("timed out waiting for demoted user's own job events (lifecycle=%v progress=%v)", gotOwnLifecycle, gotOwnProgress)
+		}
+	}
+
+	// Check bufferedEvents: first event was gateJob job.started; subsequent events must NOT include gateJob's buffered progress tick or autoAfter!
+	var seenBuffered []app.StreamEvent
+	bufDeadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev := <-bufferedEvents:
+			seenBuffered = append(seenBuffered, ev)
+			if ev.Name == string(domain.EventJobStarted) {
+				var pub app.PublicEvent
+				if err := json.Unmarshal(ev.Data, &pub); err == nil && pub.AggregateID == demoteOwnJob.ID {
+					goto checkedBuffered
+				}
+			}
+		case <-bufDeadline:
+			t.Fatalf("timed out waiting for demoteOwnJob on buffered stream, got: %+v", seenBuffered)
+		}
+	}
+checkedBuffered:
+	for _, ev := range seenBuffered {
+		if ev.Name == domain.ProgressTickEventName {
+			var tick domain.JobProgressTick
+			if err := json.Unmarshal(ev.Data, &tick); err == nil && (tick.JobID == gateJob.ID || tick.JobID == autoAfter.ID) {
+				t.Fatalf("demoted buffered stream emitted unauthorized progress tick for %q", tick.JobID)
+			}
+		} else {
+			var pub app.PublicEvent
+			if err := json.Unmarshal(ev.Data, &pub); err == nil && pub.AggregateID == autoAfter.ID {
+				t.Fatalf("demoted buffered stream emitted unauthorized lifecycle event for %q", pub.AggregateID)
+			}
+		}
+	}
+
+	// Positive control: stayAdminCh receives autoAfter, revokedOwnJob, and demoteOwnJob.
+	seenStay := make(map[string]bool)
+	stayDeadline := time.After(5 * time.Second)
+	for !seenStay[autoAfter.ID] || !seenStay[revokedOwnJob.ID] || !seenStay[demoteOwnJob.ID] {
+		select {
+		case ev := <-stayAdminCh:
+			if ev.Name == domain.ProgressTickEventName {
+				continue
+			}
+			var pub app.PublicEvent
+			if err := json.Unmarshal(ev.Data, &pub); err == nil {
+				seenStay[pub.AggregateID] = true
+			}
+		case <-stayDeadline:
+			t.Fatalf("timed out waiting for positive-control admin events, saw: %+v", seenStay)
+		}
 	}
 }

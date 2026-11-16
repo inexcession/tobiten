@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,6 +61,18 @@ func writeSSEFrame(w io.Writer, ev app.StreamEvent) error {
 	return err
 }
 
+func mergeStreamContext(reqCtx, shutdownCtx context.Context) (context.Context, context.CancelFunc) {
+	if shutdownCtx == nil {
+		return reqCtx, func() {}
+	}
+	merged, cancel := context.WithCancel(reqCtx)
+	stop := context.AfterFunc(shutdownCtx, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (m *Module) handleEvents(w http.ResponseWriter, r *http.Request) {
 	p, ok := domain.PrincipalFromContext(r.Context())
 	if !ok || p == nil {
@@ -83,9 +96,12 @@ func (m *Module) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	jobID := strings.TrimSpace(r.URL.Query().Get("job_id"))
 	rc := http.NewResponseController(w)
+	streamCtx, cancelStream := mergeStreamContext(r.Context(), middleware.ShutdownContextFromContext(r.Context()))
+	defer cancelStream()
+
 	attached := false
 	err := svc.Stream(
-		r.Context(),
+		streamCtx,
 		p,
 		app.EventStreamFilter{JobID: jobID},
 		func() error {

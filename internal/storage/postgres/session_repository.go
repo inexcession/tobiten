@@ -96,6 +96,19 @@ func (r *SessionRepository) CreateSession(ctx context.Context, session *domain.S
 	return nil
 }
 
+// GetSessionByID fetches a session by its ID.
+func (r *SessionRepository) GetSessionByID(ctx context.Context, id string) (*domain.Session, error) {
+	row, err := r.q.GetSessionByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("getting session by id %q: %w", id, err)
+	}
+	s := sessionFromRow(row)
+	return &s, nil
+}
+
 // GetSessionByTokenHash fetches a session by its hashed opaque bearer/cookie token.
 func (r *SessionRepository) GetSessionByTokenHash(ctx context.Context, tokenHash string) (*domain.Session, error) {
 	row, err := r.q.GetSessionByTokenHash(ctx, tokenHash)

@@ -24,7 +24,7 @@ func (rw *responseRecorder) WriteHeader(code int) {
 	if rw.wroteHeader {
 		return
 	}
-	if code >= 100 && code <= 199 {
+	if code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols {
 		rw.ResponseWriter.WriteHeader(code)
 		return
 	}

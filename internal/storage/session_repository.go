@@ -10,6 +10,7 @@ import (
 // SessionRepository persists and queries credential-bound server-side sessions.
 type SessionRepository interface {
 	CreateSession(ctx context.Context, session *domain.Session) error
+	GetSessionByID(ctx context.Context, id string) (*domain.Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (*domain.Session, error)
 	UpdateSessionLastUsed(ctx context.Context, id string, lastUsedAt time.Time) error
 	RevokeSession(ctx context.Context, id string, revokedAt time.Time) error

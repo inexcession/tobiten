@@ -256,4 +256,33 @@ func TestRequestLogger_Informational1xxNotFinal(t *testing.T) {
 			t.Errorf("logged status = %v, want 200", logMap["status"])
 		}
 	})
+
+	t.Run("101 Switching Protocols is recorded as final even if WriteHeader called again", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+		handler := RequestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusSwitchingProtocols)
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		rec := &informationalStatusRecorder{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		handler.ServeHTTP(rec, req)
+
+		if len(rec.codes) != 1 || rec.codes[0] != http.StatusSwitchingProtocols {
+			t.Fatalf("forwarded codes = %v, want [101]", rec.codes)
+		}
+
+		var logMap map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &logMap); err != nil {
+			t.Fatalf("invalid JSON log: %v", err)
+		}
+		if status, ok := logMap["status"].(float64); !ok || int(status) != http.StatusSwitchingProtocols {
+			t.Errorf("logged status = %v, want 101", logMap["status"])
+		}
+		if logMap["level"] != "INFO" {
+			t.Errorf("logged level = %v, want INFO", logMap["level"])
+		}
+	})
 }

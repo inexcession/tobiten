@@ -27,6 +27,12 @@ FROM sessions
 WHERE token_hash = $1
 LIMIT 1;
 
+-- name: GetSessionByID :one
+SELECT id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, created_at, last_used_at, expires_at, revoked_at
+FROM sessions
+WHERE id = $1
+LIMIT 1;
+
 -- name: UpdateSessionLastUsed :execrows
 UPDATE sessions
 SET last_used_at = $2

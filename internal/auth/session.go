@@ -303,6 +303,7 @@ func (a *SessionAuthenticator) AuthenticateSession(ctx context.Context, token st
 	}
 
 	principal := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
+	principal.SessionID = session.ID
 	return principal, session.CSRFTokenHash, nil
 }
 

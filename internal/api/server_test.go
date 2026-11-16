@@ -1625,3 +1625,136 @@ func TestServer_CompositeRouteCollision_StreamingSSEFlushAndLogging(t *testing.T
 		})
 	}
 }
+
+func TestServer_GracefulShutdown_EndsIdleSSEWhileOrdinaryInFlightCompletes(t *testing.T) {
+	stubEvents := &streamingStubEventService{
+		attached: make(chan struct{}, 1),
+		sendCh:   make(chan app.StreamEvent, 1),
+	}
+	reg := module.NewRegistry()
+	_ = reg.Register(NewSystemModule())
+	_ = reg.Register(openapi.NewModule(&app.Services{Events: stubEvents}))
+
+	cfg := &config.Config{
+		Host:    "127.0.0.1",
+		Port:    0,
+		BaseURL: "http://localhost:8080",
+	}
+	srv, err := NewServer(ServerOptions{
+		Config:         cfg,
+		Registry:       reg,
+		Authenticators: []module.Authenticator{passthroughAuth{}},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	slowStarted := make(chan struct{})
+	allowSlowFinish := make(chan struct{})
+	srv.Mux().HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
+		close(slowStarted)
+		select {
+		case <-allowSlowFinish:
+		case <-r.Context().Done():
+			http.Error(w, "unexpected request cancellation", http.StatusRequestTimeout)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ordinary request finished"))
+	})
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Run(serverCtx)
+	}()
+
+	baseURL := srv.URL()
+
+	// 1. Open an idle SSE connection and keep it open on the client side.
+	sseResp, err := http.Get(baseURL + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("GET /api/v1/events: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE status = %d, want 200", sseResp.StatusCode)
+	}
+	select {
+	case <-stubEvents.attached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE attach")
+	}
+
+	sseEOF := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(sseResp.Body)
+		sseEOF <- readErr
+	}()
+
+	// 2. Start an ordinary in-flight request that must NOT be cancelled on shutdown.
+	type slowResult struct {
+		status int
+		body   string
+		err    error
+	}
+	slowCh := make(chan slowResult, 1)
+	go func() {
+		resp, reqErr := http.Get(baseURL + "/slow")
+		if reqErr != nil {
+			slowCh <- slowResult{err: reqErr}
+			return
+		}
+		defer resp.Body.Close()
+		b, readErr := io.ReadAll(resp.Body)
+		slowCh <- slowResult{status: resp.StatusCode, body: string(b), err: readErr}
+	}()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for /slow to start")
+	}
+
+	// 3. Initiate graceful shutdown while the idle SSE client stays connected and /slow is in-flight.
+	cancelServer()
+
+	// Idle SSE stream must terminate promptly without waiting for client disconnect.
+	select {
+	case readErr := <-sseEOF:
+		if readErr != nil {
+			t.Fatalf("idle SSE ReadAll error = %v, want clean EOF", readErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for idle SSE stream to close on shutdown")
+	}
+
+	// Ordinary in-flight /slow request must still be running (not aborted) until released.
+	select {
+	case res := <-slowCh:
+		t.Fatalf("/slow completed prematurely during shutdown: %+v", res)
+	case srvErr := <-serverDone:
+		t.Fatalf("srv.Run exited before ordinary in-flight /slow completed: %v", srvErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 4. Release /slow and verify both /slow and srv.Run complete cleanly well before DefaultShutdownTimeout.
+	close(allowSlowFinish)
+	select {
+	case res := <-slowCh:
+		if res.err != nil || res.status != http.StatusOK || res.body != "ordinary request finished" {
+			t.Fatalf("/slow result = %+v, want 200 'ordinary request finished'", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for /slow response")
+	}
+
+	select {
+	case srvErr := <-serverDone:
+		if srvErr != nil {
+			t.Fatalf("srv.Run returned error: %v, want nil", srvErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for srv.Run to return cleanly")
+	}
+}

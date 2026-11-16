@@ -49,6 +49,7 @@ type Querier interface {
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
 	GetServerLabelByName(ctx context.Context, name string) (Label, error)
+	GetSessionByID(ctx context.Context, id string) (Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetSystemSetting(ctx context.Context, key string) (SystemSetting, error)
 	GetUserByID(ctx context.Context, id string) (User, error)

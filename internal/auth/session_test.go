@@ -189,6 +189,17 @@ func (m *memSessionStore) activeSessionCount() int {
 	return count
 }
 
+func (m *memSessionStore) GetSessionByID(_ context.Context, id string) (*domain.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	copyS := s
+	return &copyS, nil
+}
+
 func (m *memSessionStore) GetSessionByTokenHash(_ context.Context, tokenHash string) (*domain.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

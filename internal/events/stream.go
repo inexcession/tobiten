@@ -31,21 +31,27 @@ type WakeSource interface {
 
 // StreamOptions configures a StreamService instance.
 type StreamOptions struct {
+	Users        storage.UserRepository
+	Sessions     storage.SessionRepository
 	ProgressHub  *ProgressHub
 	WakeSource   WakeSource
 	PollInterval time.Duration
 	BatchSize    int
+	Now          func() time.Time
 }
 
 // StreamService implements app.EventService by draining committed domain_events in
 // published_sequence order and forwarding live ephemeral worker progress ticks from
-// ProgressHub, enforcing current job ownership and effective jobs:read_all on every item
-// (ADR-0013 §3, ADR-0018 S3).
+// ProgressHub, enforcing live credential validity, effective role/PAT grants, and
+// current job ownership on every lifecycle and progress frame (ADR-0006, ADR-0013 §3, ADR-0018 S3).
 type StreamService struct {
 	events       storage.EventRepository
 	jobs         storage.JobRepository
+	users        storage.UserRepository
+	sessions     storage.SessionRepository
 	pollInterval time.Duration
 	batchSize    int
+	now          func() time.Time
 
 	mu       sync.RWMutex
 	progress *ProgressHub
@@ -58,7 +64,7 @@ type StreamService struct {
 
 var _ app.EventService = (*StreamService)(nil)
 
-// NewStreamService constructs a StreamService backed by eventsRepo and jobsRepo.
+// NewStreamService constructs a StreamService backed by eventsRepo, jobsRepo, and opts.Users.
 func NewStreamService(eventsRepo storage.EventRepository, jobsRepo storage.JobRepository, opts StreamOptions) *StreamService {
 	pollInterval := opts.PollInterval
 	if pollInterval == 0 {
@@ -70,11 +76,18 @@ func NewStreamService(eventsRepo storage.EventRepository, jobsRepo storage.JobRe
 	if batchSize <= 0 {
 		batchSize = DefaultStreamBatchSize
 	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	return &StreamService{
 		events:       eventsRepo,
 		jobs:         jobsRepo,
+		users:        opts.Users,
+		sessions:     opts.Sessions,
 		pollInterval: pollInterval,
 		batchSize:    batchSize,
+		now:          nowFn,
 		progress:     opts.ProgressHub,
 		wake:         opts.WakeSource,
 		notifySubs:   make(map[uint64]chan struct{}),
@@ -155,11 +168,19 @@ func (s *StreamService) Stream(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s == nil || s.events == nil || s.jobs == nil {
+	if s == nil || s.events == nil || s.jobs == nil || s.users == nil {
 		return fmt.Errorf("%w: event stream service is unavailable", app.ErrServiceBusy)
 	}
 	if emit == nil {
 		return errors.New("stream emit callback is required")
+	}
+
+	livePrincipal, valid, err := s.resolveLivePrincipal(ctx, principal)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return app.ErrUnauthorized
 	}
 
 	s.mu.RLock()
@@ -185,12 +206,12 @@ func (s *StreamService) Stream(
 	var progressCh <-chan domain.JobProgressTick
 	unsubProgress := func() {}
 	if progress != nil {
-		ch, cancelProgress, err := progress.Subscribe(ctx, ProgressSubscribeOptions{
-			Principal: principal,
+		ch, cancelProgress, subErr := progress.Subscribe(ctx, ProgressSubscribeOptions{
+			Principal: livePrincipal,
 			JobID:     strings.TrimSpace(filter.JobID),
 		})
-		if err != nil {
-			return err
+		if subErr != nil {
+			return subErr
 		}
 		progressCh = ch
 		unsubProgress = cancelProgress
@@ -204,10 +225,14 @@ func (s *StreamService) Stream(
 	}
 
 	jobIDFilter := strings.TrimSpace(filter.JobID)
-	if err := s.drainCommitted(ctx, principal, jobIDFilter, &cursor, emit); err != nil {
+	keepOpen, err := s.drainCommitted(ctx, principal, jobIDFilter, &cursor, emit)
+	if err != nil {
 		if ctx.Err() == nil {
 			return err
 		}
+		return nil
+	}
+	if !keepOpen {
 		return nil
 	}
 
@@ -220,7 +245,7 @@ func (s *StreamService) Stream(
 
 func (s *StreamService) runLoop(
 	ctx context.Context,
-	principal *domain.Principal,
+	origin *domain.Principal,
 	jobIDFilter string,
 	cursor *int64,
 	wakeCh <-chan struct{},
@@ -240,15 +265,18 @@ func (s *StreamService) runLoop(
 		case <-ctx.Done():
 			return nil
 		case <-wakeCh:
-			if err := s.drainCommitted(ctx, principal, jobIDFilter, cursor, emit); err != nil {
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			if err != nil || !keepOpen {
 				return err
 			}
 		case <-manualCh:
-			if err := s.drainCommitted(ctx, principal, jobIDFilter, cursor, emit); err != nil {
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			if err != nil || !keepOpen {
 				return err
 			}
 		case <-pollCh:
-			if err := s.drainCommitted(ctx, principal, jobIDFilter, cursor, emit); err != nil {
+			keepOpen, err := s.drainCommitted(ctx, origin, jobIDFilter, cursor, emit)
+			if err != nil || !keepOpen {
 				return err
 			}
 		case tick, ok := <-progressCh:
@@ -256,7 +284,8 @@ func (s *StreamService) runLoop(
 				progressCh = nil
 				continue
 			}
-			if err := emitProgressTick(tick, emit); err != nil {
+			keepOpen, err := s.handleProgressTick(ctx, origin, jobIDFilter, tick, emit)
+			if err != nil || !keepOpen {
 				return err
 			}
 		}
@@ -265,21 +294,27 @@ func (s *StreamService) runLoop(
 
 func (s *StreamService) drainCommitted(
 	ctx context.Context,
-	principal *domain.Principal,
+	origin *domain.Principal,
 	jobIDFilter string,
 	cursor *int64,
 	emit func(app.StreamEvent) error,
-) error {
+) (bool, error) {
+	if _, valid, err := s.resolveLivePrincipal(ctx, origin); err != nil {
+		return false, err
+	} else if !valid {
+		return false, nil
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		batch, err := s.events.ListPublishedEventsAfter(ctx, *cursor, s.batchSize)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if len(batch) == 0 {
-			return nil
+			return true, nil
 		}
 
 		for _, ev := range batch {
@@ -290,20 +325,23 @@ func (s *StreamService) drainCommitted(
 			if seq > *cursor {
 				*cursor = seq
 			}
-			streamEv, visible, err := s.projectJobEvent(ctx, principal, jobIDFilter, ev, seq)
+			streamEv, visible, keepOpen, err := s.projectJobEvent(ctx, origin, jobIDFilter, ev, seq)
 			if err != nil {
-				return err
+				return false, err
+			}
+			if !keepOpen {
+				return false, nil
 			}
 			if !visible {
 				continue
 			}
 			if err := emit(streamEv); err != nil {
-				return err
+				return false, err
 			}
 		}
 
 		if len(batch) < s.batchSize {
-			return nil
+			return true, nil
 		}
 	}
 }
@@ -328,6 +366,104 @@ func (s *StreamService) lookupJob(ctx context.Context, jobID string) (*domain.Jo
 	return job, nil
 }
 
+func (s *StreamService) lookupCredential(ctx context.Context, credID string) (*domain.Credential, error) {
+	cred, err := s.users.GetCredentialByID(ctx, credID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return cred, nil
+}
+
+func (s *StreamService) lookupSession(ctx context.Context, sessionID string) (*domain.Session, error) {
+	sess, err := s.sessions.GetSessionByID(ctx, sessionID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sess, nil
+}
+
+func (s *StreamService) lookupUser(ctx context.Context, userID string) (*domain.User, error) {
+	user, err := s.users.GetUserByID(ctx, userID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+func isUsableStreamCredential(cred *domain.Credential, origin *domain.Principal, now time.Time) bool {
+	if cred == nil || origin == nil {
+		return false
+	}
+	if cred.UserID != origin.User.ID || cred.Kind != origin.CredentialKind {
+		return false
+	}
+	if cred.IsRevoked() || cred.IsExpired(now) {
+		return false
+	}
+	return cred.Validate() == nil
+}
+
+func (s *StreamService) resolveLivePrincipal(ctx context.Context, origin *domain.Principal) (*domain.Principal, bool, error) {
+	if origin == nil || strings.TrimSpace(origin.User.ID) == "" || strings.TrimSpace(origin.CredentialID) == "" {
+		return nil, false, nil
+	}
+
+	nowFn := time.Now
+	if s.now != nil {
+		nowFn = s.now
+	}
+	now := nowFn().UTC()
+
+	cred, err := s.lookupCredential(ctx, origin.CredentialID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !isUsableStreamCredential(cred, origin, now) {
+		return nil, false, nil
+	}
+
+	if origin.SessionID != "" {
+		if s.sessions == nil {
+			return nil, false, nil
+		}
+		sess, err := s.lookupSession(ctx, origin.SessionID)
+		if err != nil {
+			return nil, false, err
+		}
+		if sess == nil || sess.UserID != origin.User.ID || sess.CredentialID != cred.ID ||
+			sess.IsRevoked() || sess.IsExpired(now) ||
+			!domain.MatchesCredentialSecretDigest(cred.Kind, cred.SecretHash, sess.CredentialHashDigest) {
+			return nil, false, nil
+		}
+	}
+
+	user, err := s.lookupUser(ctx, origin.User.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if user == nil {
+		return nil, false, nil
+	}
+
+	roles, err := s.users.ListUserRoles(ctx, user.ID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	live := domain.NewPrincipal(*user, roles, cred.Kind, cred.ID, cred.Scopes)
+	live.SessionID = origin.SessionID
+	return live, true, nil
+}
+
 func decodeJobEventPayload(ev domain.DomainEvent) (domain.JobEventPayloadV1, bool) {
 	payload, err := domain.DecodeEventPayload[domain.JobEventPayloadV1](ev)
 	if err != nil || strings.TrimSpace(payload.JobID) == "" || payload.Kind.IsInternal() {
@@ -338,28 +474,36 @@ func decodeJobEventPayload(ev domain.DomainEvent) (domain.JobEventPayloadV1, boo
 
 func (s *StreamService) projectJobEvent(
 	ctx context.Context,
-	principal *domain.Principal,
+	origin *domain.Principal,
 	jobIDFilter string,
 	ev domain.DomainEvent,
 	seq int64,
-) (app.StreamEvent, bool, error) {
+) (app.StreamEvent, bool, bool, error) {
 	if !isJobLifecycleEventKind(ev.Kind) {
-		return app.StreamEvent{}, false, nil
+		return app.StreamEvent{}, false, true, nil
 	}
 	payload, ok := decodeJobEventPayload(ev)
 	if !ok {
-		return app.StreamEvent{}, false, nil
+		return app.StreamEvent{}, false, true, nil
 	}
 	if jobIDFilter != "" && payload.JobID != jobIDFilter {
-		return app.StreamEvent{}, false, nil
+		return app.StreamEvent{}, false, true, nil
+	}
+
+	live, valid, err := s.resolveLivePrincipal(ctx, origin)
+	if err != nil {
+		return app.StreamEvent{}, false, false, err
+	}
+	if !valid {
+		return app.StreamEvent{}, false, false, nil
 	}
 
 	job, err := s.lookupJob(ctx, payload.JobID)
 	if err != nil {
-		return app.StreamEvent{}, false, err
+		return app.StreamEvent{}, false, false, err
 	}
-	if job == nil || job.Kind.IsInternal() || !job.VisibleTo(principal) {
-		return app.StreamEvent{}, false, nil
+	if job == nil || job.Kind.IsInternal() || !job.VisibleTo(live) {
+		return app.StreamEvent{}, false, true, nil
 	}
 
 	var publishedAt time.Time
@@ -378,13 +522,57 @@ func (s *StreamService) projectJobEvent(
 	}
 	data, err := json.Marshal(pub)
 	if err != nil {
-		return app.StreamEvent{}, false, err
+		return app.StreamEvent{}, false, false, err
 	}
 	return app.StreamEvent{
 		ID:   strconv.FormatInt(seq, 10),
 		Name: string(ev.Kind),
 		Data: data,
-	}, true, nil
+	}, true, true, nil
+}
+
+func (s *StreamService) handleProgressTick(
+	ctx context.Context,
+	origin *domain.Principal,
+	jobIDFilter string,
+	tick domain.JobProgressTick,
+	emit func(app.StreamEvent) error,
+) (bool, error) {
+	if tick.Kind.IsInternal() {
+		return true, nil
+	}
+	if jobIDFilter != "" && tick.JobID != jobIDFilter {
+		return true, nil
+	}
+
+	live, valid, err := s.resolveLivePrincipal(ctx, origin)
+	if err != nil {
+		return false, err
+	}
+	if !valid {
+		return false, nil
+	}
+
+	job, err := s.lookupJob(ctx, tick.JobID)
+	if err != nil {
+		return false, err
+	}
+	if job == nil || job.Kind.IsInternal() || !job.VisibleTo(live) {
+		return true, nil
+	}
+
+	outTick := tick.Clone()
+	if job.CreatedBy != nil {
+		createdBy := *job.CreatedBy
+		outTick.CreatedBy = &createdBy
+	} else {
+		outTick.CreatedBy = nil
+	}
+
+	if err := emitProgressTick(outTick, emit); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func emitProgressTick(tick domain.JobProgressTick, emit func(app.StreamEvent) error) error {

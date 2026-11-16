@@ -494,7 +494,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	eventRepo := postgres.NewEventRepository(d.pool)
 	jobRepo := postgres.NewJobRepository(d.pool)
 	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
-	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{})
+	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
+		Users:    userRepo,
+		Sessions: sessionRepo,
+	})
 	services := app.NewAuthorizingServices(&app.Services{
 		Setup:       setup,
 		BasicAuth:   basicAuth,

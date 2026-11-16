@@ -34,13 +34,15 @@ type ServerOptions struct {
 
 // Server represents the Tobiten HTTP server daemon.
 type Server struct {
-	cfg        *config.Config
-	logger     *slog.Logger
-	listener   net.Listener
-	httpServer *http.Server
-	mux        *http.ServeMux
-	urlBuilder *URLBuilder
-	registry   module.Registry
+	cfg            *config.Config
+	logger         *slog.Logger
+	listener       net.Listener
+	httpServer     *http.Server
+	mux            *http.ServeMux
+	urlBuilder     *URLBuilder
+	registry       module.Registry
+	shutdownCtx    context.Context
+	cancelShutdown context.CancelFunc
 }
 
 // NewServer initializes a new Server with configured routes and middleware.
@@ -90,7 +92,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	// Core liveness (/healthz) and native REST (/api/v1) resolve through the registry.
 	mountModuleRoutes(mux, reg, ub, logger)
 
-	// Wrap root router with global RequestLogger, URLBuilder, and Auth middleware (ADR-0006 §1, ADR-0018 S1)
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+
+	// Wrap root router with global RequestLogger, shutdown stream context, URLBuilder, and Auth middleware (ADR-0006 §1, ADR-0018 S1)
 	authOpts := middleware.AuthOptions{
 		Registry:        reg,
 		Authenticators:  opts.Authenticators,
@@ -98,11 +102,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		OriginResolver:  ub,
 		Logger:          logger,
 	}
-	handler := middleware.RequestLogger(logger)(
-		URLBuilderMiddleware(ub)(
-			middleware.Auth(authOpts)(mux),
-		),
+	inner := URLBuilderMiddleware(ub)(
+		middleware.Auth(authOpts)(mux),
 	)
+	withShutdown := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner.ServeHTTP(w, r.WithContext(middleware.WithShutdownContext(r.Context(), shutdownCtx)))
+	})
+	handler := middleware.RequestLogger(logger)(withShutdown)
 
 	httpServer := &http.Server{
 		Addr:              listener.Addr().String(),
@@ -112,13 +118,15 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:        cfg,
-		logger:     logger,
-		listener:   listener,
-		httpServer: httpServer,
-		mux:        mux,
-		urlBuilder: ub,
-		registry:   reg,
+		cfg:            cfg,
+		logger:         logger,
+		listener:       listener,
+		httpServer:     httpServer,
+		mux:            mux,
+		urlBuilder:     ub,
+		registry:       reg,
+		shutdownCtx:    shutdownCtx,
+		cancelShutdown: cancelShutdown,
 	}, nil
 }
 
@@ -243,7 +251,7 @@ func (r *fallbackRecorder) WriteHeader(statusCode int) {
 	if r.written {
 		return
 	}
-	if statusCode >= 100 && statusCode <= 199 {
+	if statusCode >= 100 && statusCode <= 199 && statusCode != http.StatusSwitchingProtocols {
 		if !r.passedThrough {
 			r.copyHeadersToUnderlying()
 			r.passedThrough = true
@@ -430,14 +438,21 @@ func (s *Server) Serve() error {
 	return s.httpServer.Serve(s.listener)
 }
 
-// Shutdown gracefully shuts down the server without interrupting active connections,
-// waiting until ctx expires for in-flight requests to complete.
+// Shutdown gracefully shuts down the server without interrupting active ordinary requests,
+// signalling long-lived streaming handlers (such as SSE) to finish and waiting until ctx
+// expires for in-flight requests to complete.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.cancelShutdown != nil {
+		s.cancelShutdown()
+	}
 	return s.httpServer.Shutdown(ctx)
 }
 
 // Close immediately closes the listener and active connections.
 func (s *Server) Close() error {
+	if s.cancelShutdown != nil {
+		s.cancelShutdown()
+	}
 	return s.httpServer.Close()
 }
 

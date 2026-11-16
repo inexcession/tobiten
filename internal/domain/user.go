@@ -378,6 +378,7 @@ type Principal struct {
 	Roles          []Role         `json:"roles"`
 	CredentialID   string         `json:"credential_id"`
 	CredentialKind CredentialKind `json:"credential_kind"`
+	SessionID      string         `json:"session_id,omitempty"`
 	Scopes         []PATScope     `json:"scopes"`
 	Permissions    []Permission   `json:"permissions"`
 }

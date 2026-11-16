@@ -562,3 +562,452 @@ func TestDaemonEventsSSE_RealStreamOrderVisibilityAndLogging(t *testing.T) {
 		t.Fatalf("runDaemon failed: %v", err)
 	}
 }
+
+func openSSEStreamWithCookie(t *testing.T, url string, cookie *http.Cookie) *sseClientStream {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("NewRequest(%s): %v", url, err)
+	}
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		cancel()
+		t.Fatalf("GET %s status = %d, want 200 (body: %s)", url, resp.StatusCode, string(body))
+	}
+
+	s := &sseClientStream{
+		resp:   resp,
+		cancel: cancel,
+		frames: make(chan sseFrame, 64),
+		errCh:  make(chan error, 1),
+	}
+	go func() {
+		defer close(s.frames)
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		var cur sseFrame
+		var dataLines []string
+		hasFields := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				if hasFields {
+					cur.Data = strings.Join(dataLines, "\n")
+					s.frames <- cur
+					cur = sseFrame{}
+					dataLines = nil
+					hasFields = false
+				}
+				continue
+			}
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			field, val, hasColon := strings.Cut(line, ":")
+			if hasColon {
+				val = strings.TrimPrefix(val, " ")
+			}
+			switch field {
+			case "id":
+				cur.ID = val
+				hasFields = true
+			case "event":
+				cur.Event = val
+				hasFields = true
+			case "data":
+				dataLines = append(dataLines, val)
+				hasFields = true
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			s.errCh <- err
+		}
+	}()
+	t.Cleanup(func() {
+		s.close()
+	})
+	return s
+}
+
+func (s *sseClientStream) waitClosed(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case f, ok := <-s.frames:
+			if !ok {
+				return
+			}
+			t.Fatalf("expected SSE stream to close without delivering post-revocation frame %+v", f)
+		case <-deadline:
+			t.Fatalf("timed out after %s waiting for revoked SSE stream to close", timeout)
+		}
+	}
+}
+
+func TestDaemonEventsSSE_OpenStreamRoleDowngradeRevocationAndGracefulShutdown(t *testing.T) {
+	db := testdb.New(t)
+	cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron([]string{
+		"TOBITEN_STORAGE_MODE=postgres",
+		"TOBITEN_DATABASE_URL=" + db.URL,
+		"TOBITEN_ADMIN_USER=sysadmin",
+		"TOBITEN_ADMIN_PASS=admin-secret-123",
+		"TOBITEN_BASE_URL=http://localhost:8080/comics",
+		"TOBITEN_LOG_FORMAT=json",
+	}))
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	originalRegistry := buildDaemonRegistry
+	originalServer := startServer
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		buildDaemonRegistry = originalRegistry
+		startServer = originalServer
+		slog.SetDefault(originalLogger)
+	})
+
+	var mu sync.Mutex
+	var sharedRunner *jobs.Runner
+	slowStarted := make(chan struct{})
+	allowSlowFinish := make(chan struct{})
+
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+		reg := BuildRegistryWithServices(cfg, services)
+		jobRepo := postgres.NewJobRepository(db.Pool)
+
+		probeMod := &testJobRegistrarModule{
+			SimpleModule: &module.SimpleModule{
+				ModuleName: "sse-live-auth-probe",
+				Jobs: []module.JobKind{
+					module.JobKindSpec{Kind: domain.JobKindScan, Policy: domain.JobResumeCheckpoint, Workers: 1},
+				},
+				Mounts: []module.RouteMount{
+					{
+						ModuleName: "sse-live-auth-probe",
+						Prefix:     "/api/v1/test-jobs",
+						Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if r.Method == http.MethodGet && r.URL.Path == "/api/v1/test-jobs/slow" {
+								close(slowStarted)
+								select {
+								case <-allowSlowFinish:
+								case <-r.Context().Done():
+									http.Error(w, "unexpected request cancellation", http.StatusRequestTimeout)
+									return
+								}
+								w.WriteHeader(http.StatusOK)
+								_, _ = w.Write([]byte("slow-ok"))
+								return
+							}
+							if r.Method != http.MethodPost || r.URL.Path != "/api/v1/test-jobs/trigger" {
+								http.NotFound(w, r)
+								return
+							}
+							p := domain.MustPrincipalFromContext(r.Context())
+							var body struct {
+								Automatic bool `json:"automatic"`
+							}
+							if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+								middleware.WriteAppError(w, r, app.ErrInvalidInput)
+								return
+							}
+							var createdBy *string
+							if !body.Automatic {
+								uid := p.User.ID
+								createdBy = &uid
+							}
+							mu.Lock()
+							notifier := sharedRunner
+							mu.Unlock()
+							middleware.HandleJobTrigger(w, r, func(ctx context.Context) (string, error) {
+								return jobs.TriggerJob(ctx, jobRepo, notifier, jobs.TriggerRequest{
+									Kind:      domain.JobKindScan,
+									Payload:   json.RawMessage(`{"source":"live-auth-probe"}`),
+									CreatedBy: createdBy,
+								}, time.Now().UTC())
+							})
+						}),
+					},
+				},
+			},
+			register: func(r *jobs.Runner) error {
+				mu.Lock()
+				sharedRunner = r
+				mu.Unlock()
+				return r.RegisterKind(jobs.KindConfig{
+					Kind:         domain.JobKindScan,
+					ResumePolicy: domain.JobResumeCheckpoint,
+					Handler: jobs.HandlerFunc(func(execCtx context.Context, exec *jobs.Execution) error {
+						exec.ReportProgress(execCtx, 1, "/library/live.cbz")
+						return nil
+					}),
+				})
+			},
+		}
+		if err := reg.Register(probeMod); err != nil {
+			t.Fatalf("register probeMod: %v", err)
+		}
+		return reg
+	}
+
+	daemonCtx, cancelDaemon := context.WithCancel(context.Background())
+	defer cancelDaemon()
+
+	idleSSEEOF := make(chan error, 1)
+	slowResultCh := make(chan struct {
+		status int
+		body   string
+		err    error
+	}, 1)
+
+	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
+		reg := buildDaemonRegistry(cfg, services)
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:   cfg,
+			Logger:   logger,
+			Registry: reg,
+		})
+		if err != nil {
+			return err
+		}
+		srvDone := make(chan error, 1)
+		go func() {
+			srvDone <- srv.Run(ctx)
+		}()
+
+		baseURL := srv.URL()
+		userRepo := postgres.NewUserRepository(db.Pool)
+		sessionRepo := postgres.NewSessionRepository(db.Pool)
+
+		demotedAdmin := createTestUserWithPassword(ctx, t, userRepo, "demoted-sse-admin", "demoted-pass-123", domain.RoleAdminID)
+		revokedUser := createTestUserWithPassword(ctx, t, userRepo, "revoked-sse-user", "revoked-pass-123", domain.RoleAdminID)
+		stayAdmin := createTestUserWithPassword(ctx, t, userRepo, "stay-sse-admin", "stay-pass-123", domain.RoleAdminID)
+
+		revokedPAT := createTestPAT(ctx, t, userRepo, revokedUser.ID, []domain.PATScope{domain.ScopeAdmin})
+		revokedCreds, err := userRepo.ListCredentialsByUserID(ctx, revokedUser.ID)
+		if err != nil {
+			t.Fatalf("ListCredentialsByUserID: %v", err)
+		}
+		var revokedPATCredID string
+		for _, c := range revokedCreds {
+			if c.Kind == domain.CredentialKindPAT {
+				revokedPATCredID = c.ID
+				break
+			}
+		}
+		if revokedPATCredID == "" {
+			t.Fatal("failed to locate PAT credential ID")
+		}
+
+		// Session-backed SSE user whose session is revoked while stream stays open.
+		sessUser := createTestUserWithPassword(ctx, t, userRepo, "sess-sse-user", "sess-pass-123", domain.RoleAdminID)
+		_, sessCookie, _ := performLogin(t, srv.Handler(), "/api/v1/auth/login", `{"username":"sess-sse-user","password":"sess-pass-123"}`, "198.51.100.88:5000", nil)
+
+		demotedStream := openSSEStream(t, baseURL+"/api/v1/events", demotedAdmin.Username, "demoted-pass-123", "")
+		revokedPATStream := openSSEStream(t, baseURL+"/api/v1/events", "", "", revokedPAT)
+		revokedSessStream := openSSEStreamWithCookie(t, baseURL+"/api/v1/events", sessCookie)
+		stayAdminStream := openSSEStream(t, baseURL+"/api/v1/events", stayAdmin.Username, "stay-pass-123", "")
+
+		// 1. Downgrade demotedAdmin -> Reader, revoke revokedPAT, and revoke sessCookie's session while all streams are open.
+		if err := userRepo.RemoveUserRole(ctx, demotedAdmin.ID, domain.RoleAdminID); err != nil {
+			t.Fatalf("RemoveUserRole: %v", err)
+		}
+		if err := userRepo.AssignUserRole(ctx, demotedAdmin.ID, domain.RoleReaderID); err != nil {
+			t.Fatalf("AssignUserRole: %v", err)
+		}
+		if err := userRepo.RevokeCredential(ctx, revokedPATCredID, time.Now().UTC()); err != nil {
+			t.Fatalf("RevokeCredential(PAT): %v", err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1`, sessUser.ID); err != nil {
+			t.Fatalf("revoke user session: %v", err)
+		}
+		_ = sessionRepo
+
+		httpClient := &http.Client{Timeout: 5 * time.Second}
+		trigger := func(user, pass string, automatic bool) string {
+			body := `{"automatic":false}`
+			if automatic {
+				body = `{"automatic":true}`
+			}
+			req, reqErr := http.NewRequest(http.MethodPost, baseURL+"/api/v1/test-jobs/trigger", strings.NewReader(body))
+			if reqErr != nil {
+				t.Fatalf("NewRequest trigger: %v", reqErr)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.SetBasicAuth(user, pass)
+			resp, doErr := httpClient.Do(req)
+			if doErr != nil {
+				t.Fatalf("POST trigger: %v", doErr)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("trigger status = %d, want 202", resp.StatusCode)
+			}
+			var out middleware.JobAcceptedResponse
+			if decErr := json.NewDecoder(resp.Body).Decode(&out); decErr != nil {
+				t.Fatalf("decode trigger: %v", decErr)
+			}
+			return out.JobID
+		}
+
+		// 2. Trigger an automatic job and a revokedUser-owned job:
+		//    - revokedPATStream and revokedSessStream must close without delivering any post-revocation events.
+		//    - demotedStream must NOT receive the automatic job or revokedUser's job.
+		//    - stayAdminStream (positive control) receives both.
+		autoJobID := trigger(stayAdmin.Username, "stay-pass-123", true)
+		revokedOwnJobID := trigger(revokedUser.Username, "revoked-pass-123", false)
+
+		revokedPATStream.waitClosed(t, 4*time.Second)
+		revokedSessStream.waitClosed(t, 4*time.Second)
+
+		// Positive control: demotedAdmin triggers their own job and still receives it on demotedStream
+		// as their very first lifecycle/progress job (proving autoJobID and revokedOwnJobID were filtered out).
+		demotedOwnJobID := trigger(demotedAdmin.Username, "demoted-pass-123", false)
+
+		var demotedSeen []string
+		for len(demotedSeen) < 2 {
+			f := demotedStream.nextFrame(t)
+			if f.Event == domain.ProgressTickEventName {
+				var tick domain.JobProgressTick
+				if err := json.Unmarshal([]byte(f.Data), &tick); err != nil {
+					t.Fatalf("unmarshal demoted tick: %v", err)
+				}
+				if tick.JobID != demotedOwnJobID {
+					t.Fatalf("demoted admin leaked progress tick for %q (want %q)", tick.JobID, demotedOwnJobID)
+				}
+				continue
+			}
+			var pub app.PublicEvent
+			if err := json.Unmarshal([]byte(f.Data), &pub); err != nil {
+				t.Fatalf("unmarshal demoted frame: %v", err)
+			}
+			if pub.AggregateID != demotedOwnJobID {
+				t.Fatalf("demoted admin received unauthorized job %q (%s), want only %q", pub.AggregateID, f.Event, demotedOwnJobID)
+			}
+			demotedSeen = append(demotedSeen, f.Event)
+		}
+
+		staySeen := make(map[string]int)
+		for staySeen[autoJobID] < 2 || staySeen[revokedOwnJobID] < 2 || staySeen[demotedOwnJobID] < 2 {
+			f := stayAdminStream.nextFrame(t)
+			if f.Event == domain.ProgressTickEventName {
+				continue
+			}
+			var pub app.PublicEvent
+			if err := json.Unmarshal([]byte(f.Data), &pub); err != nil {
+				t.Fatalf("unmarshal stayAdmin frame: %v", err)
+			}
+			staySeen[pub.AggregateID]++
+		}
+
+		// Close active test streams before opening the dedicated unclosed-SSE shutdown probe.
+		demotedStream.close()
+
+		// 3. Leave stayAdminStream's underlying HTTP connection open? Even clearer: open a fresh raw http.Get SSE client
+		//    that is NEVER closed by the test before cancelDaemon(), alongside an in-flight /slow request!
+		idleReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/events", nil)
+		if err != nil {
+			t.Fatalf("NewRequest idle SSE: %v", err)
+		}
+		idleReq.SetBasicAuth(stayAdmin.Username, "stay-pass-123")
+		idleResp, err := (&http.Client{}).Do(idleReq)
+		if err != nil {
+			t.Fatalf("open idle SSE: %v", err)
+		}
+		defer idleResp.Body.Close()
+		if idleResp.StatusCode != http.StatusOK {
+			t.Fatalf("idle SSE status = %d, want 200", idleResp.StatusCode)
+		}
+		go func() {
+			_, rErr := io.ReadAll(idleResp.Body)
+			idleSSEEOF <- rErr
+		}()
+
+		go func() {
+			req, reqErr := http.NewRequest(http.MethodGet, baseURL+"/api/v1/test-jobs/slow", nil)
+			if reqErr != nil {
+				slowResultCh <- struct {
+					status int
+					body   string
+					err    error
+				}{err: reqErr}
+				return
+			}
+			req.SetBasicAuth(stayAdmin.Username, "stay-pass-123")
+			resp, doErr := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+			if doErr != nil {
+				slowResultCh <- struct {
+					status int
+					body   string
+					err    error
+				}{err: doErr}
+				return
+			}
+			defer resp.Body.Close()
+			b, rErr := io.ReadAll(resp.Body)
+			slowResultCh <- struct {
+				status int
+				body   string
+				err    error
+			}{status: resp.StatusCode, body: string(b), err: rErr}
+		}()
+
+		select {
+		case <-slowStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for /slow to start")
+		}
+
+		// Trigger daemon shutdown while both idleResp and stayAdminStream remain open on the client side!
+		cancelDaemon()
+
+		// Idle SSE client must receive clean EOF promptly when serving stops.
+		select {
+		case rErr := <-idleSSEEOF:
+			if rErr != nil {
+				t.Fatalf("idle SSE ReadAll err = %v, want clean EOF", rErr)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for idle SSE client to close during daemon shutdown")
+		}
+
+		// Ordinary in-flight /slow request must still be alive until allowed to finish.
+		select {
+		case res := <-slowResultCh:
+			t.Fatalf("/slow finished prematurely on shutdown: %+v", res)
+		case srvErr := <-srvDone:
+			t.Fatalf("srv.Run returned before in-flight /slow finished: %v", srvErr)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(allowSlowFinish)
+		select {
+		case res := <-slowResultCh:
+			if res.err != nil || res.status != http.StatusOK || res.body != "slow-ok" {
+				t.Fatalf("/slow result = %+v, want 200 slow-ok", res)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for /slow completion")
+		}
+
+		return <-srvDone
+	}
+
+	if err := runDaemon(daemonCtx, cfg, startServer); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("runDaemon graceful shutdown failed: %v", err)
+	}
+}

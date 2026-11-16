@@ -142,6 +142,32 @@ func (q *Queries) GetCredentialForSessionLock(ctx context.Context, id string) (G
 	return i, err
 }
 
+const getSessionByID = `-- name: GetSessionByID :one
+SELECT id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, created_at, last_used_at, expires_at, revoked_at
+FROM sessions
+WHERE id = $1
+LIMIT 1
+`
+
+func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error) {
+	row := q.db.QueryRow(ctx, getSessionByID, id)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.CredentialID,
+		&i.Kind,
+		&i.TokenHash,
+		&i.CsrfTokenHash,
+		&i.CredentialHashDigest,
+		&i.CreatedAt,
+		&i.LastUsedAt,
+		&i.ExpiresAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
 SELECT id, user_id, credential_id, kind, token_hash, csrf_token_hash, credential_hash_digest, created_at, last_used_at, expires_at, revoked_at
 FROM sessions
