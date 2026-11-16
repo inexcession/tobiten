@@ -92,6 +92,7 @@ SET state = 'SUCCEEDED',
     finished_at = $2
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $3
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;
@@ -105,6 +106,7 @@ SET state = 'QUEUED',
     finished_at = NULL
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $5
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;
@@ -117,6 +119,7 @@ SET state = 'FAILED',
     finished_at = $3
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $4
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;
@@ -125,11 +128,24 @@ RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
 UPDATE jobs
 SET state = 'CANCELLED',
     cancel_requested = TRUE,
-    last_error = COALESCE(sqlc.narg(last_error), last_error),
+    last_error = COALESCE(sqlc.narg(last_error)::text, last_error),
     updated_at = $2,
     finished_at = $2
 WHERE id = $1
-  AND state IN ('QUEUED', 'RUNNING')
+  AND state = 'RUNNING'
+  AND attempts = $3
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: CancelQueuedJob :one
+UPDATE jobs
+SET state = 'CANCELLED',
+    cancel_requested = TRUE,
+    updated_at = $2,
+    finished_at = $2
+WHERE id = $1
+  AND state = 'QUEUED'
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;

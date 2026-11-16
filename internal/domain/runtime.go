@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -15,7 +16,8 @@ var (
 	ErrEmptyJobKind           = errors.New("job kind cannot be empty")
 	ErrInvalidJobState        = errors.New("invalid job state")
 	ErrInvalidJobTransition   = errors.New("invalid job state transition")
-	ErrInvalidJobAttempts     = errors.New("job attempts must be non-negative and max_attempts must be positive")
+	ErrStaleJobAttempt        = errors.New("stale job attempt")
+	ErrInvalidJobAttempts     = errors.New("job attempts must be non-negative and max_attempts must be positive within 32-bit integer bounds")
 	ErrInvalidJobJSON         = errors.New("job payload and checkpoint must be valid JSON")
 	ErrEmptyDedupeKey         = errors.New("job dedupe_key cannot be empty when present")
 	ErrEmptyEventKind         = errors.New("domain event kind cannot be empty")
@@ -151,7 +153,7 @@ func (j *Job) Validate() error {
 	if !j.State.IsValid() {
 		return fmt.Errorf("%w: %q", ErrInvalidJobState, j.State)
 	}
-	if j.Attempts < 0 || j.MaxAttempts < 1 {
+	if j.Attempts < 0 || j.MaxAttempts < 1 || j.Attempts > math.MaxInt32 || j.MaxAttempts > math.MaxInt32 {
 		return ErrInvalidJobAttempts
 	}
 	if j.DedupeKey != nil && strings.TrimSpace(*j.DedupeKey) == "" {

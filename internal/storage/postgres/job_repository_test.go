@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -149,6 +150,18 @@ func TestJobRepository_EnqueueGetListAndNilDedupe(t *testing.T) {
 	if _, err := repo.Enqueue(ctx, &domain.Job{Kind: domain.JobKindScan, DedupeKey: &blankDedupe}); !errors.Is(err, domain.ErrEmptyDedupeKey) {
 		t.Fatalf("expected ErrEmptyDedupeKey for blank dedupe_key, got %v", err)
 	}
+	for _, badMax := range []int{-1, math.MaxInt32 + 1, (1 << 32) + 1, math.MaxInt} {
+		overflowDedupe := fmt.Sprintf("SCAN:overflow-%d", badMax)
+		badJob := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: badMax, DedupeKey: &overflowDedupe}
+		if _, err := repo.Enqueue(ctx, badJob); !errors.Is(err, domain.ErrInvalidJobAttempts) {
+			t.Fatalf("Enqueue(MaxAttempts=%d) = %v, want ErrInvalidJobAttempts", badMax, err)
+		}
+		// Invalid request must not persist or occupy the dedupe key.
+		validAtBoundary := &domain.Job{Kind: domain.JobKindScan, MaxAttempts: math.MaxInt32, DedupeKey: &overflowDedupe}
+		if createdBoundary, err := repo.Enqueue(ctx, validAtBoundary); err != nil || !createdBoundary {
+			t.Fatalf("Enqueue(MaxAttempts=MaxInt32, dedupe=%s) = (%v, %v), want (true, nil)", overflowDedupe, createdBoundary, err)
+		}
+	}
 }
 
 func TestJobRepository_DedupeAndTerminalReuse(t *testing.T) {
@@ -208,7 +221,7 @@ func TestJobRepository_DedupeAndTerminalReuse(t *testing.T) {
 	}
 
 	// Transition to terminal SUCCEEDED; dedupe_key is released for reuse.
-	if _, err := repo.MarkSucceeded(ctx, first.ID, t0.Add(4*time.Second)); err != nil {
+	if _, err := repo.MarkSucceeded(ctx, first.ID, claimed.Attempts, t0.Add(4*time.Second)); err != nil {
 		t.Fatalf("MarkSucceeded: %v", err)
 	}
 
@@ -227,10 +240,11 @@ func TestJobRepository_DedupeAndTerminalReuse(t *testing.T) {
 	}
 
 	// Terminal FAILED also releases dedupe_key.
-	if _, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(6*time.Second)); err != nil {
+	claimedFourth, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(6*time.Second))
+	if err != nil {
 		t.Fatalf("ClaimNext fourth: %v", err)
 	}
-	failed, err := repo.FailOrRetry(ctx, fourth.ID, "boom", time.Time{}, t0.Add(7*time.Second))
+	failed, err := repo.FailOrRetry(ctx, fourth.ID, claimedFourth.Attempts, "boom", time.Time{}, t0.Add(7*time.Second))
 	if err != nil {
 		t.Fatalf("FailOrRetry fourth: %v", err)
 	}
@@ -486,7 +500,7 @@ func TestJobRepository_AttemptsBackoffAndMaxAttempts(t *testing.T) {
 	// Fail attempt 1 with explicit retryAt (+30s).
 	tFail1 := tClaim1.Add(time.Second)
 	explicitRetryAt := tFail1.Add(30 * time.Second)
-	retried1, err := repo.FailOrRetry(ctx, job.ID, "io timeout", explicitRetryAt, tFail1)
+	retried1, err := repo.FailOrRetry(ctx, job.ID, claimed.Attempts, "io timeout", explicitRetryAt, tFail1)
 	if err != nil {
 		t.Fatalf("FailOrRetry attempt 1: %v", err)
 	}
@@ -517,7 +531,7 @@ func TestJobRepository_AttemptsBackoffAndMaxAttempts(t *testing.T) {
 	// Fail attempt 2 with zero retryAt -> uses default exponential backoff for attempt 2 (10s).
 	tFail2 := explicitRetryAt.Add(time.Second)
 	expectedDefaultRetryAt := tFail2.Add(domain.JobRetryBackoff(2))
-	retried2, err := repo.FailOrRetry(ctx, job.ID, "disk busy", time.Time{}, tFail2)
+	retried2, err := repo.FailOrRetry(ctx, job.ID, claimed2.Attempts, "disk busy", time.Time{}, tFail2)
 	if err != nil {
 		t.Fatalf("FailOrRetry attempt 2: %v", err)
 	}
@@ -541,7 +555,7 @@ func TestJobRepository_AttemptsBackoffAndMaxAttempts(t *testing.T) {
 
 	// Fail attempt 3 -> max_attempts reached -> moves to FAILED.
 	tFail3 := expectedDefaultRetryAt.Add(time.Second)
-	failed, err := repo.FailOrRetry(ctx, job.ID, "corrupt archive", time.Time{}, tFail3)
+	failed, err := repo.FailOrRetry(ctx, job.ID, claimed3.Attempts, "corrupt archive", time.Time{}, tFail3)
 	if err != nil {
 		t.Fatalf("FailOrRetry attempt 3: %v", err)
 	}
@@ -566,16 +580,18 @@ func TestJobRepository_AttemptsBackoffAndMaxAttempts(t *testing.T) {
 	if _, err := repo.Enqueue(ctx, retrySuccessJob); err != nil {
 		t.Fatalf("Enqueue retrySuccessJob: %v", err)
 	}
-	if _, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0); err != nil {
+	rs1, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0)
+	if err != nil {
 		t.Fatalf("ClaimNext 1: %v", err)
 	}
-	if _, err := repo.FailOrRetry(ctx, retrySuccessJob.ID, "transient", t0.Add(time.Second), t0); err != nil {
+	if _, err := repo.FailOrRetry(ctx, retrySuccessJob.ID, rs1.Attempts, "transient", t0.Add(time.Second), t0); err != nil {
 		t.Fatalf("FailOrRetry: %v", err)
 	}
-	if _, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0.Add(time.Second)); err != nil {
+	rs2, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0.Add(time.Second))
+	if err != nil {
 		t.Fatalf("ClaimNext 2: %v", err)
 	}
-	succeeded, err := repo.MarkSucceeded(ctx, retrySuccessJob.ID, t0.Add(2*time.Second))
+	succeeded, err := repo.MarkSucceeded(ctx, retrySuccessJob.ID, rs2.Attempts, t0.Add(2*time.Second))
 	if err != nil {
 		t.Fatalf("MarkSucceeded: %v", err)
 	}
@@ -623,7 +639,8 @@ func TestJobRepository_CancelRequestedAndStateMachine(t *testing.T) {
 	if _, err := repo.Enqueue(ctx, runningJob); err != nil {
 		t.Fatalf("Enqueue runningJob: %v", err)
 	}
-	if _, err := repo.ClaimNext(ctx, domain.JobKindPurge, t0.Add(4*time.Second)); err != nil {
+	claimedRunning, err := repo.ClaimNext(ctx, domain.JobKindPurge, t0.Add(4*time.Second))
+	if err != nil {
 		t.Fatalf("ClaimNext runningJob: %v", err)
 	}
 
@@ -648,7 +665,7 @@ func TestJobRepository_CancelRequestedAndStateMachine(t *testing.T) {
 
 	// Worker observes cancellation and marks cancelled.
 	cancelNote := "cancelled at safe point"
-	markedCancelled, err := repo.MarkCancelled(ctx, runningJob.ID, &cancelNote, t0.Add(7*time.Second))
+	markedCancelled, err := repo.MarkCancelled(ctx, runningJob.ID, claimedRunning.Attempts, &cancelNote, t0.Add(7*time.Second))
 	if err != nil {
 		t.Fatalf("MarkCancelled: %v", err)
 	}
@@ -665,13 +682,14 @@ func TestJobRepository_CancelRequestedAndStateMachine(t *testing.T) {
 	if _, err := repo.Enqueue(ctx, cancelOnFailJob); err != nil {
 		t.Fatalf("Enqueue cancelOnFailJob: %v", err)
 	}
-	if _, err := repo.ClaimNext(ctx, domain.JobKindPurge, t0.Add(9*time.Second)); err != nil {
+	claimedCancelOnFail, err := repo.ClaimNext(ctx, domain.JobKindPurge, t0.Add(9*time.Second))
+	if err != nil {
 		t.Fatalf("ClaimNext cancelOnFailJob: %v", err)
 	}
 	if _, err := repo.RequestCancel(ctx, cancelOnFailJob.ID, t0.Add(10*time.Second)); err != nil {
 		t.Fatalf("RequestCancel cancelOnFailJob: %v", err)
 	}
-	afterFail, err := repo.FailOrRetry(ctx, cancelOnFailJob.ID, "context canceled", time.Time{}, t0.Add(11*time.Second))
+	afterFail, err := repo.FailOrRetry(ctx, cancelOnFailJob.ID, claimedCancelOnFail.Attempts, "context canceled", time.Time{}, t0.Add(11*time.Second))
 	if err != nil {
 		t.Fatalf("FailOrRetry on cancel_requested job: %v", err)
 	}
@@ -679,37 +697,32 @@ func TestJobRepository_CancelRequestedAndStateMachine(t *testing.T) {
 		t.Fatalf("expected CANCELLED instead of retry, got %+v", afterFail)
 	}
 
-	// 4. Invalid transitions return domain.ErrInvalidJobTransition; MarkCancelled works on QUEUED too.
-	queuedDirectCancel := &domain.Job{Kind: domain.JobKindPurge, CreatedAt: t0.Add(11 * time.Second)}
-	if _, err := repo.Enqueue(ctx, queuedDirectCancel); err != nil {
-		t.Fatalf("Enqueue queuedDirectCancel: %v", err)
-	}
-	if res, err := repo.MarkCancelled(ctx, queuedDirectCancel.ID, nil, t0.Add(11*time.Second)); err != nil || res.State != domain.JobStateCancelled {
-		t.Fatalf("MarkCancelled on QUEUED = (%+v, %v), want CANCELLED", res, err)
-	}
-
+	// 4. Invalid transitions return domain.ErrInvalidJobTransition.
 	queuedOnly := &domain.Job{Kind: domain.JobKindPurge, CreatedAt: t0.Add(12 * time.Second)}
 	if _, err := repo.Enqueue(ctx, queuedOnly); err != nil {
 		t.Fatalf("Enqueue queuedOnly: %v", err)
 	}
-	if _, err := repo.MarkSucceeded(ctx, queuedOnly.ID, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+	if _, err := repo.MarkSucceeded(ctx, queuedOnly.ID, 1, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 		t.Fatalf("MarkSucceeded on QUEUED = %v, want ErrInvalidJobTransition", err)
 	}
-	if _, err := repo.FailOrRetry(ctx, queuedOnly.ID, "err", time.Time{}, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+	if _, err := repo.FailOrRetry(ctx, queuedOnly.ID, 1, "err", time.Time{}, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 		t.Fatalf("FailOrRetry on QUEUED = %v, want ErrInvalidJobTransition", err)
+	}
+	if _, err := repo.MarkCancelled(ctx, queuedOnly.ID, 1, nil, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("MarkCancelled on QUEUED = %v, want ErrInvalidJobTransition", err)
 	}
 
 	for _, terminalID := range []string{cancelledQueued.ID, markedCancelled.ID} {
-		if _, err := repo.MarkSucceeded(ctx, terminalID, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		if _, err := repo.MarkSucceeded(ctx, terminalID, 1, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 			t.Fatalf("MarkSucceeded on terminal %s = %v, want ErrInvalidJobTransition", terminalID, err)
 		}
-		if _, err := repo.FailOrRetry(ctx, terminalID, "err", time.Time{}, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		if _, err := repo.FailOrRetry(ctx, terminalID, 1, "err", time.Time{}, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 			t.Fatalf("FailOrRetry on terminal %s = %v, want ErrInvalidJobTransition", terminalID, err)
 		}
 		if _, err := repo.RequestCancel(ctx, terminalID, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 			t.Fatalf("RequestCancel on terminal %s = %v, want ErrInvalidJobTransition", terminalID, err)
 		}
-		if _, err := repo.MarkCancelled(ctx, terminalID, nil, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		if _, err := repo.MarkCancelled(ctx, terminalID, 1, nil, t0); !errors.Is(err, domain.ErrInvalidJobTransition) {
 			t.Fatalf("MarkCancelled on terminal %s = %v, want ErrInvalidJobTransition", terminalID, err)
 		}
 	}
@@ -728,5 +741,112 @@ func TestJobRepository_CancelRequestedAndStateMachine(t *testing.T) {
 	}
 	if _, err := repo.GetJobByID(ctx, rolledBackID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected rolled-back job not found, got %v", err)
+	}
+}
+
+func TestJobRepository_StaleWorkerOutcomePreservesNewerClaim(t *testing.T) {
+	t.Parallel()
+	_, repo, _ := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC)
+	dedupe := "SCRAPE:stale-outcome"
+	job := &domain.Job{
+		Kind:        domain.JobKindScrape,
+		MaxAttempts: 3,
+		DedupeKey:   &dedupe,
+		CreatedAt:   t0,
+	}
+	if _, err := repo.Enqueue(ctx, job); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Worker A claims attempt 1.
+	claim1, err := repo.ClaimNext(ctx, domain.JobKindScrape, t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext attempt 1: %v", err)
+	}
+	if claim1.Attempts != 1 {
+		t.Fatalf("expected attempt 1, got %d", claim1.Attempts)
+	}
+
+	// Invalid attempt numbers on RUNNING job are rejected and preserve claim 1.
+	for _, badAttempt := range []int{0, -1, math.MaxInt32 + 1} {
+		if _, err := repo.MarkSucceeded(ctx, job.ID, badAttempt, t0.Add(2*time.Second)); !errors.Is(err, domain.ErrInvalidJobAttempts) {
+			t.Fatalf("MarkSucceeded(attempt=%d) = %v, want ErrInvalidJobAttempts", badAttempt, err)
+		}
+	}
+	if _, err := repo.MarkSucceeded(ctx, job.ID, 2, t0.Add(2*time.Second)); !errors.Is(err, domain.ErrStaleJobAttempt) {
+		t.Fatalf("MarkSucceeded(ahead attempt=2) = %v, want ErrStaleJobAttempt", err)
+	}
+
+	// Attempt 1 fails and is retried; Worker B claims attempt 2.
+	tRetry := t0.Add(5 * time.Second)
+	if _, err := repo.FailOrRetry(ctx, job.ID, claim1.Attempts, "attempt-1-err", tRetry, t0.Add(3*time.Second)); err != nil {
+		t.Fatalf("FailOrRetry attempt 1: %v", err)
+	}
+
+	// Stale Worker A reporting again while QUEUED is rejected.
+	if _, err := repo.MarkSucceeded(ctx, job.ID, claim1.Attempts, t0.Add(4*time.Second)); !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("MarkSucceeded on QUEUED job = %v, want ErrInvalidJobTransition", err)
+	}
+
+	claim2, err := repo.ClaimNext(ctx, domain.JobKindScrape, tRetry)
+	if err != nil {
+		t.Fatalf("ClaimNext attempt 2: %v", err)
+	}
+	if claim2.Attempts != 2 || claim2.State != domain.JobStateRunning {
+		t.Fatalf("expected RUNNING attempt 2, got %+v", claim2)
+	}
+
+	assertClaim2Preserved := func(step string) {
+		t.Helper()
+		cur, err := repo.GetJobByID(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("%s: GetJobByID: %v", step, err)
+		}
+		if cur.State != domain.JobStateRunning ||
+			cur.Attempts != 2 ||
+			cur.CancelRequested ||
+			cur.FinishedAt != nil ||
+			cur.DedupeKey == nil || *cur.DedupeKey != dedupe ||
+			cur.LastError == nil || *cur.LastError != "attempt-1-err" ||
+			!cur.UpdatedAt.Equal(tRetry) {
+			t.Fatalf("%s: newer claim mutated: %+v", step, cur)
+		}
+		probe := &domain.Job{Kind: domain.JobKindScrape, DedupeKey: &dedupe, CreatedAt: tRetry}
+		if probeCreated, err := repo.Enqueue(ctx, probe); err != nil || probeCreated || probe.ID != job.ID {
+			t.Fatalf("%s: active dedupe_key check = (created=%v, id=%s, err=%v), want (false, %s, nil)", step, probeCreated, probe.ID, err, job.ID)
+		}
+	}
+
+	// Stale Worker A (holding attempt 1) tries all three outcome methods; all fail and preserve attempt 2.
+	tLate := tRetry.Add(time.Second)
+	if _, err := repo.MarkSucceeded(ctx, job.ID, claim1.Attempts, tLate); !errors.Is(err, domain.ErrStaleJobAttempt) || !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("stale MarkSucceeded = %v, want ErrStaleJobAttempt & ErrInvalidJobTransition", err)
+	}
+	assertClaim2Preserved("after stale MarkSucceeded")
+
+	if _, err := repo.FailOrRetry(ctx, job.ID, claim1.Attempts, "stale-err", tLate.Add(time.Minute), tLate); !errors.Is(err, domain.ErrStaleJobAttempt) || !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("stale FailOrRetry = %v, want ErrStaleJobAttempt & ErrInvalidJobTransition", err)
+	}
+	assertClaim2Preserved("after stale FailOrRetry")
+
+	staleCancelNote := "stale cancel"
+	if _, err := repo.MarkCancelled(ctx, job.ID, claim1.Attempts, &staleCancelNote, tLate); !errors.Is(err, domain.ErrStaleJobAttempt) || !errors.Is(err, domain.ErrInvalidJobTransition) {
+		t.Fatalf("stale MarkCancelled = %v, want ErrStaleJobAttempt & ErrInvalidJobTransition", err)
+	}
+	assertClaim2Preserved("after stale MarkCancelled")
+
+	// Worker B (holding current attempt 2) completes the job cleanly.
+	tDone := tRetry.Add(2 * time.Second)
+	done, err := repo.MarkSucceeded(ctx, job.ID, claim2.Attempts, tDone)
+	if err != nil {
+		t.Fatalf("current worker MarkSucceeded: %v", err)
+	}
+	if done.State != domain.JobStateSucceeded || done.Attempts != 2 || done.LastError != nil || done.FinishedAt == nil || !done.FinishedAt.Equal(tDone) {
+		t.Fatalf("unexpected SUCCEEDED job: %+v", done)
 	}
 }

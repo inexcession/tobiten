@@ -12,6 +12,7 @@ import (
 type Querier interface {
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
+	CancelQueuedJob(ctx context.Context, arg CancelQueuedJobParams) (Job, error)
 	ClaimJobByID(ctx context.Context, arg ClaimJobByIDParams) (Job, error)
 	CountUsers(ctx context.Context) (int64, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error

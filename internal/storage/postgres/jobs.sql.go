@@ -12,6 +12,48 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelQueuedJob = `-- name: CancelQueuedJob :one
+UPDATE jobs
+SET state = 'CANCELLED',
+    cancel_requested = TRUE,
+    updated_at = $2,
+    finished_at = $2
+WHERE id = $1
+  AND state = 'QUEUED'
+RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
+          cancel_requested, last_error, created_by, dedupe_key,
+          run_after, created_at, started_at, updated_at, finished_at
+`
+
+type CancelQueuedJobParams struct {
+	ID        string
+	UpdatedAt time.Time
+}
+
+func (q *Queries) CancelQueuedJob(ctx context.Context, arg CancelQueuedJobParams) (Job, error) {
+	row := q.db.QueryRow(ctx, cancelQueuedJob, arg.ID, arg.UpdatedAt)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const claimJobByID = `-- name: ClaimJobByID :one
 UPDATE jobs
 SET state = 'RUNNING',
@@ -334,11 +376,12 @@ const markJobCancelled = `-- name: MarkJobCancelled :one
 UPDATE jobs
 SET state = 'CANCELLED',
     cancel_requested = TRUE,
-    last_error = COALESCE($3, last_error),
+    last_error = COALESCE($4::text, last_error),
     updated_at = $2,
     finished_at = $2
 WHERE id = $1
-  AND state IN ('QUEUED', 'RUNNING')
+  AND state = 'RUNNING'
+  AND attempts = $3
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at
@@ -347,11 +390,17 @@ RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
 type MarkJobCancelledParams struct {
 	ID        string
 	UpdatedAt time.Time
+	Attempts  int32
 	LastError *string
 }
 
 func (q *Queries) MarkJobCancelled(ctx context.Context, arg MarkJobCancelledParams) (Job, error) {
-	row := q.db.QueryRow(ctx, markJobCancelled, arg.ID, arg.UpdatedAt, arg.LastError)
+	row := q.db.QueryRow(ctx, markJobCancelled,
+		arg.ID,
+		arg.UpdatedAt,
+		arg.Attempts,
+		arg.LastError,
+	)
 	var i Job
 	err := row.Scan(
 		&i.ID,
@@ -382,6 +431,7 @@ SET state = 'FAILED',
     finished_at = $3
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $4
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at
@@ -391,10 +441,16 @@ type MarkJobFailedParams struct {
 	ID        string
 	LastError *string
 	UpdatedAt time.Time
+	Attempts  int32
 }
 
 func (q *Queries) MarkJobFailed(ctx context.Context, arg MarkJobFailedParams) (Job, error) {
-	row := q.db.QueryRow(ctx, markJobFailed, arg.ID, arg.LastError, arg.UpdatedAt)
+	row := q.db.QueryRow(ctx, markJobFailed,
+		arg.ID,
+		arg.LastError,
+		arg.UpdatedAt,
+		arg.Attempts,
+	)
 	var i Job
 	err := row.Scan(
 		&i.ID,
@@ -425,6 +481,7 @@ SET state = 'SUCCEEDED',
     finished_at = $2
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $3
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at
@@ -433,10 +490,11 @@ RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
 type MarkJobSucceededParams struct {
 	ID        string
 	UpdatedAt time.Time
+	Attempts  int32
 }
 
 func (q *Queries) MarkJobSucceeded(ctx context.Context, arg MarkJobSucceededParams) (Job, error) {
-	row := q.db.QueryRow(ctx, markJobSucceeded, arg.ID, arg.UpdatedAt)
+	row := q.db.QueryRow(ctx, markJobSucceeded, arg.ID, arg.UpdatedAt, arg.Attempts)
 	var i Job
 	err := row.Scan(
 		&i.ID,
@@ -468,6 +526,7 @@ SET state = 'QUEUED',
     finished_at = NULL
 WHERE id = $1
   AND state = 'RUNNING'
+  AND attempts = $5
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at
@@ -478,6 +537,7 @@ type RequeueJobForRetryParams struct {
 	LastError *string
 	RunAfter  time.Time
 	UpdatedAt time.Time
+	Attempts  int32
 }
 
 func (q *Queries) RequeueJobForRetry(ctx context.Context, arg RequeueJobForRetryParams) (Job, error) {
@@ -486,6 +546,7 @@ func (q *Queries) RequeueJobForRetry(ctx context.Context, arg RequeueJobForRetry
 		arg.LastError,
 		arg.RunAfter,
 		arg.UpdatedAt,
+		arg.Attempts,
 	)
 	var i Job
 	err := row.Scan(

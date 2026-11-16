@@ -3,6 +3,7 @@ package domain
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -94,6 +95,18 @@ func TestJobValidationAndHelpers(t *testing.T) {
 				t.Errorf("terminal state %s must not transition to %s", term, next)
 			}
 		}
+	}
+
+	// 32-bit PostgreSQL INT bounds.
+	overflowMax := job
+	overflowMax.MaxAttempts = math.MaxInt32 + 1
+	if !errors.Is(overflowMax.Validate(), ErrInvalidJobAttempts) {
+		t.Fatalf("expected ErrInvalidJobAttempts for max_attempts > MaxInt32, got %v", overflowMax.Validate())
+	}
+	overflowAttempts := job
+	overflowAttempts.Attempts = math.MaxInt32 + 1
+	if !errors.Is(overflowAttempts.Validate(), ErrInvalidJobAttempts) {
+		t.Fatalf("expected ErrInvalidJobAttempts for attempts > MaxInt32, got %v", overflowAttempts.Validate())
 	}
 
 	// Exponential retry backoff with cap.

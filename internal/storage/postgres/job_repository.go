@@ -109,6 +109,8 @@ func prepareJobForEnqueue(job *domain.Job) (domain.Job, error) {
 	}
 	if candidate.MaxAttempts == 0 {
 		candidate.MaxAttempts = domain.DefaultJobMaxAttempts
+	} else if candidate.MaxAttempts < 1 || candidate.MaxAttempts > math.MaxInt32 {
+		return domain.Job{}, domain.ErrInvalidJobAttempts
 	}
 
 	payload, err := normalizeJobJSON(candidate.Payload)
@@ -281,10 +283,31 @@ func (r *JobRepository) ClaimNext(ctx context.Context, kind domain.JobKind, now 
 	return &claimed, nil
 }
 
-// MarkSucceeded transitions a RUNNING job to SUCCEEDED.
-func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, now time.Time) (*domain.Job, error) {
+func validateRunningOutcomeArgs(id string, attempt int) error {
 	if strings.TrimSpace(id) == "" {
-		return nil, domain.ErrEmptyJobID
+		return domain.ErrEmptyJobID
+	}
+	if attempt < 1 || attempt > math.MaxInt32 {
+		return domain.ErrInvalidJobAttempts
+	}
+	return nil
+}
+
+func requireRunningAttempt(current Job, attempt int) error {
+	if int(current.Attempts) != attempt {
+		return fmt.Errorf("%w: %w (expected attempt %d, current attempt %d in state %s)",
+			domain.ErrStaleJobAttempt, domain.ErrInvalidJobTransition, attempt, current.Attempts, current.State)
+	}
+	if current.State != string(domain.JobStateRunning) {
+		return fmt.Errorf("%w: job is in state %s", domain.ErrInvalidJobTransition, current.State)
+	}
+	return nil
+}
+
+// MarkSucceeded transitions a RUNNING job at the given attempt to SUCCEEDED.
+func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, attempt int, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
 	}
 	ts := normalizeJobTime(now)
 
@@ -293,12 +316,13 @@ func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, now time.T
 		if err != nil {
 			return domain.Job{}, mapPgError(err)
 		}
-		if !domain.JobState(current.State).CanTransitionTo(domain.JobStateSucceeded) {
-			return domain.Job{}, fmt.Errorf("%w: cannot mark %s job as SUCCEEDED", domain.ErrInvalidJobTransition, current.State)
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
 		}
 		row, err := q.MarkJobSucceeded(ctx, MarkJobSucceededParams{
 			ID:        id,
 			UpdatedAt: ts,
+			Attempts:  int32(attempt),
 		})
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q succeeded: %w", id, err)
@@ -311,11 +335,12 @@ func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, now time.T
 	return &updated, nil
 }
 
-// FailOrRetry records a failure for a RUNNING job, requeueing with backoff while attempts < max_attempts
-// (unless cancellation was requested) or transitioning to FAILED once max_attempts is reached.
-func (r *JobRepository) FailOrRetry(ctx context.Context, id string, errMsg string, retryAt time.Time, now time.Time) (*domain.Job, error) {
-	if strings.TrimSpace(id) == "" {
-		return nil, domain.ErrEmptyJobID
+// FailOrRetry records a failure for a RUNNING job at the given attempt, requeueing with backoff
+// while attempts < max_attempts (unless cancellation was requested) or transitioning to FAILED once
+// max_attempts is reached.
+func (r *JobRepository) FailOrRetry(ctx context.Context, id string, attempt int, errMsg string, retryAt time.Time, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
 	}
 	ts := normalizeJobTime(now)
 
@@ -324,8 +349,8 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, errMsg strin
 		if err != nil {
 			return domain.Job{}, mapPgError(err)
 		}
-		if current.State != string(domain.JobStateRunning) {
-			return domain.Job{}, fmt.Errorf("%w: cannot fail or retry job in state %s", domain.ErrInvalidJobTransition, current.State)
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
 		}
 
 		var errPtr *string
@@ -337,6 +362,7 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, errMsg strin
 			row, err := q.MarkJobCancelled(ctx, MarkJobCancelledParams{
 				ID:        id,
 				UpdatedAt: ts,
+				Attempts:  int32(attempt),
 				LastError: errPtr,
 			})
 			if err != nil {
@@ -357,6 +383,7 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, errMsg strin
 				LastError: errPtr,
 				RunAfter:  nextRun,
 				UpdatedAt: ts,
+				Attempts:  int32(attempt),
 			})
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("requeueing job %q for retry: %w", id, err)
@@ -368,6 +395,7 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, errMsg strin
 			ID:        id,
 			LastError: errPtr,
 			UpdatedAt: ts,
+			Attempts:  int32(attempt),
 		})
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q failed: %w", id, err)
@@ -395,7 +423,7 @@ func (r *JobRepository) RequestCancel(ctx context.Context, id string, now time.T
 
 		switch domain.JobState(current.State) {
 		case domain.JobStateQueued:
-			row, err := q.MarkJobCancelled(ctx, MarkJobCancelledParams{
+			row, err := q.CancelQueuedJob(ctx, CancelQueuedJobParams{
 				ID:        id,
 				UpdatedAt: ts,
 			})
@@ -422,10 +450,10 @@ func (r *JobRepository) RequestCancel(ctx context.Context, id string, now time.T
 	return &updated, nil
 }
 
-// MarkCancelled transitions a QUEUED or RUNNING job to CANCELLED.
-func (r *JobRepository) MarkCancelled(ctx context.Context, id string, errMsg *string, now time.Time) (*domain.Job, error) {
-	if strings.TrimSpace(id) == "" {
-		return nil, domain.ErrEmptyJobID
+// MarkCancelled transitions a RUNNING job at the given attempt to CANCELLED.
+func (r *JobRepository) MarkCancelled(ctx context.Context, id string, attempt int, errMsg *string, now time.Time) (*domain.Job, error) {
+	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
+		return nil, err
 	}
 	ts := normalizeJobTime(now)
 
@@ -434,12 +462,13 @@ func (r *JobRepository) MarkCancelled(ctx context.Context, id string, errMsg *st
 		if err != nil {
 			return domain.Job{}, mapPgError(err)
 		}
-		if !domain.JobState(current.State).CanTransitionTo(domain.JobStateCancelled) {
-			return domain.Job{}, fmt.Errorf("%w: cannot mark %s job as CANCELLED", domain.ErrInvalidJobTransition, current.State)
+		if err := requireRunningAttempt(current, attempt); err != nil {
+			return domain.Job{}, err
 		}
 		row, err := q.MarkJobCancelled(ctx, MarkJobCancelledParams{
 			ID:        id,
 			UpdatedAt: ts,
+			Attempts:  int32(attempt),
 			LastError: errMsg,
 		})
 		if err != nil {

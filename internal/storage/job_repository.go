@@ -39,17 +39,19 @@ type JobRepository interface {
 	// Returns ErrNotFound if no runnable job of that kind is currently eligible.
 	ClaimNext(ctx context.Context, kind domain.JobKind, now time.Time) (*domain.Job, error)
 
-	// MarkSucceeded transitions a RUNNING job to SUCCEEDED, clearing last_error and
-	// setting finished_at. Returns ErrNotFound if missing or domain.ErrInvalidJobTransition
-	// if the job is not RUNNING.
-	MarkSucceeded(ctx context.Context, id string, now time.Time) (*domain.Job, error)
+	// MarkSucceeded transitions a RUNNING job at the claimed attempt to SUCCEEDED,
+	// clearing last_error and setting finished_at. Returns ErrNotFound if missing,
+	// domain.ErrStaleJobAttempt if the job is at a different attempt, or
+	// domain.ErrInvalidJobTransition if the job is not RUNNING.
+	MarkSucceeded(ctx context.Context, id string, attempt int, now time.Time) (*domain.Job, error)
 
-	// FailOrRetry records a failure for a RUNNING job.
+	// FailOrRetry records a failure for a RUNNING job at the claimed attempt.
 	// If cancel_requested is true, the job transitions to CANCELLED instead of retrying.
 	// Otherwise, if attempts < max_attempts it returns to QUEUED with run_after set to retryAt
 	// (or now + domain.JobRetryBackoff(attempts) when retryAt is zero); if attempts >= max_attempts
-	// it transitions to FAILED.
-	FailOrRetry(ctx context.Context, id string, errMsg string, retryAt time.Time, now time.Time) (*domain.Job, error)
+	// it transitions to FAILED. Returns domain.ErrStaleJobAttempt / domain.ErrInvalidJobTransition
+	// if the job is no longer RUNNING at attempt.
+	FailOrRetry(ctx context.Context, id string, attempt int, errMsg string, retryAt time.Time, now time.Time) (*domain.Job, error)
 
 	// RequestCancel requests cancellation of an active job.
 	// A QUEUED job transitions immediately to CANCELLED (releasing any dedupe_key).
@@ -57,9 +59,10 @@ type JobRepository interface {
 	// Terminal jobs return domain.ErrInvalidJobTransition.
 	RequestCancel(ctx context.Context, id string, now time.Time) (*domain.Job, error)
 
-	// MarkCancelled transitions a RUNNING or QUEUED job to CANCELLED, setting cancel_requested=true
-	// and finished_at. Terminal jobs return domain.ErrInvalidJobTransition.
-	MarkCancelled(ctx context.Context, id string, errMsg *string, now time.Time) (*domain.Job, error)
+	// MarkCancelled transitions a RUNNING job at the claimed attempt to CANCELLED,
+	// setting cancel_requested=true and finished_at. Returns domain.ErrStaleJobAttempt /
+	// domain.ErrInvalidJobTransition if the job is not RUNNING at attempt.
+	MarkCancelled(ctx context.Context, id string, attempt int, errMsg *string, now time.Time) (*domain.Job, error)
 
 	// IsCancelRequested reports whether cancel_requested is set on the job.
 	// Returns ErrNotFound if no such job exists.
