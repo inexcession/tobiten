@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
@@ -36,14 +37,29 @@ type PATCreationResult struct {
 
 // JobInfo represents the status of an asynchronous background job (ADR-0017).
 type JobInfo struct {
-	ID          string     `json:"id"`
-	Kind        string     `json:"kind"`
-	State       string     `json:"state"`
-	ProgressPct float64    `json:"progress_pct"`
-	CreatedAt   time.Time  `json:"created_at"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	FinishedAt  *time.Time `json:"finished_at,omitempty"`
-	Error       *string    `json:"error,omitempty"`
+	ID              string          `json:"id"`
+	Kind            string          `json:"kind"`
+	State           string          `json:"state"`
+	Attempts        int             `json:"attempts"`
+	MaxAttempts     int             `json:"max_attempts"`
+	CancelRequested bool            `json:"cancel_requested"`
+	ProgressPct     float64         `json:"progress_pct"`
+	Checkpoint      json.RawMessage `json:"checkpoint"`
+	CreatedBy       *string         `json:"created_by"`
+	DedupeKey       *string         `json:"dedupe_key"`
+	RunAfter        time.Time       `json:"run_after"`
+	CreatedAt       time.Time       `json:"created_at"`
+	StartedAt       *time.Time      `json:"started_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	FinishedAt      *time.Time      `json:"finished_at"`
+	Error           *string         `json:"error"`
+}
+
+// JobService defines use-cases for querying and cancelling durable background jobs (ADR-0017 §2).
+type JobService interface {
+	ListJobs(ctx context.Context, principal *domain.Principal) ([]JobInfo, error)
+	GetJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error)
+	CancelJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error)
 }
 
 // SetupService implements the unauthenticated first-run bootstrap only.
@@ -94,6 +110,7 @@ type SessionAuthenticator interface {
 // AdminService defines use-cases for user administration, auth bootstrap, and job monitoring.
 type AdminService interface {
 	SetupService
+	JobService
 	AuthenticateUser(ctx context.Context, username, password string) (*domain.Principal, error)
 	ListUsers(ctx context.Context, principal *domain.Principal) ([]domain.User, error)
 	GetUser(ctx context.Context, principal *domain.Principal, id string) (*domain.User, error)
@@ -101,6 +118,4 @@ type AdminService interface {
 	DeleteUser(ctx context.Context, principal *domain.Principal, id string) error
 	CreatePAT(ctx context.Context, principal *domain.Principal, req CreatePATRequest) (*PATCreationResult, error)
 	RevokeCredential(ctx context.Context, principal *domain.Principal, credID string) error
-	ListJobs(ctx context.Context, principal *domain.Principal) ([]JobInfo, error)
-	GetJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error)
 }

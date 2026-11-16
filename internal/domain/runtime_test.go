@@ -71,6 +71,45 @@ func TestJobValidationAndHelpers(t *testing.T) {
 		t.Error("automatic job must be visible to jobs:read_all")
 	}
 
+	// Cancellation authority rules (decision I-10).
+	if job.CanCancel(nil) {
+		t.Error("nil principal must not be able to cancel any job")
+	}
+	if !job.CanCancel(creator) {
+		t.Error("creator with built-in Reader role (jobs:cancel_own) must be able to cancel own job")
+	}
+	creatorReadPAT := NewPrincipal(User{ID: creatorID, Username: "alice"}, []Role{mustBuiltInRole(t, RoleReaderID)}, CredentialKindPAT, "pat-read", []PATScope{ScopeRead})
+	if job.CanCancel(creatorReadPAT) {
+		t.Error("creator with read PAT lacks jobs:cancel_own and must not cancel own job")
+	}
+	creatorAdminPAT := NewPrincipal(User{ID: creatorID, Username: "alice"}, []Role{mustBuiltInRole(t, RoleReaderID)}, CredentialKindPAT, "pat-admin", []PATScope{ScopeAdmin})
+	if !job.CanCancel(creatorAdminPAT) {
+		t.Error("creator with admin PAT capped to Reader role keeps jobs:cancel_own and can cancel own job")
+	}
+	if job.CanCancel(other) {
+		t.Error("other user without jobs:read_all and jobs:cancel_all must not cancel another user's job")
+	}
+	readAllOnly := NewPrincipal(User{ID: otherID, Username: "auditor"}, []Role{{ID: "r-readall", Name: "Auditor", Permissions: []Permission{PermissionJobsReadAll}}}, CredentialKindPassword, "c4", nil)
+	if job.CanCancel(readAllOnly) {
+		t.Error("principal with jobs:read_all only (without jobs:cancel_all) must not cancel another user's job")
+	}
+	cancelAllOnly := NewPrincipal(User{ID: otherID, Username: "canceller"}, []Role{{ID: "r-cancelall", Name: "Canceller", Permissions: []Permission{PermissionJobsCancelAll}}}, CredentialKindPassword, "c5", nil)
+	if job.CanCancel(cancelAllOnly) {
+		t.Error("principal with jobs:cancel_all without jobs:read_all must not cancel another user's job")
+	}
+	if !job.CanCancel(admin) {
+		t.Error("admin with jobs:read_all and jobs:cancel_all must be able to cancel another user's job")
+	}
+	if autoJob.CanCancel(creator) {
+		t.Error("non-admin must not cancel automatic job")
+	}
+	if autoJob.CanCancel(readAllOnly) {
+		t.Error("jobs:read_all without jobs:cancel_all must not cancel automatic job")
+	}
+	if !autoJob.CanCancel(admin) {
+		t.Error("admin with jobs:read_all and jobs:cancel_all must be able to cancel automatic job")
+	}
+
 	badState := job
 	badState.State = JobState("BOGUS")
 	if !errors.Is(badState.Validate(), ErrInvalidJobState) {

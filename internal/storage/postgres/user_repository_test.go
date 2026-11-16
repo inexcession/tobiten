@@ -459,18 +459,20 @@ func TestUserRoleAssignment(t *testing.T) {
 	}
 
 	// Verify roles are returned ordered by name (Curator then Reader) with their permissions
+	curatorRole, _ := domain.BuiltInRoleByID(domain.RoleCuratorID)
 	if userRoles[0].ID != domain.RoleCuratorID || userRoles[0].Name != domain.RoleCuratorName {
 		t.Errorf("expected first role to be Curator, got %+v", userRoles[0])
 	}
-	if len(userRoles[0].Permissions) != 4 {
-		t.Errorf("expected 4 permissions for Curator, got %d (%v)", len(userRoles[0].Permissions), userRoles[0].Permissions)
+	if len(userRoles[0].Permissions) != len(curatorRole.Permissions) {
+		t.Errorf("expected %d permissions for Curator, got %d (%v)", len(curatorRole.Permissions), len(userRoles[0].Permissions), userRoles[0].Permissions)
 	}
 
+	readerRole, _ := domain.BuiltInRoleByID(domain.RoleReaderID)
 	if userRoles[1].ID != domain.RoleReaderID || userRoles[1].Name != domain.RoleReaderName {
 		t.Errorf("expected second role to be Reader, got %+v", userRoles[1])
 	}
-	if len(userRoles[1].Permissions) != 2 {
-		t.Errorf("expected 2 permissions for Reader, got %d (%v)", len(userRoles[1].Permissions), userRoles[1].Permissions)
+	if len(userRoles[1].Permissions) != len(readerRole.Permissions) {
+		t.Errorf("expected %d permissions for Reader, got %d (%v)", len(readerRole.Permissions), len(userRoles[1].Permissions), userRoles[1].Permissions)
 	}
 
 	// Remove role

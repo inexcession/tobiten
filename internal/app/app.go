@@ -25,6 +25,7 @@ type Services struct {
 	PATAuth     PATAuthenticator
 	Session     SessionService
 	SessionAuth SessionAuthenticator
+	Jobs        JobService
 	Library     LibraryService
 	Reading     ReadingService
 	Curation    CurationService

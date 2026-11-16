@@ -49,6 +49,10 @@ func (m *Module) buildRouter() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/login", m.handleLogin)
 	mux.HandleFunc("POST /api/v1/auth/setup", m.handleSetup)
 
+	// Job detail and cancellation routes (ADR-0017 §2, decision I-10).
+	mux.HandleFunc("GET /api/v1/jobs/{job_id}", m.handleGetJob)
+	mux.HandleFunc("POST /api/v1/jobs/{job_id}/cancel", m.handleCancelJob)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path
 		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {

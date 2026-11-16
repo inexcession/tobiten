@@ -148,14 +148,36 @@ func JobInfoFromDomain(j domain.Job) JobInfo {
 		}
 	}
 
-	return JobInfo{
-		ID:          j.ID,
-		Kind:        string(j.Kind),
-		State:       string(j.State),
-		ProgressPct: progressPct,
-		CreatedAt:   j.CreatedAt,
-		StartedAt:   j.StartedAt,
-		FinishedAt:  j.FinishedAt,
-		Error:       j.LastError,
+	cp := json.RawMessage("{}")
+	if len(j.Checkpoint) > 0 && json.Valid(j.Checkpoint) {
+		cp = make(json.RawMessage, len(j.Checkpoint))
+		copy(cp, j.Checkpoint)
 	}
+
+	return JobInfo{
+		ID:              j.ID,
+		Kind:            string(j.Kind),
+		State:           string(j.State),
+		Attempts:        j.Attempts,
+		MaxAttempts:     j.MaxAttempts,
+		CancelRequested: j.CancelRequested,
+		ProgressPct:     progressPct,
+		Checkpoint:      cp,
+		CreatedBy:       copyStringPtr(j.CreatedBy),
+		DedupeKey:       copyStringPtr(j.DedupeKey),
+		RunAfter:        j.RunAfter,
+		CreatedAt:       j.CreatedAt,
+		StartedAt:       j.StartedAt,
+		UpdatedAt:       j.UpdatedAt,
+		FinishedAt:      j.FinishedAt,
+		Error:           copyStringPtr(j.LastError),
+	}
+}
+
+func copyStringPtr(src *string) *string {
+	if src == nil {
+		return nil
+	}
+	v := *src
+	return &v
 }

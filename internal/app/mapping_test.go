@@ -132,14 +132,26 @@ func TestReadingProgressAndJobInfoMappings(t *testing.T) {
 		t.Fatalf("ReadingProgressFromDomain mismatch: %+v", prog)
 	}
 
+	creator := "u1"
+	errMsg := "boom"
 	jobInfo := JobInfoFromDomain(domain.Job{
-		ID:         "j1",
-		Kind:       domain.JobKindScan,
-		State:      domain.JobStateSucceeded,
-		CreatedAt:  now,
-		FinishedAt: &now,
+		ID:              "j1",
+		Kind:            domain.JobKindScan,
+		State:           domain.JobStateSucceeded,
+		Attempts:        1,
+		MaxAttempts:     3,
+		CancelRequested: true,
+		CreatedBy:       &creator,
+		LastError:       &errMsg,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		FinishedAt:      &now,
 	})
-	if jobInfo.ProgressPct != 100 || jobInfo.State != "SUCCEEDED" {
+	if jobInfo.ProgressPct != 100 || jobInfo.State != "SUCCEEDED" ||
+		!jobInfo.CancelRequested || jobInfo.Attempts != 1 || jobInfo.MaxAttempts != 3 ||
+		jobInfo.CreatedBy == nil || *jobInfo.CreatedBy != creator ||
+		jobInfo.Error == nil || *jobInfo.Error != errMsg ||
+		string(jobInfo.Checkpoint) != "{}" {
 		t.Fatalf("JobInfoFromDomain mismatch: %+v", jobInfo)
 	}
 }

@@ -147,9 +147,11 @@ const (
 	PermissionCollectionsManage Permission = "collections:manage"
 	PermissionLibraryAdmin      Permission = "library:admin"
 	PermissionUsersAdmin        Permission = "users:admin"
-	// Administrator-only permissions (implementation decision I-3, 2026-11-10)
-	PermissionJobsReadAll Permission = "jobs:read_all"
-	PermissionTrashPurge  Permission = "trash:purge"
+	// Administrator-only and job cancellation permissions (decisions I-3, I-10)
+	PermissionJobsReadAll   Permission = "jobs:read_all"
+	PermissionJobsCancelOwn Permission = "jobs:cancel_own"
+	PermissionJobsCancelAll Permission = "jobs:cancel_all"
+	PermissionTrashPurge    Permission = "trash:purge"
 )
 
 // AllPermissions returns all defined permissions in canonical order.
@@ -162,6 +164,8 @@ func AllPermissions() []Permission {
 		PermissionLibraryAdmin,
 		PermissionUsersAdmin,
 		PermissionJobsReadAll,
+		PermissionJobsCancelOwn,
+		PermissionJobsCancelAll,
 		PermissionTrashPurge,
 	}
 }
@@ -268,6 +272,8 @@ func BuiltInRoles() []Role {
 				PermissionLibraryAdmin,
 				PermissionUsersAdmin,
 				PermissionJobsReadAll,
+				PermissionJobsCancelOwn,
+				PermissionJobsCancelAll,
 				PermissionTrashPurge,
 			},
 		},
@@ -281,6 +287,7 @@ func BuiltInRoles() []Role {
 				PermissionProgressWrite,
 				PermissionMetadataEdit,
 				PermissionCollectionsManage,
+				PermissionJobsCancelOwn,
 			},
 		},
 		{
@@ -291,6 +298,7 @@ func BuiltInRoles() []Role {
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
+				PermissionJobsCancelOwn,
 			},
 		},
 		{
@@ -301,6 +309,7 @@ func BuiltInRoles() []Role {
 			Permissions: []Permission{
 				PermissionLibraryRead,
 				PermissionProgressWrite,
+				PermissionJobsCancelOwn,
 			},
 		},
 	}

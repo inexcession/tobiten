@@ -88,6 +88,8 @@ func TestMigration0001_Applies(t *testing.T) {
 			requiresAllowLabels: false,
 			permissions: []string{
 				"collections:manage",
+				"jobs:cancel_all",
+				"jobs:cancel_own",
 				"jobs:read_all",
 				"library:admin",
 				"library:read",
@@ -103,6 +105,7 @@ func TestMigration0001_Applies(t *testing.T) {
 			requiresAllowLabels: false,
 			permissions: []string{
 				"collections:manage",
+				"jobs:cancel_own",
 				"library:read",
 				"metadata:edit",
 				"progress:write",
@@ -113,6 +116,7 @@ func TestMigration0001_Applies(t *testing.T) {
 			builtIn:             true,
 			requiresAllowLabels: false,
 			permissions: []string{
+				"jobs:cancel_own",
 				"library:read",
 				"progress:write",
 			},
@@ -122,6 +126,7 @@ func TestMigration0001_Applies(t *testing.T) {
 			builtIn:             true,
 			requiresAllowLabels: true,
 			permissions: []string{
+				"jobs:cancel_own",
 				"library:read",
 				"progress:write",
 			},

@@ -169,6 +169,32 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			if lastEventSeq != 1 {
 				t.Fatalf("expected domain_event_sequence.last_sequence = 1 after upgrade, got %d", lastEventSeq)
 			}
+
+			// Verify 0007_job_cancel_permissions.sql granted jobs:cancel_own to all built-in roles
+			// and jobs:cancel_all to Admin only (decision I-10).
+			for _, roleID := range []string{
+				domain.RoleAdminID,
+				domain.RoleCuratorID,
+				domain.RoleReaderID,
+				domain.RoleRestrictedReaderID,
+			} {
+				var hasCancelOwn, hasCancelAll bool
+				if err := db.QueryRow(ctx,
+					`SELECT
+						EXISTS(SELECT 1 FROM role_permissions WHERE role_id = $1 AND permission = 'jobs:cancel_own'),
+						EXISTS(SELECT 1 FROM role_permissions WHERE role_id = $1 AND permission = 'jobs:cancel_all')`,
+					roleID,
+				).Scan(&hasCancelOwn, &hasCancelAll); err != nil {
+					t.Fatalf("verify job cancel permissions for role %s after upgrade: %v", roleID, err)
+				}
+				if !hasCancelOwn {
+					t.Errorf("role %s missing jobs:cancel_own after upgrade", roleID)
+				}
+				wantCancelAll := roleID == domain.RoleAdminID
+				if hasCancelAll != wantCancelAll {
+					t.Errorf("role %s jobs:cancel_all = %v, want %v after upgrade", roleID, hasCancelAll, wantCancelAll)
+				}
+			}
 		})
 	}
 }

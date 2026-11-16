@@ -491,17 +491,26 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	if err != nil {
 		return err
 	}
+	jobRepo := postgres.NewJobRepository(d.pool)
+	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 	services := app.NewAuthorizingServices(&app.Services{
 		Setup:       setup,
 		BasicAuth:   basicAuth,
 		PATAuth:     patAuth,
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
+		Jobs:        jobService,
 	})
 	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
 	if err != nil {
 		return err
 	}
+	jobService.SetNotifier(workers.runner)
+	jobService.SetOnTransition(func(job domain.Job) {
+		if workers != nil && workers.dispatcher != nil && !job.Kind.IsInternal() {
+			workers.dispatcher.Notify()
+		}
+	})
 	defer func() {
 		cancel(nil)
 		workers.stopAndWait()

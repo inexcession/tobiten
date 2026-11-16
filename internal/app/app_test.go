@@ -302,4 +302,8 @@ func TestStubAdminService(t *testing.T) {
 	if job.ID != jobs[0].ID {
 		t.Errorf("GetJob got %q, want %q", job.ID, jobs[0].ID)
 	}
+
+	if _, err := svc.CancelJob(ctx, p, jobs[0].ID); !errors.Is(err, ErrConflict) {
+		t.Errorf("CancelJob on terminal stub job = %v, want ErrConflict", err)
+	}
 }

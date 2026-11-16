@@ -243,16 +243,35 @@ func (j *Job) CanRetry() bool {
 	return j.Attempts < j.MaxAttempts
 }
 
+// IsCreatedBy reports whether this job was created by userID.
+func (j *Job) IsCreatedBy(userID string) bool {
+	return j != nil && userID != "" && j.CreatedBy != nil && *j.CreatedBy != "" && *j.CreatedBy == userID
+}
+
 // VisibleTo reports whether principal is permitted to view details of this job (ADR-0017, ADR-0018 S3).
 // Automatically scheduled jobs (CreatedBy == nil) are visible only to principals holding jobs:read_all.
 func (j *Job) VisibleTo(principal *Principal) bool {
-	if principal == nil {
+	if j == nil || principal == nil {
 		return false
 	}
 	if principal.HasPermission(PermissionJobsReadAll) {
 		return true
 	}
-	return j.CreatedBy != nil && *j.CreatedBy != "" && *j.CreatedBy == principal.User.ID
+	return j.IsCreatedBy(principal.User.ID)
+}
+
+// CanCancel reports whether principal is authorized to cancel this job (ADR-0006 §4, ADR-0017 §2, decision I-10).
+// A creator cancelling their own job requires effective jobs:cancel_own; cancelling another user's job
+// or a job with no creator (automatic or creator-deleted) requires both effective jobs:read_all and jobs:cancel_all.
+// Callers must check VisibleTo first so invisible jobs return 404 instead of 403.
+func (j *Job) CanCancel(principal *Principal) bool {
+	if j == nil || principal == nil {
+		return false
+	}
+	if j.IsCreatedBy(principal.User.ID) {
+		return principal.HasPermission(PermissionJobsCancelOwn)
+	}
+	return principal.HasAllPermissions(PermissionJobsReadAll, PermissionJobsCancelAll)
 }
 
 // EventKind identifies a transactional outbox domain event kind (ADR-0018 S3).

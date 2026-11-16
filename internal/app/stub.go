@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -304,10 +305,13 @@ func NewStubAdminService() *StubAdminService {
 		Jobs: []JobInfo{
 			{
 				ID:          "job-stub-1",
-				Kind:        "scanner",
-				State:       "FINISHED",
+				Kind:        string(domain.JobKindScan),
+				State:       string(domain.JobStateSucceeded),
+				MaxAttempts: domain.DefaultJobMaxAttempts,
 				ProgressPct: 100,
+				Checkpoint:  json.RawMessage("{}"),
 				CreatedAt:   time.Now().UTC(),
+				UpdatedAt:   time.Now().UTC(),
 			},
 		},
 	}
@@ -434,21 +438,80 @@ func (s *StubAdminService) RevokeCredential(_ context.Context, _ *domain.Princip
 	return nil
 }
 
-func (s *StubAdminService) ListJobs(_ context.Context, _ *domain.Principal) ([]JobInfo, error) {
+func stubJobAuthView(j JobInfo) *domain.Job {
+	return &domain.Job{
+		ID:        j.ID,
+		Kind:      domain.JobKind(j.Kind),
+		State:     domain.JobState(j.State),
+		CreatedBy: j.CreatedBy,
+	}
+}
+
+func (s *StubAdminService) ListJobs(_ context.Context, p *domain.Principal) ([]JobInfo, error) {
+	if err := requirePrincipal(p); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]JobInfo, len(s.Jobs))
-	copy(out, s.Jobs)
+	out := make([]JobInfo, 0, len(s.Jobs))
+	for _, j := range s.Jobs {
+		if stubJobAuthView(j).VisibleTo(p) {
+			out = append(out, j)
+		}
+	}
 	return out, nil
 }
 
-func (s *StubAdminService) GetJob(_ context.Context, _ *domain.Principal, jobID string) (*JobInfo, error) {
+func (s *StubAdminService) GetJob(_ context.Context, p *domain.Principal, jobID string) (*JobInfo, error) {
+	if err := requirePrincipal(p); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, j := range s.Jobs {
 		if j.ID == jobID {
-			return &j, nil
+			if !stubJobAuthView(j).VisibleTo(p) {
+				return nil, ErrNotFound
+			}
+			cp := j
+			return &cp, nil
 		}
+	}
+	return nil, ErrNotFound
+}
+
+func (s *StubAdminService) CancelJob(_ context.Context, p *domain.Principal, jobID string) (*JobInfo, error) {
+	if err := requirePrincipal(p); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, j := range s.Jobs {
+		if j.ID != jobID {
+			continue
+		}
+		view := stubJobAuthView(j)
+		if !view.VisibleTo(p) {
+			return nil, ErrNotFound
+		}
+		if !view.CanCancel(p) {
+			return nil, ErrForbidden
+		}
+		now := time.Now().UTC()
+		switch domain.JobState(j.State) {
+		case domain.JobStateQueued:
+			s.Jobs[i].State = string(domain.JobStateCancelled)
+			s.Jobs[i].CancelRequested = true
+			s.Jobs[i].UpdatedAt = now
+			s.Jobs[i].FinishedAt = &now
+		case domain.JobStateRunning:
+			s.Jobs[i].CancelRequested = true
+			s.Jobs[i].UpdatedAt = now
+		default:
+			return nil, ErrConflict
+		}
+		cp := s.Jobs[i]
+		return &cp, nil
 	}
 	return nil, ErrNotFound
 }

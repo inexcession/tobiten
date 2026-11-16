@@ -58,6 +58,8 @@ func TestScopeToPermissions(t *testing.T) {
 				domain.PermissionLibraryAdmin,
 				domain.PermissionUsersAdmin,
 				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelOwn,
+				domain.PermissionJobsCancelAll,
 				domain.PermissionTrashPurge,
 			},
 		},
@@ -149,6 +151,8 @@ func TestScopeCapArithmetic(t *testing.T) {
 				domain.PermissionLibraryAdmin,
 				domain.PermissionUsersAdmin,
 				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelOwn,
+				domain.PermissionJobsCancelAll,
 				domain.PermissionTrashPurge,
 			},
 		},
@@ -178,6 +182,8 @@ func TestScopeCapArithmetic(t *testing.T) {
 			wantDenied: []domain.Permission{
 				domain.PermissionProgressWrite,
 				domain.PermissionLibraryAdmin,
+				domain.PermissionJobsCancelOwn,
+				domain.PermissionJobsCancelAll,
 			},
 		},
 		{
@@ -192,6 +198,9 @@ func TestScopeCapArithmetic(t *testing.T) {
 			wantDenied: []domain.Permission{
 				domain.PermissionMetadataEdit,
 				domain.PermissionUsersAdmin,
+				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelOwn,
+				domain.PermissionJobsCancelAll,
 				domain.PermissionTrashPurge,
 			},
 		},
@@ -212,11 +221,13 @@ func TestScopeCapArithmetic(t *testing.T) {
 				domain.PermissionProgressWrite,
 				domain.PermissionMetadataEdit,
 				domain.PermissionCollectionsManage,
+				domain.PermissionJobsCancelOwn,
 			},
 			wantDenied: []domain.Permission{
 				domain.PermissionLibraryAdmin,
 				domain.PermissionUsersAdmin,
 				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelAll,
 				domain.PermissionTrashPurge,
 			},
 		},
@@ -250,12 +261,15 @@ func TestScopeCapArithmetic(t *testing.T) {
 			expected: []domain.Permission{
 				domain.PermissionLibraryRead,
 				domain.PermissionProgressWrite,
+				domain.PermissionJobsCancelOwn,
 			},
 			wantDenied: []domain.Permission{
 				domain.PermissionMetadataEdit,
 				domain.PermissionCollectionsManage,
 				domain.PermissionLibraryAdmin,
 				domain.PermissionUsersAdmin,
+				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelAll,
 			},
 		},
 		{
@@ -266,10 +280,13 @@ func TestScopeCapArithmetic(t *testing.T) {
 			expected: []domain.Permission{
 				domain.PermissionLibraryRead,
 				domain.PermissionProgressWrite,
+				domain.PermissionJobsCancelOwn,
 			},
 			wantDenied: []domain.Permission{
 				domain.PermissionMetadataEdit,
 				domain.PermissionLibraryAdmin,
+				domain.PermissionJobsReadAll,
+				domain.PermissionJobsCancelAll,
 			},
 		},
 		{
@@ -519,8 +536,10 @@ func TestBuiltInRolesExactMatching(t *testing.T) {
 		t.Errorf("Admin role must have RequiresAllowLabels=false")
 	}
 	if !slices.Contains(admin.Permissions, domain.PermissionJobsReadAll) ||
+		!slices.Contains(admin.Permissions, domain.PermissionJobsCancelOwn) ||
+		!slices.Contains(admin.Permissions, domain.PermissionJobsCancelAll) ||
 		!slices.Contains(admin.Permissions, domain.PermissionTrashPurge) {
-		t.Errorf("Admin role missing administrator-only permissions (decision I-3)")
+		t.Errorf("Admin role missing administrator-only permissions (decisions I-3, I-10)")
 	}
 
 	curator, ok := domain.BuiltInRoleByID(domain.RoleCuratorID)

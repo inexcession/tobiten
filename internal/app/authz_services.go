@@ -19,6 +19,9 @@ func NewAuthorizingServices(next *Services) *Services {
 		Session:     next.Session,
 		SessionAuth: next.SessionAuth,
 	}
+	if next.Jobs != nil {
+		out.Jobs = NewAuthorizingJobService(next.Jobs)
+	}
 	if next.Library != nil {
 		out.Library = NewAuthorizingLibraryService(next.Library)
 	}
@@ -323,4 +326,54 @@ func (s *authorizingAdminService) GetJob(ctx context.Context, principal *domain.
 		return nil, ErrNotImplemented
 	}
 	return s.next.GetJob(ctx, principal, jobID)
+}
+
+func (s *authorizingAdminService) CancelJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error) {
+	if err := requirePrincipal(principal); err != nil {
+		return nil, err
+	}
+	if s.next == nil {
+		return nil, ErrNotImplemented
+	}
+	return s.next.CancelJob(ctx, principal, jobID)
+}
+
+type authorizingJobService struct {
+	next JobService
+}
+
+// NewAuthorizingJobService wraps next with authentication enforcement on every JobService method.
+// Object-level creator/admin visibility and cancellation authority are enforced by the concrete service.
+func NewAuthorizingJobService(next JobService) JobService {
+	return &authorizingJobService{next: next}
+}
+
+func (s *authorizingJobService) ListJobs(ctx context.Context, principal *domain.Principal) ([]JobInfo, error) {
+	if err := requirePrincipal(principal); err != nil {
+		return nil, err
+	}
+	if s.next == nil {
+		return nil, ErrNotImplemented
+	}
+	return s.next.ListJobs(ctx, principal)
+}
+
+func (s *authorizingJobService) GetJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error) {
+	if err := requirePrincipal(principal); err != nil {
+		return nil, err
+	}
+	if s.next == nil {
+		return nil, ErrNotImplemented
+	}
+	return s.next.GetJob(ctx, principal, jobID)
+}
+
+func (s *authorizingJobService) CancelJob(ctx context.Context, principal *domain.Principal, jobID string) (*JobInfo, error) {
+	if err := requirePrincipal(principal); err != nil {
+		return nil, err
+	}
+	if s.next == nil {
+		return nil, ErrNotImplemented
+	}
+	return s.next.CancelJob(ctx, principal, jobID)
 }

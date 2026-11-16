@@ -199,6 +199,11 @@ func (s *spyAdminService) GetJob(context.Context, *domain.Principal, string) (*J
 	return &JobInfo{ID: "job-1"}, nil
 }
 
+func (s *spyAdminService) CancelJob(context.Context, *domain.Principal, string) (*JobInfo, error) {
+	s.selfCalls++
+	return &JobInfo{ID: "job-1", State: string(domain.JobStateCancelled), CancelRequested: true}, nil
+}
+
 func TestPermissionHelpers_FailClosedAndCheckPermissionsNotRoleNames(t *testing.T) {
 	t.Parallel()
 
@@ -757,4 +762,47 @@ func TestAuthorizingAdminService_CreatePATCallerAuthorityAndValidation(t *testin
 			t.Fatalf("permitted CreatePAT against nil delegate = %v, want ErrNotImplemented", err)
 		}
 	})
+}
+
+func TestAuthorizingJobService_RequiresPrincipalAndDelegates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	spy := &spyAdminService{}
+	svcs := NewAuthorizingServices(&Services{Jobs: spy})
+	if svcs.Jobs == nil {
+		t.Fatal("expected Jobs decorator to be wired")
+	}
+
+	if _, err := svcs.Jobs.ListJobs(ctx, nil); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("ListJobs(nil) = %v, want ErrUnauthorized", err)
+	}
+	if _, err := svcs.Jobs.GetJob(ctx, nil, "job-1"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("GetJob(nil) = %v, want ErrUnauthorized", err)
+	}
+	if _, err := svcs.Jobs.CancelJob(ctx, nil, "job-1"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("CancelJob(nil) = %v, want ErrUnauthorized", err)
+	}
+	if spy.selfCalls != 0 {
+		t.Fatalf("unauthenticated job calls reached delegate %d times, want 0", spy.selfCalls)
+	}
+
+	reader := domain.NewPrincipal(testUser("u-reader"), []domain.Role{builtInRoleByID(t, domain.RoleReaderID)}, domain.CredentialKindPassword, "cred-r", nil)
+	if _, err := svcs.Jobs.ListJobs(ctx, reader); err != nil {
+		t.Fatalf("ListJobs(reader) = %v, want nil", err)
+	}
+	if _, err := svcs.Jobs.GetJob(ctx, reader, "job-1"); err != nil {
+		t.Fatalf("GetJob(reader) = %v, want nil", err)
+	}
+	if _, err := svcs.Jobs.CancelJob(ctx, reader, "job-1"); err != nil {
+		t.Fatalf("CancelJob(reader) = %v, want nil", err)
+	}
+	if spy.selfCalls != 3 {
+		t.Fatalf("authenticated job delegate calls = %d, want 3", spy.selfCalls)
+	}
+
+	nilJobs := NewAuthorizingJobService(nil)
+	if _, err := nilJobs.CancelJob(ctx, reader, "job-1"); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("CancelJob against nil delegate = %v, want ErrNotImplemented", err)
+	}
 }
