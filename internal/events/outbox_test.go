@@ -16,8 +16,13 @@ import (
 )
 
 type spyAppender struct {
+	inTx   bool
 	called int
 	last   *domain.DomainEvent
+}
+
+func (s *spyAppender) InTx() bool {
+	return s.inTx
 }
 
 func (s *spyAppender) AppendEvent(_ context.Context, event *domain.DomainEvent) error {
@@ -55,7 +60,21 @@ func TestOutbox_UnitValidationAndSuppression(t *testing.T) {
 	if err := outbox.Append(ctx, nil, &domain.DomainEvent{}); !errors.Is(err, events.ErrNilOutboxAppender) {
 		t.Fatalf("expected ErrNilOutboxAppender, got %v", err)
 	}
-	spy := &spyAppender{}
+
+	nonTxSpy := &spyAppender{inTx: false}
+	if err := outbox.Append(ctx, nonTxSpy, &domain.DomainEvent{
+		Kind:          domain.EventJobStarted,
+		Version:       1,
+		AggregateType: domain.AggregateTypeJob,
+		AggregateID:   "job-1",
+	}); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("expected ErrTransactionRequired for non-tx appender, got %v", err)
+	}
+	if nonTxSpy.called != 0 {
+		t.Fatalf("expected non-tx appender not to be called, got %d calls", nonTxSpy.called)
+	}
+
+	spy := &spyAppender{inTx: true}
 	if err := outbox.Append(ctx, spy, nil); !errors.Is(err, events.ErrNilDomainEvent) {
 		t.Fatalf("expected ErrNilDomainEvent, got %v", err)
 	}
@@ -98,6 +117,51 @@ func TestOutbox_UnitValidationAndSuppression(t *testing.T) {
 	}
 	if spy.called != 1 || ev.ID != 1 || !ev.CreatedAt.Equal(fixedNow) || ev.IsPublished() {
 		t.Fatalf("unexpected appended event: %+v (calls=%d)", ev, spy.called)
+	}
+}
+
+func TestOutbox_RejectsPoolBackedRepository(t *testing.T) {
+	t.Parallel()
+	db, _, poolRepo, _, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	outbox := events.NewOutbox()
+
+	if err := outbox.Append(ctx, poolRepo, &domain.DomainEvent{
+		Kind:          domain.EventAssetAdded,
+		Version:       domain.EventVersion1,
+		AggregateType: domain.AggregateTypeAsset,
+		AggregateID:   "asset-pool-1",
+	}); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("Append with pool repo err = %v, want ErrTransactionRequired", err)
+	}
+
+	if _, err := outbox.AppendPayload(ctx, poolRepo, domain.EventSeriesMetadataChanged, domain.EventVersion1,
+		domain.AggregateTypeSeries, "ser-pool-1", domain.SeriesEventPayloadV1{
+			SeriesID:  "ser-pool-1",
+			LibraryID: "lib-1",
+		}); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("AppendPayload with pool repo err = %v, want ErrTransactionRequired", err)
+	}
+
+	if _, err := outbox.AppendJobLifecycle(ctx, poolRepo, domain.EventJobStarted, domain.Job{
+		ID:          "job-pool-1",
+		Kind:        domain.JobKindScan,
+		State:       domain.JobStateRunning,
+		Attempts:    1,
+		MaxAttempts: 3,
+	}); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("AppendJobLifecycle with pool repo err = %v, want ErrTransactionRequired", err)
+	}
+
+	var count int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events`).Scan(&count); err != nil {
+		t.Fatalf("counting domain_events: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 domain_events rows after rejected pool appends, got %d", count)
 	}
 }
 
@@ -233,6 +297,119 @@ func TestOutbox_CommitAndRollbackWithCallerWrite(t *testing.T) {
 	}
 	if kind != string(domain.EventAssetAdded) || version != 1 {
 		t.Fatalf("unexpected SQL row kind=%q version=%d", kind, version)
+	}
+}
+
+func TestOutbox_CancelledInnerSavepointCannotSurviveOuterCommit(t *testing.T) {
+	t.Parallel()
+	_, transactor, eventRepo, jobRepo, settingsRepo := setupOutboxTestDB(t)
+
+	outerCtx, outerCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer outerCancel()
+
+	outbox := events.NewOutbox()
+
+	var outerEventID, innerErrEventID, innerCommitEventID int64
+	var innerErrJobID, innerCommitJobID string
+
+	err := transactor.WithTx(outerCtx, func(outerTx storage.Tx) error {
+		if err := outerTx.Settings().SetSetting(outerCtx, &domain.SystemSetting{
+			Key:   "test.outbox.outer_survives",
+			Value: []byte(`"committed"`),
+		}); err != nil {
+			return err
+		}
+		outerEv, err := outbox.AppendPayload(outerCtx, outerTx.Events(), domain.EventSeriesMetadataChanged, domain.EventVersion1,
+			domain.AggregateTypeSeries, "ser-outer-ok", domain.SeriesEventPayloadV1{
+				SeriesID:  "ser-outer-ok",
+				LibraryID: "lib-1",
+			})
+		if err != nil {
+			return err
+		}
+		outerEventID = outerEv.ID
+
+		// Inner savepoint 1: caller writes + appends event, then context is cancelled and callback returns ctx.Err().
+		innerCtx1, innerCancel1 := context.WithCancel(outerCtx)
+		err1 := outerTx.WithTx(innerCtx1, func(innerTx storage.Tx) error {
+			if err := innerTx.Settings().SetSetting(innerCtx1, &domain.SystemSetting{
+				Key:   "test.outbox.inner_cancel_err",
+				Value: []byte(`"must-rollback"`),
+			}); err != nil {
+				return err
+			}
+			j := &domain.Job{Kind: domain.JobKindScan}
+			if _, err := innerTx.Jobs().Enqueue(innerCtx1, j); err != nil {
+				return err
+			}
+			innerErrJobID = j.ID
+			ev, err := outbox.AppendPayload(innerCtx1, innerTx.Events(), domain.EventAssetAdded, domain.EventVersion1,
+				domain.AggregateTypeAsset, "asset-inner-cancel-err", nil)
+			if err != nil {
+				return err
+			}
+			innerErrEventID = ev.ID
+			innerCancel1()
+			return innerCtx1.Err()
+		})
+		if !errors.Is(err1, context.Canceled) {
+			t.Fatalf("inner savepoint 1 err = %v, want context.Canceled", err1)
+		}
+
+		// Inner savepoint 2: caller writes + appends event, context is cancelled, callback returns nil (Commit fails).
+		innerCtx2, innerCancel2 := context.WithCancel(outerCtx)
+		err2 := outerTx.WithTx(innerCtx2, func(innerTx storage.Tx) error {
+			if err := innerTx.Settings().SetSetting(innerCtx2, &domain.SystemSetting{
+				Key:   "test.outbox.inner_cancel_commit",
+				Value: []byte(`"must-rollback"`),
+			}); err != nil {
+				return err
+			}
+			j := &domain.Job{Kind: domain.JobKindScan}
+			if _, err := innerTx.Jobs().Enqueue(innerCtx2, j); err != nil {
+				return err
+			}
+			innerCommitJobID = j.ID
+			ev, err := outbox.AppendPayload(innerCtx2, innerTx.Events(), domain.EventAssetAdded, domain.EventVersion1,
+				domain.AggregateTypeAsset, "asset-inner-cancel-commit", nil)
+			if err != nil {
+				return err
+			}
+			innerCommitEventID = ev.ID
+			innerCancel2()
+			return nil
+		})
+		if !errors.Is(err2, context.Canceled) {
+			t.Fatalf("inner savepoint 2 err = %v, want context.Canceled", err2)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("outer commit failed: %v", err)
+	}
+
+	if setting, err := settingsRepo.GetSetting(outerCtx, "test.outbox.outer_survives"); err != nil || setting.ValueString() != "committed" {
+		t.Fatalf("expected outer setting to commit, got %+v, err=%v", setting, err)
+	}
+	if _, err := eventRepo.GetEventByID(outerCtx, outerEventID); err != nil {
+		t.Fatalf("expected outer event %d to commit, got %v", outerEventID, err)
+	}
+
+	for _, key := range []string{"test.outbox.inner_cancel_err", "test.outbox.inner_cancel_commit"} {
+		if _, err := settingsRepo.GetSetting(outerCtx, key); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("cancelled inner setting %q survived outer commit! err=%v", key, err)
+		}
+	}
+	for _, jobID := range []string{innerErrJobID, innerCommitJobID} {
+		if _, err := jobRepo.GetJobByID(outerCtx, jobID); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("cancelled inner job %q survived outer commit! err=%v", jobID, err)
+		}
+	}
+	for _, evID := range []int64{innerErrEventID, innerCommitEventID} {
+		if _, err := eventRepo.GetEventByID(outerCtx, evID); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("cancelled inner event %d survived outer commit! err=%v", evID, err)
+		}
 	}
 }
 

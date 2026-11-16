@@ -30,6 +30,10 @@ var (
 	// ErrProtectedLabel is returned when attempting to rename, modify, or delete
 	// the protected canonical trash label (marked_for_deletion).
 	ErrProtectedLabel = errors.New("protected built-in label cannot be modified or deleted")
+
+	// ErrTransactionRequired is returned when an operation that requires an active
+	// caller transaction (such as outbox append) is called on a non-transactional handle.
+	ErrTransactionRequired = errors.New("active caller transaction required")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.

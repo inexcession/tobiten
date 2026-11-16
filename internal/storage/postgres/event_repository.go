@@ -16,36 +16,52 @@ var _ storage.EventRepository = (*EventRepository)(nil)
 
 // EventRepository implements storage.EventRepository backed by PostgreSQL and sqlc.
 type EventRepository struct {
-	q  *Queries
-	tx TxBeginner
+	q    *Queries
+	tx   TxBeginner
+	inTx bool
 }
 
 // NewEventRepository creates a new EventRepository using the provided database handle
-// (such as a *pgxpool.Pool or an active pgx.Tx).
+// (such as a *pgxpool.Pool or an active pgx.Tx). AppendEvent requires an active pgx.Tx
+// (either passed directly or entered via WithTx).
 func NewEventRepository(db DBTX) *EventRepository {
 	var beginner TxBeginner
 	if b, ok := db.(TxBeginner); ok {
 		beginner = b
 	}
+	_, inTx := db.(pgx.Tx)
 	return &EventRepository{
-		q:  New(db),
-		tx: beginner,
+		q:    New(db),
+		tx:   beginner,
+		inTx: inTx,
 	}
+}
+
+// InTx reports whether this repository handle is bound to an active PostgreSQL transaction.
+func (r *EventRepository) InTx() bool {
+	return r != nil && r.inTx
 }
 
 // WithTx executes fn inside a transaction (or nested savepoint when already inside one).
 func (r *EventRepository) WithTx(ctx context.Context, fn func(repo storage.EventRepository) error) error {
+	if r == nil {
+		return errors.New("event repository is required")
+	}
 	if fn == nil {
 		return errors.New("transaction callback cannot be nil")
 	}
 	return runTx(ctx, r.tx, "event", func(tx pgx.Tx, q *Queries) error {
-		return fn(&EventRepository{q: q, tx: tx})
+		return fn(&EventRepository{q: q, tx: tx, inTx: true})
 	})
 }
 
-// AppendEvent inserts an unpublished domain event into domain_events within the repository's
-// current connection or transaction, leaving published_sequence and published_at NULL.
+// AppendEvent inserts an unpublished domain event into domain_events within an active
+// transaction, leaving published_sequence and published_at NULL. Pool-backed or
+// non-transactional repositories return storage.ErrTransactionRequired.
 func (r *EventRepository) AppendEvent(ctx context.Context, event *domain.DomainEvent) error {
+	if !r.InTx() {
+		return storage.ErrTransactionRequired
+	}
 	if event == nil {
 		return errors.New("domain event cannot be nil")
 	}

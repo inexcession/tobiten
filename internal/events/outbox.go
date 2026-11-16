@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/storage"
 )
 
 // Common errors returned by the transactional outbox.
@@ -18,6 +19,7 @@ var (
 // Appender persists an unpublished domain event inside the caller's active transaction.
 // storage.EventRepository satisfies this interface.
 type Appender interface {
+	InTx() bool
 	AppendEvent(ctx context.Context, event *domain.DomainEvent) error
 }
 
@@ -53,11 +55,14 @@ func NewOutbox(opts ...OutboxOption) *Outbox {
 }
 
 // Append validates an unpublished domain event and writes it through appender.
-// Callers must pass an appender bound to their active database transaction so the event
-// commits or rolls back atomically with the caller's state change.
+// Callers must pass an appender bound to an active database transaction (InTx() == true)
+// so the event commits or rolls back atomically with the caller's state change.
 func (o *Outbox) Append(ctx context.Context, appender Appender, event *domain.DomainEvent) error {
 	if appender == nil {
 		return ErrNilOutboxAppender
+	}
+	if !appender.InTx() {
+		return storage.ErrTransactionRequired
 	}
 	if event == nil {
 		return ErrNilDomainEvent
