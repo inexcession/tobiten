@@ -77,12 +77,6 @@ func WithOnFatal(fn func(error)) DispatcherOption {
 	}
 }
 
-type dispatcherGeneration struct {
-	cancel context.CancelCauseFunc
-	wake   chan struct{}
-	wg     sync.WaitGroup
-}
-
 // Dispatcher is the single serialized transactional-outbox dispatcher (ADR-0018 S3).
 // Each dispatch selects all committed domain_events rows with published_sequence IS NULL
 // regardless of raw id, assigns contiguous published_sequence values and published_at
@@ -96,10 +90,7 @@ type Dispatcher struct {
 	onFatal      func(error)
 
 	dispatchMu sync.Mutex
-
-	stateMu sync.RWMutex
-	runGen  *dispatcherGeneration
-	runErr  error
+	loop       wakeLoop
 }
 
 // NewDispatcher constructs a Dispatcher backed by publisher.
@@ -178,31 +169,28 @@ func (d *Dispatcher) Start(ctx context.Context) error {
 		return ErrInvalidDispatcherInterval
 	}
 
-	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-
-	if d.runGen != nil {
-		return ErrDispatcherAlreadyRunning
-	}
-
 	interval := d.pollInterval
 	if interval == 0 {
 		interval = DefaultDispatcherPollInterval
 	}
 
-	loopCtx, loopCancel := context.WithCancelCause(ctx)
-	gen := &dispatcherGeneration{
-		cancel: loopCancel,
-		wake:   make(chan struct{}, 1),
-	}
-
-	d.runErr = nil
-	d.runGen = gen
-
-	gen.wg.Add(1)
-	go d.runLoop(loopCtx, gen, interval)
-
-	return nil
+	return d.loop.start(
+		ctx,
+		interval,
+		ErrDispatcherAlreadyRunning,
+		func(loopCtx context.Context) error {
+			_, err := d.DispatchOnce(loopCtx)
+			return err
+		},
+		func(err error) {
+			if d.logger != nil {
+				d.logger.Error("event dispatcher failed; stopping", logging.Err(err))
+			}
+			if d.onFatal != nil {
+				d.onFatal(err)
+			}
+		},
+	)
 }
 
 // Notify wakes the running background dispatcher loop so newly committed events
@@ -211,17 +199,7 @@ func (d *Dispatcher) Notify() {
 	if d == nil {
 		return
 	}
-	d.stateMu.RLock()
-	gen := d.runGen
-	d.stateMu.RUnlock()
-
-	if gen == nil {
-		return
-	}
-	select {
-	case gen.wake <- struct{}{}:
-	default:
-	}
+	d.loop.wake()
 }
 
 // Stop cancels the running background dispatcher loop and waits for it to exit.
@@ -229,15 +207,7 @@ func (d *Dispatcher) Stop() {
 	if d == nil {
 		return
 	}
-	d.stateMu.RLock()
-	gen := d.runGen
-	d.stateMu.RUnlock()
-
-	if gen == nil {
-		return
-	}
-	gen.cancel(nil)
-	d.waitGeneration(gen)
+	d.loop.stop()
 }
 
 // Wait blocks until the current background dispatcher loop exits.
@@ -245,11 +215,7 @@ func (d *Dispatcher) Wait() {
 	if d == nil {
 		return
 	}
-	d.stateMu.RLock()
-	gen := d.runGen
-	d.stateMu.RUnlock()
-
-	d.waitGeneration(gen)
+	d.loop.wait()
 }
 
 // Err returns the fatal error that stopped the most recent background dispatcher run, if any.
@@ -257,83 +223,5 @@ func (d *Dispatcher) Err() error {
 	if d == nil {
 		return nil
 	}
-	d.stateMu.RLock()
-	defer d.stateMu.RUnlock()
-	return d.runErr
-}
-
-func (d *Dispatcher) waitGeneration(gen *dispatcherGeneration) {
-	if gen == nil {
-		return
-	}
-	gen.wg.Wait()
-
-	d.stateMu.Lock()
-	if d.runGen == gen {
-		d.runGen = nil
-	}
-	d.stateMu.Unlock()
-}
-
-func (d *Dispatcher) runLoop(ctx context.Context, gen *dispatcherGeneration, interval time.Duration) {
-	defer gen.wg.Done()
-	defer func() {
-		d.stateMu.Lock()
-		if d.runGen == gen {
-			d.runGen = nil
-		}
-		d.stateMu.Unlock()
-	}()
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if _, err := d.DispatchOnce(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			d.failGeneration(gen, err)
-			return
-		}
-
-		if !waitForNextDispatch(ctx, interval, gen.wake) {
-			return
-		}
-	}
-}
-
-func (d *Dispatcher) failGeneration(gen *dispatcherGeneration, err error) {
-	if d.logger != nil {
-		d.logger.Error("event dispatcher failed; stopping", logging.Err(err))
-	}
-
-	d.stateMu.Lock()
-	shouldNotify := false
-	if d.runGen == gen && d.runErr == nil {
-		d.runErr = err
-		shouldNotify = d.onFatal != nil
-	}
-	onFatal := d.onFatal
-	d.stateMu.Unlock()
-
-	gen.cancel(err)
-	if shouldNotify {
-		onFatal(err)
-	}
-}
-
-func waitForNextDispatch(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-wake:
-		return ctx.Err() == nil
-	case <-timer.C:
-		return ctx.Err() == nil
-	}
+	return d.loop.err()
 }

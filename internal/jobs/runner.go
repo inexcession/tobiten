@@ -78,6 +78,7 @@ type KindConfig struct {
 	Reconciler         Reconciler
 	RequiresReconciler bool
 	PoolSize           int
+	OnSucceeded        func(ctx context.Context, job domain.Job)
 }
 
 // KindRegistrar is an optional interface implemented by modules that register
@@ -275,6 +276,9 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 		return fmt.Errorf("%w: kind %q pool size %d conflicts with %d",
 			ErrDuplicateJobKind, cfg.Kind, cfg.PoolSize, existing.PoolSize)
 	}
+	if existing.OnSucceeded != nil && cfg.OnSucceeded != nil {
+		return fmt.Errorf("%w: kind %q already has an OnSucceeded hook", ErrDuplicateJobKind, cfg.Kind)
+	}
 
 	if existing.Handler == nil {
 		existing.Handler = cfg.Handler
@@ -284,6 +288,9 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	}
 	if existing.PoolSize == 0 {
 		existing.PoolSize = cfg.PoolSize
+	}
+	if existing.OnSucceeded == nil {
+		existing.OnSucceeded = cfg.OnSucceeded
 	}
 	existing.RequiresReconciler = existing.RequiresReconciler || cfg.RequiresReconciler
 	r.kinds[cfg.Kind] = existing
@@ -623,18 +630,33 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 
 	now := r.now().UTC()
 	if runErr == nil {
-		return r.persistOutcomeWithRetry(
+		settled := *job
+		err := r.persistOutcomeWithRetry(
 			ctx,
 			job,
 			"marking succeeded",
 			func(writeCtx context.Context) error {
-				_, err := r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
+				updated, err := r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
+				if err == nil && updated != nil {
+					settled = *updated
+				}
 				return err
 			},
 			func(row *domain.Job) bool {
-				return (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
+				ok := (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
+				if ok {
+					settled = *row
+				}
+				return ok
 			},
 		)
+		if err != nil {
+			return err
+		}
+		if cfg.OnSucceeded != nil {
+			cfg.OnSucceeded(ctx, settled)
+		}
+		return nil
 	}
 
 	if errors.Is(runErr, ErrJobCancelled) {

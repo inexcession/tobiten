@@ -16,6 +16,7 @@ import (
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/events"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
@@ -292,13 +293,34 @@ func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.
 	return poolSizes, nil
 }
 
+type daemonWorkers struct {
+	runner     *jobs.Runner
+	delivery   *events.DeliveryCoordinator
+	dispatcher *events.Dispatcher
+}
+
+func (w *daemonWorkers) stopAndWait() {
+	if w == nil {
+		return
+	}
+	if w.dispatcher != nil {
+		w.dispatcher.Stop()
+	}
+	if w.delivery != nil {
+		w.delivery.Stop()
+	}
+	if w.runner != nil {
+		w.runner.Stop()
+	}
+}
+
 func startDaemonJobs(
 	ctx context.Context,
 	cancel context.CancelCauseFunc,
 	pool *pgxpool.Pool,
 	cfg *config.Config,
 	services *app.Services,
-) (*jobs.Runner, error) {
+) (*daemonWorkers, error) {
 	parsed, err := parsePoolSettings(cfg)
 	if err != nil {
 		return nil, err
@@ -308,23 +330,45 @@ func startDaemonJobs(
 		scannerWorkers = cfg.ScannerWorkers
 	}
 
+	onFatal := func(fatalErr error) {
+		if cancel != nil {
+			cancel(fatalErr)
+		}
+	}
 	runnerOpts := jobs.RunnerOptions{
 		Logger:          slog.Default(),
 		DefaultPoolSize: parsed.defaultPoolSize,
-		OnFatal: func(fatalErr error) {
-			if cancel != nil {
-				cancel(fatalErr)
-			}
-		},
+		OnFatal:         onFatal,
 	}
 
 	reg := buildDaemonRegistry(cfg, services)
-	runner := jobs.NewRunner(postgres.NewJobRepository(pool), runnerOpts)
+	eventRepo := postgres.NewEventRepository(pool)
+	jobRepo := postgres.NewJobRepository(pool)
+	runner := jobs.NewRunner(jobRepo, runnerOpts)
+	delivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
+		Logger:  slog.Default(),
+		OnFatal: onFatal,
+	})
+	dispatcher := events.NewDispatcher(eventRepo,
+		events.WithDispatcherLogger(slog.Default()),
+		events.WithOnPublished(func(_ context.Context, _ []domain.DomainEvent) error {
+			delivery.Wake()
+			return nil
+		}),
+		events.WithOnFatal(onFatal),
+	)
+
 	if err := runner.RegisterModuleKinds(reg); err != nil {
 		return nil, fmt.Errorf("registering module job kinds: %w", err)
 	}
 	if err := runner.RegisterModuleHandlers(reg); err != nil {
 		return nil, fmt.Errorf("registering module job handlers: %w", err)
+	}
+	if err := delivery.RegisterModuleSubscribers(reg); err != nil {
+		return nil, fmt.Errorf("registering module event subscribers: %w", err)
+	}
+	if err := delivery.RegisterJobs(runner); err != nil {
+		return nil, fmt.Errorf("registering internal EVENT_DELIVERY job kind: %w", err)
 	}
 
 	initialSizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds(), scannerWorkers)
@@ -347,13 +391,29 @@ func startDaemonJobs(
 		return nil, err
 	}
 
+	if err := delivery.SyncSubscribers(ctx); err != nil {
+		return nil, fmt.Errorf("syncing durable event subscribers: %w", err)
+	}
 	if _, err := runner.Recover(ctx); err != nil {
 		return nil, fmt.Errorf("recovering interrupted jobs: %w", err)
 	}
 	if err := runner.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting job worker pools: %w", err)
 	}
-	return runner, nil
+	if err := delivery.Start(ctx); err != nil {
+		runner.Stop()
+		return nil, fmt.Errorf("starting event delivery coordinator: %w", err)
+	}
+	if err := dispatcher.Start(ctx); err != nil {
+		delivery.Stop()
+		runner.Stop()
+		return nil, fmt.Errorf("starting domain event dispatcher: %w", err)
+	}
+	return &daemonWorkers{
+		runner:     runner,
+		delivery:   delivery,
+		dispatcher: dispatcher,
+	}, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -425,13 +485,13 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
 	})
-	jobRunner, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
+	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		cancel(nil)
-		jobRunner.Wait()
+		workers.stopAndWait()
 	}()
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)

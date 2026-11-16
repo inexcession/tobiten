@@ -102,4 +102,8 @@ type JobRepository interface {
 	// an interrupted RUNNING job at attempt to FAILED (or CANCELLED if cancel_requested is true).
 	// When checkpoint is empty, the existing checkpoint is preserved.
 	RecoverFailed(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, errMsg string, now time.Time) (*domain.Job, error)
+
+	// HasFailedEventDeliverySince reports whether a terminal FAILED EVENT_DELIVERY job exists
+	// for (subscriberID, publishedSequence) updated at or after since.
+	HasFailedEventDeliverySince(ctx context.Context, subscriberID string, publishedSequence int64, since time.Time) (bool, error)
 }

@@ -1,6 +1,7 @@
 package module
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -185,6 +186,20 @@ type EventSubscriberProvider interface {
 // EventSubscriber represents a declared domain event subscriber.
 type EventSubscriber interface {
 	Name() string
+}
+
+// TypedEventSubscriber is an optional interface implemented by an EventSubscriber
+// to declare its subscriber module kind persisted in event_subscribers.kind.
+type TypedEventSubscriber interface {
+	EventSubscriber
+	Kind() string
+}
+
+// DeliveringEventSubscriber is an optional interface implemented by an EventSubscriber
+// to execute durable at-least-once event delivery for its cursor (ADR-0018 S3).
+type DeliveringEventSubscriber interface {
+	EventSubscriber
+	DeliverEvent(ctx context.Context, event domain.DomainEvent) (domain.EventDeliveryOutcome, error)
 }
 
 // Registry manages compiled-in modules, their lifecycle, route mounts, and extension seams.
@@ -592,3 +607,17 @@ func (s JobKindSpec) PoolSize() int                        { return s.Workers }
 type NamedEventSubscriber string
 
 func (n NamedEventSubscriber) Name() string { return string(n) }
+
+// EventSubscriberSpec is an EventSubscriber descriptor pairing a subscriber ID with
+// its kind and delivery function.
+type EventSubscriberSpec struct {
+	ID          string
+	SubKind     string
+	DeliverFunc func(ctx context.Context, event domain.DomainEvent) (domain.EventDeliveryOutcome, error)
+}
+
+func (s EventSubscriberSpec) Name() string { return s.ID }
+func (s EventSubscriberSpec) Kind() string { return s.SubKind }
+func (s EventSubscriberSpec) DeliverEvent(ctx context.Context, event domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+	return s.DeliverFunc(ctx, event)
+}

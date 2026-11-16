@@ -187,6 +187,12 @@ func TestDomainEventAndSubscriber(t *testing.T) {
 	if !errors.Is(badStalled.Validate(), ErrInvalidStalledPair) {
 		t.Fatalf("expected ErrInvalidStalledPair, got %v", badStalled.Validate())
 	}
+
+	negPos := sub
+	negPos.Position = -1
+	if !errors.Is(negPos.Validate(), ErrInvalidSubscriberPosition) {
+		t.Fatalf("expected ErrInvalidSubscriberPosition, got %v", negPos.Validate())
+	}
 }
 
 func mustBuiltInRole(t *testing.T, id string) Role {

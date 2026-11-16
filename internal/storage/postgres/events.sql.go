@@ -85,6 +85,220 @@ func (q *Queries) GetDomainEventByID(ctx context.Context, id int64) (DomainEvent
 	return i, err
 }
 
+const getEventSubscriberByID = `-- name: GetEventSubscriberByID :one
+SELECT id, kind, position, state, stalled_at, updated_at
+FROM event_subscribers
+WHERE id = $1
+`
+
+func (q *Queries) GetEventSubscriberByID(ctx context.Context, id string) (EventSubscriber, error) {
+	row := q.db.QueryRow(ctx, getEventSubscriberByID, id)
+	var i EventSubscriber
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Position,
+		&i.State,
+		&i.StalledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getEventSubscriberByIDForUpdate = `-- name: GetEventSubscriberByIDForUpdate :one
+SELECT id, kind, position, state, stalled_at, updated_at
+FROM event_subscribers
+WHERE id = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetEventSubscriberByIDForUpdate(ctx context.Context, id string) (EventSubscriber, error) {
+	row := q.db.QueryRow(ctx, getEventSubscriberByIDForUpdate, id)
+	var i EventSubscriber
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Position,
+		&i.State,
+		&i.StalledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getNextPublishedDomainEventAfter = `-- name: GetNextPublishedDomainEventAfter :one
+SELECT id, published_sequence, published_at, kind, version, aggregate_type, aggregate_id, payload, created_at
+FROM domain_events
+WHERE published_sequence IS NOT NULL
+  AND published_sequence > $1
+ORDER BY published_sequence ASC
+LIMIT 1
+`
+
+func (q *Queries) GetNextPublishedDomainEventAfter(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error) {
+	row := q.db.QueryRow(ctx, getNextPublishedDomainEventAfter, publishedSequence)
+	var i DomainEvent
+	err := row.Scan(
+		&i.ID,
+		&i.PublishedSequence,
+		&i.PublishedAt,
+		&i.Kind,
+		&i.Version,
+		&i.AggregateType,
+		&i.AggregateID,
+		&i.Payload,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getPublishedDomainEventBySequence = `-- name: GetPublishedDomainEventBySequence :one
+SELECT id, published_sequence, published_at, kind, version, aggregate_type, aggregate_id, payload, created_at
+FROM domain_events
+WHERE published_sequence = $1
+`
+
+func (q *Queries) GetPublishedDomainEventBySequence(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error) {
+	row := q.db.QueryRow(ctx, getPublishedDomainEventBySequence, publishedSequence)
+	var i DomainEvent
+	err := row.Scan(
+		&i.ID,
+		&i.PublishedSequence,
+		&i.PublishedAt,
+		&i.Kind,
+		&i.Version,
+		&i.AggregateType,
+		&i.AggregateID,
+		&i.Payload,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertEventSubscriber = `-- name: InsertEventSubscriber :one
+INSERT INTO event_subscribers (
+    id,
+    kind,
+    position,
+    state,
+    stalled_at,
+    updated_at
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+ON CONFLICT (id) DO NOTHING
+RETURNING id, kind, position, state, stalled_at, updated_at
+`
+
+type InsertEventSubscriberParams struct {
+	ID        string
+	Kind      string
+	Position  int64
+	State     string
+	StalledAt *time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) InsertEventSubscriber(ctx context.Context, arg InsertEventSubscriberParams) (EventSubscriber, error) {
+	row := q.db.QueryRow(ctx, insertEventSubscriber,
+		arg.ID,
+		arg.Kind,
+		arg.Position,
+		arg.State,
+		arg.StalledAt,
+		arg.UpdatedAt,
+	)
+	var i EventSubscriber
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Position,
+		&i.State,
+		&i.StalledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listEventSubscribers = `-- name: ListEventSubscribers :many
+SELECT id, kind, position, state, stalled_at, updated_at
+FROM event_subscribers
+WHERE ($1::text IS NULL OR state = $1::text)
+ORDER BY id ASC
+`
+
+func (q *Queries) ListEventSubscribers(ctx context.Context, state *string) ([]EventSubscriber, error) {
+	rows, err := q.db.Query(ctx, listEventSubscribers, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []EventSubscriber
+	for rows.Next() {
+		var i EventSubscriber
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Position,
+			&i.State,
+			&i.StalledAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublishedDomainEventsAfter = `-- name: ListPublishedDomainEventsAfter :many
+SELECT id, published_sequence, published_at, kind, version, aggregate_type, aggregate_id, payload, created_at
+FROM domain_events
+WHERE published_sequence IS NOT NULL
+  AND published_sequence > $1
+ORDER BY published_sequence ASC
+LIMIT $2
+`
+
+type ListPublishedDomainEventsAfterParams struct {
+	PublishedSequence pgtype.Int8
+	Limit             int32
+}
+
+func (q *Queries) ListPublishedDomainEventsAfter(ctx context.Context, arg ListPublishedDomainEventsAfterParams) ([]DomainEvent, error) {
+	rows, err := q.db.Query(ctx, listPublishedDomainEventsAfter, arg.PublishedSequence, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DomainEvent
+	for rows.Next() {
+		var i DomainEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublishedSequence,
+			&i.PublishedAt,
+			&i.Kind,
+			&i.Version,
+			&i.AggregateType,
+			&i.AggregateID,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockDomainEventSequence = `-- name: LockDomainEventSequence :one
 SELECT last_sequence
 FROM domain_event_sequence
@@ -203,4 +417,69 @@ WHERE id = TRUE
 func (q *Queries) UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error {
 	_, err := q.db.Exec(ctx, updateDomainEventSequence, lastSequence)
 	return err
+}
+
+const updateEventSubscriberCursor = `-- name: UpdateEventSubscriberCursor :one
+UPDATE event_subscribers
+SET position = $2,
+    updated_at = $3
+WHERE id = $1
+  AND state = 'ACTIVE'
+  AND position < $2
+RETURNING id, kind, position, state, stalled_at, updated_at
+`
+
+type UpdateEventSubscriberCursorParams struct {
+	ID        string
+	Position  int64
+	UpdatedAt time.Time
+}
+
+func (q *Queries) UpdateEventSubscriberCursor(ctx context.Context, arg UpdateEventSubscriberCursorParams) (EventSubscriber, error) {
+	row := q.db.QueryRow(ctx, updateEventSubscriberCursor, arg.ID, arg.Position, arg.UpdatedAt)
+	var i EventSubscriber
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Position,
+		&i.State,
+		&i.StalledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateEventSubscriberState = `-- name: UpdateEventSubscriberState :one
+UPDATE event_subscribers
+SET state = $2,
+    stalled_at = $3,
+    updated_at = $4
+WHERE id = $1
+RETURNING id, kind, position, state, stalled_at, updated_at
+`
+
+type UpdateEventSubscriberStateParams struct {
+	ID        string
+	State     string
+	StalledAt *time.Time
+	UpdatedAt time.Time
+}
+
+func (q *Queries) UpdateEventSubscriberState(ctx context.Context, arg UpdateEventSubscriberStateParams) (EventSubscriber, error) {
+	row := q.db.QueryRow(ctx, updateEventSubscriberState,
+		arg.ID,
+		arg.State,
+		arg.StalledAt,
+		arg.UpdatedAt,
+	)
+	var i EventSubscriber
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Position,
+		&i.State,
+		&i.StalledAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

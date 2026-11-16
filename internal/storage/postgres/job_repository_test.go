@@ -1116,3 +1116,65 @@ func TestJobRepository_AtomicTerminalRecoveryAndRollback(t *testing.T) {
 		t.Fatalf("doneFail = (%+v, cp=%s), want FAILED with evidence checkpoint", doneFail, doneFail.Checkpoint)
 	}
 }
+
+func TestJobRepository_HasFailedEventDeliverySince(t *testing.T) {
+	t.Parallel()
+	_, repo, _ := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 15, 0, 0, 0, time.UTC)
+	payloadBytes, err := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:one",
+		PublishedSequence: 3,
+		EventID:           10,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	dedupeKey := "EVENT_DELIVERY:sub:one"
+	j := &domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     payloadBytes,
+		DedupeKey:   &dedupeKey,
+		MaxAttempts: 1,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := repo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := repo.ClaimNext(ctx, domain.JobKindEventDelivery, t0); err != nil {
+		t.Fatalf("ClaimNext: %v", err)
+	}
+
+	// While RUNNING, HasFailedEventDeliverySince must be false.
+	has, err := repo.HasFailedEventDeliverySince(ctx, "sub:one", 3, t0)
+	if err != nil || has {
+		t.Fatalf("while RUNNING: has=%v err=%v, want false", has, err)
+	}
+
+	failTime := t0.Add(5 * time.Second)
+	if _, err := repo.FailOrRetry(ctx, j.ID, 1, "downstream error", time.Time{}, failTime); err != nil {
+		t.Fatalf("FailOrRetry: %v", err)
+	}
+
+	// Once FAILED at failTime, queries since <= failTime match; queries since > failTime do not.
+	if has, err := repo.HasFailedEventDeliverySince(ctx, "sub:one", 3, t0); err != nil || !has {
+		t.Fatalf("at t0: has=%v err=%v, want true", has, err)
+	}
+	if has, err := repo.HasFailedEventDeliverySince(ctx, "sub:one", 3, failTime); err != nil || !has {
+		t.Fatalf("at failTime: has=%v err=%v, want true", has, err)
+	}
+	if has, err := repo.HasFailedEventDeliverySince(ctx, "sub:one", 3, failTime.Add(time.Second)); err != nil || has {
+		t.Fatalf("after failTime: has=%v err=%v, want false", has, err)
+	}
+	if has, err := repo.HasFailedEventDeliverySince(ctx, "sub:one", 4, t0); err != nil || has {
+		t.Fatalf("other seq: has=%v err=%v, want false", has, err)
+	}
+	if has, err := repo.HasFailedEventDeliverySince(ctx, "sub:two", 3, t0); err != nil || has {
+		t.Fatalf("other subscriber: has=%v err=%v, want false", has, err)
+	}
+}

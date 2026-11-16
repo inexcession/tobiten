@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -239,4 +240,66 @@ func DecodeEventPayload[T any](e DomainEvent) (T, error) {
 		return out, fmt.Errorf("%w: %v", ErrInvalidEventPayload, err)
 	}
 	return out, nil
+}
+
+// EventDeliveryOutcome reports the authorized disposition of delivering a published
+// domain event to a durable subscriber (ADR-0018 S3).
+type EventDeliveryOutcome int
+
+const (
+	// DeliveryAcknowledged indicates the subscriber accepted/delivered the event
+	// and its durable cursor may advance to PublishedSequence.
+	DeliveryAcknowledged EventDeliveryOutcome = iota + 1
+
+	// DeliverySkipped indicates an authorized filter or permission/label policy
+	// excluded the event for this subscriber and its durable cursor may advance.
+	DeliverySkipped
+)
+
+// IsValid reports whether o is a recognized EventDeliveryOutcome.
+func (o EventDeliveryOutcome) IsValid() bool {
+	return o == DeliveryAcknowledged || o == DeliverySkipped
+}
+
+// EventDeliveryPayloadV1 is the versioned job payload for internal EVENT_DELIVERY jobs
+// (ADR-0017, ADR-0018 S3).
+type EventDeliveryPayloadV1 struct {
+	SubscriberID      string `json:"subscriber_id"`
+	PublishedSequence int64  `json:"published_sequence"`
+	EventID           int64  `json:"event_id,omitempty"`
+}
+
+// Validate checks that p identifies a subscriber and a positive publication sequence.
+func (p EventDeliveryPayloadV1) Validate() error {
+	if strings.TrimSpace(p.SubscriberID) == "" {
+		return fmt.Errorf("%w: %w", ErrInvalidDeliveryPayload, ErrEmptySubscriberID)
+	}
+	if p.PublishedSequence <= 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidDeliveryPayload, ErrInvalidPublishedSeq)
+	}
+	return nil
+}
+
+// EventDeliveryDedupeKey returns the active-job deduplication key serializing
+// EVENT_DELIVERY execution per durable subscriber (ADR-0017 §1, ADR-0018 S3).
+func EventDeliveryDedupeKey(subscriberID string) (string, error) {
+	if strings.TrimSpace(subscriberID) == "" {
+		return "", ErrEmptySubscriberID
+	}
+	return "EVENT_DELIVERY:" + subscriberID, nil
+}
+
+// DecodeEventDeliveryPayload unmarshals and validates a durable EVENT_DELIVERY job payload.
+func DecodeEventDeliveryPayload(raw json.RawMessage) (EventDeliveryPayloadV1, error) {
+	var p EventDeliveryPayloadV1
+	if !isValidJSONObject(raw) {
+		return p, ErrInvalidDeliveryPayload
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return p, fmt.Errorf("%w: %v", ErrInvalidDeliveryPayload, err)
+	}
+	if err := p.Validate(); err != nil {
+		return p, err
+	}
+	return p, nil
 }

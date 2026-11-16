@@ -802,3 +802,19 @@ func (r *JobRepository) RecoverFailed(ctx context.Context, id string, attempt in
 		return row, nil
 	})
 }
+
+// HasFailedEventDeliverySince reports whether a terminal FAILED EVENT_DELIVERY job exists
+// for (subscriberID, publishedSequence) updated at or after since.
+func (r *JobRepository) HasFailedEventDeliverySince(ctx context.Context, subscriberID string, publishedSequence int64, since time.Time) (bool, error) {
+	if strings.TrimSpace(subscriberID) == "" {
+		return false, domain.ErrEmptySubscriberID
+	}
+	if publishedSequence <= 0 {
+		return false, domain.ErrInvalidPublishedSeq
+	}
+	return r.q.HasFailedEventDeliveryJobSince(ctx, HasFailedEventDeliveryJobSinceParams{
+		SubscriberID:      subscriberID,
+		PublishedSequence: publishedSequence,
+		Since:             since.UTC(),
+	})
+}

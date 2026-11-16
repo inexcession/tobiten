@@ -296,6 +296,34 @@ func (q *Queries) GetNextRunnableJobIDForUpdate(ctx context.Context, arg GetNext
 	return id, err
 }
 
+const hasFailedEventDeliveryJobSince = `-- name: HasFailedEventDeliveryJobSince :one
+SELECT EXISTS (
+    SELECT 1
+    FROM jobs
+    WHERE kind = 'EVENT_DELIVERY'
+      AND state = 'FAILED'
+      AND dedupe_key = ('EVENT_DELIVERY:' || $1::text)
+      AND payload @> jsonb_build_object(
+          'subscriber_id', $1::text,
+          'published_sequence', $2::bigint
+      )
+      AND updated_at >= $3::timestamptz
+)
+`
+
+type HasFailedEventDeliveryJobSinceParams struct {
+	SubscriberID      string
+	PublishedSequence int64
+	Since             time.Time
+}
+
+func (q *Queries) HasFailedEventDeliveryJobSince(ctx context.Context, arg HasFailedEventDeliveryJobSinceParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasFailedEventDeliveryJobSince, arg.SubscriberID, arg.PublishedSequence, arg.Since)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const isJobCancelRequested = `-- name: IsJobCancelRequested :one
 SELECT cancel_requested
 FROM jobs

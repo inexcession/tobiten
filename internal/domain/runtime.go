@@ -36,7 +36,12 @@ var (
 	ErrEmptySubscriberID             = errors.New("event subscriber ID cannot be empty")
 	ErrEmptySubscriberKind           = errors.New("event subscriber kind cannot be empty")
 	ErrInvalidSubscriberState        = errors.New("invalid event subscriber state")
+	ErrInvalidSubscriberPosition     = errors.New("event subscriber position cannot be negative")
 	ErrInvalidStalledPair            = errors.New("subscriber state STALLED and stalled_at must be set together")
+	ErrSubscriberNotActive           = errors.New("event subscriber is not active")
+	ErrCursorSequenceMismatch        = errors.New("event subscriber cursor cannot skip earlier published events")
+	ErrInvalidDeliveryPayload        = errors.New("invalid event delivery job payload")
+	ErrInvalidDeliveryOutcome        = errors.New("invalid event delivery outcome")
 )
 
 // DefaultJobMaxAttempts is the default maximum execution attempts for a durable job.
@@ -378,6 +383,9 @@ func (s *EventSubscriber) Validate() error {
 	}
 	if !s.State.IsValid() {
 		return fmt.Errorf("%w: %q", ErrInvalidSubscriberState, s.State)
+	}
+	if s.Position < 0 {
+		return ErrInvalidSubscriberPosition
 	}
 	if (s.State == SubscriberStateStalled) != (s.StalledAt != nil) {
 		return ErrInvalidStalledPair

@@ -7,6 +7,8 @@ package postgres
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -35,10 +37,14 @@ type Querier interface {
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error)
 	GetDomainEventByID(ctx context.Context, id int64) (DomainEvent, error)
+	GetEventSubscriberByID(ctx context.Context, id string) (EventSubscriber, error)
+	GetEventSubscriberByIDForUpdate(ctx context.Context, id string) (EventSubscriber, error)
 	GetJobByID(ctx context.Context, id string) (Job, error)
 	GetJobByIDForUpdate(ctx context.Context, id string) (Job, error)
 	GetLabelByID(ctx context.Context, id string) (Label, error)
+	GetNextPublishedDomainEventAfter(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)
 	GetNextRunnableJobIDForUpdate(ctx context.Context, arg GetNextRunnableJobIDForUpdateParams) (string, error)
+	GetPublishedDomainEventBySequence(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
 	GetServerLabelByName(ctx context.Context, name string) (Label, error)
@@ -47,15 +53,19 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	GetUserLabelByName(ctx context.Context, arg GetUserLabelByNameParams) (Label, error)
+	HasFailedEventDeliveryJobSince(ctx context.Context, arg HasFailedEventDeliveryJobSinceParams) (bool, error)
+	InsertEventSubscriber(ctx context.Context, arg InsertEventSubscriberParams) (EventSubscriber, error)
 	IsJobCancelRequested(ctx context.Context, id string) (bool, error)
 	ListAllItemLabelsForMaintenance(ctx context.Context, arg ListAllItemLabelsForMaintenanceParams) ([]Label, error)
 	ListAllRolePermissions(ctx context.Context) ([]RolePermission, error)
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
+	ListEventSubscribers(ctx context.Context, state *string) ([]EventSubscriber, error)
 	ListItemIDsByLabel(ctx context.Context, arg ListItemIDsByLabelParams) ([]string, error)
 	ListItemLabels(ctx context.Context, arg ListItemLabelsParams) ([]Label, error)
 	ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, error)
 	ListLabelPoliciesByLabel(ctx context.Context, labelID string) ([]UserLabelPolicy, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
+	ListPublishedDomainEventsAfter(ctx context.Context, arg ListPublishedDomainEventsAfterParams) ([]DomainEvent, error)
 	ListRoles(ctx context.Context) ([]Role, error)
 	ListRunningJobs(ctx context.Context) ([]Job, error)
 	ListServerItemLabels(ctx context.Context, arg ListServerItemLabelsParams) ([]Label, error)
@@ -88,6 +98,8 @@ type Querier interface {
 	SetUserLabelPolicy(ctx context.Context, arg SetUserLabelPolicyParams) error
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
 	UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error
+	UpdateEventSubscriberCursor(ctx context.Context, arg UpdateEventSubscriberCursorParams) (EventSubscriber, error)
+	UpdateEventSubscriberState(ctx context.Context, arg UpdateEventSubscriberStateParams) (EventSubscriber, error)
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
 	UpsertBuiltInServerLabel(ctx context.Context, arg UpsertBuiltInServerLabelParams) error

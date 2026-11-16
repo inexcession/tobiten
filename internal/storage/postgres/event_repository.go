@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 var _ storage.EventRepository = (*EventRepository)(nil)
@@ -192,4 +195,246 @@ func (r *EventRepository) publishUnsequencedInTx(ctx context.Context, ts time.Ti
 	}
 
 	return published, nil
+}
+
+func normalizeEventTime(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t.UTC()
+}
+
+// GetPublishedEventBySequence retrieves a published domain event by its published_sequence.
+func (r *EventRepository) GetPublishedEventBySequence(ctx context.Context, seq int64) (*domain.DomainEvent, error) {
+	if seq <= 0 {
+		return nil, storage.ErrNotFound
+	}
+	row, err := r.q.GetPublishedDomainEventBySequence(ctx, pgtype.Int8{Int64: seq, Valid: true})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := DomainEventToDomain(row)
+	return &out, nil
+}
+
+// GetNextPublishedEventAfter returns the earliest committed published domain event
+// with published_sequence > afterSeq.
+func (r *EventRepository) GetNextPublishedEventAfter(ctx context.Context, afterSeq int64) (*domain.DomainEvent, error) {
+	if afterSeq < 0 {
+		afterSeq = 0
+	}
+	row, err := r.q.GetNextPublishedDomainEventAfter(ctx, pgtype.Int8{Int64: afterSeq, Valid: true})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := DomainEventToDomain(row)
+	return &out, nil
+}
+
+// ListPublishedEventsAfter returns up to limit committed published domain events with
+// published_sequence > afterSeq ordered by published_sequence ASC.
+func (r *EventRepository) ListPublishedEventsAfter(ctx context.Context, afterSeq int64, limit int) ([]domain.DomainEvent, error) {
+	if afterSeq < 0 {
+		return nil, domain.ErrInvalidSubscriberPosition
+	}
+	if limit < 1 || limit > math.MaxInt32 {
+		return nil, fmt.Errorf("invalid event list limit=%d", limit)
+	}
+	rows, err := r.q.ListPublishedDomainEventsAfter(ctx, ListPublishedDomainEventsAfterParams{
+		PublishedSequence: pgtype.Int8{Int64: afterSeq, Valid: true},
+		Limit:             int32(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing published domain events: %w", err)
+	}
+	out := make([]domain.DomainEvent, len(rows))
+	for i, row := range rows {
+		out[i] = DomainEventToDomain(row)
+	}
+	return out, nil
+}
+
+// EnsureEventSubscriber inserts sub if absent (preserving existing position/state if present)
+// and returns the persisted row.
+func (r *EventRepository) EnsureEventSubscriber(ctx context.Context, sub domain.EventSubscriber) (*domain.EventSubscriber, error) {
+	if r == nil {
+		return nil, errors.New("event repository is required")
+	}
+	candidate := sub
+	if candidate.State == "" {
+		candidate.State = domain.SubscriberStateActive
+	}
+	if err := candidate.Validate(); err != nil {
+		return nil, err
+	}
+	ts := normalizeEventTime(candidate.UpdatedAt)
+
+	row, err := r.q.InsertEventSubscriber(ctx, InsertEventSubscriberParams{
+		ID:        candidate.ID,
+		Kind:      candidate.Kind,
+		Position:  candidate.Position,
+		State:     string(candidate.State),
+		StalledAt: candidate.StalledAt,
+		UpdatedAt: ts,
+	})
+	if err == nil {
+		out := EventSubscriberToDomain(row)
+		return &out, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, mapPgError(err)
+	}
+
+	existing, err := r.q.GetEventSubscriberByID(ctx, candidate.ID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	if existing.Kind != candidate.Kind {
+		return nil, fmt.Errorf("%w: event subscriber %q exists with kind %q, got %q",
+			storage.ErrAlreadyExists, candidate.ID, existing.Kind, candidate.Kind)
+	}
+	out := EventSubscriberToDomain(existing)
+	return &out, nil
+}
+
+// GetEventSubscriber retrieves a durable subscriber cursor row by ID.
+func (r *EventRepository) GetEventSubscriber(ctx context.Context, id string) (*domain.EventSubscriber, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptySubscriberID
+	}
+	row, err := r.q.GetEventSubscriberByID(ctx, id)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := EventSubscriberToDomain(row)
+	return &out, nil
+}
+
+// ListEventSubscribers returns durable subscriber rows ordered by ID, optionally filtered by state.
+func (r *EventRepository) ListEventSubscribers(ctx context.Context, state *domain.SubscriberState) ([]domain.EventSubscriber, error) {
+	var stateStr *string
+	if state != nil {
+		if !state.IsValid() {
+			return nil, fmt.Errorf("%w: %q", domain.ErrInvalidSubscriberState, *state)
+		}
+		s := string(*state)
+		stateStr = &s
+	}
+	rows, err := r.q.ListEventSubscribers(ctx, stateStr)
+	if err != nil {
+		return nil, fmt.Errorf("listing event subscribers: %w", err)
+	}
+	out := make([]domain.EventSubscriber, len(rows))
+	for i, row := range rows {
+		out[i] = EventSubscriberToDomain(row)
+	}
+	return out, nil
+}
+
+// AdvanceEventSubscriberCursor atomically locks the subscriber row, verifies state == ACTIVE
+// and that targetSeq is the next committed published_sequence after the current position,
+// and advances position to targetSeq.
+func (r *EventRepository) AdvanceEventSubscriberCursor(ctx context.Context, id string, targetSeq int64, now time.Time) (*domain.EventSubscriber, error) {
+	if r == nil {
+		return nil, errors.New("event repository is required")
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptySubscriberID
+	}
+	if targetSeq <= 0 {
+		return nil, domain.ErrInvalidPublishedSeq
+	}
+	ts := normalizeEventTime(now)
+
+	var out domain.EventSubscriber
+	run := func(txRepo *EventRepository) error {
+		var err error
+		out, err = txRepo.advanceSubscriberCursorInTx(ctx, id, targetSeq, ts)
+		return err
+	}
+	if r.InTx() {
+		if err := run(r); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	}
+	if err := r.WithTx(ctx, func(repo storage.EventRepository) error {
+		pgTxRepo, ok := repo.(*EventRepository)
+		if !ok {
+			return errors.New("unexpected event repository implementation inside transaction")
+		}
+		return run(pgTxRepo)
+	}); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (r *EventRepository) advanceSubscriberCursorInTx(ctx context.Context, id string, targetSeq int64, ts time.Time) (domain.EventSubscriber, error) {
+	row, err := r.q.GetEventSubscriberByIDForUpdate(ctx, id)
+	if err != nil {
+		return domain.EventSubscriber{}, mapPgError(err)
+	}
+	if row.State != string(domain.SubscriberStateActive) {
+		return domain.EventSubscriber{}, fmt.Errorf("%w: subscriber %q is in state %s", domain.ErrSubscriberNotActive, id, row.State)
+	}
+	if row.Position >= targetSeq {
+		return EventSubscriberToDomain(row), nil
+	}
+	nextRow, err := r.q.GetNextPublishedDomainEventAfter(ctx, pgtype.Int8{Int64: row.Position, Valid: true})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.EventSubscriber{}, fmt.Errorf("%w: no published event after position %d for subscriber %q",
+				domain.ErrCursorSequenceMismatch, row.Position, id)
+		}
+		return domain.EventSubscriber{}, fmt.Errorf("checking next published event for subscriber %q: %w", id, err)
+	}
+	if !nextRow.PublishedSequence.Valid || nextRow.PublishedSequence.Int64 != targetSeq {
+		return domain.EventSubscriber{}, fmt.Errorf("%w: subscriber %q at position %d must process sequence %d before %d",
+			domain.ErrCursorSequenceMismatch, id, row.Position, nextRow.PublishedSequence.Int64, targetSeq)
+	}
+
+	updated, err := r.q.UpdateEventSubscriberCursor(ctx, UpdateEventSubscriberCursorParams{
+		ID:        id,
+		Position:  targetSeq,
+		UpdatedAt: ts,
+	})
+	if err != nil {
+		return domain.EventSubscriber{}, fmt.Errorf("updating cursor for subscriber %q: %w", id, err)
+	}
+	return EventSubscriberToDomain(updated), nil
+}
+
+// UpdateEventSubscriberState updates a durable subscriber's state (ACTIVE, PAUSED, STALLED).
+func (r *EventRepository) UpdateEventSubscriberState(ctx context.Context, id string, state domain.SubscriberState, stalledAt *time.Time, now time.Time) (*domain.EventSubscriber, error) {
+	if r == nil {
+		return nil, errors.New("event repository is required")
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptySubscriberID
+	}
+	if !state.IsValid() {
+		return nil, fmt.Errorf("%w: %q", domain.ErrInvalidSubscriberState, state)
+	}
+	var normalizedStalledAt *time.Time
+	if stalledAt != nil {
+		t := stalledAt.UTC()
+		normalizedStalledAt = &t
+	}
+	if (state == domain.SubscriberStateStalled) != (normalizedStalledAt != nil) {
+		return nil, domain.ErrInvalidStalledPair
+	}
+	ts := normalizeEventTime(now)
+
+	row, err := r.q.UpdateEventSubscriberState(ctx, UpdateEventSubscriberStateParams{
+		ID:        id,
+		State:     string(state),
+		StalledAt: normalizedStalledAt,
+		UpdatedAt: ts,
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := EventSubscriberToDomain(row)
+	return &out, nil
 }

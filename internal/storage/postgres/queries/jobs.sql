@@ -241,3 +241,17 @@ WHERE id = $1
 RETURNING id, kind, state, payload, checkpoint, attempts, max_attempts,
           cancel_requested, last_error, created_by, dedupe_key,
           run_after, created_at, started_at, updated_at, finished_at;
+
+-- name: HasFailedEventDeliveryJobSince :one
+SELECT EXISTS (
+    SELECT 1
+    FROM jobs
+    WHERE kind = 'EVENT_DELIVERY'
+      AND state = 'FAILED'
+      AND dedupe_key = ('EVENT_DELIVERY:' || sqlc.arg(subscriber_id)::text)
+      AND payload @> jsonb_build_object(
+          'subscriber_id', sqlc.arg(subscriber_id)::text,
+          'published_sequence', sqlc.arg(published_sequence)::bigint
+      )
+      AND updated_at >= sqlc.arg(since)::timestamptz
+);

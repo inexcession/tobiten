@@ -820,3 +820,53 @@ func TestRunner_TerminalRecoveryDoesNotPreCommitCheckpointOnTransitionFailure(t 
 		t.Fatalf("job mutated despite failed terminal transition: state=%s cp=%s", got.State, got.Checkpoint)
 	}
 }
+
+func TestRunner_OnSucceededInvokedAfterCommitAndDuplicateRejected(t *testing.T) {
+	t.Parallel()
+	_, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	now := time.Date(2026, 11, 16, 17, 50, 0, 0, time.UTC)
+	runner := jobs.NewRunner(repo, jobs.RunnerOptions{Now: func() time.Time { return now }})
+
+	var settled domain.Job
+	var called int
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindEventDelivery,
+		ResumePolicy: domain.JobResumeRestart,
+		Handler:      jobs.HandlerFunc(func(context.Context, *jobs.Execution) error { return nil }),
+		OnSucceeded: func(hookCtx context.Context, job domain.Job) {
+			called++
+			persisted, err := repo.GetJobByID(hookCtx, job.ID)
+			if err != nil {
+				t.Fatalf("GetJobByID inside OnSucceeded: %v", err)
+			}
+			settled = *persisted
+		},
+	}); err != nil {
+		t.Fatalf("RegisterKind: %v", err)
+	}
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindEventDelivery,
+		ResumePolicy: domain.JobResumeRestart,
+		OnSucceeded:  func(context.Context, domain.Job) {},
+	}); !errors.Is(err, jobs.ErrDuplicateJobKind) {
+		t.Fatalf("duplicate OnSucceeded err = %v, want ErrDuplicateJobKind", err)
+	}
+
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	j := &domain.Job{Kind: domain.JobKindEventDelivery, CreatedAt: now, RunAfter: now}
+	if _, err := repo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+	}
+	if called != 1 || settled.State != domain.JobStateSucceeded || settled.ID != j.ID {
+		t.Fatalf("OnSucceeded called=%d settled=%+v, want called=1 SUCCEEDED", called, settled)
+	}
+}

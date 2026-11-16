@@ -231,3 +231,48 @@ func TestNewDomainEventAndDecodeVersionedPayloads(t *testing.T) {
 		}
 	})
 }
+
+func TestEventDeliveryHelpers(t *testing.T) {
+	if !DeliveryAcknowledged.IsValid() || !DeliverySkipped.IsValid() {
+		t.Fatal("expected DeliveryAcknowledged and DeliverySkipped to be valid")
+	}
+	if EventDeliveryOutcome(0).IsValid() || EventDeliveryOutcome(99).IsValid() {
+		t.Fatal("expected unknown EventDeliveryOutcome values to be invalid")
+	}
+
+	key, err := EventDeliveryDedupeKey("notify:shoutrrr")
+	if err != nil || key != "EVENT_DELIVERY:notify:shoutrrr" {
+		t.Fatalf("EventDeliveryDedupeKey = (%q, %v), want (EVENT_DELIVERY:notify:shoutrrr, nil)", key, err)
+	}
+	if _, err := EventDeliveryDedupeKey("   "); !errors.Is(err, ErrEmptySubscriberID) {
+		t.Fatalf("empty EventDeliveryDedupeKey err = %v, want ErrEmptySubscriberID", err)
+	}
+
+	raw, err := json.Marshal(EventDeliveryPayloadV1{
+		SubscriberID:      "notify:shoutrrr",
+		PublishedSequence: 7,
+		EventID:           42,
+	})
+	if err != nil {
+		t.Fatalf("Marshal EventDeliveryPayloadV1: %v", err)
+	}
+	decoded, err := DecodeEventDeliveryPayload(raw)
+	if err != nil {
+		t.Fatalf("DecodeEventDeliveryPayload: %v", err)
+	}
+	if decoded.SubscriberID != "notify:shoutrrr" || decoded.PublishedSequence != 7 || decoded.EventID != 42 {
+		t.Fatalf("decoded = %+v", decoded)
+	}
+
+	for _, bad := range []json.RawMessage{
+		json.RawMessage(`not-json`),
+		json.RawMessage(`[]`),
+		json.RawMessage(`{"subscriber_id":"","published_sequence":1}`),
+		json.RawMessage(`{"subscriber_id":"sub-1","published_sequence":0}`),
+		json.RawMessage(`{"subscriber_id":"sub-1","published_sequence":-5}`),
+	} {
+		if _, err := DecodeEventDeliveryPayload(bad); !errors.Is(err, ErrInvalidDeliveryPayload) {
+			t.Fatalf("DecodeEventDeliveryPayload(%s) err = %v, want ErrInvalidDeliveryPayload", bad, err)
+		}
+	}
+}

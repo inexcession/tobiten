@@ -1474,3 +1474,219 @@ func TestEventRepository_PublishUnsequenced_ConcurrentSerializesWithoutGapsOrDup
 		}
 	}
 }
+
+func TestEventRepository_SubscriberCursorsAndPublishedReads(t *testing.T) {
+	t.Parallel()
+	_, repo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 15, 0, 0, 0, time.UTC)
+
+	// Append 3 events, publish only the first 2, leave the 3rd unpublished.
+	if err := repo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		for _, id := range []string{"a1", "a2"} {
+			ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, id, nil, t0)
+			if err != nil {
+				return err
+			}
+			if err := txRepo.AppendEvent(ctx, &ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("append initial events: %v", err)
+	}
+	published, err := repo.PublishUnsequencedEvents(ctx, t0.Add(time.Second))
+	if err != nil || len(published) != 2 {
+		t.Fatalf("PublishUnsequencedEvents = (%d, %v), want 2", len(published), err)
+	}
+	if err := repo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "a3-unpub", nil, t0.Add(2*time.Second))
+		if err != nil {
+			return err
+		}
+		return txRepo.AppendEvent(ctx, &ev)
+	}); err != nil {
+		t.Fatalf("append unpublished event: %v", err)
+	}
+
+	// EnsureEventSubscriber inserts new row and preserves existing state/position on re-ensure.
+	sub1, err := repo.EnsureEventSubscriber(ctx, domain.EventSubscriber{
+		ID:        "sub:alpha",
+		Kind:      "test-kind",
+		Position:  0,
+		State:     domain.SubscriberStateActive,
+		UpdatedAt: t0,
+	})
+	if err != nil || sub1.Position != 0 || sub1.State != domain.SubscriberStateActive {
+		t.Fatalf("EnsureEventSubscriber sub1 = (%+v, %v)", sub1, err)
+	}
+	if _, err := repo.EnsureEventSubscriber(ctx, domain.EventSubscriber{
+		ID:        "sub:alpha",
+		Kind:      "different-kind",
+		UpdatedAt: t0,
+	}); !errors.Is(err, storage.ErrAlreadyExists) {
+		t.Fatalf("EnsureEventSubscriber kind conflict err = %v, want ErrAlreadyExists", err)
+	}
+
+	// Published read helpers ignore unpublished row.
+	next1, err := repo.GetNextPublishedEventAfter(ctx, 0)
+	if err != nil || *next1.PublishedSequence != 1 || next1.AggregateID != "a1" {
+		t.Fatalf("GetNextPublishedEventAfter(0) = (%+v, %v)", next1, err)
+	}
+	bySeq2, err := repo.GetPublishedEventBySequence(ctx, 2)
+	if err != nil || bySeq2.AggregateID != "a2" {
+		t.Fatalf("GetPublishedEventBySequence(2) = (%+v, %v)", bySeq2, err)
+	}
+	listAll, err := repo.ListPublishedEventsAfter(ctx, 0, 10)
+	if err != nil || len(listAll) != 2 {
+		t.Fatalf("ListPublishedEventsAfter(0) = (%d, %v), want 2", len(listAll), err)
+	}
+
+	// Skipping sequence 1 to advance directly to 2 must fail and leave cursor at 0.
+	if _, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 2, t0.Add(3*time.Second)); !errors.Is(err, domain.ErrCursorSequenceMismatch) {
+		t.Fatalf("skipping cursor err = %v, want ErrCursorSequenceMismatch", err)
+	}
+	gotSub, err := repo.GetEventSubscriber(ctx, "sub:alpha")
+	if err != nil || gotSub.Position != 0 {
+		t.Fatalf("cursor after rejected skip = (%+v, %v), want position 0", gotSub, err)
+	}
+
+	// Advancing to sequence 1 succeeds; re-advancing to 1 is idempotent; then advancing to 2 succeeds.
+	adv1, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 1, t0.Add(4*time.Second))
+	if err != nil || adv1.Position != 1 {
+		t.Fatalf("AdvanceEventSubscriberCursor(1) = (%+v, %v)", adv1, err)
+	}
+	idem1, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 1, t0.Add(5*time.Second))
+	if err != nil || idem1.Position != 1 {
+		t.Fatalf("idempotent AdvanceEventSubscriberCursor(1) = (%+v, %v)", idem1, err)
+	}
+	adv2, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 2, t0.Add(6*time.Second))
+	if err != nil || adv2.Position != 2 {
+		t.Fatalf("AdvanceEventSubscriberCursor(2) = (%+v, %v)", adv2, err)
+	}
+
+	// No further published events after 2.
+	if _, err := repo.GetNextPublishedEventAfter(ctx, 2); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetNextPublishedEventAfter(2) err = %v, want ErrNotFound", err)
+	}
+	if _, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 3, t0.Add(7*time.Second)); !errors.Is(err, domain.ErrCursorSequenceMismatch) {
+		t.Fatalf("advancing to unpublished/missing sequence err = %v, want ErrCursorSequenceMismatch", err)
+	}
+
+	// Re-ensuring existing subscriber preserves position=2.
+	reEnsured, err := repo.EnsureEventSubscriber(ctx, domain.EventSubscriber{
+		ID:        "sub:alpha",
+		Kind:      "test-kind",
+		Position:  0,
+		State:     domain.SubscriberStateActive,
+		UpdatedAt: t0.Add(8 * time.Second),
+	})
+	if err != nil || reEnsured.Position != 2 {
+		t.Fatalf("re-ensured subscriber = (%+v, %v), want position=2", reEnsured, err)
+	}
+
+	// Pausing prevents cursor advance even if a new event is published.
+	if _, err := repo.PublishUnsequencedEvents(ctx, t0.Add(9*time.Second)); err != nil {
+		t.Fatalf("publish 3rd event: %v", err)
+	}
+	paused, err := repo.UpdateEventSubscriberState(ctx, "sub:alpha", domain.SubscriberStatePaused, nil, t0.Add(10*time.Second))
+	if err != nil || paused.State != domain.SubscriberStatePaused {
+		t.Fatalf("UpdateEventSubscriberState PAUSED = (%+v, %v)", paused, err)
+	}
+	if _, err := repo.AdvanceEventSubscriberCursor(ctx, "sub:alpha", 3, t0.Add(11*time.Second)); !errors.Is(err, domain.ErrSubscriberNotActive) {
+		t.Fatalf("advance while PAUSED err = %v, want ErrSubscriberNotActive", err)
+	}
+
+	activeFilter := domain.SubscriberStateActive
+	activeList, err := repo.ListEventSubscribers(ctx, &activeFilter)
+	if err != nil || len(activeList) != 0 {
+		t.Fatalf("ListEventSubscribers(ACTIVE) = (%+v, %v), want empty", activeList, err)
+	}
+	allList, err := repo.ListEventSubscribers(ctx, nil)
+	if err != nil || len(allList) != 1 {
+		t.Fatalf("ListEventSubscribers(all) = (%+v, %v), want 1", allList, err)
+	}
+}
+
+func TestEventRepository_ConcurrentAdvanceCursorCannotSkip(t *testing.T) {
+	t.Parallel()
+	db, repo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	t0 := time.Date(2026, 11, 16, 15, 30, 0, 0, time.UTC)
+
+	if err := repo.WithTx(ctx, func(txRepo storage.EventRepository) error {
+		for _, id := range []string{"c1", "c2"} {
+			ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, id, nil, t0)
+			if err != nil {
+				return err
+			}
+			if err := txRepo.AppendEvent(ctx, &ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+	if _, err := repo.PublishUnsequencedEvents(ctx, t0); err != nil {
+		t.Fatalf("PublishUnsequencedEvents: %v", err)
+	}
+	if _, err := repo.EnsureEventSubscriber(ctx, domain.EventSubscriber{
+		ID:        "sub:concurrent",
+		Kind:      "test-kind",
+		State:     domain.SubscriberStateActive,
+		UpdatedAt: t0,
+	}); err != nil {
+		t.Fatalf("EnsureEventSubscriber: %v", err)
+	}
+
+	// Race sequence 2 advances against sequence 1 advances across independent connections.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	seq2Successes := atomic.Int32{}
+	seq1Successes := atomic.Int32{}
+
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			workerRepo := postgres.NewEventRepository(db.Pool)
+			<-start
+			if _, err := workerRepo.AdvanceEventSubscriberCursor(ctx, "sub:concurrent", 2, t0); err == nil {
+				seq2Successes.Add(1)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		workerRepo := postgres.NewEventRepository(db.Pool)
+		<-start
+		if _, err := workerRepo.AdvanceEventSubscriberCursor(ctx, "sub:concurrent", 1, t0); err == nil {
+			seq1Successes.Add(1)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	if seq1Successes.Load() != 1 {
+		t.Fatalf("expected seq1 advance to succeed once, got %d", seq1Successes.Load())
+	}
+	got, err := repo.GetEventSubscriber(ctx, "sub:concurrent")
+	if err != nil {
+		t.Fatalf("GetEventSubscriber: %v", err)
+	}
+	if seq2Successes.Load() == 0 && got.Position != 1 {
+		t.Fatalf("unexpected position %d when seq2 did not win after seq1", got.Position)
+	}
+	if seq2Successes.Load() > 0 && got.Position != 2 {
+		t.Fatalf("unexpected position %d after seq2 succeeded", got.Position)
+	}
+}

@@ -367,3 +367,31 @@ CREATE TABLE module_test_items (
 		t.Errorf("name = %q, want %q", name, "test-item")
 	}
 }
+
+func TestEventSubscriberSpec(t *testing.T) {
+	spec := EventSubscriberSpec{
+		ID:      "notify:shoutrrr",
+		SubKind: "shoutrrr",
+		DeliverFunc: func(_ context.Context, ev domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+			if ev.AggregateID == "skip-me" {
+				return domain.DeliverySkipped, nil
+			}
+			return domain.DeliveryAcknowledged, nil
+		},
+	}
+
+	if spec.Name() != "notify:shoutrrr" {
+		t.Errorf("Name() = %q, want notify:shoutrrr", spec.Name())
+	}
+	if spec.Kind() != "shoutrrr" {
+		t.Errorf("Kind() = %q, want shoutrrr", spec.Kind())
+	}
+	out1, err := spec.DeliverEvent(context.Background(), domain.DomainEvent{AggregateID: "ack-me"})
+	if err != nil || out1 != domain.DeliveryAcknowledged {
+		t.Errorf("DeliverEvent(ack-me) = (%v, %v), want (DeliveryAcknowledged, nil)", out1, err)
+	}
+	out2, err := spec.DeliverEvent(context.Background(), domain.DomainEvent{AggregateID: "skip-me"})
+	if err != nil || out2 != domain.DeliverySkipped {
+		t.Errorf("DeliverEvent(skip-me) = (%v, %v), want (DeliverySkipped, nil)", out2, err)
+	}
+}
