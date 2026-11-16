@@ -399,6 +399,255 @@ func TestEventRepository_CancelledReleaseSavepointAbortsParentBeforeCommit(t *te
 	}
 }
 
+type twoLevelRollbackControl struct {
+	errByLevel    map[int]error
+	rollbackCalls map[int]int
+	commitCalls   map[int]int
+}
+
+type twoLevelFaultBeginner struct {
+	postgres.TxBeginner
+	ctrl *twoLevelRollbackControl
+}
+
+func (b *twoLevelFaultBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &twoLevelFaultTx{Tx: tx, level: 0, ctrl: b.ctrl}, nil
+}
+
+type twoLevelFaultTx struct {
+	pgx.Tx
+	level int
+	ctrl  *twoLevelRollbackControl
+}
+
+func (t *twoLevelFaultTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	sp, err := t.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &twoLevelFaultTx{Tx: sp, level: t.level + 1, ctrl: t.ctrl}, nil
+}
+
+func (t *twoLevelFaultTx) Commit(ctx context.Context) error {
+	t.ctrl.commitCalls[t.level]++
+	return t.Tx.Commit(ctx)
+}
+
+func (t *twoLevelFaultTx) Rollback(ctx context.Context) error {
+	t.ctrl.rollbackCalls[t.level]++
+	if err := t.ctrl.errByLevel[t.level]; err != nil {
+		// Fail before sending ROLLBACK / ROLLBACK TO SAVEPOINT SQL to PostgreSQL.
+		return err
+	}
+	return t.Tx.Rollback(ctx)
+}
+
+func TestEventRepository_TwoLevelSavepointRollbackFailurePreventsRootCommit(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 1. Both inner (level 2) and parent (level 1) savepoint rollbacks fail before SQL is sent;
+	//    even when parent and root catch errors and attempt to commit, root commit is prevented
+	//    and none of root, parent, or inner events survive.
+	errInnerRB := errors.New("forced inner savepoint rollback failure")
+	errParentRB := errors.New("forced parent savepoint rollback failure")
+	ctrlBothFail := &twoLevelRollbackControl{
+		errByLevel:    map[int]error{1: errParentRB, 2: errInnerRB},
+		rollbackCalls: make(map[int]int),
+		commitCalls:   make(map[int]int),
+	}
+
+	var observedParentErr error
+	rootErr := postgres.NewTransactor(&twoLevelFaultBeginner{TxBeginner: db.Pool, ctrl: ctrlBothFail}).WithTx(ctx, func(root storage.Tx) error {
+		rootEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-root-aborted", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := root.Events().AppendEvent(ctx, &rootEv); err != nil {
+			return err
+		}
+
+		observedParentErr = root.WithTx(ctx, func(parent storage.Tx) error {
+			parentEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-parent-aborted", nil, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if err := parent.Events().AppendEvent(ctx, &parentEv); err != nil {
+				return err
+			}
+
+			innerErr := parent.WithTx(ctx, func(inner storage.Tx) error {
+				innerEv, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "twolevel-inner-aborted", nil, time.Now().UTC())
+				if err != nil {
+					return err
+				}
+				if err := inner.Events().AppendEvent(ctx, &innerEv); err != nil {
+					return err
+				}
+				return errors.New("inner callback failure")
+			})
+			if innerErr == nil {
+				t.Fatal("expected inner savepoint error")
+			}
+			// Parent swallows innerErr and attempts to commit.
+			return nil
+		})
+		if observedParentErr == nil {
+			t.Fatal("expected parent savepoint to fail when inner rollback failed")
+		}
+		// Root swallows parent error and attempts to commit.
+		return nil
+	})
+	if rootErr == nil {
+		t.Fatal("expected root WithTx to fail instead of committing after unconfirmed two-level savepoint rollback")
+	}
+	if ctrlBothFail.commitCalls[0] != 0 || ctrlBothFail.commitCalls[1] != 0 || ctrlBothFail.commitCalls[2] != 0 {
+		t.Fatalf("expected zero commits at all levels, got %+v", ctrlBothFail.commitCalls)
+	}
+	if ctrlBothFail.rollbackCalls[2] == 0 || ctrlBothFail.rollbackCalls[1] == 0 || ctrlBothFail.rollbackCalls[0] == 0 {
+		t.Fatalf("expected rollback escalation across all levels, got %+v", ctrlBothFail.rollbackCalls)
+	}
+
+	var leakedCount int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM domain_events WHERE aggregate_id IN ('twolevel-root-aborted', 'twolevel-parent-aborted', 'twolevel-inner-aborted')`,
+	).Scan(&leakedCount); err != nil {
+		t.Fatalf("counting leaked events: %v", err)
+	}
+	if leakedCount != 0 {
+		t.Fatalf("expected 0 committed events after root abort, got %d", leakedCount)
+	}
+
+	// 2. Inner (level 2) rollback fails before SQL, parent (level 1) savepoint rollback succeeds:
+	//    parent cannot commit, but root preserves outer commit cleanly without parent/inner writes.
+	ctrlParentRecovers := &twoLevelRollbackControl{
+		errByLevel:    map[int]error{2: errInnerRB},
+		rollbackCalls: make(map[int]int),
+		commitCalls:   make(map[int]int),
+	}
+	var rootSurvivesID int64
+	err := postgres.NewTransactor(&twoLevelFaultBeginner{TxBeginner: db.Pool, ctrl: ctrlParentRecovers}).WithTx(ctx, func(root storage.Tx) error {
+		rootEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-root-parent-ok", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := root.Events().AppendEvent(ctx, &rootEv); err != nil {
+			return err
+		}
+		rootSurvivesID = rootEv.ID
+
+		parentErr := root.WithTx(ctx, func(parent storage.Tx) error {
+			parentEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-parent-rolledback", nil, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if err := parent.Events().AppendEvent(ctx, &parentEv); err != nil {
+				return err
+			}
+			_ = parent.WithTx(ctx, func(inner storage.Tx) error {
+				innerEv, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "twolevel-inner-rolledback", nil, time.Now().UTC())
+				if err != nil {
+					return err
+				}
+				if err := inner.Events().AppendEvent(ctx, &innerEv); err != nil {
+					return err
+				}
+				return errors.New("inner failure")
+			})
+			return nil
+		})
+		if parentErr == nil {
+			t.Fatal("expected parent to fail when inner rollback failed")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected root commit to succeed after parent savepoint rolled back cleanly, got %v", err)
+	}
+	if ctrlParentRecovers.commitCalls[0] != 1 {
+		t.Fatalf("expected root commit count 1, got %+v", ctrlParentRecovers.commitCalls)
+	}
+	if _, err := poolRepo.GetEventByID(ctx, rootSurvivesID); err != nil {
+		t.Fatalf("expected root event %d to commit, got %v", rootSurvivesID, err)
+	}
+	var rolledBackChildren int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM domain_events WHERE aggregate_id IN ('twolevel-parent-rolledback', 'twolevel-inner-rolledback')`,
+	).Scan(&rolledBackChildren); err != nil {
+		t.Fatalf("counting rolled-back child events: %v", err)
+	}
+	if rolledBackChildren != 0 {
+		t.Fatalf("expected 0 child events after parent savepoint rollback, got %d", rolledBackChildren)
+	}
+
+	// 3. Successful savepoint rollback at level 2 preserves both parent and root commits.
+	ctrlSuccess := &twoLevelRollbackControl{
+		errByLevel:    map[int]error{},
+		rollbackCalls: make(map[int]int),
+		commitCalls:   make(map[int]int),
+	}
+	var committedRootID, committedParentID, rolledBackInnerID int64
+	err = postgres.NewTransactor(&twoLevelFaultBeginner{TxBeginner: db.Pool, ctrl: ctrlSuccess}).WithTx(ctx, func(root storage.Tx) error {
+		rootEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-root-ok", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := root.Events().AppendEvent(ctx, &rootEv); err != nil {
+			return err
+		}
+		committedRootID = rootEv.ID
+
+		return root.WithTx(ctx, func(parent storage.Tx) error {
+			parentEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "twolevel-parent-ok", nil, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if err := parent.Events().AppendEvent(ctx, &parentEv); err != nil {
+				return err
+			}
+			committedParentID = parentEv.ID
+
+			innerErr := parent.WithTx(ctx, func(inner storage.Tx) error {
+				innerEv, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "twolevel-inner-rb-ok", nil, time.Now().UTC())
+				if err != nil {
+					return err
+				}
+				if err := inner.Events().AppendEvent(ctx, &innerEv); err != nil {
+					return err
+				}
+				rolledBackInnerID = innerEv.ID
+				return errors.New("expected inner rollback")
+			})
+			if innerErr == nil {
+				t.Fatal("expected inner error")
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("expected outer commit to succeed after successful savepoint rollback, got %v", err)
+	}
+	if ctrlSuccess.commitCalls[0] != 1 || ctrlSuccess.commitCalls[1] != 1 {
+		t.Fatalf("expected root and parent commits to succeed, got %+v", ctrlSuccess.commitCalls)
+	}
+	if _, err := poolRepo.GetEventByID(ctx, committedRootID); err != nil {
+		t.Fatalf("expected root event %d to commit, got %v", committedRootID, err)
+	}
+	if _, err := poolRepo.GetEventByID(ctx, committedParentID); err != nil {
+		t.Fatalf("expected parent event %d to commit, got %v", committedParentID, err)
+	}
+	if _, err := poolRepo.GetEventByID(ctx, rolledBackInnerID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected rolled-back inner event %d to be absent, got %v", rolledBackInnerID, err)
+	}
+}
+
 func TestEventRepository_Guards(t *testing.T) {
 	t.Parallel()
 	_, repo := setupEventTestDB(t)

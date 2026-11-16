@@ -16,9 +16,10 @@ var _ storage.EventRepository = (*EventRepository)(nil)
 
 // EventRepository implements storage.EventRepository backed by PostgreSQL and sqlc.
 type EventRepository struct {
-	q    *Queries
-	tx   TxBeginner
-	inTx bool
+	q     *Queries
+	tx    TxBeginner
+	scope *txScope
+	inTx  bool
 }
 
 // NewEventRepository creates a new EventRepository using the provided database handle
@@ -29,11 +30,16 @@ func NewEventRepository(db DBTX) *EventRepository {
 	if b, ok := db.(TxBeginner); ok {
 		beginner = b
 	}
-	_, inTx := db.(pgx.Tx)
+	var scope *txScope
+	extTx, inTx := db.(pgx.Tx)
+	if inTx {
+		scope = &txScope{tx: extTx}
+	}
 	return &EventRepository{
-		q:    New(db),
-		tx:   beginner,
-		inTx: inTx,
+		q:     New(db),
+		tx:    beginner,
+		scope: scope,
+		inTx:  inTx,
 	}
 }
 
@@ -50,8 +56,8 @@ func (r *EventRepository) WithTx(ctx context.Context, fn func(repo storage.Event
 	if fn == nil {
 		return errors.New("transaction callback cannot be nil")
 	}
-	return runTx(ctx, r.tx, "event", func(tx pgx.Tx, q *Queries) error {
-		return fn(&EventRepository{q: q, tx: tx, inTx: true})
+	return runTx(ctx, r.tx, r.scope, "event", func(child *txScope) error {
+		return fn(&EventRepository{q: New(child.tx), tx: child.tx, scope: child, inTx: true})
 	})
 }
 
