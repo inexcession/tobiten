@@ -18,16 +18,18 @@ import (
 
 // Sentinel errors returned by the durable job runner and kind registry.
 var (
-	ErrRecoveryNotCompleted = errors.New("startup recovery must complete before claiming jobs")
-	ErrUnknownJobKind       = errors.New("unregistered job kind")
-	ErrDuplicateJobKind     = errors.New("duplicate or conflicting job kind registration")
-	ErrInvalidJobKind       = errors.New("invalid job kind registration")
-	ErrInvalidPoolSize      = errors.New("invalid worker pool size")
-	ErrPoolsAlreadyRunning  = errors.New("worker pools already running")
-	ErrMissingJobHandler    = errors.New("job kind has no execution handler")
-	ErrMissingJobReconciler = errors.New("job kind requires a reconciliation hook")
-	ErrJobCancelled         = errors.New("job cancelled")
-	ErrPermanentFailure     = errors.New("permanent job failure")
+	ErrRecoveryNotCompleted     = errors.New("startup recovery must complete before claiming jobs")
+	ErrUnknownJobKind           = errors.New("unregistered job kind")
+	ErrDuplicateJobKind         = errors.New("duplicate or conflicting job kind registration")
+	ErrInvalidJobKind           = errors.New("invalid job kind registration")
+	ErrInvalidPoolSize          = errors.New("invalid worker pool size")
+	ErrPoolsAlreadyRunning      = errors.New("worker pools already running")
+	ErrDirectClaimInProgress    = errors.New("direct job claim is currently in progress")
+	ErrOutcomePersistenceFailed = errors.New("failed to persist job outcome")
+	ErrMissingJobHandler        = errors.New("job kind has no execution handler")
+	ErrMissingJobReconciler     = errors.New("job kind requires a reconciliation hook")
+	ErrJobCancelled             = errors.New("job cancelled")
+	ErrPermanentFailure         = errors.New("permanent job failure")
 )
 
 // ReconcileAction describes the state transition chosen during startup recovery
@@ -90,6 +92,7 @@ type RunnerOptions struct {
 	DefaultPoolSize int
 	PoolSizes       map[domain.JobKind]int
 	PollInterval    time.Duration
+	OnFatal         func(error)
 }
 
 // RecoveryReport summarizes the interrupted RUNNING jobs reconciled at startup.
@@ -185,19 +188,19 @@ func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
 // Runner coordinates job-kind registration, startup recovery under daemon ownership,
 // and attempt-safe job execution over storage.JobRepository (ADR-0017).
 type Runner struct {
-	repo            storage.JobRepository
-	logger          *slog.Logger
-	now             func() time.Time
-	defaultPoolSize int
-	poolSizes       map[domain.JobKind]int
-	pollInterval    time.Duration
-	mu              sync.RWMutex
-	kinds           map[domain.JobKind]KindConfig
-	pools           map[domain.JobKind]*kindPool
-	poolsRunning    bool
-	poolCancel      context.CancelFunc
-	poolWG          *sync.WaitGroup
-	recovered       atomic.Bool
+	repo               storage.JobRepository
+	logger             *slog.Logger
+	now                func() time.Time
+	defaultPoolSize    int
+	poolSizes          map[domain.JobKind]int
+	pollInterval       time.Duration
+	onFatal            func(error)
+	mu                 sync.RWMutex
+	kinds              map[domain.JobKind]KindConfig
+	activePools        *poolGeneration
+	activeDirectClaims int
+	poolErr            error
+	recovered          atomic.Bool
 }
 
 // NewRunner constructs a Runner over repo.
@@ -224,6 +227,7 @@ func NewRunner(repo storage.JobRepository, opts RunnerOptions) *Runner {
 		defaultPoolSize: opts.DefaultPoolSize,
 		poolSizes:       poolSizes,
 		pollInterval:    opts.PollInterval,
+		onFatal:         opts.OnFatal,
 		kinds:           make(map[domain.JobKind]KindConfig),
 	}
 }
@@ -243,8 +247,11 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.poolsRunning {
+	if r.activePools != nil {
 		return ErrPoolsAlreadyRunning
+	}
+	if r.activeDirectClaims > 0 {
+		return ErrDirectClaimInProgress
 	}
 
 	existing, exists := r.kinds[cfg.Kind]
@@ -544,7 +551,7 @@ func resolveRequeueCheckpoint(job domain.Job, policy domain.JobResumePolicy, ove
 }
 
 // ClaimAndRunNext claims the next runnable job of kind and executes its registered handler.
-// It refuses to claim until startup recovery has completed.
+// It refuses to claim until startup recovery has completed or while managed worker pools are running.
 // Returns claimed=false, err=nil when no runnable job of kind is available.
 func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool, error) {
 	if !r.recovered.Load() {
@@ -554,13 +561,28 @@ func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool
 		return false, err
 	}
 
-	cfg, ok := r.lookupKind(kind)
+	r.mu.Lock()
+	if r.activePools != nil {
+		r.mu.Unlock()
+		return false, ErrPoolsAlreadyRunning
+	}
+	cfg, ok := r.kinds[kind]
 	if !ok {
+		r.mu.Unlock()
 		return false, fmt.Errorf("%w: %q", ErrUnknownJobKind, kind)
 	}
 	if cfg.Handler == nil {
+		r.mu.Unlock()
 		return false, fmt.Errorf("%w: %q", ErrMissingJobHandler, kind)
 	}
+	r.activeDirectClaims++
+	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		r.activeDirectClaims--
+		r.mu.Unlock()
+	}()
 
 	job, err := r.repo.ClaimNext(ctx, kind, r.now())
 	if err != nil {
@@ -571,6 +593,12 @@ func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool
 	}
 
 	return true, r.executeClaimedJob(ctx, cfg, job)
+}
+
+var defaultOutcomeRetryDelays = []time.Duration{
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+	50 * time.Millisecond,
 }
 
 func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *domain.Job) error {
@@ -594,29 +622,114 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 
 	now := r.now().UTC()
 	if runErr == nil {
-		if _, err := r.repo.MarkSucceeded(ctx, job.ID, job.Attempts, now); err != nil {
-			return fmt.Errorf("marking job %q succeeded: %w", job.ID, err)
-		}
-		return nil
+		return r.persistOutcomeWithRetry(
+			ctx,
+			job,
+			"marking succeeded",
+			func(writeCtx context.Context) error {
+				_, err := r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
+				return err
+			},
+			func(row *domain.Job) bool {
+				return (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
+			},
+		)
 	}
 
 	if errors.Is(runErr, ErrJobCancelled) {
 		msg := runErr.Error()
-		if _, err := r.repo.MarkCancelled(ctx, job.ID, job.Attempts, &msg, now); err != nil {
-			return fmt.Errorf("marking job %q cancelled: %w", job.ID, err)
-		}
-		return nil
+		return r.persistOutcomeWithRetry(
+			ctx,
+			job,
+			"marking cancelled",
+			func(writeCtx context.Context) error {
+				_, err := r.repo.MarkCancelled(writeCtx, job.ID, job.Attempts, &msg, now)
+				return err
+			},
+			func(row *domain.Job) bool {
+				return (row.State == domain.JobStateCancelled && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
+			},
+		)
 	}
 
 	if errors.Is(runErr, ErrPermanentFailure) {
-		if _, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, runErr.Error(), now); err != nil {
-			return fmt.Errorf("marking job %q permanently failed: %w", job.ID, err)
-		}
-		return nil
+		return r.persistOutcomeWithRetry(
+			ctx,
+			job,
+			"marking permanently failed",
+			func(writeCtx context.Context) error {
+				_, err := r.repo.MarkFailed(writeCtx, job.ID, job.Attempts, runErr.Error(), now)
+				return err
+			},
+			func(row *domain.Job) bool {
+				return ((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
+			},
+		)
 	}
 
-	if _, err := r.repo.FailOrRetry(ctx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now); err != nil {
-		return fmt.Errorf("recording failure for job %q: %w", job.ID, err)
+	return r.persistOutcomeWithRetry(
+		ctx,
+		job,
+		"recording failure",
+		func(writeCtx context.Context) error {
+			_, err := r.repo.FailOrRetry(writeCtx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now)
+			return err
+		},
+		func(row *domain.Job) bool {
+			return (row.State == domain.JobStateQueued && row.Attempts == job.Attempts) ||
+				((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) ||
+				row.Attempts > job.Attempts
+		},
+	)
+}
+
+func (r *Runner) persistOutcomeWithRetry(
+	ctx context.Context,
+	job *domain.Job,
+	label string,
+	writeFn func(context.Context) error,
+	isResolved func(*domain.Job) bool,
+) error {
+	var lastErr error
+	maxAttempts := 1 + len(defaultOutcomeRetryDelays)
+	for attemptIdx := range maxAttempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		err := writeFn(ctx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if errors.Is(err, domain.ErrInvalidJobTransition) || errors.Is(err, domain.ErrStaleJobAttempt) {
+			row, getErr := r.repo.GetJobByID(ctx, job.ID)
+			if getErr == nil {
+				if isResolved(row) {
+					return nil
+				}
+				if row.State != domain.JobStateRunning || row.Attempts != job.Attempts {
+					return fmt.Errorf("%w: %s job %q (attempt %d) ended in unexpected state %s (attempt %d): %w",
+						ErrOutcomePersistenceFailed, label, job.ID, job.Attempts, row.State, row.Attempts, err)
+				}
+			}
+		}
+
+		if attemptIdx >= len(defaultOutcomeRetryDelays) {
+			break
+		}
+		timer := time.NewTimer(defaultOutcomeRetryDelays[attemptIdx])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return nil
+
+	return fmt.Errorf("%w: %s job %q (attempt %d): %w", ErrOutcomePersistenceFailed, label, job.ID, job.Attempts, lastErr)
 }

@@ -15,9 +15,24 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/module"
+	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/testdb"
 )
+
+func waitDaemonJobSucceeded(ctx context.Context, t *testing.T, repo storage.JobRepository, id string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := repo.GetJobByID(ctx, id)
+		if err == nil && got.State == domain.JobStateSucceeded {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	got, err := repo.GetJobByID(ctx, id)
+	t.Fatalf("job %s = (%+v, %v), want state %s", id, got, err, domain.JobStateSucceeded)
+}
 
 type testJobRegistrarModule struct {
 	*module.SimpleModule
@@ -210,7 +225,7 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 				return fmt.Errorf("while saturated: SCAN running=%d queued=%d, want running=%d queued=1", runningScanCount, queuedScanCount, scanCap)
 			}
 
-			// 2. While SCAN pool is saturated, REPACK pool progresses and finishes both jobs.
+			// 2. While SCAN pool is saturated, REPACK pool progresses and persists SUCCEEDED for both jobs.
 			for range 2 {
 				select {
 				case <-repackDone:
@@ -218,17 +233,18 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 					return errors.New("REPACK pool starved while SCAN pool saturated")
 				}
 			}
+			waitDaemonJobSucceeded(serveCtx, t, repo, jRepack1.ID)
+			waitDaemonJobSucceeded(serveCtx, t, repo, jRepack2.ID)
 
-			// 3. Release SCAN barrier; verify the 3rd SCAN job runs and all 3 succeed.
+			// 3. Release SCAN barrier; verify the 3rd SCAN job runs and all 3 persist SUCCEEDED.
 			close(releaseScan)
 			select {
 			case <-scanEntered:
 			case <-time.After(10 * time.Second):
 				return errors.New("timed out waiting for (N+1)th SCAN job")
 			}
-			deadline := time.Now().Add(10 * time.Second)
-			for scanCompleted.Load() < totalScan && time.Now().Before(deadline) {
-				time.Sleep(15 * time.Millisecond)
+			for _, id := range []string{jScanInterrupted.ID, jScan2.ID, jScan3.ID} {
+				waitDaemonJobSucceeded(serveCtx, t, repo, id)
 			}
 			if scanCompleted.Load() != totalScan {
 				return fmt.Errorf("scanCompleted = %d, want %d", scanCompleted.Load(), totalScan)
@@ -390,6 +406,136 @@ func TestRunDaemonPoolConfigValidation(t *testing.T) {
 		}
 		if gotSize != 3 {
 			t.Fatalf("SCRAPE pool size = %d, want 3 from jobs.default_pool_size", gotSize)
+		}
+	})
+
+	t.Run("custom mixed-case kind preserves identity under lowercase override", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		putSetting(t, db, "jobs.pool.custom.thumbnail", "3")
+
+		originalRegistryBuilder := buildDaemonRegistry
+		originalConfigHook := configureDaemonJobRunner
+		t.Cleanup(func() {
+			buildDaemonRegistry = originalRegistryBuilder
+			configureDaemonJobRunner = originalConfigHook
+		})
+
+		const customKind = domain.JobKind("custom.Thumbnail")
+		var active atomic.Int32
+		var maxActive atomic.Int32
+		entered := make(chan struct{}, 4)
+		release := make(chan struct{})
+
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+			reg := BuildRegistryWithServices(cfg, services)
+			_ = reg.Register(&testJobRegistrarModule{
+				SimpleModule: &module.SimpleModule{
+					ModuleName: "custom-thumb-mod",
+					Jobs: []module.JobKind{
+						module.JobKindSpec{Kind: customKind, Policy: domain.JobResumeRestart, Workers: 1},
+					},
+				},
+				register: func(r *jobs.Runner) error {
+					return r.RegisterKind(jobs.KindConfig{
+						Kind:         customKind,
+						ResumePolicy: domain.JobResumeRestart,
+						Handler: jobs.HandlerFunc(func(runCtx context.Context, _ *jobs.Execution) error {
+							cur := active.Add(1)
+							defer active.Add(-1)
+							for {
+								prev := maxActive.Load()
+								if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
+									break
+								}
+							}
+							entered <- struct{}{}
+							select {
+							case <-release:
+								return nil
+							case <-runCtx.Done():
+								return runCtx.Err()
+							}
+						}),
+					})
+				},
+			})
+			return reg
+		}
+
+		var gotSize int
+		configureDaemonJobRunner = func(r *jobs.Runner, _ module.Registry, _ *config.Config, _ *app.Services) error {
+			gotSize, _ = r.PoolSize(customKind)
+			return nil
+		}
+
+		repo := postgres.NewJobRepository(db.Pool)
+		now := time.Now().UTC().Add(-time.Minute)
+		jobIDs := make([]string, 4)
+		for i := range jobIDs {
+			j := &domain.Job{Kind: customKind, MaxAttempts: 3, CreatedAt: now.Add(time.Duration(i) * time.Millisecond), RunAfter: now}
+			if _, err := repo.Enqueue(t.Context(), j); err != nil {
+				t.Fatalf("Enqueue custom job %d: %v", i, err)
+			}
+			jobIDs[i] = j.ID
+		}
+
+		err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			for range 3 {
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					return fmt.Errorf("timed out waiting for 3 concurrent custom.Thumbnail workers (active=%d)", active.Load())
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			if maxActive.Load() != 3 {
+				return fmt.Errorf("maxActive = %d, want 3", maxActive.Load())
+			}
+			close(release)
+			for _, id := range jobIDs {
+				waitDaemonJobSucceeded(serveCtx, t, repo, id)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+		if gotSize != 3 {
+			t.Fatalf("custom.Thumbnail pool size = %d, want 3", gotSize)
+		}
+	})
+
+	t.Run("conflicting normalized pool setting aliases fail startup deterministically", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			k1   string
+			v1   string
+			k2   string
+			v2   string
+		}{
+			{name: "conflicting kind aliases", k1: "jobs.pool.scan", v1: "2", k2: "jobs.pool.SCAN", v2: "4"},
+			{name: "redundant kind aliases with equal values", k1: "jobs.pool.custom.thumbnail", v1: "2", k2: "jobs.pool.Custom.Thumbnail", v2: "2"},
+			{name: "conflicting default pool size aliases", k1: "jobs.default_pool_size", v1: "2", k2: "JOBS.DEFAULT_POOL_SIZE", v2: "4"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				db := testdb.New(t)
+				migrateStartupDB(t, db)
+				putSetting(t, db, tc.k1, tc.v1)
+				putSetting(t, db, tc.k2, tc.v2)
+
+				served := false
+				err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
+					served = true
+					return nil
+				})
+				if !errors.Is(err, jobs.ErrInvalidPoolSize) {
+					t.Fatalf("runDaemon err = %v, want ErrInvalidPoolSize", err)
+				}
+				if served {
+					t.Fatal("serve must not run on conflicting pool setting aliases")
+				}
+			})
 		}
 	})
 }

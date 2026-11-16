@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,6 +29,50 @@ type kindPool struct {
 	wake chan struct{}
 }
 
+type poolGeneration struct {
+	cancel context.CancelCauseFunc
+	wg     sync.WaitGroup
+	pools  map[domain.JobKind]*kindPool
+}
+
+// Kinds returns a sorted list of all registered job kinds.
+func (r *Runner) Kinds() []domain.JobKind {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]domain.JobKind, 0, len(r.kinds))
+	for k := range r.kinds {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// SetPoolSizes replaces the runner's per-kind pool size overrides before pools are started.
+func (r *Runner) SetPoolSizes(sizes map[domain.JobKind]int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.activePools != nil {
+		return ErrPoolsAlreadyRunning
+	}
+	for kind, size := range sizes {
+		if size < 0 {
+			return fmt.Errorf("%w: kind %q pool size %d must be non-negative", ErrInvalidPoolSize, kind, size)
+		}
+	}
+	if len(sizes) == 0 {
+		r.poolSizes = nil
+		return nil
+	}
+	copied := make(map[domain.JobKind]int, len(sizes))
+	for k, v := range sizes {
+		copied[k] = v
+	}
+	r.poolSizes = copied
+	return nil
+}
+
 // PoolSize returns the effective bounded worker pool size for a registered kind.
 func (r *Runner) PoolSize(kind domain.JobKind) (int, bool) {
 	r.mu.RLock()
@@ -42,6 +87,13 @@ func (r *Runner) PoolSize(kind domain.JobKind) (int, bool) {
 		return 0, false
 	}
 	return size, true
+}
+
+// Err returns the fatal worker pool error that stopped the most recent pool run, if any.
+func (r *Runner) Err() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.poolErr
 }
 
 func (r *Runner) validatePoolOptionsLocked() error {
@@ -103,8 +155,11 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.poolsRunning {
+	if r.activePools != nil {
 		return ErrPoolsAlreadyRunning
+	}
+	if r.activeDirectClaims > 0 {
+		return ErrDirectClaimInProgress
 	}
 	if err := r.validatePoolOptionsLocked(); err != nil {
 		return err
@@ -139,18 +194,19 @@ func (r *Runner) Start(ctx context.Context) error {
 		interval = DefaultPollInterval
 	}
 
-	poolCtx, poolCancel := context.WithCancel(ctx)
-	wg := &sync.WaitGroup{}
+	poolCtx, poolCancel := context.WithCancelCause(ctx)
+	gen := &poolGeneration{
+		cancel: poolCancel,
+		pools:  pools,
+	}
 
-	r.pools = pools
-	r.poolCancel = poolCancel
-	r.poolWG = wg
-	r.poolsRunning = true
+	r.poolErr = nil
+	r.activePools = gen
 
 	for _, item := range planned {
 		for range item.pool.size {
-			wg.Add(1)
-			go r.runPoolWorker(poolCtx, wg, item.cfg, item.pool, interval)
+			gen.wg.Add(1)
+			go r.runPoolWorker(poolCtx, gen, item.cfg, item.pool, interval)
 		}
 		r.logger.Debug("started job worker pool",
 			slog.String("job_kind", string(item.cfg.Kind)),
@@ -164,9 +220,13 @@ func (r *Runner) Start(ctx context.Context) error {
 // Notify wakes an idle worker in kind's pool, if running, so newly enqueued work is claimed promptly.
 func (r *Runner) Notify(kind domain.JobKind) {
 	r.mu.RLock()
-	pool := r.pools[kind]
+	gen := r.activePools
 	r.mu.RUnlock()
 
+	if gen == nil {
+		return
+	}
+	pool := gen.pools[kind]
 	if pool == nil {
 		return
 	}
@@ -179,13 +239,13 @@ func (r *Runner) Notify(kind domain.JobKind) {
 // NotifyAll wakes an idle worker in every running per-kind pool.
 func (r *Runner) NotifyAll() {
 	r.mu.RLock()
-	pools := make([]*kindPool, 0, len(r.pools))
-	for _, pool := range r.pools {
-		pools = append(pools, pool)
-	}
+	gen := r.activePools
 	r.mu.RUnlock()
 
-	for _, pool := range pools {
+	if gen == nil {
+		return
+	}
+	for _, pool := range gen.pools {
 		select {
 		case pool.wake <- struct{}{}:
 		default:
@@ -193,40 +253,63 @@ func (r *Runner) NotifyAll() {
 	}
 }
 
-// Wait blocks until all worker pool goroutines started by Start have exited.
-func (r *Runner) Wait() {
-	r.mu.RLock()
-	wg := r.poolWG
-	r.mu.RUnlock()
-
-	if wg != nil {
-		wg.Wait()
+func (r *Runner) waitGeneration(gen *poolGeneration) {
+	if gen == nil {
+		return
 	}
+	gen.wg.Wait()
 
 	r.mu.Lock()
-	if r.poolWG == wg {
-		r.poolsRunning = false
-		r.pools = nil
-		r.poolCancel = nil
-		r.poolWG = nil
+	if r.activePools == gen {
+		r.activePools = nil
 	}
 	r.mu.Unlock()
 }
 
-// Stop cancels all running worker pools and waits for active workers to finish.
-func (r *Runner) Stop() {
+// Wait blocks until all worker pool goroutines in the current pool generation have exited.
+func (r *Runner) Wait() {
 	r.mu.RLock()
-	cancel := r.poolCancel
+	gen := r.activePools
 	r.mu.RUnlock()
 
-	if cancel != nil {
-		cancel()
-	}
-	r.Wait()
+	r.waitGeneration(gen)
 }
 
-func (r *Runner) runPoolWorker(ctx context.Context, wg *sync.WaitGroup, cfg KindConfig, pool *kindPool, interval time.Duration) {
-	defer wg.Done()
+// Stop cancels the current pool generation and waits for its active workers to finish.
+func (r *Runner) Stop() {
+	r.mu.RLock()
+	gen := r.activePools
+	r.mu.RUnlock()
+
+	if gen == nil {
+		return
+	}
+	gen.cancel(nil)
+	r.waitGeneration(gen)
+}
+
+func (r *Runner) failPoolGeneration(gen *poolGeneration, err error) {
+	r.logger.Error("job worker outcome persistence failed; stopping worker pools",
+		logging.Err(err),
+	)
+
+	r.mu.Lock()
+	shouldNotify := false
+	if r.activePools == gen && r.poolErr == nil {
+		r.poolErr = err
+		shouldNotify = r.onFatal != nil
+	}
+	onFatal := r.onFatal
+	r.mu.Unlock()
+
+	gen.cancel(err)
+	if shouldNotify {
+		onFatal(err)
+	}
+}
+
+func (r *Runner) runPoolWorker(ctx context.Context, gen *poolGeneration, cfg KindConfig, pool *kindPool, interval time.Duration) {
+	defer gen.wg.Done()
 
 	for {
 		if ctx.Err() != nil {
@@ -239,13 +322,8 @@ func (r *Runner) runPoolWorker(ctx context.Context, wg *sync.WaitGroup, cfg Kind
 		}
 		if claimed {
 			if err != nil {
-				r.logger.Error("job worker step failed",
-					slog.String("job_kind", string(cfg.Kind)),
-					logging.Err(err),
-				)
-				if !waitForNextPoll(ctx, interval, pool.wake) {
-					return
-				}
+				r.failPoolGeneration(gen, err)
+				return
 			}
 			continue
 		}

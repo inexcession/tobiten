@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -156,16 +157,36 @@ var configureDaemonJobRunner = func(*jobs.Runner, module.Registry, *config.Confi
 	return nil
 }
 
-func runnerOptionsFromConfig(cfg *config.Config) (jobs.RunnerOptions, error) {
-	opts := jobs.RunnerOptions{
-		Logger: slog.Default(),
-	}
+type parsedPoolSetting struct {
+	rawKey string
+	suffix string
+	size   int
+}
+
+type parsedPoolConfig struct {
+	defaultPoolSize int
+	byNorm          map[string][]parsedPoolSetting
+}
+
+func parsePoolSettings(cfg *config.Config) (parsedPoolConfig, error) {
+	var out parsedPoolConfig
 	if cfg == nil {
-		return opts, nil
+		return out, nil
 	}
 
-	poolSizes := make(map[domain.JobKind]int)
-	for key, rawVal := range cfg.SystemSettings() {
+	sys := cfg.SystemSettings()
+	keys := make([]string, 0, len(sys))
+	for key := range sys {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	var defaultKey string
+	var defaultSeen bool
+	out.byNorm = make(map[string][]parsedPoolSetting)
+
+	for _, key := range keys {
+		rawVal := sys[key]
 		trimmedKey := strings.TrimSpace(key)
 		trimmedVal := strings.TrimSpace(rawVal)
 		if trimmedVal == "" {
@@ -174,39 +195,129 @@ func runnerOptionsFromConfig(cfg *config.Config) (jobs.RunnerOptions, error) {
 		if strings.EqualFold(trimmedKey, "jobs.default_pool_size") {
 			n, err := strconv.Atoi(trimmedVal)
 			if err != nil || n < 1 {
-				return opts, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
+				return out, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
 			}
-			opts.DefaultPoolSize = n
+			if defaultSeen {
+				return out, fmt.Errorf("%w: conflicting default pool size settings %q (%d) and %q (%d)",
+					jobs.ErrInvalidPoolSize, defaultKey, out.defaultPoolSize, key, n)
+			}
+			defaultSeen = true
+			defaultKey = key
+			out.defaultPoolSize = n
 			continue
 		}
+
 		const poolPrefix = "jobs.pool."
-		if len(trimmedKey) > len(poolPrefix) && strings.EqualFold(trimmedKey[:len(poolPrefix)], poolPrefix) {
-			kindName := strings.ToUpper(strings.TrimSpace(trimmedKey[len(poolPrefix):]))
-			if kindName == "" {
-				return opts, fmt.Errorf("%w: system_settings %q has empty job kind", jobs.ErrInvalidPoolSize, key)
+		if len(trimmedKey) >= len(poolPrefix) && strings.EqualFold(trimmedKey[:len(poolPrefix)], poolPrefix) {
+			suffix := strings.TrimSpace(trimmedKey[len(poolPrefix):])
+			if suffix == "" {
+				return out, fmt.Errorf("%w: system_settings %q has empty job kind", jobs.ErrInvalidPoolSize, key)
 			}
 			n, err := strconv.Atoi(trimmedVal)
 			if err != nil || n < 1 {
-				return opts, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
+				return out, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
 			}
-			poolSizes[domain.JobKind(kindName)] = n
+			entry := parsedPoolSetting{rawKey: key, suffix: suffix, size: n}
+			norm := strings.ToLower(suffix)
+			out.byNorm[norm] = append(out.byNorm[norm], entry)
 		}
 	}
 
-	if cfg.ScannerWorkers > 0 {
-		poolSizes[domain.JobKindScan] = cfg.ScannerWorkers
-	}
-	if len(poolSizes) > 0 {
-		opts.PoolSizes = poolSizes
-	}
-	return opts, nil
+	return out, nil
 }
 
-func startDaemonJobs(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, services *app.Services) (*jobs.Runner, error) {
-	runnerOpts, err := runnerOptionsFromConfig(cfg)
+func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.JobKind, scannerWorkers int) (map[domain.JobKind]int, error) {
+	exactRegistered := make(map[domain.JobKind]struct{}, len(registeredKinds))
+	normRegistered := make(map[string][]domain.JobKind, len(registeredKinds))
+	for _, kind := range registeredKinds {
+		exactRegistered[kind] = struct{}{}
+		norm := strings.ToLower(string(kind))
+		normRegistered[norm] = append(normRegistered[norm], kind)
+	}
+
+	norms := make([]string, 0, len(parsed.byNorm))
+	for norm := range parsed.byNorm {
+		norms = append(norms, norm)
+	}
+	slices.Sort(norms)
+
+	poolSizes := make(map[domain.JobKind]int)
+	for _, norm := range norms {
+		entries := parsed.byNorm[norm]
+		if len(entries) > 1 {
+			// Multiple setting keys normalize to the same name. Only allow if each setting
+			// resolves cleanly to a distinct exact registered kind; otherwise reject the alias conflict.
+			seenTargets := make(map[domain.JobKind]string, len(entries))
+			for _, e := range entries {
+				target := domain.JobKind(e.suffix)
+				if _, isExact := exactRegistered[target]; !isExact {
+					return nil, fmt.Errorf("%w: conflicting pool size settings %q (%d) and %q (%d)",
+						jobs.ErrInvalidPoolSize, entries[0].rawKey, entries[0].size, e.rawKey, e.size)
+				}
+				if prevKey, dup := seenTargets[target]; dup {
+					return nil, fmt.Errorf("%w: conflicting pool size settings %q and %q for job kind %q",
+						jobs.ErrInvalidPoolSize, prevKey, e.rawKey, target)
+				}
+				seenTargets[target] = e.rawKey
+				poolSizes[target] = e.size
+			}
+			continue
+		}
+
+		e := entries[0]
+		exact := domain.JobKind(e.suffix)
+		if _, ok := exactRegistered[exact]; ok {
+			poolSizes[exact] = e.size
+			continue
+		}
+
+		matches := normRegistered[norm]
+		switch len(matches) {
+		case 1:
+			poolSizes[matches[0]] = e.size
+		case 0:
+			poolSizes[exact] = e.size
+		default:
+			return nil, fmt.Errorf("%w: setting %q is ambiguous across registered job kinds %v",
+				jobs.ErrInvalidPoolSize, e.rawKey, matches)
+		}
+	}
+
+	if scannerWorkers > 0 {
+		poolSizes[domain.JobKindScan] = scannerWorkers
+	}
+	if len(poolSizes) == 0 {
+		return nil, nil
+	}
+	return poolSizes, nil
+}
+
+func startDaemonJobs(
+	ctx context.Context,
+	cancel context.CancelCauseFunc,
+	pool *pgxpool.Pool,
+	cfg *config.Config,
+	services *app.Services,
+) (*jobs.Runner, error) {
+	parsed, err := parsePoolSettings(cfg)
 	if err != nil {
 		return nil, err
 	}
+	var scannerWorkers int
+	if cfg != nil {
+		scannerWorkers = cfg.ScannerWorkers
+	}
+
+	runnerOpts := jobs.RunnerOptions{
+		Logger:          slog.Default(),
+		DefaultPoolSize: parsed.defaultPoolSize,
+		OnFatal: func(fatalErr error) {
+			if cancel != nil {
+				cancel(fatalErr)
+			}
+		},
+	}
+
 	reg := buildDaemonRegistry(cfg, services)
 	runner := jobs.NewRunner(postgres.NewJobRepository(pool), runnerOpts)
 	if err := runner.RegisterModuleKinds(reg); err != nil {
@@ -215,9 +326,27 @@ func startDaemonJobs(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config
 	if err := runner.RegisterModuleHandlers(reg); err != nil {
 		return nil, fmt.Errorf("registering module job handlers: %w", err)
 	}
+
+	initialSizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds(), scannerWorkers)
+	if err != nil {
+		return nil, err
+	}
+	if err := runner.SetPoolSizes(initialSizes); err != nil {
+		return nil, err
+	}
+
 	if err := configureDaemonJobRunner(runner, reg, cfg, services); err != nil {
 		return nil, fmt.Errorf("configuring daemon job runner: %w", err)
 	}
+
+	finalSizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds(), scannerWorkers)
+	if err != nil {
+		return nil, err
+	}
+	if err := runner.SetPoolSizes(finalSizes); err != nil {
+		return nil, err
+	}
+
 	if _, err := runner.Recover(ctx); err != nil {
 		return nil, fmt.Errorf("recovering interrupted jobs: %w", err)
 	}
@@ -296,7 +425,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
 	})
-	jobRunner, err := startDaemonJobs(ctx, d.pool, cfg, services)
+	jobRunner, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
 	if err != nil {
 		return err
 	}
