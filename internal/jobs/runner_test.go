@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -868,5 +870,167 @@ func TestRunner_OnSucceededInvokedAfterCommitAndDuplicateRejected(t *testing.T) 
 	}
 	if called != 1 || settled.State != domain.JobStateSucceeded || settled.ID != j.ID {
 		t.Fatalf("OnSucceeded called=%d settled=%+v, want called=1 SUCCEEDED", called, settled)
+	}
+}
+
+type spyProgressPublisher struct {
+	mu      sync.Mutex
+	ticks   []domain.JobProgressTick
+	cleared []string
+}
+
+func (s *spyProgressPublisher) Publish(tick domain.JobProgressTick) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ticks = append(s.ticks, tick.Clone())
+	return true
+}
+
+func (s *spyProgressPublisher) ClearJob(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleared = append(s.cleared, jobID)
+}
+
+func TestRunner_LifecycleOutboxRetryAndExecutionProgress(t *testing.T) {
+	t.Parallel()
+	db, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, 11, 16, 19, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	userRepo := postgres.NewUserRepository(db.Pool)
+	creator := &domain.User{ID: domain.MustNewID(), Username: "runner-creator"}
+	if err := userRepo.CreateUser(ctx, creator); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// Simulate one transient failure inside the MarkSucceeded transition transaction
+	// by rejecting the first INSERT into domain_events for job.finished.
+	// Use a PostgreSQL sequence so the fault counter survives the transaction rollback.
+	if _, err := db.Exec(ctx, `
+		DROP TRIGGER IF EXISTS trg_runner_fail_once ON domain_events;
+		DROP FUNCTION IF EXISTS fn_runner_fail_once();
+		DROP SEQUENCE IF EXISTS test_outbox_fault_seq;
+		CREATE SEQUENCE test_outbox_fault_seq START 1;
+		CREATE OR REPLACE FUNCTION fn_runner_fail_once() RETURNS TRIGGER AS $$
+		BEGIN
+			IF NEW.kind = 'job.finished' AND nextval('test_outbox_fault_seq') = 1 THEN
+				RAISE EXCEPTION 'transient outbox failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_runner_fail_once
+		BEFORE INSERT ON domain_events
+		FOR EACH ROW EXECUTE FUNCTION fn_runner_fail_once();
+	`); err != nil {
+		t.Fatalf("installing transient outbox fault trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DROP TRIGGER IF EXISTS trg_runner_fail_once ON domain_events`)
+		_, _ = db.Exec(context.Background(), `DROP FUNCTION IF EXISTS fn_runner_fail_once()`)
+		_, _ = db.Exec(context.Background(), `DROP SEQUENCE IF EXISTS test_outbox_fault_seq`)
+	})
+
+	pub := &spyProgressPublisher{}
+	var transitions []domain.JobState
+	runner := jobs.NewRunner(repo, jobs.RunnerOptions{
+		Now:         nowFn,
+		ProgressHub: pub,
+		OnTransition: func(job domain.Job) {
+			transitions = append(transitions, job.State)
+		},
+	})
+
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeCheckpoint,
+		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+			advance(120 * time.Millisecond)
+			if !exec.ReportProgress(10, "/comics/a.cbz") {
+				return errors.New("expected ReportProgress to publish")
+			}
+			advance(80 * time.Millisecond)
+			if !exec.ReportProgress(25, "/comics/b.cbz") {
+				return errors.New("expected second ReportProgress to publish")
+			}
+			return nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind SCAN: %v", err)
+	}
+
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	j := &domain.Job{
+		Kind:      domain.JobKindScan,
+		CreatedBy: &creator.ID,
+		CreatedAt: nowFn(),
+		RunAfter:  nowFn(),
+	}
+	if _, err := repo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+	}
+
+	got, err := repo.GetJobByID(ctx, j.ID)
+	if err != nil || got.State != domain.JobStateSucceeded {
+		t.Fatalf("job = (%+v, %v), want SUCCEEDED", got, err)
+	}
+
+	// Exactly one job.started and one job.finished event despite the retried MarkSucceeded commit.
+	rows, err := db.Query(ctx, `SELECT kind FROM domain_events WHERE aggregate_id = $1 ORDER BY id ASC`, j.ID)
+	if err != nil {
+		t.Fatalf("querying domain_events: %v", err)
+	}
+	defer rows.Close()
+	var kinds []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatalf("scan kind: %v", err)
+		}
+		kinds = append(kinds, k)
+	}
+	if !slices.Equal(kinds, []string{"job.started", "job.finished"}) {
+		t.Fatalf("domain_events kinds = %v, want [job.started job.finished]", kinds)
+	}
+
+	if !slices.Equal(transitions, []domain.JobState{domain.JobStateRunning, domain.JobStateSucceeded}) {
+		t.Fatalf("OnTransition states = %v, want [RUNNING SUCCEEDED]", transitions)
+	}
+
+	pub.mu.Lock()
+	ticks := slices.Clone(pub.ticks)
+	cleared := slices.Clone(pub.cleared)
+	pub.mu.Unlock()
+	if len(ticks) != 2 || ticks[0].ScannedCount != 10 || ticks[0].DurationMS != 120 || ticks[1].ScannedCount != 25 || ticks[1].DurationMS != 200 {
+		t.Fatalf("unexpected progress ticks: %+v", ticks)
+	}
+	if ticks[0].CreatedBy == nil || *ticks[0].CreatedBy != creator.ID {
+		t.Fatalf("expected tick CreatedBy = %q, got %v", creator.ID, ticks[0].CreatedBy)
+	}
+	if !slices.Equal(cleared, []string{j.ID}) {
+		t.Fatalf("cleared progress jobs = %v, want [%s]", cleared, j.ID)
 	}
 }

@@ -44,6 +44,7 @@ var (
 	ErrInvalidDeliveryOutcome        = errors.New("invalid event delivery outcome")
 	ErrInvalidEventDeliveryDedupeKey = errors.New("EVENT_DELIVERY job must use canonical subscriber dedupe_key")
 	ErrEventDeliveryBlocked          = errors.New("event subscriber delivery blocked by terminal failure")
+	ErrInvalidProgressTick           = errors.New("invalid job progress tick")
 )
 
 // DefaultJobMaxAttempts is the default maximum execution attempts for a durable job.

@@ -12,6 +12,10 @@ import (
 // EventVersion1 is the initial payload schema version for 1.0 domain events (ADR-0018 S3).
 const EventVersion1 = 1
 
+// ProgressTickEventName is the ephemeral SSE event name for worker progress ticks.
+// Progress ticks are never persisted in domain_events, carry no SSE ID, and are never replayed (ADR-0018 S3).
+const ProgressTickEventName = "job.progress"
+
 // Canonical aggregate_type values for 1.0 domain_events rows.
 const (
 	AggregateTypeAsset      = "asset"
@@ -196,6 +200,73 @@ var jobLifecycleStateByEvent = map[EventKind]JobState{
 	EventJobFinished:  JobStateSucceeded,
 	EventJobFailed:    JobStateFailed,
 	EventJobCancelled: JobStateCancelled,
+}
+
+// JobLifecycleEventKind returns the outbox EventKind corresponding to a committed job
+// state transition, or false for states that do not emit a lifecycle event (such as QUEUED).
+func JobLifecycleEventKind(state JobState) (EventKind, bool) {
+	switch state {
+	case JobStateRunning:
+		return EventJobStarted, true
+	case JobStateSucceeded:
+		return EventJobFinished, true
+	case JobStateFailed:
+		return EventJobFailed, true
+	case JobStateCancelled:
+		return EventJobCancelled, true
+	default:
+		return "", false
+	}
+}
+
+// JobProgressTick is an ephemeral, rate-limited worker progress update (ADR-0017 §2, ADR-0018 S3).
+// It carries no SSE ID or publication sequence, is never stored in domain_events, and obeys
+// the same creator/jobs:read_all visibility rules as Job details.
+type JobProgressTick struct {
+	JobID        string  `json:"job_id"`
+	Kind         JobKind `json:"kind"`
+	CreatedBy    *string `json:"created_by,omitempty"`
+	ScannedCount int64   `json:"scanned_count"`
+	CurrentPath  string  `json:"current_path,omitempty"`
+	DurationMS   int64   `json:"duration_ms"`
+}
+
+// Validate checks that t identifies a job and carries non-negative progress counters.
+func (t JobProgressTick) Validate() error {
+	if strings.TrimSpace(t.JobID) == "" {
+		return fmt.Errorf("%w: %w", ErrInvalidProgressTick, ErrEmptyJobID)
+	}
+	if strings.TrimSpace(string(t.Kind)) == "" {
+		return fmt.Errorf("%w: %w", ErrInvalidProgressTick, ErrEmptyJobKind)
+	}
+	if t.ScannedCount < 0 {
+		return fmt.Errorf("%w: scanned_count must be non-negative", ErrInvalidProgressTick)
+	}
+	if t.DurationMS < 0 {
+		return fmt.Errorf("%w: duration_ms must be non-negative", ErrInvalidProgressTick)
+	}
+	return nil
+}
+
+// VisibleTo reports whether principal is permitted to receive progress ticks for this job
+// (creator or jobs:read_all; automatic jobs with nil CreatedBy are jobs:read_all only).
+func (t JobProgressTick) VisibleTo(principal *Principal) bool {
+	j := Job{
+		ID:        t.JobID,
+		Kind:      t.Kind,
+		CreatedBy: t.CreatedBy,
+	}
+	return j.VisibleTo(principal)
+}
+
+// Clone returns a copy of t with an independent CreatedBy string pointer.
+func (t JobProgressTick) Clone() JobProgressTick {
+	out := t
+	if t.CreatedBy != nil {
+		createdBy := *t.CreatedBy
+		out.CreatedBy = &createdBy
+	}
+	return out
 }
 
 // NewJobLifecycleEvent constructs a version 1 job lifecycle outbox event for job.

@@ -294,9 +294,10 @@ func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.
 }
 
 type daemonWorkers struct {
-	runner     *jobs.Runner
-	delivery   *events.DeliveryCoordinator
-	dispatcher *events.Dispatcher
+	runner      *jobs.Runner
+	delivery    *events.DeliveryCoordinator
+	dispatcher  *events.Dispatcher
+	progressHub *events.ProgressHub
 }
 
 func (w *daemonWorkers) stopAndWait() {
@@ -335,21 +336,32 @@ func startDaemonJobs(
 			cancel(fatalErr)
 		}
 	}
-	runnerOpts := jobs.RunnerOptions{
-		Logger:          slog.Default(),
-		DefaultPoolSize: parsed.defaultPoolSize,
-		OnFatal:         onFatal,
-	}
 
 	reg := buildDaemonRegistry(cfg, services)
 	eventRepo := postgres.NewEventRepository(pool)
 	jobRepo := postgres.NewJobRepository(pool)
+	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("initializing job progress hub: %w", err)
+	}
+	var dispatcher *events.Dispatcher
+	runnerOpts := jobs.RunnerOptions{
+		Logger:          slog.Default(),
+		DefaultPoolSize: parsed.defaultPoolSize,
+		OnFatal:         onFatal,
+		ProgressHub:     progressHub,
+		OnTransition: func(job domain.Job) {
+			if dispatcher != nil && !job.Kind.IsInternal() {
+				dispatcher.Notify()
+			}
+		},
+	}
 	runner := jobs.NewRunner(jobRepo, runnerOpts)
 	delivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
 		Logger:  slog.Default(),
 		OnFatal: onFatal,
 	})
-	dispatcher := events.NewDispatcher(eventRepo,
+	dispatcher = events.NewDispatcher(eventRepo,
 		events.WithDispatcherLogger(slog.Default()),
 		events.WithOnPublished(func(_ context.Context, _ []domain.DomainEvent) error {
 			delivery.Wake()
@@ -410,9 +422,10 @@ func startDaemonJobs(
 		return nil, fmt.Errorf("starting domain event dispatcher: %w", err)
 	}
 	return &daemonWorkers{
-		runner:     runner,
-		delivery:   delivery,
-		dispatcher: dispatcher,
+		runner:      runner,
+		delivery:    delivery,
+		dispatcher:  dispatcher,
+		progressHub: progressHub,
 	}, nil
 }
 

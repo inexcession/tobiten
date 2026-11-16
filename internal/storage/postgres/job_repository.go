@@ -22,9 +22,10 @@ const maxDedupeEnqueueAttempts = 5
 
 // JobRepository implements storage.JobRepository backed by PostgreSQL and sqlc.
 type JobRepository struct {
-	q    *Queries
-	tx   TxBeginner
-	inTx bool
+	q     *Queries
+	tx    TxBeginner
+	scope *txScope
+	inTx  bool
 }
 
 // NewJobRepository creates a new JobRepository using the provided database handle.
@@ -33,11 +34,16 @@ func NewJobRepository(db DBTX) *JobRepository {
 	if b, ok := db.(TxBeginner); ok {
 		beginner = b
 	}
-	_, inTx := db.(pgx.Tx)
+	var scope *txScope
+	extTx, inTx := db.(pgx.Tx)
+	if inTx {
+		scope = newCallerTxScope(extTx)
+	}
 	return &JobRepository{
-		q:    New(db),
-		tx:   beginner,
-		inTx: inTx,
+		q:     New(db),
+		tx:    beginner,
+		scope: scope,
+		inTx:  inTx,
 	}
 }
 
@@ -48,33 +54,68 @@ func (r *JobRepository) InTx() bool {
 
 // WithTx executes fn inside a transaction (or nested savepoint when already inside one).
 func (r *JobRepository) WithTx(ctx context.Context, fn func(repo storage.JobRepository) error) error {
-	_, err := runInJobTx(ctx, r, func(tx pgx.Tx, q *Queries) (struct{}, error) {
-		return struct{}{}, fn(&JobRepository{q: q, tx: tx, inTx: true})
+	if r == nil {
+		return errors.New("job repository is required")
+	}
+	if fn == nil {
+		return errors.New("transaction callback cannot be nil")
+	}
+	return runTx(ctx, r.tx, r.scope, "job", func(child *txScope) error {
+		return fn(&JobRepository{q: New(child.tx), tx: child.tx, scope: child, inTx: true})
 	})
-	return err
 }
 
 func runInJobTx[T any](ctx context.Context, r *JobRepository, fn func(tx pgx.Tx, q *Queries) (T, error)) (T, error) {
 	var zero T
-	if r.tx == nil {
-		return zero, errors.New("db connection does not support transactions")
+	if r == nil {
+		return zero, errors.New("job repository is required")
 	}
-	tx, err := r.tx.Begin(ctx)
-	if err != nil {
-		return zero, fmt.Errorf("beginning job transaction: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
-
-	res, err := fn(tx, r.q.WithTx(tx))
+	var out T
+	err := runTx(ctx, r.tx, r.scope, "job", func(child *txScope) error {
+		var fnErr error
+		out, fnErr = fn(child.tx, New(child.tx))
+		return fnErr
+	})
 	if err != nil {
 		return zero, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return zero, fmt.Errorf("committing job transaction: %w", err)
+	return out, nil
+}
+
+func appendJobLifecycleEventInTx(ctx context.Context, q *Queries, job domain.Job, ts time.Time) error {
+	if job.Kind.IsInternal() {
+		return nil
 	}
-	return res, nil
+	evKind, ok := domain.JobLifecycleEventKind(job.State)
+	if !ok {
+		return nil
+	}
+	ev, err := domain.NewJobLifecycleEvent(evKind, job, ts)
+	if err != nil {
+		if errors.Is(err, domain.ErrInternalJobEventSuppressed) {
+			return nil
+		}
+		return fmt.Errorf("building job lifecycle event %s for job %q: %w", evKind, job.ID, err)
+	}
+	if _, err := q.AppendDomainEvent(ctx, AppendDomainEventParams{
+		Kind:          string(ev.Kind),
+		Version:       int32(ev.Version),
+		AggregateType: ev.AggregateType,
+		AggregateID:   ev.AggregateID,
+		Payload:       []byte(ev.Payload),
+		CreatedAt:     ev.CreatedAt,
+	}); err != nil {
+		return fmt.Errorf("appending job lifecycle event %s for job %q: %w", ev.Kind, job.ID, err)
+	}
+	return nil
+}
+
+func finishJobTransitionInTx(ctx context.Context, q *Queries, row Job, ts time.Time) (domain.Job, error) {
+	job := JobToDomain(row)
+	if err := appendJobLifecycleEventInTx(ctx, q, job, ts); err != nil {
+		return domain.Job{}, err
+	}
+	return job, nil
 }
 
 func normalizeJobTime(t time.Time) time.Time {
@@ -374,7 +415,7 @@ func (r *JobRepository) ClaimNext(ctx context.Context, kind domain.JobKind, now 
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("claiming job %q: %w", jobID, err)
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err
@@ -447,7 +488,7 @@ func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, attempt in
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q succeeded: %w", id, err)
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err
@@ -488,7 +529,7 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, attempt int,
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("cancelling failing job %q: %w", id, err)
 			}
-			return JobToDomain(row), nil
+			return finishJobTransitionInTx(ctx, q, row, ts)
 		}
 
 		if int(current.Attempts) < int(current.MaxAttempts) {
@@ -520,7 +561,7 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, attempt int,
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q failed: %w", id, err)
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err
@@ -550,7 +591,7 @@ func (r *JobRepository) RequestCancel(ctx context.Context, id string, now time.T
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("cancelling queued job %q: %w", id, err)
 			}
-			return JobToDomain(row), nil
+			return finishJobTransitionInTx(ctx, q, row, ts)
 		case domain.JobStateRunning:
 			row, err := q.SetJobCancelRequested(ctx, SetJobCancelRequestedParams{
 				ID:        id,
@@ -594,7 +635,7 @@ func (r *JobRepository) MarkCancelled(ctx context.Context, id string, attempt in
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q cancelled: %w", id, err)
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err
@@ -706,7 +747,7 @@ func (r *JobRepository) RequeueInterrupted(ctx context.Context, id string, attem
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("cancelling interrupted job %q: %w", id, err)
 			}
-			return JobToDomain(row), nil
+			return finishJobTransitionInTx(ctx, q, row, ts)
 		}
 
 		if int(current.Attempts) >= int(current.MaxAttempts) {
@@ -724,7 +765,7 @@ func (r *JobRepository) RequeueInterrupted(ctx context.Context, id string, attem
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("failing exhausted interrupted job %q: %w", id, err)
 			}
-			return JobToDomain(row), nil
+			return finishJobTransitionInTx(ctx, q, row, ts)
 		}
 
 		row, err := q.RequeueInterruptedJob(ctx, RequeueInterruptedJobParams{
@@ -777,7 +818,7 @@ func (r *JobRepository) MarkFailed(ctx context.Context, id string, attempt int, 
 			if err != nil {
 				return domain.Job{}, fmt.Errorf("cancelling job %q: %w", id, err)
 			}
-			return JobToDomain(row), nil
+			return finishJobTransitionInTx(ctx, q, row, ts)
 		}
 
 		row, err := q.MarkJobFailed(ctx, MarkJobFailedParams{
@@ -789,7 +830,7 @@ func (r *JobRepository) MarkFailed(ctx context.Context, id string, attempt int, 
 		if err != nil {
 			return domain.Job{}, fmt.Errorf("marking job %q failed: %w", id, err)
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err
@@ -840,7 +881,7 @@ func (r *JobRepository) runTerminalRecoveryTx(
 		if err != nil {
 			return domain.Job{}, err
 		}
-		return JobToDomain(row), nil
+		return finishJobTransitionInTx(ctx, q, row, ts)
 	})
 	if err != nil {
 		return nil, err

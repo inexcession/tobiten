@@ -276,3 +276,75 @@ func TestEventDeliveryHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestJobLifecycleEventKindAndProgressTick(t *testing.T) {
+	cases := []struct {
+		state  JobState
+		want   EventKind
+		wantOK bool
+	}{
+		{JobStateRunning, EventJobStarted, true},
+		{JobStateSucceeded, EventJobFinished, true},
+		{JobStateFailed, EventJobFailed, true},
+		{JobStateCancelled, EventJobCancelled, true},
+		{JobStateQueued, "", false},
+		{JobState("UNKNOWN"), "", false},
+	}
+	for _, tc := range cases {
+		got, ok := JobLifecycleEventKind(tc.state)
+		if got != tc.want || ok != tc.wantOK {
+			t.Fatalf("JobLifecycleEventKind(%s) = (%q, %v), want (%q, %v)", tc.state, got, ok, tc.want, tc.wantOK)
+		}
+	}
+
+	if ProgressTickEventName != "job.progress" {
+		t.Fatalf("ProgressTickEventName = %q, want job.progress", ProgressTickEventName)
+	}
+	if EventKind(ProgressTickEventName).IsValid() {
+		t.Fatal("progress tick event name must not be a persisted outbox EventKind")
+	}
+
+	creatorID := "usr-creator"
+	otherID := "usr-other"
+	tick := JobProgressTick{
+		JobID:        "job-1",
+		Kind:         JobKindScan,
+		CreatedBy:    &creatorID,
+		ScannedCount: 42,
+		CurrentPath:  "/comics/Series/v01.cbz",
+		DurationMS:   150,
+	}
+	if err := tick.Validate(); err != nil {
+		t.Fatalf("valid JobProgressTick failed: %v", err)
+	}
+
+	cloned := tick.Clone()
+	*cloned.CreatedBy = "mutated"
+	if *tick.CreatedBy != creatorID {
+		t.Fatal("Clone must deep-copy CreatedBy")
+	}
+
+	creator := NewPrincipal(User{ID: creatorID, Username: "alice"}, []Role{mustBuiltInRole(t, RoleReaderID)}, CredentialKindPassword, "c1", nil)
+	other := NewPrincipal(User{ID: otherID, Username: "bob"}, []Role{mustBuiltInRole(t, RoleReaderID)}, CredentialKindPassword, "c2", nil)
+	admin := NewPrincipal(User{ID: otherID, Username: "admin"}, []Role{mustBuiltInRole(t, RoleAdminID)}, CredentialKindPassword, "c3", nil)
+
+	if tick.VisibleTo(nil) || tick.VisibleTo(other) || !tick.VisibleTo(creator) || !tick.VisibleTo(admin) {
+		t.Fatal("unexpected visibility result for user-created progress tick")
+	}
+	autoTick := tick
+	autoTick.CreatedBy = nil
+	if autoTick.VisibleTo(creator) || !autoTick.VisibleTo(admin) {
+		t.Fatal("unexpected visibility result for automatic progress tick")
+	}
+
+	for _, bad := range []JobProgressTick{
+		{JobID: " ", Kind: JobKindScan},
+		{JobID: "job-1", Kind: ""},
+		{JobID: "job-1", Kind: JobKindScan, ScannedCount: -1},
+		{JobID: "job-1", Kind: JobKindScan, DurationMS: -1},
+	} {
+		if err := bad.Validate(); !errors.Is(err, ErrInvalidProgressTick) {
+			t.Fatalf("Validate(%+v) = %v, want ErrInvalidProgressTick", bad, err)
+		}
+	}
+}

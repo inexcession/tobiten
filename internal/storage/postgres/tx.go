@@ -249,7 +249,7 @@ func (s *pgTx) Events() storage.EventRepository {
 }
 
 func (s *pgTx) Jobs() storage.JobRepository {
-	return &JobRepository{q: s.q, tx: s.scope.tx, inTx: true}
+	return &JobRepository{q: s.q, tx: s.scope.tx, scope: s.scope, inTx: true}
 }
 
 func (s *pgTx) Users() storage.UserRepository {

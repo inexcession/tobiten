@@ -1242,3 +1242,340 @@ func TestJobRepository_EventDeliveryEnforcesCanonicalDedupeKey(t *testing.T) {
 		t.Fatalf("canonical Enqueue = (%v, %v), want (true, nil)", created, err)
 	}
 }
+
+func listJobLifecycleEventsForJob(ctx context.Context, t *testing.T, db *testdb.TestDB, jobID string) []domain.DomainEvent {
+	t.Helper()
+	rows, err := db.Query(ctx, `
+		SELECT id, published_sequence, published_at, kind, version, aggregate_type, aggregate_id, payload, created_at
+		FROM domain_events
+		WHERE aggregate_type = 'job' AND aggregate_id = $1
+		ORDER BY id ASC
+	`, jobID)
+	if err != nil {
+		t.Fatalf("querying domain_events for job %q: %v", jobID, err)
+	}
+	defer rows.Close()
+
+	var out []domain.DomainEvent
+	for rows.Next() {
+		var (
+			ev           domain.DomainEvent
+			publishedSeq *int64
+			publishedAt  *time.Time
+			payload      []byte
+		)
+		if err := rows.Scan(
+			&ev.ID,
+			&publishedSeq,
+			&publishedAt,
+			&ev.Kind,
+			&ev.Version,
+			&ev.AggregateType,
+			&ev.AggregateID,
+			&payload,
+			&ev.CreatedAt,
+		); err != nil {
+			t.Fatalf("scanning domain_event for job %q: %v", jobID, err)
+		}
+		ev.PublishedSequence = publishedSeq
+		ev.PublishedAt = publishedAt
+		ev.Payload = json.RawMessage(payload)
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterating domain_events for job %q: %v", jobID, err)
+	}
+	return out
+}
+
+func assertJobLifecycleEvent(
+	t *testing.T,
+	ev domain.DomainEvent,
+	wantKind domain.EventKind,
+	wantJobID string,
+	wantJobKind domain.JobKind,
+	wantState domain.JobState,
+	wantAttempts int,
+	wantErr *string,
+) {
+	t.Helper()
+	if ev.PublishedSequence != nil || ev.PublishedAt != nil {
+		t.Fatalf("outbox event %d must stay unpublished, got seq=%v at=%v", ev.ID, ev.PublishedSequence, ev.PublishedAt)
+	}
+	if ev.Kind != wantKind || ev.Version != domain.EventVersion1 || ev.AggregateType != domain.AggregateTypeJob || ev.AggregateID != wantJobID {
+		t.Fatalf("event envelope = %+v, want kind=%s job=%s", ev, wantKind, wantJobID)
+	}
+	payload, err := domain.DecodeEventPayload[domain.JobEventPayloadV1](ev)
+	if err != nil {
+		t.Fatalf("DecodeEventPayload(%s): %v", ev.Kind, err)
+	}
+	if payload.JobID != wantJobID || payload.Kind != wantJobKind || payload.State != wantState || payload.Attempts != wantAttempts {
+		t.Fatalf("payload = %+v, want job=%s kind=%s state=%s attempts=%d", payload, wantJobID, wantJobKind, wantState, wantAttempts)
+	}
+	if (wantErr == nil) != (payload.LastError == nil) || (wantErr != nil && *wantErr != *payload.LastError) {
+		t.Fatalf("payload.LastError = %v, want %v", payload.LastError, wantErr)
+	}
+}
+
+func TestJobRepository_LifecycleOutboxEventsCommittedRolledBackAndRetried(t *testing.T) {
+	t.Parallel()
+	db, repo, userRepo := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 18, 30, 0, 0, time.UTC)
+	creator := &domain.User{
+		ID:       domain.MustNewID(),
+		Username: "lifecycle-creator",
+	}
+	if err := userRepo.CreateUser(ctx, creator); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// 1. Committed retry + success path: Enqueue (0 events) -> ClaimNext #1 (job.started) ->
+	// FailOrRetry requeue (0 new events) -> ClaimNext #2 (job.started) -> MarkSucceeded (job.finished).
+	scanJob := &domain.Job{
+		Kind:        domain.JobKindScan,
+		MaxAttempts: 2,
+		CreatedBy:   &creator.ID,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := repo.Enqueue(ctx, scanJob); err != nil {
+		t.Fatalf("Enqueue scanJob: %v", err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, scanJob.ID); len(evs) != 0 {
+		t.Fatalf("expected 0 events on QUEUED enqueue, got %d", len(evs))
+	}
+
+	c1, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext #1: %v", err)
+	}
+	evs := listJobLifecycleEventsForJob(ctx, t, db, scanJob.ID)
+	if len(evs) != 1 {
+		t.Fatalf("after ClaimNext #1 got %d events, want 1", len(evs))
+	}
+	assertJobLifecycleEvent(t, evs[0], domain.EventJobStarted, scanJob.ID, domain.JobKindScan, domain.JobStateRunning, 1, nil)
+
+	// Retry requeue (RUNNING -> QUEUED) writes no lifecycle event.
+	retryTime := t0.Add(2 * time.Second)
+	if _, err := repo.FailOrRetry(ctx, scanJob.ID, c1.Attempts, "transient io err", retryTime, retryTime); err != nil {
+		t.Fatalf("FailOrRetry retry: %v", err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, scanJob.ID); len(evs) != 1 {
+		t.Fatalf("expected 0 new events on retry requeue, got %d total", len(evs))
+	}
+
+	c2, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext #2: %v", err)
+	}
+	if _, err := repo.MarkSucceeded(ctx, scanJob.ID, c2.Attempts, t0.Add(4*time.Second)); err != nil {
+		t.Fatalf("MarkSucceeded: %v", err)
+	}
+	evs = listJobLifecycleEventsForJob(ctx, t, db, scanJob.ID)
+	if len(evs) != 3 {
+		t.Fatalf("after retry + succeed got %d events, want 3", len(evs))
+	}
+	retryErr := "transient io err"
+	assertJobLifecycleEvent(t, evs[1], domain.EventJobStarted, scanJob.ID, domain.JobKindScan, domain.JobStateRunning, 2, &retryErr)
+	assertJobLifecycleEvent(t, evs[2], domain.EventJobFinished, scanJob.ID, domain.JobKindScan, domain.JobStateSucceeded, 2, nil)
+
+	// 2. Exhausted FailOrRetry emits job.failed.
+	failJob := &domain.Job{
+		Kind:        domain.JobKindIntake,
+		MaxAttempts: 1,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := repo.Enqueue(ctx, failJob); err != nil {
+		t.Fatalf("Enqueue failJob: %v", err)
+	}
+	cf, err := repo.ClaimNext(ctx, domain.JobKindIntake, t0.Add(5*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext failJob: %v", err)
+	}
+	if _, err := repo.FailOrRetry(ctx, failJob.ID, cf.Attempts, "boom", time.Time{}, t0.Add(6*time.Second)); err != nil {
+		t.Fatalf("FailOrRetry terminal: %v", err)
+	}
+	evs = listJobLifecycleEventsForJob(ctx, t, db, failJob.ID)
+	if len(evs) != 2 {
+		t.Fatalf("failJob events = %d, want 2", len(evs))
+	}
+	boom := "boom"
+	assertJobLifecycleEvent(t, evs[0], domain.EventJobStarted, failJob.ID, domain.JobKindIntake, domain.JobStateRunning, 1, nil)
+	assertJobLifecycleEvent(t, evs[1], domain.EventJobFailed, failJob.ID, domain.JobKindIntake, domain.JobStateFailed, 1, &boom)
+
+	// 3. Cancellation paths:
+	// 3a. RequestCancel on QUEUED emits job.cancelled directly.
+	queuedCancelJob := &domain.Job{Kind: domain.JobKindRepack, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, queuedCancelJob); err != nil {
+		t.Fatalf("Enqueue queuedCancelJob: %v", err)
+	}
+	if _, err := repo.RequestCancel(ctx, queuedCancelJob.ID, t0.Add(time.Second)); err != nil {
+		t.Fatalf("RequestCancel queued: %v", err)
+	}
+	evs = listJobLifecycleEventsForJob(ctx, t, db, queuedCancelJob.ID)
+	if len(evs) != 1 {
+		t.Fatalf("queuedCancelJob events = %d, want 1", len(evs))
+	}
+	assertJobLifecycleEvent(t, evs[0], domain.EventJobCancelled, queuedCancelJob.ID, domain.JobKindRepack, domain.JobStateCancelled, 0, nil)
+
+	// 3b. RequestCancel on RUNNING emits nothing while RUNNING; MarkCancelled emits job.cancelled.
+	runCancelJob := &domain.Job{Kind: domain.JobKindRepack, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, runCancelJob); err != nil {
+		t.Fatalf("Enqueue runCancelJob: %v", err)
+	}
+	cr, err := repo.ClaimNext(ctx, domain.JobKindRepack, t0.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClaimNext runCancelJob: %v", err)
+	}
+	if _, err := repo.RequestCancel(ctx, runCancelJob.ID, t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("RequestCancel running: %v", err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, runCancelJob.ID); len(evs) != 1 {
+		t.Fatalf("RequestCancel on RUNNING should not emit extra event, got %d", len(evs))
+	}
+	cancelMsg := "cancelled by user"
+	if _, err := repo.MarkCancelled(ctx, runCancelJob.ID, cr.Attempts, &cancelMsg, t0.Add(3*time.Second)); err != nil {
+		t.Fatalf("MarkCancelled: %v", err)
+	}
+	evs = listJobLifecycleEventsForJob(ctx, t, db, runCancelJob.ID)
+	if len(evs) != 2 {
+		t.Fatalf("runCancelJob events = %d, want 2", len(evs))
+	}
+	assertJobLifecycleEvent(t, evs[1], domain.EventJobCancelled, runCancelJob.ID, domain.JobKindRepack, domain.JobStateCancelled, 1, &cancelMsg)
+
+	// 4. Recovery transitions (RecoverSucceeded, RecoverCancelled, RecoverFailed, RequeueInterrupted).
+	recJobs := make([]*domain.Job, 4)
+	for i := range recJobs {
+		j := &domain.Job{Kind: domain.JobKindWriteBack, MaxAttempts: 2, CreatedAt: t0, RunAfter: t0}
+		if _, err := repo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue recJob[%d]: %v", i, err)
+		}
+		claimed, err := repo.ClaimNext(ctx, domain.JobKindWriteBack, t0.Add(time.Second))
+		if err != nil {
+			t.Fatalf("ClaimNext recJob[%d]: %v", i, err)
+		}
+		recJobs[i] = claimed
+	}
+	if _, err := repo.RecoverSucceeded(ctx, recJobs[0].ID, 1, nil, t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("RecoverSucceeded: %v", err)
+	}
+	if _, err := repo.RecoverCancelled(ctx, recJobs[1].ID, 1, nil, nil, t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("RecoverCancelled: %v", err)
+	}
+	if _, err := repo.RecoverFailed(ctx, recJobs[2].ID, 1, nil, "fatal recovery", t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("RecoverFailed: %v", err)
+	}
+	if _, err := repo.RequeueInterrupted(ctx, recJobs[3].ID, 1, nil, nil, t0.Add(2*time.Second), t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("RequeueInterrupted: %v", err)
+	}
+	assertJobLifecycleEvent(t, listJobLifecycleEventsForJob(ctx, t, db, recJobs[0].ID)[1], domain.EventJobFinished, recJobs[0].ID, domain.JobKindWriteBack, domain.JobStateSucceeded, 1, nil)
+	assertJobLifecycleEvent(t, listJobLifecycleEventsForJob(ctx, t, db, recJobs[1].ID)[1], domain.EventJobCancelled, recJobs[1].ID, domain.JobKindWriteBack, domain.JobStateCancelled, 1, nil)
+	fatalRec := "fatal recovery"
+	assertJobLifecycleEvent(t, listJobLifecycleEventsForJob(ctx, t, db, recJobs[2].ID)[1], domain.EventJobFailed, recJobs[2].ID, domain.JobKindWriteBack, domain.JobStateFailed, 1, &fatalRec)
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, recJobs[3].ID); len(evs) != 1 {
+		t.Fatalf("RequeueInterrupted to QUEUED emitted unexpected event: count=%d", len(evs))
+	}
+
+	// 5. Rolled-back caller transaction reverts both job transition and lifecycle event.
+	rbJob := &domain.Job{Kind: domain.JobKindPurge, CreatedAt: t0, RunAfter: t0}
+	if _, err := repo.Enqueue(ctx, rbJob); err != nil {
+		t.Fatalf("Enqueue rbJob: %v", err)
+	}
+	if _, err := repo.ClaimNext(ctx, domain.JobKindPurge, t0.Add(time.Second)); err != nil {
+		t.Fatalf("ClaimNext rbJob: %v", err)
+	}
+	rollbackErr := errors.New("abort caller tx")
+	if err := repo.WithTx(ctx, func(txRepo storage.JobRepository) error {
+		if _, err := txRepo.MarkSucceeded(ctx, rbJob.ID, 1, t0.Add(2*time.Second)); err != nil {
+			return err
+		}
+		return rollbackErr
+	}); !errors.Is(err, rollbackErr) {
+		t.Fatalf("WithTx err = %v, want %v", err, rollbackErr)
+	}
+	gotRB, err := repo.GetJobByID(ctx, rbJob.ID)
+	if err != nil || gotRB.State != domain.JobStateRunning {
+		t.Fatalf("rolled-back job state = (%+v, %v), want RUNNING", gotRB, err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, rbJob.ID); len(evs) != 1 || evs[0].Kind != domain.EventJobStarted {
+		t.Fatalf("rolled-back transition left unexpected events: %+v", evs)
+	}
+
+	// 6. Failure appending to domain_events inside MarkSucceeded rolls back the job state update too!
+	if _, err := db.Exec(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION fail_job_finished_outbox_%s() RETURNS TRIGGER AS $$
+		BEGIN
+			IF NEW.aggregate_id = '%s' AND NEW.kind = 'job.finished' THEN
+				RAISE EXCEPTION 'simulated outbox write failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_fail_job_finished_outbox
+		BEFORE INSERT ON domain_events
+		FOR EACH ROW EXECUTE FUNCTION fail_job_finished_outbox_%s();
+	`, "test", rbJob.ID, "test")); err != nil {
+		t.Fatalf("creating outbox fault trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DROP TRIGGER IF EXISTS trg_fail_job_finished_outbox ON domain_events`)
+		_, _ = db.Exec(context.Background(), `DROP FUNCTION IF EXISTS fail_job_finished_outbox_test()`)
+	})
+
+	if _, err := repo.MarkSucceeded(ctx, rbJob.ID, 1, t0.Add(3*time.Second)); err == nil {
+		t.Fatal("expected MarkSucceeded to fail when domain_events insert fails")
+	}
+	gotAfterFault, err := repo.GetJobByID(ctx, rbJob.ID)
+	if err != nil || gotAfterFault.State != domain.JobStateRunning {
+		t.Fatalf("job must remain RUNNING when outbox insert fails in tx, got (%+v, %v)", gotAfterFault, err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, rbJob.ID); len(evs) != 1 {
+		t.Fatalf("expected still 1 event after failed MarkSucceeded, got %d", len(evs))
+	}
+
+	// Clear fault and retry MarkSucceeded: transitions cleanly and writes exactly 1 job.finished event.
+	if _, err := db.Exec(ctx, `DROP TRIGGER trg_fail_job_finished_outbox ON domain_events`); err != nil {
+		t.Fatalf("dropping trigger: %v", err)
+	}
+	if _, err := repo.MarkSucceeded(ctx, rbJob.ID, 1, t0.Add(4*time.Second)); err != nil {
+		t.Fatalf("MarkSucceeded retry after fault cleared: %v", err)
+	}
+	evs = listJobLifecycleEventsForJob(ctx, t, db, rbJob.ID)
+	if len(evs) != 2 {
+		t.Fatalf("after retry got %d events, want 2", len(evs))
+	}
+	assertJobLifecycleEvent(t, evs[1], domain.EventJobFinished, rbJob.ID, domain.JobKindPurge, domain.JobStateSucceeded, 1, nil)
+
+	// 7. Internal EVENT_DELIVERY jobs suppress lifecycle events across every transition.
+	delivPayload, _ := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:suppress",
+		PublishedSequence: 1,
+		EventID:           1,
+	})
+	delivKey, _ := domain.EventDeliveryDedupeKey("sub:suppress")
+	delivJob := &domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     delivPayload,
+		DedupeKey:   &delivKey,
+		MaxAttempts: 2,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := repo.Enqueue(ctx, delivJob); err != nil {
+		t.Fatalf("Enqueue delivJob: %v", err)
+	}
+	if _, err := repo.ClaimNext(ctx, domain.JobKindEventDelivery, t0.Add(time.Second)); err != nil {
+		t.Fatalf("ClaimNext delivJob: %v", err)
+	}
+	if _, err := repo.MarkSucceeded(ctx, delivJob.ID, 1, t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("MarkSucceeded delivJob: %v", err)
+	}
+	if evs := listJobLifecycleEventsForJob(ctx, t, db, delivJob.ID); len(evs) != 0 {
+		t.Fatalf("expected 0 lifecycle events for EVENT_DELIVERY job, got %d", len(evs))
+	}
+}

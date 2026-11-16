@@ -1275,3 +1275,171 @@ func TestDeliveryCoordinator_UnsetModuleCallbackRejectedAndNamedPreserved(t *tes
 		t.Fatalf("seen = %v, want [named-1]", seen)
 	}
 }
+
+func TestDelivery_RegularJobPositiveControlAndProgressHubNoRows(t *testing.T) {
+	t.Parallel()
+	db, _, eventRepo, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, 11, 16, 19, 15, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	userRepo := postgres.NewUserRepository(db.Pool)
+	creator := &domain.User{ID: domain.MustNewID(), Username: "pos-ctrl-creator"}
+	if err := userRepo.CreateUser(ctx, creator); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	creatorPrincipal := testPrincipalWithPerms(creator.ID, domain.PermissionLibraryRead)
+	otherPrincipal := testPrincipalWithPerms("other-user", domain.PermissionLibraryRead)
+	adminPrincipal := testPrincipalWithPerms("admin-user", domain.PermissionLibraryRead, domain.PermissionJobsReadAll)
+
+	hub, err := events.NewProgressHub(events.ProgressHubOptions{
+		MinInterval: 100 * time.Millisecond,
+		Now:         nowFn,
+	})
+	if err != nil {
+		t.Fatalf("NewProgressHub: %v", err)
+	}
+
+	chCreator, unsubCreator, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: creatorPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe creator: %v", err)
+	}
+	defer unsubCreator()
+
+	chOther, unsubOther, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: otherPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe other: %v", err)
+	}
+	defer unsubOther()
+
+	chAdmin, unsubAdmin, err := hub.Subscribe(ctx, events.ProgressSubscribeOptions{Principal: adminPrincipal})
+	if err != nil {
+		t.Fatalf("Subscribe admin: %v", err)
+	}
+	defer unsubAdmin()
+
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{
+		Now:         nowFn,
+		ProgressHub: hub,
+	})
+	coord := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{Now: nowFn})
+	dispatcher := events.NewDispatcher(eventRepo, events.WithDispatcherClock(nowFn))
+
+	var delivered []domain.DomainEvent
+	if err := coord.RegisterSubscriber(events.SubscriberSpec{
+		SubscriberID:   "sub:pos-control",
+		SubscriberKind: "webhook",
+		DeliverFn: func(_ context.Context, ev domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+			delivered = append(delivered, ev)
+			return domain.DeliveryAcknowledged, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterSubscriber: %v", err)
+	}
+	if err := coord.RegisterJobs(runner); err != nil {
+		t.Fatalf("RegisterJobs EVENT_DELIVERY: %v", err)
+	}
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeCheckpoint,
+		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+			// Tick 1 at t0: delivered.
+			if !exec.ReportProgress(1, "/manga/v01.cbz") {
+				return errors.New("expected tick 1 to publish")
+			}
+			// Tick 2 at +40ms: rate-limited.
+			advance(40 * time.Millisecond)
+			if exec.ReportProgress(2, "/manga/v02.cbz") {
+				return errors.New("expected tick 2 to be rate-limited")
+			}
+			// Tick 3 at +120ms: delivered.
+			advance(80 * time.Millisecond)
+			if !exec.ReportProgress(3, "/manga/v03.cbz") {
+				return errors.New("expected tick 3 to publish")
+			}
+			return nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind SCAN: %v", err)
+	}
+
+	if err := coord.SyncSubscribers(ctx); err != nil {
+		t.Fatalf("SyncSubscribers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Enqueue and execute a regular SCAN job (positive control).
+	scanJob := &domain.Job{
+		Kind:      domain.JobKindScan,
+		CreatedBy: &creator.ID,
+		CreatedAt: nowFn(),
+		RunAfter:  nowFn(),
+	}
+	if _, err := jobRepo.Enqueue(ctx, scanJob); err != nil {
+		t.Fatalf("Enqueue scanJob: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext SCAN = (%v, %v)", claimed, err)
+	}
+
+	// Verify live progress ticks reached creator & admin with no IDs and left no non-lifecycle rows.
+	for _, wantCount := range []int64{1, 3} {
+		tickC := <-chCreator
+		tickA := <-chAdmin
+		if tickC.JobID != scanJob.ID || tickC.ScannedCount != wantCount || tickA.ScannedCount != wantCount {
+			t.Fatalf("unexpected progress ticks: creator=%+v admin=%+v want count=%d", tickC, tickA, wantCount)
+		}
+	}
+	select {
+	case unexpected := <-chOther:
+		t.Fatalf("non-creator received unexpected progress tick: %+v", unexpected)
+	default:
+	}
+
+	// Sequence the outbox events from the regular SCAN job and deliver them via EVENT_DELIVERY.
+	published, err := dispatcher.DispatchOnce(ctx)
+	if err != nil {
+		t.Fatalf("DispatchOnce: %v", err)
+	}
+	if len(published) != 2 {
+		t.Fatalf("published %d events, want 2 (job.started + job.finished)", len(published))
+	}
+	for range 2 {
+		if n, err := coord.DrainOnce(ctx); err != nil || n != 1 {
+			t.Fatalf("DrainOnce = (%d, %v), want (1, nil)", n, err)
+		}
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext EVENT_DELIVERY = (%v, %v)", claimed, err)
+		}
+	}
+	waitSubscriberPosition(ctx, t, eventRepo, "sub:pos-control", 2)
+
+	if len(delivered) != 2 || delivered[0].Kind != domain.EventJobStarted || delivered[1].Kind != domain.EventJobFinished {
+		t.Fatalf("delivered = %+v, want [job.started job.finished]", delivered)
+	}
+
+	// Total domain_events must remain 2: zero rows for progress ticks, zero rows for EVENT_DELIVERY!
+	var totalCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events`).Scan(&totalCount); err != nil {
+		t.Fatalf("counting total domain_events: %v", err)
+	}
+	if totalCount != 2 {
+		t.Fatalf("total domain_events = %d, want 2 (only SCAN job.started + job.finished)", totalCount)
+	}
+}

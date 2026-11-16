@@ -87,6 +87,15 @@ type KindRegistrar interface {
 	RegisterJobs(r *Runner) error
 }
 
+// ProgressPublisher receives rate-limited ephemeral worker progress ticks (ADR-0017 §2, ADR-0018 S3).
+type ProgressPublisher interface {
+	Publish(tick domain.JobProgressTick) bool
+}
+
+type progressJobCleaner interface {
+	ClearJob(jobID string)
+}
+
 // RunnerOptions configures a durable job Runner and its bounded per-kind worker pools.
 type RunnerOptions struct {
 	Logger          *slog.Logger
@@ -95,6 +104,8 @@ type RunnerOptions struct {
 	PoolSizes       map[domain.JobKind]int
 	PollInterval    time.Duration
 	OnFatal         func(error)
+	ProgressHub     ProgressPublisher
+	OnTransition    func(job domain.Job)
 }
 
 // RecoveryReport summarizes the interrupted RUNNING jobs reconciled at startup.
@@ -107,13 +118,15 @@ type RecoveryReport struct {
 	Cancelled          int
 }
 
-// Execution provides a running job handler with checkpoint persistence and cancellation checks
-// bound to the claimed attempt.
+// Execution provides a running job handler with checkpoint persistence, cancellation checks,
+// and ephemeral progress reporting bound to the claimed attempt.
 type Execution struct {
-	mu   sync.RWMutex
-	job  domain.Job
-	repo storage.JobRepository
-	now  func() time.Time
+	mu        sync.RWMutex
+	job       domain.Job
+	repo      storage.JobRepository
+	now       func() time.Time
+	startedAt time.Time
+	progress  ProgressPublisher
 }
 
 // Job returns a snapshot of the claimed job, including its latest saved checkpoint.
@@ -187,6 +200,44 @@ func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
 	return e.repo.IsCancelRequested(ctx, jobID)
 }
 
+// ReportProgress publishes an ephemeral, rate-limited progress tick for this job
+// without persisting any outbox row or SSE ID (ADR-0017 §2, ADR-0018 S3).
+// Internal EVENT_DELIVERY jobs suppress progress ticks.
+func (e *Execution) ReportProgress(scannedCount int64, currentPath string) bool {
+	if e == nil || e.progress == nil {
+		return false
+	}
+	e.mu.RLock()
+	job := e.job
+	startedAt := e.startedAt
+	e.mu.RUnlock()
+
+	if job.Kind.IsInternal() {
+		return false
+	}
+	nowFn := time.Now
+	if e.now != nil {
+		nowFn = e.now
+	}
+	now := nowFn().UTC()
+	durationMS := max(int64(0), now.Sub(startedAt).Milliseconds())
+
+	var createdBy *string
+	if job.CreatedBy != nil {
+		v := *job.CreatedBy
+		createdBy = &v
+	}
+
+	return e.progress.Publish(domain.JobProgressTick{
+		JobID:        job.ID,
+		Kind:         job.Kind,
+		CreatedBy:    createdBy,
+		ScannedCount: scannedCount,
+		CurrentPath:  currentPath,
+		DurationMS:   durationMS,
+	})
+}
+
 // Runner coordinates job-kind registration, startup recovery under daemon ownership,
 // and attempt-safe job execution over storage.JobRepository (ADR-0017).
 type Runner struct {
@@ -197,6 +248,8 @@ type Runner struct {
 	poolSizes          map[domain.JobKind]int
 	pollInterval       time.Duration
 	onFatal            func(error)
+	progress           ProgressPublisher
+	onTransition       func(domain.Job)
 	mu                 sync.RWMutex
 	kinds              map[domain.JobKind]KindConfig
 	activePools        *poolGeneration
@@ -230,7 +283,33 @@ func NewRunner(repo storage.JobRepository, opts RunnerOptions) *Runner {
 		poolSizes:       poolSizes,
 		pollInterval:    opts.PollInterval,
 		onFatal:         opts.OnFatal,
+		progress:        opts.ProgressHub,
+		onTransition:    opts.OnTransition,
 		kinds:           make(map[domain.JobKind]KindConfig),
+	}
+}
+
+func (r *Runner) notifyTransition(job domain.Job) {
+	if r == nil || r.onTransition == nil || job.Kind.IsInternal() {
+		return
+	}
+	if _, ok := domain.JobLifecycleEventKind(job.State); ok {
+		r.onTransition(job)
+	}
+}
+
+func (r *Runner) notifyTransitionPtr(job *domain.Job) {
+	if job != nil {
+		r.notifyTransition(*job)
+	}
+}
+
+func (r *Runner) clearProgressJob(jobID string) {
+	if r == nil || r.progress == nil || jobID == "" {
+		return
+	}
+	if cleaner, ok := r.progress.(progressJobCleaner); ok {
+		cleaner.ClearJob(jobID)
 	}
 }
 
@@ -455,93 +534,111 @@ func (r *Runner) applyReconcileOutcome(
 ) error {
 	switch outcome.Action {
 	case ReconcileSucceeded:
-		if _, err := r.repo.RecoverSucceeded(ctx, job.ID, job.Attempts, outcome.Checkpoint, now); err != nil {
+		updated, err := r.repo.RecoverSucceeded(ctx, job.ID, job.Attempts, outcome.Checkpoint, now)
+		if err != nil {
 			return fmt.Errorf("recovering reconciled job %q as succeeded: %w", job.ID, err)
 		}
 		report.Succeeded++
+		r.notifyTransitionPtr(updated)
 		return nil
 
 	case ReconcileCancelled:
-		var errPtr *string
-		if outcome.Error != "" {
-			errPtr = &outcome.Error
-		}
-		if _, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, errPtr, now); err != nil {
+		updated, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, optionalErrorPtr(outcome.Error), now)
+		if err != nil {
 			return fmt.Errorf("recovering reconciled job %q as cancelled: %w", job.ID, err)
 		}
 		report.Cancelled++
+		r.notifyTransitionPtr(updated)
 		return nil
 
 	case ReconcileFailed:
-		errMsg := outcome.Error
-		if errMsg == "" {
-			errMsg = "interrupted job marked failed during reconciliation"
-		}
+		errMsg := fallbackMsg(outcome.Error, "interrupted job marked failed during reconciliation")
 		updated, err := r.repo.RecoverFailed(ctx, job.ID, job.Attempts, outcome.Checkpoint, errMsg, now)
 		if err != nil {
 			return fmt.Errorf("recovering reconciled job %q as failed: %w", job.ID, err)
 		}
-		if updated.State == domain.JobStateCancelled {
-			report.Cancelled++
-		} else {
-			report.Failed++
-		}
+		recordTerminalOutcome(updated, report)
+		r.notifyTransitionPtr(updated)
 		return nil
 
 	case ReconcileRequeue:
-		if job.CancelRequested {
-			var errPtr *string
-			if outcome.Error != "" {
-				errPtr = &outcome.Error
-			}
-			if _, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, errPtr, now); err != nil {
-				return fmt.Errorf("cancelling interrupted job %q (%s): %w", job.ID, job.Kind, err)
-			}
-			report.Cancelled++
-			return nil
-		}
-		if job.Attempts >= job.MaxAttempts {
-			failMsg := outcome.Error
-			if failMsg == "" {
-				failMsg = "interrupted by daemon restart after exhausting max_attempts"
-			}
-			updated, err := r.repo.RecoverFailed(ctx, job.ID, job.Attempts, outcome.Checkpoint, failMsg, now)
-			if err != nil {
-				return fmt.Errorf("failing exhausted interrupted job %q (%s): %w", job.ID, job.Kind, err)
-			}
-			if updated.State == domain.JobStateCancelled {
-				report.Cancelled++
-			} else {
-				report.Failed++
-			}
-			return nil
-		}
-
-		targetCheckpoint := resolveRequeueCheckpoint(job, policy, outcome.Checkpoint)
-		reason := outcome.Error
-		if reason == "" {
-			reason = "interrupted by daemon restart"
-		}
-		updated, err := r.repo.RequeueInterrupted(ctx, job.ID, job.Attempts, targetCheckpoint, &reason, now, now)
-		if err != nil {
-			return fmt.Errorf("requeueing interrupted job %q (%s): %w", job.ID, job.Kind, err)
-		}
-		switch updated.State {
-		case domain.JobStateCancelled:
-			report.Cancelled++
-		case domain.JobStateFailed:
-			report.Failed++
-		case domain.JobStateQueued:
-			if policy == domain.JobResumeCheckpoint {
-				report.RequeuedCheckpoint++
-			} else {
-				report.RequeuedRestart++
-			}
-		}
-		return nil
+		return r.applyReconcileRequeue(ctx, job, policy, outcome, now, report)
 
 	default:
 		return fmt.Errorf("unsupported reconcile action %d for job %q", outcome.Action, job.ID)
+	}
+}
+
+func (r *Runner) applyReconcileRequeue(
+	ctx context.Context,
+	job domain.Job,
+	policy domain.JobResumePolicy,
+	outcome ReconcileOutcome,
+	now time.Time,
+	report *RecoveryReport,
+) error {
+	if job.CancelRequested {
+		updated, err := r.repo.RecoverCancelled(ctx, job.ID, job.Attempts, outcome.Checkpoint, optionalErrorPtr(outcome.Error), now)
+		if err != nil {
+			return fmt.Errorf("cancelling interrupted job %q (%s): %w", job.ID, job.Kind, err)
+		}
+		report.Cancelled++
+		r.notifyTransitionPtr(updated)
+		return nil
+	}
+	if job.Attempts >= job.MaxAttempts {
+		failMsg := fallbackMsg(outcome.Error, "interrupted by daemon restart after exhausting max_attempts")
+		updated, err := r.repo.RecoverFailed(ctx, job.ID, job.Attempts, outcome.Checkpoint, failMsg, now)
+		if err != nil {
+			return fmt.Errorf("failing exhausted interrupted job %q (%s): %w", job.ID, job.Kind, err)
+		}
+		recordTerminalOutcome(updated, report)
+		r.notifyTransitionPtr(updated)
+		return nil
+	}
+
+	targetCheckpoint := resolveRequeueCheckpoint(job, policy, outcome.Checkpoint)
+	reason := fallbackMsg(outcome.Error, "interrupted by daemon restart")
+	updated, err := r.repo.RequeueInterrupted(ctx, job.ID, job.Attempts, targetCheckpoint, &reason, now, now)
+	if err != nil {
+		return fmt.Errorf("requeueing interrupted job %q (%s): %w", job.ID, job.Kind, err)
+	}
+	switch updated.State {
+	case domain.JobStateCancelled:
+		report.Cancelled++
+		r.notifyTransition(*updated)
+	case domain.JobStateFailed:
+		report.Failed++
+		r.notifyTransition(*updated)
+	case domain.JobStateQueued:
+		if policy == domain.JobResumeCheckpoint {
+			report.RequeuedCheckpoint++
+		} else {
+			report.RequeuedRestart++
+		}
+	}
+	return nil
+}
+
+func optionalErrorPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func fallbackMsg(s, fallback string) string {
+	if s != "" {
+		return s
+	}
+	return fallback
+}
+
+func recordTerminalOutcome(updated *domain.Job, report *RecoveryReport) {
+	if updated.State == domain.JobStateCancelled {
+		report.Cancelled++
+	} else {
+		report.Failed++
 	}
 }
 
@@ -599,6 +696,7 @@ func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool
 		}
 		return false, err
 	}
+	r.notifyTransition(*job)
 
 	return true, r.executeClaimedJob(ctx, cfg, job)
 }
@@ -613,11 +711,18 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer r.clearProgressJob(job.ID)
 
+	startedAt := r.now().UTC()
+	if job.StartedAt != nil && !job.StartedAt.IsZero() && !job.StartedAt.After(startedAt) {
+		startedAt = job.StartedAt.UTC()
+	}
 	exec := &Execution{
-		job:  *job,
-		repo: r.repo,
-		now:  r.now,
+		job:       *job,
+		repo:      r.repo,
+		now:       r.now,
+		startedAt: startedAt,
+		progress:  r.progress,
 	}
 
 	runErr := cfg.Handler.Run(ctx, exec)
@@ -628,82 +733,84 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 		return err
 	}
 
+	return r.persistExecutionOutcome(ctx, cfg, job, runErr)
+}
+
+func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, job *domain.Job, runErr error) error {
 	now := r.now().UTC()
-	if runErr == nil {
-		settled := *job
-		err := r.persistOutcomeWithRetry(
-			ctx,
-			job,
-			"marking succeeded",
-			func(writeCtx context.Context) error {
-				updated, err := r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
-				if err == nil && updated != nil {
-					settled = *updated
-				}
-				return err
-			},
-			func(row *domain.Job) bool {
-				ok := (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
-				if ok {
-					settled = *row
-				}
-				return ok
-			},
-		)
-		if err != nil {
-			return err
-		}
-		if cfg.OnSucceeded != nil {
-			cfg.OnSucceeded(ctx, settled)
-		}
-		return nil
-	}
+	settled := *job
+	var (
+		label      string
+		writeFn    func(context.Context) (*domain.Job, error)
+		isResolved func(*domain.Job) bool
+	)
 
-	if errors.Is(runErr, ErrJobCancelled) {
+	switch {
+	case runErr == nil:
+		label = "marking succeeded"
+		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
+			return r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
+		}
+		isResolved = func(row *domain.Job) bool {
+			return (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
+		}
+	case errors.Is(runErr, ErrJobCancelled):
 		msg := runErr.Error()
-		return r.persistOutcomeWithRetry(
-			ctx,
-			job,
-			"marking cancelled",
-			func(writeCtx context.Context) error {
-				_, err := r.repo.MarkCancelled(writeCtx, job.ID, job.Attempts, &msg, now)
-				return err
-			},
-			func(row *domain.Job) bool {
-				return (row.State == domain.JobStateCancelled && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
-			},
-		)
-	}
-
-	if errors.Is(runErr, ErrPermanentFailure) {
-		return r.persistOutcomeWithRetry(
-			ctx,
-			job,
-			"marking permanently failed",
-			func(writeCtx context.Context) error {
-				_, err := r.repo.MarkFailed(writeCtx, job.ID, job.Attempts, runErr.Error(), now)
-				return err
-			},
-			func(row *domain.Job) bool {
-				return ((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
-			},
-		)
-	}
-
-	return r.persistOutcomeWithRetry(
-		ctx,
-		job,
-		"recording failure",
-		func(writeCtx context.Context) error {
-			_, err := r.repo.FailOrRetry(writeCtx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now)
-			return err
-		},
-		func(row *domain.Job) bool {
+		label = "marking cancelled"
+		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
+			return r.repo.MarkCancelled(writeCtx, job.ID, job.Attempts, &msg, now)
+		}
+		isResolved = func(row *domain.Job) bool {
+			return (row.State == domain.JobStateCancelled && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
+		}
+	case errors.Is(runErr, ErrPermanentFailure):
+		label = "marking permanently failed"
+		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
+			return r.repo.MarkFailed(writeCtx, job.ID, job.Attempts, runErr.Error(), now)
+		}
+		isResolved = func(row *domain.Job) bool {
+			return ((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
+		}
+	default:
+		label = "recording failure"
+		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
+			return r.repo.FailOrRetry(writeCtx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now)
+		}
+		isResolved = func(row *domain.Job) bool {
 			return (row.State == domain.JobStateQueued && row.Attempts == job.Attempts) ||
 				((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) ||
 				row.Attempts > job.Attempts
+		}
+	}
+
+	err := r.persistOutcomeWithRetry(
+		ctx,
+		job,
+		label,
+		func(writeCtx context.Context) error {
+			updated, err := writeFn(writeCtx)
+			if err == nil && updated != nil {
+				settled = *updated
+			}
+			return err
+		},
+		func(row *domain.Job) bool {
+			ok := isResolved(row)
+			if ok {
+				settled = *row
+			}
+			return ok
 		},
 	)
+	if err != nil {
+		return err
+	}
+
+	r.notifyTransition(settled)
+	if runErr == nil && cfg.OnSucceeded != nil {
+		cfg.OnSucceeded(ctx, settled)
+	}
+	return nil
 }
 
 func (r *Runner) persistOutcomeWithRetry(

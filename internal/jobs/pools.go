@@ -350,6 +350,7 @@ func (r *Runner) claimAndRunKind(ctx context.Context, cfg KindConfig, pool *kind
 		}
 		return false, err
 	}
+	r.notifyTransition(*job)
 
 	if pool.size > 1 && ctx.Err() == nil {
 		select {
