@@ -734,14 +734,6 @@ func WithEnviron(env []string) Option {
 	}
 }
 
-// WithEnvFile specifies a custom path to a .env file.
-func WithEnvFile(path string) Option {
-	return func(o *loadOptions) {
-		o.envFile = path
-		o.hasEnvFile = true
-	}
-}
-
 // WithEnvFileReader supplies .env contents from an io.Reader (e.g. for testing).
 func WithEnvFileReader(r io.Reader) Option {
 	return func(o *loadOptions) {

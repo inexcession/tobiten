@@ -590,19 +590,3 @@ func (d *DeliveryCoordinator) Stop() {
 	}
 	d.loop.stop()
 }
-
-// Wait blocks until the current background DeliveryCoordinator loop exits.
-func (d *DeliveryCoordinator) Wait() {
-	if d == nil {
-		return
-	}
-	d.loop.wait()
-}
-
-// Err returns the fatal error that stopped the most recent DeliveryCoordinator run, if any.
-func (d *DeliveryCoordinator) Err() error {
-	if d == nil {
-		return nil
-	}
-	return d.loop.err()
-}

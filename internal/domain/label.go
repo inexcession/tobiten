@@ -25,11 +25,6 @@ const (
 	LabelScopeUser   LabelScope = "USER"
 )
 
-// ValidLabelScopes returns all valid label scopes.
-func ValidLabelScopes() []LabelScope {
-	return []LabelScope{LabelScopeServer, LabelScopeUser}
-}
-
 // Label represents a scoped label (ADR-0006 §5).
 type Label struct {
 	ID      string     `json:"id"`
@@ -258,16 +253,6 @@ func NewEffectiveLabelPolicyForPrincipal(principal *Principal, userPolicies []Us
 		return NewEffectiveLabelPolicy(nil, nil, true)
 	}
 	return NewEffectiveLabelPolicy(userPolicies, groupPolicies, principal.RequiresAllowLabels())
-}
-
-// AllowCount returns the number of ALLOW policies in effect.
-func (p *EffectiveLabelPolicy) AllowCount() int {
-	return len(p.allowLabels)
-}
-
-// RestrictCount returns the number of RESTRICT policies in effect.
-func (p *EffectiveLabelPolicy) RestrictCount() int {
-	return len(p.restrictLabels)
 }
 
 // AllowLabelIDs returns the sorted slice of SERVER label IDs in the effective ALLOW set.
