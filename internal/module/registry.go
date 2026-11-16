@@ -170,6 +170,13 @@ type ReconcilerRequirement interface {
 	RequiresReconciler() bool
 }
 
+// PooledJobKind is an optional interface implemented by a JobKind to declare
+// its default bounded worker pool size (ADR-0017 §6).
+type PooledJobKind interface {
+	JobKind
+	PoolSize() int
+}
+
 // EventSubscriberProvider indicates a module provides domain event subscribers (ADR-0018 S3).
 type EventSubscriberProvider interface {
 	EventSubscribers() []EventSubscriber
@@ -566,18 +573,20 @@ func (n NamedJobKind) Name() string                         { return string(n) }
 func (n NamedJobKind) ResumePolicy() domain.JobResumePolicy { return domain.JobResumeRestart }
 
 // JobKindSpec is a JobKind descriptor pairing a canonical kind name with its declared
-// resume policy and optional startup reconciliation hook.
+// resume policy, optional startup reconciliation hook, and optional default worker pool size.
 type JobKindSpec struct {
 	Kind             domain.JobKind
 	Policy           domain.JobResumePolicy
 	ReconcileHook    domain.JobReconciler
 	RequireReconcile bool
+	Workers          int
 }
 
 func (s JobKindSpec) Name() string                         { return string(s.Kind) }
 func (s JobKindSpec) ResumePolicy() domain.JobResumePolicy { return s.Policy }
 func (s JobKindSpec) Reconciler() domain.JobReconciler     { return s.ReconcileHook }
 func (s JobKindSpec) RequiresReconciler() bool             { return s.RequireReconcile }
+func (s JobKindSpec) PoolSize() int                        { return s.Workers }
 
 // NamedEventSubscriber is a simple string-backed EventSubscriber descriptor.
 type NamedEventSubscriber string

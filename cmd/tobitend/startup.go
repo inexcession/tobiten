@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/api"
@@ -12,8 +14,10 @@ import (
 	"github.com/inexcession/tobiten/internal/auth"
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/logging"
+	"github.com/inexcession/tobiten/internal/module"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
@@ -148,18 +152,79 @@ func (d *daemonStorage) open(ctx context.Context, cfg *config.Config) (err error
 
 var buildDaemonRegistry = BuildRegistryWithServices
 
-func recoverDaemonJobs(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, services *app.Services) error {
-	reg := buildDaemonRegistry(cfg, services)
-	runner := jobs.NewRunner(postgres.NewJobRepository(pool), jobs.RunnerOptions{
+var configureDaemonJobRunner = func(*jobs.Runner, module.Registry, *config.Config, *app.Services) error {
+	return nil
+}
+
+func runnerOptionsFromConfig(cfg *config.Config) (jobs.RunnerOptions, error) {
+	opts := jobs.RunnerOptions{
 		Logger: slog.Default(),
-	})
+	}
+	if cfg == nil {
+		return opts, nil
+	}
+
+	poolSizes := make(map[domain.JobKind]int)
+	for key, rawVal := range cfg.SystemSettings() {
+		trimmedKey := strings.TrimSpace(key)
+		trimmedVal := strings.TrimSpace(rawVal)
+		if trimmedVal == "" {
+			continue
+		}
+		if strings.EqualFold(trimmedKey, "jobs.default_pool_size") {
+			n, err := strconv.Atoi(trimmedVal)
+			if err != nil || n < 1 {
+				return opts, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
+			}
+			opts.DefaultPoolSize = n
+			continue
+		}
+		const poolPrefix = "jobs.pool."
+		if len(trimmedKey) > len(poolPrefix) && strings.EqualFold(trimmedKey[:len(poolPrefix)], poolPrefix) {
+			kindName := strings.ToUpper(strings.TrimSpace(trimmedKey[len(poolPrefix):]))
+			if kindName == "" {
+				return opts, fmt.Errorf("%w: system_settings %q has empty job kind", jobs.ErrInvalidPoolSize, key)
+			}
+			n, err := strconv.Atoi(trimmedVal)
+			if err != nil || n < 1 {
+				return opts, fmt.Errorf("%w: system_settings %q = %q (must be a positive integer)", jobs.ErrInvalidPoolSize, key, rawVal)
+			}
+			poolSizes[domain.JobKind(kindName)] = n
+		}
+	}
+
+	if cfg.ScannerWorkers > 0 {
+		poolSizes[domain.JobKindScan] = cfg.ScannerWorkers
+	}
+	if len(poolSizes) > 0 {
+		opts.PoolSizes = poolSizes
+	}
+	return opts, nil
+}
+
+func startDaemonJobs(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, services *app.Services) (*jobs.Runner, error) {
+	runnerOpts, err := runnerOptionsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	reg := buildDaemonRegistry(cfg, services)
+	runner := jobs.NewRunner(postgres.NewJobRepository(pool), runnerOpts)
 	if err := runner.RegisterModuleKinds(reg); err != nil {
-		return fmt.Errorf("registering module job kinds: %w", err)
+		return nil, fmt.Errorf("registering module job kinds: %w", err)
+	}
+	if err := runner.RegisterModuleHandlers(reg); err != nil {
+		return nil, fmt.Errorf("registering module job handlers: %w", err)
+	}
+	if err := configureDaemonJobRunner(runner, reg, cfg, services); err != nil {
+		return nil, fmt.Errorf("configuring daemon job runner: %w", err)
 	}
 	if _, err := runner.Recover(ctx); err != nil {
-		return fmt.Errorf("recovering interrupted jobs: %w", err)
+		return nil, fmt.Errorf("recovering interrupted jobs: %w", err)
 	}
-	return nil
+	if err := runner.Start(ctx); err != nil {
+		return nil, fmt.Errorf("starting job worker pools: %w", err)
+	}
+	return runner, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -231,9 +296,14 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		Session:     sessionService,
 		SessionAuth: sessionAuth,
 	})
-	if err := recoverDaemonJobs(ctx, d.pool, cfg, services); err != nil {
+	jobRunner, err := startDaemonJobs(ctx, d.pool, cfg, services)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		cancel(nil)
+		jobRunner.Wait()
+	}()
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), services)
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {

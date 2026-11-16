@@ -22,6 +22,8 @@ var (
 	ErrUnknownJobKind       = errors.New("unregistered job kind")
 	ErrDuplicateJobKind     = errors.New("duplicate or conflicting job kind registration")
 	ErrInvalidJobKind       = errors.New("invalid job kind registration")
+	ErrInvalidPoolSize      = errors.New("invalid worker pool size")
+	ErrPoolsAlreadyRunning  = errors.New("worker pools already running")
 	ErrMissingJobHandler    = errors.New("job kind has no execution handler")
 	ErrMissingJobReconciler = errors.New("job kind requires a reconciliation hook")
 	ErrJobCancelled         = errors.New("job cancelled")
@@ -65,19 +67,29 @@ func (f HandlerFunc) Run(ctx context.Context, exec *Execution) error {
 	return f(ctx, exec)
 }
 
-// KindConfig registers a job kind's startup recovery policy and execution hooks.
+// KindConfig registers a job kind's startup recovery policy, execution hooks, and optional pool size.
 type KindConfig struct {
 	Kind               domain.JobKind
 	ResumePolicy       domain.JobResumePolicy
 	Handler            Handler
 	Reconciler         Reconciler
 	RequiresReconciler bool
+	PoolSize           int
 }
 
-// RunnerOptions configures a durable job Runner.
+// KindRegistrar is an optional interface implemented by modules that register
+// background job handlers directly on a Runner.
+type KindRegistrar interface {
+	RegisterJobs(r *Runner) error
+}
+
+// RunnerOptions configures a durable job Runner and its bounded per-kind worker pools.
 type RunnerOptions struct {
-	Logger *slog.Logger
-	Now    func() time.Time
+	Logger          *slog.Logger
+	Now             func() time.Time
+	DefaultPoolSize int
+	PoolSizes       map[domain.JobKind]int
+	PollInterval    time.Duration
 }
 
 // RecoveryReport summarizes the interrupted RUNNING jobs reconciled at startup.
@@ -173,12 +185,19 @@ func (e *Execution) CheckCancelled(ctx context.Context) (bool, error) {
 // Runner coordinates job-kind registration, startup recovery under daemon ownership,
 // and attempt-safe job execution over storage.JobRepository (ADR-0017).
 type Runner struct {
-	repo      storage.JobRepository
-	logger    *slog.Logger
-	now       func() time.Time
-	mu        sync.RWMutex
-	kinds     map[domain.JobKind]KindConfig
-	recovered atomic.Bool
+	repo            storage.JobRepository
+	logger          *slog.Logger
+	now             func() time.Time
+	defaultPoolSize int
+	poolSizes       map[domain.JobKind]int
+	pollInterval    time.Duration
+	mu              sync.RWMutex
+	kinds           map[domain.JobKind]KindConfig
+	pools           map[domain.JobKind]*kindPool
+	poolsRunning    bool
+	poolCancel      context.CancelFunc
+	poolWG          *sync.WaitGroup
+	recovered       atomic.Bool
 }
 
 // NewRunner constructs a Runner over repo.
@@ -191,15 +210,25 @@ func NewRunner(repo storage.JobRepository, opts RunnerOptions) *Runner {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
+	var poolSizes map[domain.JobKind]int
+	if len(opts.PoolSizes) > 0 {
+		poolSizes = make(map[domain.JobKind]int, len(opts.PoolSizes))
+		for k, v := range opts.PoolSizes {
+			poolSizes[k] = v
+		}
+	}
 	return &Runner{
-		repo:   repo,
-		logger: logger,
-		now:    nowFn,
-		kinds:  make(map[domain.JobKind]KindConfig),
+		repo:            repo,
+		logger:          logger,
+		now:             nowFn,
+		defaultPoolSize: opts.DefaultPoolSize,
+		poolSizes:       poolSizes,
+		pollInterval:    opts.PollInterval,
+		kinds:           make(map[domain.JobKind]KindConfig),
 	}
 }
 
-// RegisterKind registers a job kind's recovery policy and optional handler/reconciler.
+// RegisterKind registers a job kind's recovery policy and optional handler/reconciler/pool size.
 func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if strings.TrimSpace(string(cfg.Kind)) == "" {
 		return fmt.Errorf("%w: empty job kind", ErrInvalidJobKind)
@@ -207,9 +236,16 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if !cfg.ResumePolicy.IsValid() {
 		return fmt.Errorf("%w: kind %q has invalid resume policy %q", ErrInvalidJobKind, cfg.Kind, cfg.ResumePolicy)
 	}
+	if cfg.PoolSize < 0 {
+		return fmt.Errorf("%w: kind %q pool size %d must be non-negative", ErrInvalidPoolSize, cfg.Kind, cfg.PoolSize)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.poolsRunning {
+		return ErrPoolsAlreadyRunning
+	}
 
 	existing, exists := r.kinds[cfg.Kind]
 	if !exists {
@@ -227,6 +263,10 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if existing.Reconciler != nil && cfg.Reconciler != nil {
 		return fmt.Errorf("%w: kind %q already has a reconciler", ErrDuplicateJobKind, cfg.Kind)
 	}
+	if existing.PoolSize > 0 && cfg.PoolSize > 0 && existing.PoolSize != cfg.PoolSize {
+		return fmt.Errorf("%w: kind %q pool size %d conflicts with %d",
+			ErrDuplicateJobKind, cfg.Kind, cfg.PoolSize, existing.PoolSize)
+	}
 
 	if existing.Handler == nil {
 		existing.Handler = cfg.Handler
@@ -234,13 +274,16 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if existing.Reconciler == nil {
 		existing.Reconciler = cfg.Reconciler
 	}
+	if existing.PoolSize == 0 {
+		existing.PoolSize = cfg.PoolSize
+	}
 	existing.RequiresReconciler = existing.RequiresReconciler || cfg.RequiresReconciler
 	r.kinds[cfg.Kind] = existing
 	return nil
 }
 
 // RegisterModuleKinds imports all enabled job kinds, their declared resume policies,
-// and any declared reconciliation hooks from reg into the runner's job-kind registry.
+// optional pool sizes, and any declared reconciliation hooks from reg into the runner's job-kind registry.
 func (r *Runner) RegisterModuleKinds(reg module.Registry) error {
 	if reg == nil {
 		return nil
@@ -268,14 +311,35 @@ func (r *Runner) RegisterModuleKinds(reg module.Registry) error {
 		if reqKind, ok := jk.(module.ReconcilerRequirement); ok {
 			requiresReconciler = reqKind.RequiresReconciler()
 		}
+		var poolSize int
+		if pooledKind, ok := jk.(module.PooledJobKind); ok {
+			poolSize = pooledKind.PoolSize()
+		}
 
 		if err := r.RegisterKind(KindConfig{
 			Kind:               kind,
 			ResumePolicy:       jk.ResumePolicy(),
 			Reconciler:         reconciler,
 			RequiresReconciler: requiresReconciler,
+			PoolSize:           poolSize,
 		}); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// RegisterModuleHandlers invokes RegisterJobs on every enabled module in reg
+// that implements KindRegistrar.
+func (r *Runner) RegisterModuleHandlers(reg module.Registry) error {
+	if reg == nil {
+		return nil
+	}
+	for _, m := range reg.EnabledModules() {
+		if registrar, ok := m.(KindRegistrar); ok {
+			if err := registrar.RegisterJobs(r); err != nil {
+				return fmt.Errorf("registering jobs for module %q: %w", m.Name(), err)
+			}
 		}
 	}
 	return nil
@@ -506,6 +570,14 @@ func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool
 		return false, err
 	}
 
+	return true, r.executeClaimedJob(ctx, cfg, job)
+}
+
+func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *domain.Job) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	exec := &Execution{
 		job:  *job,
 		repo: r.repo,
@@ -516,35 +588,35 @@ func (r *Runner) ClaimAndRunNext(ctx context.Context, kind domain.JobKind) (bool
 
 	// If the runner context was cancelled (shutdown or ownership loss), stop writing to DB
 	// so the interrupted RUNNING job is left cleanly for startup recovery on next boot.
-	if ctx.Err() != nil {
-		return true, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	now := r.now().UTC()
 	if runErr == nil {
 		if _, err := r.repo.MarkSucceeded(ctx, job.ID, job.Attempts, now); err != nil {
-			return true, fmt.Errorf("marking job %q succeeded: %w", job.ID, err)
+			return fmt.Errorf("marking job %q succeeded: %w", job.ID, err)
 		}
-		return true, nil
+		return nil
 	}
 
 	if errors.Is(runErr, ErrJobCancelled) {
 		msg := runErr.Error()
 		if _, err := r.repo.MarkCancelled(ctx, job.ID, job.Attempts, &msg, now); err != nil {
-			return true, fmt.Errorf("marking job %q cancelled: %w", job.ID, err)
+			return fmt.Errorf("marking job %q cancelled: %w", job.ID, err)
 		}
-		return true, nil
+		return nil
 	}
 
 	if errors.Is(runErr, ErrPermanentFailure) {
 		if _, err := r.repo.MarkFailed(ctx, job.ID, job.Attempts, runErr.Error(), now); err != nil {
-			return true, fmt.Errorf("marking job %q permanently failed: %w", job.ID, err)
+			return fmt.Errorf("marking job %q permanently failed: %w", job.ID, err)
 		}
-		return true, nil
+		return nil
 	}
 
 	if _, err := r.repo.FailOrRetry(ctx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now); err != nil {
-		return true, fmt.Errorf("recording failure for job %q: %w", job.ID, err)
+		return fmt.Errorf("recording failure for job %q: %w", job.ID, err)
 	}
-	return true, nil
+	return nil
 }
