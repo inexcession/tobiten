@@ -33,6 +33,7 @@ func writeErrorJSON(w http.ResponseWriter, r *http.Request, status int, msg stri
 // WriteJobAccepted writes a 202 Accepted JSON response containing {"job_id": "..."} (ADR-0017 §2).
 // It fails closed with 500 Internal Server Error if jobID is blank.
 func WriteJobAccepted(w http.ResponseWriter, r *http.Request, jobID string) {
+	w.Header().Set("Cache-Control", "no-store")
 	if strings.TrimSpace(jobID) == "" {
 		writeErrorJSON(w, r, http.StatusInternalServerError, "missing job id")
 		return

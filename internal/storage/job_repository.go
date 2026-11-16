@@ -36,6 +36,11 @@ type JobRepository interface {
 	// GetJobByID retrieves a job by its ID. Returns ErrNotFound if no such job exists.
 	GetJobByID(ctx context.Context, id string) (*domain.Job, error)
 
+	// GetJobByIDForUpdate locks (FOR UPDATE) and retrieves a job by its ID within an active
+	// WithTx transaction. Returns ErrTransactionRequired if called outside WithTx, or ErrNotFound
+	// if no such job exists.
+	GetJobByIDForUpdate(ctx context.Context, id string) (*domain.Job, error)
+
 	// ListJobs returns jobs matching filter ordered newest-first.
 	ListJobs(ctx context.Context, filter JobFilter) ([]domain.Job, error)
 

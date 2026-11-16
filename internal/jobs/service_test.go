@@ -11,6 +11,7 @@ import (
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
+	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/testdb"
 )
@@ -354,4 +355,216 @@ func TestService_VisibilityAndCancellationMatrix(t *testing.T) {
 	if gotTransitions != 3 {
 		t.Fatalf("OnTransition fired %d times for 3 immediate QUEUED cancellations, want 3", gotTransitions)
 	}
+}
+
+type beforeLockJobRepo struct {
+	storage.JobRepository
+	beforeLock func(ctx context.Context, id string)
+}
+
+func (r *beforeLockJobRepo) WithTx(ctx context.Context, fn func(repo storage.JobRepository) error) error {
+	return r.JobRepository.WithTx(ctx, func(txRepo storage.JobRepository) error {
+		return fn(&beforeLockJobRepo{
+			JobRepository: txRepo,
+			beforeLock:    r.beforeLock,
+		})
+	})
+}
+
+func (r *beforeLockJobRepo) GetJobByIDForUpdate(ctx context.Context, id string) (*domain.Job, error) {
+	if r.beforeLock != nil {
+		r.beforeLock(ctx, id)
+	}
+	return r.JobRepository.GetJobByIDForUpdate(ctx, id)
+}
+
+func createSucceededJobForUser(ctx context.Context, t *testing.T, repo storage.JobRepository, userID string, t0 time.Time) string {
+	t.Helper()
+	job := &domain.Job{
+		Kind:      domain.JobKindScrape,
+		CreatedBy: &userID,
+		RunAfter:  t0,
+		CreatedAt: t0,
+	}
+	if created, err := repo.Enqueue(ctx, job); err != nil || !created {
+		t.Fatalf("Enqueue terminal job = (%v, %v)", created, err)
+	}
+	claimed, err := repo.ClaimNext(ctx, domain.JobKindScrape, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext terminal job: %v", err)
+	}
+	if _, err := repo.MarkSucceeded(ctx, job.ID, claimed.Attempts, t0); err != nil {
+		t.Fatalf("MarkSucceeded terminal job: %v", err)
+	}
+	return job.ID
+}
+
+func TestService_CancelJobConcurrentCreatorDeletionBeforeLockOnTerminalJob(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, repo := setupRunnerTestDB(t)
+
+	t0 := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	svc := jobs.NewService(repo, jobs.ServiceOptions{
+		Now: func() time.Time { return t0 },
+	})
+
+	// GetJobByIDForUpdate requires an active WithTx transaction.
+	if _, err := repo.GetJobByIDForUpdate(ctx, "019318a0-0000-7000-8000-000000000999"); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("GetJobByIDForUpdate outside WithTx = %v, want ErrTransactionRequired", err)
+	}
+
+	readerRole := mustBuiltInRole(t, domain.RoleReaderID)
+	adminRole := mustBuiltInRole(t, domain.RoleAdminID)
+	readAllOwnCancelRole := domain.Role{
+		ID:          "role-readall-owncancel",
+		Name:        "Auditor Own Cancel",
+		Permissions: []domain.Permission{domain.PermissionJobsReadAll, domain.PermissionJobsCancelOwn},
+	}
+
+	adminUser := createServiceTestUser(ctx, t, db, "admin-lock-ctrl", domain.RoleAdminID)
+	adminPrincipal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-adm", nil)
+
+	// 1. Real PostgreSQL row-lock serialization: an uncommitted DELETE FROM users holds the row lock
+	// on the terminal job via ON DELETE SET NULL while CancelJob blocks on FOR UPDATE, then commits.
+	t.Run("real PostgreSQL FOR UPDATE waits for concurrent creator deletion on terminal job", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			username  string
+			principal func(domain.User) *domain.Principal
+			wantErr   error
+		}{
+			{
+				name:     "creator without jobs:read_all gets 404 ErrNotFound instead of 409",
+				username: "lock-del-creator-404",
+				principal: func(u domain.User) *domain.Principal {
+					return domain.NewPrincipal(u, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-404", nil)
+				},
+				wantErr: app.ErrNotFound,
+			},
+			{
+				name:     "creator with jobs:read_all and jobs:cancel_own but no jobs:cancel_all gets 403 ErrForbidden instead of 409",
+				username: "lock-del-creator-403",
+				principal: func(u domain.User) *domain.Principal {
+					return domain.NewPrincipal(u, []domain.Role{readAllOwnCancelRole}, domain.CredentialKindPassword, "c-403", nil)
+				},
+				wantErr: app.ErrForbidden,
+			},
+			{
+				name:     "authorized admin control gets 409 ErrConflict after creator deletion",
+				username: "lock-del-creator-409",
+				principal: func(_ domain.User) *domain.Principal {
+					return adminPrincipal
+				},
+				wantErr: app.ErrConflict,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				creator := createServiceTestUser(ctx, t, db, tc.username, domain.RoleReaderID)
+				jobID := createSucceededJobForUser(ctx, t, repo, creator.ID, t0)
+				caller := tc.principal(creator)
+
+				txDel, err := db.Pool.Begin(ctx)
+				if err != nil {
+					t.Fatalf("Begin txDel: %v", err)
+				}
+				txDelClosed := false
+				defer func() {
+					if !txDelClosed {
+						_ = txDel.Rollback(ctx)
+					}
+				}()
+
+				if _, err := txDel.Exec(ctx, `DELETE FROM users WHERE id = $1`, creator.ID); err != nil {
+					t.Fatalf("DELETE user in txDel: %v", err)
+				}
+
+				cancelErrCh := make(chan error, 1)
+				go func() {
+					_, err := svc.CancelJob(ctx, caller, jobID)
+					cancelErrCh <- err
+				}()
+
+				// Wait until PostgreSQL reports the CancelJob backend waiting on the row lock.
+				waitDeadline := time.Now().Add(5 * time.Second)
+				locked := false
+				for time.Now().Before(waitDeadline) {
+					var count int
+					err := db.Pool.QueryRow(ctx, `
+						SELECT COUNT(*)
+						FROM pg_stat_activity
+						WHERE datname = current_database()
+						  AND pid <> pg_backend_pid()
+						  AND wait_event_type = 'Lock'
+						  AND query LIKE '%FOR UPDATE%'
+					`).Scan(&count)
+					if err == nil && count > 0 {
+						locked = true
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !locked {
+					t.Fatal("CancelJob did not block on PostgreSQL FOR UPDATE row lock")
+				}
+
+				if err := txDel.Commit(ctx); err != nil {
+					t.Fatalf("Commit txDel: %v", err)
+				}
+				txDelClosed = true
+
+				select {
+				case gotErr := <-cancelErrCh:
+					if !errors.Is(gotErr, tc.wantErr) {
+						t.Fatalf("CancelJob after concurrent creator deletion = %v, want %v", gotErr, tc.wantErr)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for CancelJob after txDel commit")
+				}
+			})
+		}
+	})
+
+	// 2. Deterministic pre-lock hook simulating creator deletion committed right before lock acquisition.
+	t.Run("creator deletion immediately before lock acquisition on terminal job", func(t *testing.T) {
+		creator404 := createServiceTestUser(ctx, t, db, "hook-del-404", domain.RoleReaderID)
+		job404 := createSucceededJobForUser(ctx, t, repo, creator404.ID, t0)
+
+		creator403 := createServiceTestUser(ctx, t, db, "hook-del-403", domain.RoleReaderID)
+		job403 := createSucceededJobForUser(ctx, t, repo, creator403.ID, t0)
+
+		creator409 := createServiceTestUser(ctx, t, db, "hook-del-409", domain.RoleReaderID)
+		job409 := createSucceededJobForUser(ctx, t, repo, creator409.ID, t0)
+
+		deleteUserBeforeLock := func(userID string) *jobs.Service {
+			var once sync.Once
+			wrapped := &beforeLockJobRepo{
+				JobRepository: repo,
+				beforeLock: func(lockCtx context.Context, _ string) {
+					once.Do(func() {
+						if _, err := db.Pool.Exec(lockCtx, `DELETE FROM users WHERE id = $1`, userID); err != nil {
+							t.Errorf("delete user %s before lock: %v", userID, err)
+						}
+					})
+				},
+			}
+			return jobs.NewService(wrapped, jobs.ServiceOptions{Now: func() time.Time { return t0 }})
+		}
+
+		p404 := domain.NewPrincipal(creator404, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-h404", nil)
+		if _, err := deleteUserBeforeLock(creator404.ID).CancelJob(ctx, p404, job404); !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("hook 404 CancelJob = %v, want ErrNotFound", err)
+		}
+
+		p403 := domain.NewPrincipal(creator403, []domain.Role{readAllOwnCancelRole}, domain.CredentialKindPassword, "c-h403", nil)
+		if _, err := deleteUserBeforeLock(creator403.ID).CancelJob(ctx, p403, job403); !errors.Is(err, app.ErrForbidden) {
+			t.Fatalf("hook 403 CancelJob = %v, want ErrForbidden", err)
+		}
+
+		if _, err := deleteUserBeforeLock(creator409.ID).CancelJob(ctx, adminPrincipal, job409); !errors.Is(err, app.ErrConflict) {
+			t.Fatalf("hook 409 CancelJob = %v, want ErrConflict", err)
+		}
+	})
 }

@@ -258,7 +258,7 @@ func (s *Service) CancelJob(ctx context.Context, principal *domain.Principal, jo
 
 	var updated *domain.Job
 	err := s.repo.WithTx(ctx, func(txRepo storage.JobRepository) error {
-		job, err := txRepo.GetJobByID(ctx, jobID)
+		job, err := txRepo.GetJobByIDForUpdate(ctx, jobID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return app.ErrNotFound
@@ -282,13 +282,6 @@ func (s *Service) CancelJob(ctx context.Context, principal *domain.Principal, jo
 			default:
 				return err
 			}
-		}
-		// Re-verify against the locked row in case created_by became NULL concurrently.
-		if !res.VisibleTo(principal) {
-			return app.ErrNotFound
-		}
-		if !res.CanCancel(principal) {
-			return app.ErrForbidden
 		}
 		updated = res
 		return nil

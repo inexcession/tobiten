@@ -354,6 +354,25 @@ func (r *JobRepository) GetJobByID(ctx context.Context, id string) (*domain.Job,
 	return &out, nil
 }
 
+// GetJobByIDForUpdate locks (FOR UPDATE) and retrieves a job by its ID within an active WithTx transaction.
+func (r *JobRepository) GetJobByIDForUpdate(ctx context.Context, id string) (*domain.Job, error) {
+	if r == nil {
+		return nil, errors.New("job repository is required")
+	}
+	if !r.InTx() {
+		return nil, storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptyJobID
+	}
+	row, err := lockJobForUpdate(ctx, r.q, id)
+	if err != nil {
+		return nil, err
+	}
+	out := JobToDomain(row)
+	return &out, nil
+}
+
 // ListJobs returns jobs matching filter ordered newest-first.
 func (r *JobRepository) ListJobs(ctx context.Context, filter storage.JobFilter) ([]domain.Job, error) {
 	if filter.Limit < 0 || filter.Offset < 0 || filter.Limit > math.MaxInt32 || filter.Offset > math.MaxInt32 {

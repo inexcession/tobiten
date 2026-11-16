@@ -532,8 +532,81 @@ func TestDaemonJobsTriggerDetailAndCancelAPI(t *testing.T) {
 			t.Fatalf("cancel already-cancelled job status = %d, want 409", rec.Code)
 		}
 
-		// Cookie session login + CSRF check on POST /api/v1/jobs/{job_id}/cancel for RUNNING job.
+		// Cookie session login + Cache-Control: no-store checks on GET/HEAD (200 and absent/invisible 404)
+		// + CSRF check on POST /api/v1/jobs/{job_id}/cancel for RUNNING job.
 		_, sessCookie, csrfTok := performLogin(t, srv.Handler(), "/api/v1/auth/login", `{"username":"alice-api","password":"alice-pass-123"}`, "198.51.100.55:4010", nil)
+		callCookie := func(method, path string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(method, path, nil)
+			req.RemoteAddr = "198.51.100.55:4011"
+			req.AddCookie(sessCookie)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			return rec
+		}
+
+		for _, tc := range []struct {
+			name   string
+			method string
+			path   string
+		}{
+			{name: "direct GET own snapshot", method: http.MethodGet, path: "/api/v1/jobs/" + runTrigResp.JobID},
+			{name: "direct HEAD own snapshot", method: http.MethodHead, path: "/api/v1/jobs/" + runTrigResp.JobID},
+			{name: "subpath GET own snapshot", method: http.MethodGet, path: "/comics/api/v1/jobs/" + runTrigResp.JobID},
+			{name: "subpath HEAD own snapshot", method: http.MethodHead, path: "/comics/api/v1/jobs/" + runTrigResp.JobID},
+		} {
+			rec := callCookie(tc.method, tc.path)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("cookie %s status = %d, want 200 (body: %s)", tc.name, rec.Code, rec.Body.String())
+			}
+			if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+				t.Fatalf("cookie %s Cache-Control = %q, want no-store", tc.name, cc)
+			}
+			if tc.method == http.MethodHead && rec.Body.Len() != 0 {
+				t.Fatalf("cookie %s HEAD returned non-empty body %q", tc.name, rec.Body.String())
+			}
+		}
+
+		// Cookie-authenticated GET and HEAD for absent vs invisible (automatic/deleted-creator) jobs:
+		// must return identical 404 responses with Cache-Control: no-store.
+		recCookieAbsentGet := callCookie(http.MethodGet, "/api/v1/jobs/019318a0-0000-7000-8000-999999999999")
+		recCookieAbsentHead := callCookie(http.MethodHead, "/api/v1/jobs/019318a0-0000-7000-8000-999999999999")
+		if recCookieAbsentGet.Code != http.StatusNotFound || recCookieAbsentHead.Code != http.StatusNotFound {
+			t.Fatalf("cookie absent GET/HEAD status = %d/%d, want 404/404", recCookieAbsentGet.Code, recCookieAbsentHead.Code)
+		}
+		if recCookieAbsentGet.Header().Get("Cache-Control") != "no-store" || recCookieAbsentHead.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("cookie absent GET/HEAD Cache-Control = %q/%q, want no-store/no-store",
+				recCookieAbsentGet.Header().Get("Cache-Control"), recCookieAbsentHead.Header().Get("Cache-Control"))
+		}
+		for _, invisiblePath := range []string{
+			"/api/v1/jobs/" + autoJob.ID,
+			"/comics/api/v1/jobs/" + deletedCreatorJob.ID,
+		} {
+			recInvGet := callCookie(http.MethodGet, invisiblePath)
+			recInvHead := callCookie(http.MethodHead, invisiblePath)
+			if recInvGet.Code != http.StatusNotFound || recInvHead.Code != http.StatusNotFound {
+				t.Fatalf("cookie invisible %s GET/HEAD = %d/%d, want 404/404", invisiblePath, recInvGet.Code, recInvHead.Code)
+			}
+			if recInvGet.Header().Get("Cache-Control") != "no-store" || recInvHead.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("cookie invisible %s GET/HEAD Cache-Control = %q/%q, want no-store/no-store",
+					invisiblePath, recInvGet.Header().Get("Cache-Control"), recInvHead.Header().Get("Cache-Control"))
+			}
+			if recInvGet.Body.String() != recCookieAbsentGet.Body.String() || recInvHead.Body.Len() != 0 {
+				t.Fatalf("cookie invisible %s 404 body mismatch: get=%q absent=%q headLen=%d",
+					invisiblePath, recInvGet.Body.String(), recCookieAbsentGet.Body.String(), recInvHead.Body.Len())
+			}
+		}
+
+		// X-API-Key authentication also receives Cache-Control: no-store on job snapshots.
+		reqAPIKey := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+runTrigResp.JobID, nil)
+		reqAPIKey.RemoteAddr = "198.51.100.55:4012"
+		reqAPIKey.Header.Set("X-API-Key", aliceReadPAT)
+		recAPIKey := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(recAPIKey, reqAPIKey)
+		if recAPIKey.Code != http.StatusOK || recAPIKey.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("X-API-Key GET snapshot = (%d, Cache-Control=%q), want (200, no-store)",
+				recAPIKey.Code, recAPIKey.Header().Get("Cache-Control"))
+		}
+
 		reqNoCSRF := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+runTrigResp.JobID+"/cancel", nil)
 		reqNoCSRF.AddCookie(sessCookie)
 		recNoCSRF := httptest.NewRecorder()
@@ -549,6 +622,9 @@ func TestDaemonJobsTriggerDetailAndCancelAPI(t *testing.T) {
 		srv.Handler().ServeHTTP(recCancelRun, reqWithCSRF)
 		if recCancelRun.Code != http.StatusOK {
 			t.Fatalf("cookie cancel RUNNING with CSRF status = %d, want 200 (body: %s)", recCancelRun.Code, recCancelRun.Body.String())
+		}
+		if cc := recCancelRun.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Fatalf("cookie cancel RUNNING Cache-Control = %q, want no-store", cc)
 		}
 		var snapRun app.JobInfo
 		if err := json.Unmarshal(recCancelRun.Body.Bytes(), &snapRun); err != nil {

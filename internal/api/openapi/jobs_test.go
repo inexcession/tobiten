@@ -214,7 +214,8 @@ func TestOpenAPIModule_JobDetailAndCancel(t *testing.T) {
 		t.Errorf("GET /jobs/{id}/cancel status = %d, want 405", rec.Code)
 	}
 
-	// Absent and invisible job IDs produce identical 404 responses on GET and POST cancel.
+	// Absent and invisible job IDs produce identical 404 responses on GET, HEAD, and POST cancel,
+	// all marked Cache-Control: no-store.
 	recAbsentGet := doReq(http.MethodGet, "/api/v1/jobs/does-not-exist", bob)
 	recOtherGet := doReq(http.MethodGet, "/api/v1/jobs/job-alice-queued", bob)
 	recAutoGet := doReq(http.MethodGet, "/api/v1/jobs/job-auto-queued", bob)
@@ -223,6 +224,27 @@ func TestOpenAPIModule_JobDetailAndCancel(t *testing.T) {
 	}
 	if recAbsentGet.Body.String() != recOtherGet.Body.String() || recAbsentGet.Body.String() != recAutoGet.Body.String() {
 		t.Fatalf("GET 404 bodies differ: absent=%q other=%q auto=%q", recAbsentGet.Body.String(), recOtherGet.Body.String(), recAutoGet.Body.String())
+	}
+	for label, rec := range map[string]*httptest.ResponseRecorder{
+		"absent GET": recAbsentGet,
+		"other GET":  recOtherGet,
+		"auto GET":   recAutoGet,
+	} {
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("%s Cache-Control = %q, want no-store", label, cc)
+		}
+	}
+
+	recAbsentHead := doReq(http.MethodHead, "/api/v1/jobs/does-not-exist", bob)
+	recOtherHead := doReq(http.MethodHead, "/api/v1/jobs/job-alice-queued", bob)
+	if recAbsentHead.Code != http.StatusNotFound || recOtherHead.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for absent/other HEAD, got %d/%d", recAbsentHead.Code, recOtherHead.Code)
+	}
+	if cc := recAbsentHead.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("absent HEAD Cache-Control = %q, want no-store", cc)
+	}
+	if cc := recOtherHead.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("other HEAD Cache-Control = %q, want no-store", cc)
 	}
 
 	recAbsentCancel := doReq(http.MethodPost, "/api/v1/jobs/does-not-exist/cancel", bob)
@@ -233,18 +255,28 @@ func TestOpenAPIModule_JobDetailAndCancel(t *testing.T) {
 	if recAbsentCancel.Body.String() != recOtherCancel.Body.String() {
 		t.Fatalf("POST cancel 404 bodies differ: absent=%q other=%q", recAbsentCancel.Body.String(), recOtherCancel.Body.String())
 	}
+	if recAbsentCancel.Header().Get("Cache-Control") != "no-store" || recOtherCancel.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("expected Cache-Control: no-store on 404 cancel responses, got absent=%q other=%q",
+			recAbsentCancel.Header().Get("Cache-Control"), recOtherCancel.Header().Get("Cache-Control"))
+	}
 
-	// Creator and jobs:read_all get details; HEAD returns empty body.
+	// Creator and jobs:read_all get details with Cache-Control: no-store; HEAD returns empty body.
 	recAliceGet := doReq(http.MethodGet, "/api/v1/jobs/job-alice-running", alice)
 	if recAliceGet.Code != http.StatusOK {
 		t.Fatalf("creator GET status = %d, want 200", recAliceGet.Code)
+	}
+	if cc := recAliceGet.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("creator GET Cache-Control = %q, want no-store", cc)
 	}
 	recHead := doReq(http.MethodHead, "/api/v1/jobs/job-alice-running", alice)
 	if recHead.Code != http.StatusOK || recHead.Body.Len() != 0 {
 		t.Fatalf("HEAD /jobs status=%d bodyLen=%d, want 200 and empty body", recHead.Code, recHead.Body.Len())
 	}
-	if rec := doReq(http.MethodGet, "/api/v1/jobs/job-auto-queued", readAllOnly); rec.Code != http.StatusOK {
-		t.Fatalf("jobs:read_all GET automatic job status = %d, want 200", rec.Code)
+	if cc := recHead.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("creator HEAD Cache-Control = %q, want no-store", cc)
+	}
+	if rec := doReq(http.MethodGet, "/api/v1/jobs/job-auto-queued", readAllOnly); rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("jobs:read_all GET automatic job = (%d, Cache-Control=%q), want (200, no-store)", rec.Code, rec.Header().Get("Cache-Control"))
 	}
 
 	// Visible without cancel authority -> 403.

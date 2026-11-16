@@ -20,6 +20,8 @@ func (m *Module) jobService() app.JobService {
 }
 
 func (m *Module) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+
 	p, ok := domain.PrincipalFromContext(r.Context())
 	if !ok || p == nil {
 		middleware.WriteUnauthorized(w, r)
@@ -47,6 +49,8 @@ func (m *Module) handleGetJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Module) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+
 	p, ok := domain.PrincipalFromContext(r.Context())
 	if !ok || p == nil {
 		middleware.WriteUnauthorized(w, r)
