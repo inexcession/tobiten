@@ -10,6 +10,7 @@ import (
 )
 
 type Querier interface {
+	AppendDomainEvent(ctx context.Context, arg AppendDomainEventParams) (DomainEvent, error)
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
 	CancelQueuedJob(ctx context.Context, arg CancelQueuedJobParams) (Job, error)
@@ -33,6 +34,7 @@ type Querier interface {
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
 	GetCredentialByID(ctx context.Context, id string) (Credential, error)
 	GetCredentialForSessionLock(ctx context.Context, id string) (GetCredentialForSessionLockRow, error)
+	GetDomainEventByID(ctx context.Context, id int64) (DomainEvent, error)
 	GetJobByID(ctx context.Context, id string) (Job, error)
 	GetJobByIDForUpdate(ctx context.Context, id string) (Job, error)
 	GetLabelByID(ctx context.Context, id string) (Label, error)

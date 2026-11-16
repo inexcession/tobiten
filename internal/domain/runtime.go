@@ -13,25 +13,30 @@ import (
 
 // Common domain errors for runtime job and domain-event types.
 var (
-	ErrEmptyJobID             = errors.New("job ID cannot be empty")
-	ErrEmptyJobKind           = errors.New("job kind cannot be empty")
-	ErrInvalidJobState        = errors.New("invalid job state")
-	ErrInvalidJobResumePolicy = errors.New("invalid job resume policy")
-	ErrInvalidJobTransition   = errors.New("invalid job state transition")
-	ErrStaleJobAttempt        = errors.New("stale job attempt")
-	ErrInvalidJobAttempts     = errors.New("job attempts must be non-negative and max_attempts must be positive within 32-bit integer bounds")
-	ErrInvalidJobJSON         = errors.New("job payload and checkpoint must be valid JSON")
-	ErrEmptyDedupeKey         = errors.New("job dedupe_key cannot be empty when present")
-	ErrEmptyEventKind         = errors.New("domain event kind cannot be empty")
-	ErrInvalidEventVersion    = errors.New("domain event version must be >= 1")
-	ErrEmptyAggregateType     = errors.New("domain event aggregate_type cannot be empty")
-	ErrEmptyAggregateID       = errors.New("domain event aggregate_id cannot be empty")
-	ErrInvalidPublicationPair = errors.New("published_sequence and published_at must both be set or both be nil")
-	ErrInvalidPublishedSeq    = errors.New("published_sequence must be positive")
-	ErrEmptySubscriberID      = errors.New("event subscriber ID cannot be empty")
-	ErrEmptySubscriberKind    = errors.New("event subscriber kind cannot be empty")
-	ErrInvalidSubscriberState = errors.New("invalid event subscriber state")
-	ErrInvalidStalledPair     = errors.New("subscriber state STALLED and stalled_at must be set together")
+	ErrEmptyJobID                    = errors.New("job ID cannot be empty")
+	ErrEmptyJobKind                  = errors.New("job kind cannot be empty")
+	ErrInvalidJobState               = errors.New("invalid job state")
+	ErrInvalidJobResumePolicy        = errors.New("invalid job resume policy")
+	ErrInvalidJobTransition          = errors.New("invalid job state transition")
+	ErrStaleJobAttempt               = errors.New("stale job attempt")
+	ErrInvalidJobAttempts            = errors.New("job attempts must be non-negative and max_attempts must be positive within 32-bit integer bounds")
+	ErrInvalidJobJSON                = errors.New("job payload and checkpoint must be valid JSON")
+	ErrEmptyDedupeKey                = errors.New("job dedupe_key cannot be empty when present")
+	ErrEmptyEventKind                = errors.New("domain event kind cannot be empty")
+	ErrInvalidEventVersion           = errors.New("domain event version must be within 1..MaxInt32")
+	ErrEmptyAggregateType            = errors.New("domain event aggregate_type cannot be empty")
+	ErrEmptyAggregateID              = errors.New("domain event aggregate_id cannot be empty")
+	ErrInvalidEventPayload           = errors.New("domain event payload must be a valid JSON object")
+	ErrUnexpectedPublicationMetadata = errors.New("unpublished outbox event must not set published_sequence or published_at")
+	ErrUnexpectedEventID             = errors.New("new outbox event must not preset internal id")
+	ErrInternalJobEventSuppressed    = errors.New("internal EVENT_DELIVERY jobs do not emit lifecycle events")
+	ErrInvalidJobLifecycleEvent      = errors.New("invalid job lifecycle event kind or state")
+	ErrInvalidPublicationPair        = errors.New("published_sequence and published_at must both be set or both be nil")
+	ErrInvalidPublishedSeq           = errors.New("published_sequence must be positive")
+	ErrEmptySubscriberID             = errors.New("event subscriber ID cannot be empty")
+	ErrEmptySubscriberKind           = errors.New("event subscriber kind cannot be empty")
+	ErrInvalidSubscriberState        = errors.New("invalid event subscriber state")
+	ErrInvalidStalledPair            = errors.New("subscriber state STALLED and stalled_at must be set together")
 )
 
 // DefaultJobMaxAttempts is the default maximum execution attempts for a durable job.
@@ -283,7 +288,7 @@ func (e *DomainEvent) Validate() error {
 	if strings.TrimSpace(string(e.Kind)) == "" {
 		return ErrEmptyEventKind
 	}
-	if e.Version < 1 {
+	if e.Version < 1 || e.Version > math.MaxInt32 {
 		return ErrInvalidEventVersion
 	}
 	if strings.TrimSpace(e.AggregateType) == "" {
@@ -292,6 +297,9 @@ func (e *DomainEvent) Validate() error {
 	if strings.TrimSpace(e.AggregateID) == "" {
 		return ErrEmptyAggregateID
 	}
+	if len(e.Payload) > 0 && !isValidJSONObject(e.Payload) {
+		return ErrInvalidEventPayload
+	}
 	if (e.PublishedSequence == nil) != (e.PublishedAt == nil) {
 		return ErrInvalidPublicationPair
 	}
@@ -299,6 +307,18 @@ func (e *DomainEvent) Validate() error {
 		return ErrInvalidPublishedSeq
 	}
 	return nil
+}
+
+// ValidateUnpublished checks that e is valid for outbox append with no pre-assigned
+// internal ID, published_sequence, or published_at.
+func (e *DomainEvent) ValidateUnpublished() error {
+	if e.ID != 0 {
+		return ErrUnexpectedEventID
+	}
+	if e.PublishedSequence != nil || e.PublishedAt != nil {
+		return ErrUnexpectedPublicationMetadata
+	}
+	return e.Validate()
 }
 
 // IsPublished reports whether the serialized dispatcher has assigned a publication sequence and timestamp.
