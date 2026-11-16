@@ -438,3 +438,153 @@ func (r *EventRepository) UpdateEventSubscriberState(ctx context.Context, id str
 	out := EventSubscriberToDomain(row)
 	return &out, nil
 }
+
+// ScheduleNextEventDelivery atomically locks subscriberID's row FOR UPDATE, reads the
+// next committed published event after its cursor, checks for a terminal failure since
+// subscriber.updated_at, and enqueues at most one active EVENT_DELIVERY job.
+func (r *EventRepository) ScheduleNextEventDelivery(ctx context.Context, subscriberID string, maxAttempts int, now time.Time) (*domain.Job, bool, error) {
+	if r == nil {
+		return nil, false, errors.New("event repository is required")
+	}
+	if strings.TrimSpace(subscriberID) == "" {
+		return nil, false, domain.ErrEmptySubscriberID
+	}
+	if maxAttempts < 1 || maxAttempts > math.MaxInt32 {
+		return nil, false, domain.ErrInvalidJobAttempts
+	}
+	ts := normalizeEventTime(now)
+
+	var scheduled *domain.Job
+	var created bool
+	run := func(txRepo *EventRepository) error {
+		var err error
+		scheduled, created, err = txRepo.scheduleNextEventDeliveryInTx(ctx, subscriberID, maxAttempts, ts)
+		return err
+	}
+	if r.InTx() {
+		if err := run(r); err != nil {
+			return nil, false, err
+		}
+		return scheduled, created, nil
+	}
+	if err := r.WithTx(ctx, func(repo storage.EventRepository) error {
+		pgTxRepo, ok := repo.(*EventRepository)
+		if !ok {
+			return errors.New("unexpected event repository implementation inside transaction")
+		}
+		return run(pgTxRepo)
+	}); err != nil {
+		return nil, false, err
+	}
+	return scheduled, created, nil
+}
+
+func (r *EventRepository) scheduleNextEventDeliveryInTx(
+	ctx context.Context,
+	subscriberID string,
+	maxAttempts int,
+	ts time.Time,
+) (*domain.Job, bool, error) {
+	subRow, err := r.q.GetEventSubscriberByIDForUpdate(ctx, subscriberID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, mapPgError(err)
+	}
+	if subRow.State != string(domain.SubscriberStateActive) {
+		return nil, false, nil
+	}
+
+	nextEvRow, err := r.q.GetNextPublishedDomainEventAfter(ctx, pgtype.Int8{Int64: subRow.Position, Valid: true})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("querying next published event after %d for subscriber %q: %w", subRow.Position, subscriberID, err)
+	}
+	nextEv := DomainEventToDomain(nextEvRow)
+	seq, ok := nextEv.Cursor()
+	if !ok {
+		return nil, false, nil
+	}
+
+	failed, err := r.q.HasFailedEventDeliveryJobSince(ctx, HasFailedEventDeliveryJobSinceParams{
+		SubscriberID:      subscriberID,
+		PublishedSequence: seq,
+		Since:             subRow.UpdatedAt.UTC(),
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("checking failed delivery for subscriber %q sequence %d: %w", subscriberID, seq, err)
+	}
+	if failed {
+		return nil, false, nil
+	}
+
+	dedupeKey, err := domain.EventDeliveryDedupeKey(subscriberID)
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := r.q.GetActiveJobByDedupeKey(ctx, &dedupeKey)
+	if err == nil {
+		out := JobToDomain(existing)
+		return &out, false, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("checking active delivery job for subscriber %q: %w", subscriberID, err)
+	}
+
+	payloadBytes, err := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      subscriberID,
+		PublishedSequence: seq,
+		EventID:           nextEv.ID,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshaling delivery payload for subscriber %q sequence %d: %w", subscriberID, seq, err)
+	}
+
+	candidate, err := prepareJobForEnqueue(&domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     payloadBytes,
+		DedupeKey:   &dedupeKey,
+		MaxAttempts: maxAttempts,
+		RunAfter:    ts,
+		CreatedAt:   ts,
+		UpdatedAt:   ts,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	row, err := r.q.EnqueueJob(ctx, EnqueueJobParams{
+		ID:          candidate.ID,
+		Kind:        string(candidate.Kind),
+		Payload:     []byte(candidate.Payload),
+		Checkpoint:  []byte(candidate.Checkpoint),
+		MaxAttempts: int32(candidate.MaxAttempts),
+		CreatedBy:   candidate.CreatedBy,
+		DedupeKey:   candidate.DedupeKey,
+		RunAfter:    candidate.RunAfter,
+		CreatedAt:   candidate.CreatedAt,
+		UpdatedAt:   candidate.UpdatedAt,
+	})
+	if err == nil {
+		out := JobToDomain(row)
+		return &out, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, mapJobWriteError(err)
+	}
+
+	// An active job with the canonical dedupe key was inserted outside this lock; inspect once
+	// without looping so a concurrent terminal failure cannot be bypassed.
+	activeRow, activeErr := r.q.GetActiveJobByDedupeKey(ctx, &dedupeKey)
+	if activeErr == nil {
+		out := JobToDomain(activeRow)
+		return &out, false, nil
+	}
+	if errors.Is(activeErr, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("looking up active delivery job for subscriber %q: %w", subscriberID, activeErr)
+}

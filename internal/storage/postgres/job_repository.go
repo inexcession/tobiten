@@ -127,6 +127,19 @@ func prepareJobForEnqueue(job *domain.Job) (domain.Job, error) {
 	if err := candidate.Validate(); err != nil {
 		return domain.Job{}, err
 	}
+	if candidate.Kind == domain.JobKindEventDelivery {
+		ep, err := domain.DecodeEventDeliveryPayload(candidate.Payload)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		wantKey, err := domain.EventDeliveryDedupeKey(ep.SubscriberID)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		if candidate.DedupeKey == nil || *candidate.DedupeKey != wantKey {
+			return domain.Job{}, fmt.Errorf("%w: want %q", domain.ErrInvalidEventDeliveryDedupeKey, wantKey)
+		}
+	}
 
 	createdAt := normalizeJobTime(candidate.CreatedAt)
 	updatedAt := createdAt
@@ -176,6 +189,10 @@ func (r *JobRepository) Enqueue(ctx context.Context, job *domain.Job) (bool, err
 		UpdatedAt:   candidate.UpdatedAt,
 	}
 
+	if candidate.Kind == domain.JobKindEventDelivery && r.tx != nil {
+		return r.enqueueEventDeliverySerialized(ctx, job, candidate, params)
+	}
+
 	for range maxDedupeEnqueueAttempts {
 		row, err := r.q.EnqueueJob(ctx, params)
 		if err == nil {
@@ -199,6 +216,74 @@ func (r *JobRepository) Enqueue(ctx context.Context, job *domain.Job) (bool, err
 	}
 
 	return false, errors.New("exhausted enqueue retries resolving active dedupe conflict")
+}
+
+func (r *JobRepository) enqueueEventDeliverySerialized(
+	ctx context.Context,
+	job *domain.Job,
+	candidate domain.Job,
+	params EnqueueJobParams,
+) (bool, error) {
+	ep, err := domain.DecodeEventDeliveryPayload(candidate.Payload)
+	if err != nil {
+		return false, err
+	}
+
+	type enqueueRes struct {
+		persisted domain.Job
+		created   bool
+	}
+	res, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (enqueueRes, error) {
+		subRow, subErr := q.GetEventSubscriberByIDForUpdate(ctx, ep.SubscriberID)
+		if subErr != nil && !errors.Is(subErr, pgx.ErrNoRows) {
+			return enqueueRes{}, fmt.Errorf("locking event subscriber %q: %w", ep.SubscriberID, subErr)
+		}
+
+		existing, activeErr := q.GetActiveJobByDedupeKey(ctx, candidate.DedupeKey)
+		if activeErr == nil {
+			return enqueueRes{persisted: JobToDomain(existing), created: false}, nil
+		}
+		if !errors.Is(activeErr, pgx.ErrNoRows) {
+			return enqueueRes{}, fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
+		}
+
+		if subErr == nil {
+			failed, failErr := q.HasFailedEventDeliveryJobSince(ctx, HasFailedEventDeliveryJobSinceParams{
+				SubscriberID:      ep.SubscriberID,
+				PublishedSequence: ep.PublishedSequence,
+				Since:             subRow.UpdatedAt.UTC(),
+			})
+			if failErr != nil {
+				return enqueueRes{}, fmt.Errorf("checking failed event delivery for subscriber %q sequence %d: %w",
+					ep.SubscriberID, ep.PublishedSequence, failErr)
+			}
+			if failed {
+				return enqueueRes{}, domain.ErrEventDeliveryBlocked
+			}
+		}
+
+		row, insertErr := q.EnqueueJob(ctx, params)
+		if insertErr == nil {
+			return enqueueRes{persisted: JobToDomain(row), created: true}, nil
+		}
+		if !errors.Is(insertErr, pgx.ErrNoRows) {
+			return enqueueRes{}, mapJobWriteError(insertErr)
+		}
+
+		existing, activeErr = q.GetActiveJobByDedupeKey(ctx, candidate.DedupeKey)
+		if activeErr == nil {
+			return enqueueRes{persisted: JobToDomain(existing), created: false}, nil
+		}
+		if errors.Is(activeErr, pgx.ErrNoRows) {
+			return enqueueRes{}, errors.New("active EVENT_DELIVERY job disappeared during enqueue")
+		}
+		return enqueueRes{}, fmt.Errorf("looking up active job for dedupe_key: %w", activeErr)
+	})
+	if err != nil {
+		return false, err
+	}
+	*job = res.persisted
+	return res.created, nil
 }
 
 // GetJobByID retrieves a job by its ID.
@@ -304,6 +389,27 @@ func requireRunningAttempt(current Job, attempt int) error {
 	return nil
 }
 
+// lockJobForUpdate acquires event_subscribers FOR UPDATE before jobs FOR UPDATE for
+// EVENT_DELIVERY jobs so outcome transitions share the same lock order as scheduling.
+func lockJobForUpdate(ctx context.Context, q *Queries, id string) (Job, error) {
+	meta, err := q.GetJobByID(ctx, id)
+	if err != nil {
+		return Job{}, mapPgError(err)
+	}
+	if meta.Kind == string(domain.JobKindEventDelivery) {
+		if payload, pErr := domain.DecodeEventDeliveryPayload(meta.Payload); pErr == nil {
+			if _, subErr := q.GetEventSubscriberByIDForUpdate(ctx, payload.SubscriberID); subErr != nil && !errors.Is(subErr, pgx.ErrNoRows) {
+				return Job{}, fmt.Errorf("locking event subscriber %q for job %q: %w", payload.SubscriberID, id, subErr)
+			}
+		}
+	}
+	current, err := q.GetJobByIDForUpdate(ctx, id)
+	if err != nil {
+		return Job{}, mapPgError(err)
+	}
+	return current, nil
+}
+
 // MarkSucceeded transitions a RUNNING job at the given attempt to SUCCEEDED.
 func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, attempt int, now time.Time) (*domain.Job, error) {
 	if err := validateRunningOutcomeArgs(id, attempt); err != nil {
@@ -312,9 +418,9 @@ func (r *JobRepository) MarkSucceeded(ctx context.Context, id string, attempt in
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -345,9 +451,9 @@ func (r *JobRepository) FailOrRetry(ctx context.Context, id string, attempt int,
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -416,9 +522,9 @@ func (r *JobRepository) RequestCancel(ctx context.Context, id string, now time.T
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 
 		switch domain.JobState(current.State) {
@@ -458,9 +564,9 @@ func (r *JobRepository) MarkCancelled(ctx context.Context, id string, attempt in
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -506,9 +612,9 @@ func (r *JobRepository) SaveCheckpoint(ctx context.Context, id string, attempt i
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -567,9 +673,9 @@ func (r *JobRepository) RequeueInterrupted(ctx context.Context, id string, attem
 	}
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -635,9 +741,9 @@ func (r *JobRepository) MarkFailed(ctx context.Context, id string, attempt int, 
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err
@@ -705,9 +811,9 @@ func (r *JobRepository) runTerminalRecoveryTx(
 	ts := normalizeJobTime(now)
 
 	updated, err := runInJobTx(ctx, r, func(_ pgx.Tx, q *Queries) (domain.Job, error) {
-		current, err := q.GetJobByIDForUpdate(ctx, id)
+		current, err := lockJobForUpdate(ctx, q, id)
 		if err != nil {
-			return domain.Job{}, mapPgError(err)
+			return domain.Job{}, err
 		}
 		if err := requireRunningAttempt(current, attempt); err != nil {
 			return domain.Job{}, err

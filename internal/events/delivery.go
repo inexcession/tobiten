@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -152,6 +151,16 @@ func (d *DeliveryCoordinator) RegisterSubscriber(sub Subscriber) error {
 	if kind == "" {
 		return fmt.Errorf("%w: subscriber %q has empty kind", ErrInvalidSubscriber, id)
 	}
+	switch spec := sub.(type) {
+	case SubscriberSpec:
+		if spec.DeliverFn == nil {
+			return fmt.Errorf("%w: subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+		}
+	case *SubscriberSpec:
+		if spec == nil || spec.DeliverFn == nil {
+			return fmt.Errorf("%w: subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+		}
+	}
 	return d.registerEntry(registeredSubscriber{
 		id:      id,
 		kind:    kind,
@@ -214,6 +223,16 @@ func (d *DeliveryCoordinator) RegisterModuleSubscribers(reg module.Registry) err
 		}
 
 		var handler Subscriber
+		switch spec := es.(type) {
+		case module.EventSubscriberSpec:
+			if spec.DeliverFunc == nil {
+				return fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+			}
+		case *module.EventSubscriberSpec:
+			if spec == nil || spec.DeliverFunc == nil {
+				return fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+			}
+		}
 		if delivering, ok := es.(module.DeliveringEventSubscriber); ok {
 			handler = SubscriberSpec{
 				SubscriberID:   id,
@@ -348,49 +367,9 @@ func (d *DeliveryCoordinator) DrainOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-		nextEv, err := d.events.GetNextPublishedEventAfter(ctx, sub.Position)
+		_, created, err := d.events.ScheduleNextEventDelivery(ctx, sub.ID, d.maxAttempts, now)
 		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				continue
-			}
-			return enqueued, fmt.Errorf("querying next published event after %d for subscriber %q: %w", sub.Position, sub.ID, err)
-		}
-		seq, ok := nextEv.Cursor()
-		if !ok {
-			continue
-		}
-
-		failed, err := d.jobs.HasFailedEventDeliverySince(ctx, sub.ID, seq, sub.UpdatedAt)
-		if err != nil {
-			return enqueued, fmt.Errorf("checking failed delivery for subscriber %q sequence %d: %w", sub.ID, seq, err)
-		}
-		if failed {
-			continue
-		}
-
-		payloadBytes, err := json.Marshal(domain.EventDeliveryPayloadV1{
-			SubscriberID:      sub.ID,
-			PublishedSequence: seq,
-			EventID:           nextEv.ID,
-		})
-		if err != nil {
-			return enqueued, fmt.Errorf("marshaling delivery payload for subscriber %q sequence %d: %w", sub.ID, seq, err)
-		}
-		dedupeKey, err := domain.EventDeliveryDedupeKey(sub.ID)
-		if err != nil {
-			return enqueued, err
-		}
-
-		created, err := d.jobs.Enqueue(ctx, &domain.Job{
-			Kind:        domain.JobKindEventDelivery,
-			Payload:     payloadBytes,
-			DedupeKey:   &dedupeKey,
-			MaxAttempts: d.maxAttempts,
-			RunAfter:    now,
-			CreatedAt:   now,
-		})
-		if err != nil {
-			return enqueued, fmt.Errorf("enqueueing delivery job for subscriber %q sequence %d: %w", sub.ID, seq, err)
+			return enqueued, fmt.Errorf("scheduling delivery job for subscriber %q: %w", sub.ID, err)
 		}
 		if created {
 			enqueued++
@@ -411,6 +390,13 @@ func (d *DeliveryCoordinator) executeDeliveryJob(ctx context.Context, exec *jobs
 	payload, err := domain.DecodeEventDeliveryPayload(job.Payload)
 	if err != nil {
 		return fmt.Errorf("%w: %v", jobs.ErrPermanentFailure, err)
+	}
+	wantDedupeKey, err := domain.EventDeliveryDedupeKey(payload.SubscriberID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", jobs.ErrPermanentFailure, err)
+	}
+	if job.DedupeKey == nil || *job.DedupeKey != wantDedupeKey {
+		return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, domain.ErrInvalidEventDeliveryDedupeKey)
 	}
 
 	entry, registered := d.lookupSubscriber(payload.SubscriberID)
@@ -466,10 +452,17 @@ func (d *DeliveryCoordinator) executeDeliveryJob(ctx context.Context, exec *jobs
 	return nil
 }
 
-func decodePayloadForReconcile(raw json.RawMessage) (domain.EventDeliveryPayloadV1, string) {
-	payload, err := domain.DecodeEventDeliveryPayload(raw)
+func validateJobForReconcile(job domain.Job) (domain.EventDeliveryPayloadV1, string) {
+	payload, err := domain.DecodeEventDeliveryPayload(job.Payload)
 	if err != nil {
 		return domain.EventDeliveryPayloadV1{}, err.Error()
+	}
+	wantKey, err := domain.EventDeliveryDedupeKey(payload.SubscriberID)
+	if err != nil {
+		return domain.EventDeliveryPayloadV1{}, err.Error()
+	}
+	if job.DedupeKey == nil || *job.DedupeKey != wantKey {
+		return domain.EventDeliveryPayloadV1{}, domain.ErrInvalidEventDeliveryDedupeKey.Error()
 	}
 	return payload, ""
 }
@@ -486,7 +479,7 @@ func (d *DeliveryCoordinator) lookupSubscriberForReconcile(ctx context.Context, 
 }
 
 func (d *DeliveryCoordinator) reconcileDeliveryJob(ctx context.Context, job domain.Job) (domain.JobReconcileOutcome, error) {
-	payload, invalidReason := decodePayloadForReconcile(job.Payload)
+	payload, invalidReason := validateJobForReconcile(job)
 	if invalidReason != "" {
 		return domain.JobReconcileOutcome{
 			Action: domain.JobReconcileFailed,

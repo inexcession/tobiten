@@ -834,7 +834,7 @@ func TestRunner_OnSucceededInvokedAfterCommitAndDuplicateRejected(t *testing.T) 
 	var settled domain.Job
 	var called int
 	if err := runner.RegisterKind(jobs.KindConfig{
-		Kind:         domain.JobKindEventDelivery,
+		Kind:         domain.JobKindScrape,
 		ResumePolicy: domain.JobResumeRestart,
 		Handler:      jobs.HandlerFunc(func(context.Context, *jobs.Execution) error { return nil }),
 		OnSucceeded: func(hookCtx context.Context, job domain.Job) {
@@ -849,7 +849,7 @@ func TestRunner_OnSucceededInvokedAfterCommitAndDuplicateRejected(t *testing.T) 
 		t.Fatalf("RegisterKind: %v", err)
 	}
 	if err := runner.RegisterKind(jobs.KindConfig{
-		Kind:         domain.JobKindEventDelivery,
+		Kind:         domain.JobKindScrape,
 		ResumePolicy: domain.JobResumeRestart,
 		OnSucceeded:  func(context.Context, domain.Job) {},
 	}); !errors.Is(err, jobs.ErrDuplicateJobKind) {
@@ -859,11 +859,11 @@ func TestRunner_OnSucceededInvokedAfterCommitAndDuplicateRejected(t *testing.T) 
 	if _, err := runner.Recover(ctx); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	j := &domain.Job{Kind: domain.JobKindEventDelivery, CreatedAt: now, RunAfter: now}
+	j := &domain.Job{Kind: domain.JobKindScrape, CreatedAt: now, RunAfter: now}
 	if _, err := repo.Enqueue(ctx, j); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScrape); err != nil || !claimed {
 		t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
 	}
 	if called != 1 || settled.State != domain.JobStateSucceeded || settled.ID != j.ID {

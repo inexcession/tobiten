@@ -518,13 +518,17 @@ func TestDelivery_OverlappingHooksStartupDrainAndOutOfOrderGuard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	t0 := time.Date(2026, 11, 16, 17, 30, 0, 0, time.UTC)
-	nowFn := func() time.Time { return t0 }
+	var mu sync.Mutex
+	currentTime := time.Date(2026, 11, 16, 17, 30, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return currentTime
+	}
 
 	// 1. Seed pre-existing committed published events BEFORE startup.
-	appendPublishedCatalogEvents(ctx, t, tx, eventRepo, t0, "boot-1", "boot-2")
+	appendPublishedCatalogEvents(ctx, t, tx, eventRepo, nowFn(), "boot-1", "boot-2")
 
-	var mu sync.Mutex
 	var delivered []int64
 
 	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{
@@ -562,12 +566,14 @@ func TestDelivery_OverlappingHooksStartupDrainAndOutOfOrderGuard(t *testing.T) {
 		SubscriberID:      "sub:ordered",
 		PublishedSequence: 2,
 	})
+	rogueDedupe, _ := domain.EventDeliveryDedupeKey("sub:ordered")
 	rogueJob := &domain.Job{
 		Kind:        domain.JobKindEventDelivery,
 		Payload:     roguePayload,
+		DedupeKey:   &rogueDedupe,
 		MaxAttempts: 1,
-		CreatedAt:   t0,
-		RunAfter:    t0,
+		CreatedAt:   nowFn(),
+		RunAfter:    nowFn(),
 	}
 	if _, err := jobRepo.Enqueue(ctx, rogueJob); err != nil {
 		t.Fatalf("Enqueue rogue job: %v", err)
@@ -583,6 +589,10 @@ func TestDelivery_OverlappingHooksStartupDrainAndOutOfOrderGuard(t *testing.T) {
 	if err != nil || subBeforeStart.Position != 0 {
 		t.Fatalf("position after rogue job = %d, want 0", subBeforeStart.Position)
 	}
+
+	mu.Lock()
+	currentTime = currentTime.Add(time.Second)
+	mu.Unlock()
 
 	// Start worker pools & delivery coordinator (drains boot-1 and boot-2 on startup).
 	if err := runner.SetPoolSizes(map[domain.JobKind]int{domain.JobKindEventDelivery: 4}); err != nil {
@@ -816,5 +826,423 @@ func TestDelivery_PausedSubscriberAndCrashRecoveryReconciliation(t *testing.T) {
 	}
 	if countJobLifecycleEvents(ctx, t, db) != 0 {
 		t.Fatalf("expected 0 job.* events")
+	}
+}
+
+type pauseBeforeScheduleEventRepo struct {
+	storage.EventRepository
+	enteringSchedule chan<- struct{}
+	releaseSchedule  <-chan struct{}
+	once             sync.Once
+}
+
+func (p *pauseBeforeScheduleEventRepo) ScheduleNextEventDelivery(
+	ctx context.Context,
+	subscriberID string,
+	maxAttempts int,
+	now time.Time,
+) (*domain.Job, bool, error) {
+	p.once.Do(func() {
+		close(p.enteringSchedule)
+		select {
+		case <-p.releaseSchedule:
+		case <-ctx.Done():
+		}
+	})
+	return p.EventRepository.ScheduleNextEventDelivery(ctx, subscriberID, maxAttempts, now)
+}
+
+func TestDelivery_ConcurrentDrainCannotBypassTerminalRetryLimit(t *testing.T) {
+	t.Parallel()
+	db, tx, eventRepo, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	currentTime := time.Date(2026, 11, 16, 18, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return currentTime
+	}
+	advanceTime := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		currentTime = currentTime.Add(d)
+	}
+
+	appendPublishedCatalogEvents(ctx, t, tx, eventRepo, nowFn(), "lim-1", "lim-2")
+
+	var failSeq1 atomic.Bool
+	failSeq1.Store(true)
+	var delivered []int64
+
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{Now: nowFn})
+	baseDelivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
+		Now:         nowFn,
+		MaxAttempts: 2,
+	})
+	subSpec := events.SubscriberSpec{
+		SubscriberID:   "sub:retry-limit",
+		SubscriberKind: "webhook",
+		DeliverFn: func(_ context.Context, ev domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+			if *ev.PublishedSequence == 1 && failSeq1.Load() {
+				return 0, errors.New("downstream permanent 500")
+			}
+			mu.Lock()
+			delivered = append(delivered, *ev.PublishedSequence)
+			mu.Unlock()
+			return domain.DeliveryAcknowledged, nil
+		},
+	}
+	if err := baseDelivery.RegisterSubscriber(subSpec); err != nil {
+		t.Fatalf("RegisterSubscriber: %v", err)
+	}
+	if err := baseDelivery.RegisterJobs(runner); err != nil {
+		t.Fatalf("RegisterJobs: %v", err)
+	}
+	if err := baseDelivery.SyncSubscribers(ctx); err != nil {
+		t.Fatalf("SyncSubscribers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Attempt 1 fails -> QUEUED with backoff.
+	if n, err := baseDelivery.DrainOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("initial DrainOnce = (%d, %v), want (1, nil)", n, err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext attempt 1 = (%v, %v)", claimed, err)
+	}
+
+	// Claim attempt 2 (the final attempt) directly so it is RUNNING while a concurrent drain decides to schedule.
+	advanceTime(6 * time.Second)
+	finalRunning, err := jobRepo.ClaimNext(ctx, domain.JobKindEventDelivery, nowFn())
+	if err != nil || finalRunning.Attempts != 2 {
+		t.Fatalf("ClaimNext final attempt = (%+v, %v), want attempts=2", finalRunning, err)
+	}
+
+	// Start a concurrent DrainOnce that lists active subscribers and pauses right before ScheduleNextEventDelivery.
+	entering := make(chan struct{})
+	release := make(chan struct{})
+	pausedRepo := &pauseBeforeScheduleEventRepo{
+		EventRepository:  eventRepo,
+		enteringSchedule: entering,
+		releaseSchedule:  release,
+	}
+	racyDelivery := events.NewDeliveryCoordinator(pausedRepo, jobRepo, runner, events.DeliveryOptions{
+		Now:         nowFn,
+		MaxAttempts: 2,
+	})
+	_ = racyDelivery.RegisterSubscriber(subSpec)
+
+	type drainResult struct {
+		n   int
+		err error
+	}
+	drainCh := make(chan drainResult, 1)
+	go func() {
+		n, err := racyDelivery.DrainOnce(ctx)
+		drainCh <- drainResult{n: n, err: err}
+	}()
+
+	select {
+	case <-entering:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for DrainOnce to enter paused schedule: %v", ctx.Err())
+	}
+
+	// While the enqueue decision is paused, commit the final failure -> FAILED.
+	if _, err := jobRepo.FailOrRetry(ctx, finalRunning.ID, finalRunning.Attempts, "final failure", time.Time{}, nowFn()); err != nil {
+		t.Fatalf("FailOrRetry final attempt: %v", err)
+	}
+
+	// Release the paused DrainOnce and also race a direct JobRepository.Enqueue attempt.
+	close(release)
+	select {
+	case res := <-drainCh:
+		if res.err != nil || res.n != 0 {
+			t.Fatalf("paused DrainOnce = (%d, %v), want (0, nil)", res.n, res.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for paused DrainOnce: %v", ctx.Err())
+	}
+
+	canonPayload, _ := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:retry-limit",
+		PublishedSequence: 1,
+	})
+	canonKey, _ := domain.EventDeliveryDedupeKey("sub:retry-limit")
+	if created, err := jobRepo.Enqueue(ctx, &domain.Job{
+		Kind:        domain.JobKindEventDelivery,
+		Payload:     canonPayload,
+		DedupeKey:   &canonKey,
+		MaxAttempts: 2,
+		CreatedAt:   nowFn(),
+		RunAfter:    nowFn(),
+	}); created || !errors.Is(err, domain.ErrEventDeliveryBlocked) {
+		t.Fatalf("direct Enqueue after terminal failure = (%v, %v), want (false, ErrEventDeliveryBlocked)", created, err)
+	}
+
+	// Verify total EVENT_DELIVERY job count stays 1 (FAILED at attempts=2) and cursor stays 0.
+	kindFilter := domain.JobKindEventDelivery
+	allJobs, err := jobRepo.ListJobs(ctx, storage.JobFilter{Kind: &kindFilter})
+	if err != nil || len(allJobs) != 1 || allJobs[0].State != domain.JobStateFailed || allJobs[0].Attempts != 2 {
+		t.Fatalf("jobs = (%+v, %v), want exactly 1 FAILED job at attempts=2", allJobs, err)
+	}
+	subAfterFail, err := eventRepo.GetEventSubscriber(ctx, "sub:retry-limit")
+	if err != nil || subAfterFail.Position != 0 {
+		t.Fatalf("subscriber after terminal failure = (%+v, %v), want position 0", subAfterFail, err)
+	}
+
+	// After subscriber reset/reactivation at a later timestamp, seq=1 and seq=2 deliver cleanly.
+	failSeq1.Store(false)
+	advanceTime(time.Second)
+	if _, err := eventRepo.UpdateEventSubscriberState(ctx, "sub:retry-limit", domain.SubscriberStateActive, nil, nowFn()); err != nil {
+		t.Fatalf("reactivate subscriber: %v", err)
+	}
+	for _, wantSeq := range []int64{1, 2} {
+		if n, err := baseDelivery.DrainOnce(ctx); err != nil || n != 1 {
+			t.Fatalf("post-reset DrainOnce seq %d = (%d, %v), want (1, nil)", wantSeq, n, err)
+		}
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+			t.Fatalf("post-reset ClaimAndRunNext seq %d = (%v, %v)", wantSeq, claimed, err)
+		}
+	}
+
+	mu.Lock()
+	gotDelivered := slices.Clone(delivered)
+	mu.Unlock()
+	if !slices.Equal(gotDelivered, []int64{1, 2}) {
+		t.Fatalf("delivered = %v, want [1 2]", gotDelivered)
+	}
+	if countJobLifecycleEvents(ctx, t, db) != 0 {
+		t.Fatalf("expected 0 job.* events")
+	}
+}
+
+func TestDelivery_EnforcesCanonicalDedupeKeyWithMultipleWorkers(t *testing.T) {
+	t.Parallel()
+	db, tx, eventRepo, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	t0 := time.Now().UTC()
+	appendPublishedCatalogEvents(ctx, t, tx, eventRepo, t0, "mw-1", "mw-2")
+
+	var mu sync.Mutex
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	var deliveredSeqs []int64
+
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{
+		PollInterval: 10 * time.Millisecond,
+	})
+	delivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
+		PollInterval: 10 * time.Millisecond,
+	})
+	if err := delivery.RegisterSubscriber(events.SubscriberSpec{
+		SubscriberID:   "sub:multi",
+		SubscriberKind: "webhook",
+		DeliverFn: func(_ context.Context, ev domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+			cur := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				prev := maxInFlight.Load()
+				if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			time.Sleep(25 * time.Millisecond)
+			mu.Lock()
+			deliveredSeqs = append(deliveredSeqs, *ev.PublishedSequence)
+			mu.Unlock()
+			return domain.DeliveryAcknowledged, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterSubscriber: %v", err)
+	}
+	if err := delivery.RegisterJobs(runner); err != nil {
+		t.Fatalf("RegisterJobs: %v", err)
+	}
+	if err := delivery.SyncSubscribers(ctx); err != nil {
+		t.Fatalf("SyncSubscribers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Insert rows directly into PostgreSQL bypassing JobRepository.Enqueue to simulate
+	// executable jobs with missing (NULL) and mismatched dedupe_key values.
+	payloadSeq1, _ := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:multi",
+		PublishedSequence: 1,
+	})
+	missingID, err := domain.NewID()
+	if err != nil {
+		t.Fatalf("NewID missingID: %v", err)
+	}
+	mismatchedID, err := domain.NewID()
+	if err != nil {
+		t.Fatalf("NewID mismatchedID: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jobs (id, kind, state, payload, checkpoint, attempts, max_attempts, dedupe_key, run_after, created_at, updated_at)
+		VALUES
+			($1, 'EVENT_DELIVERY', 'QUEUED', $2, '{}', 0, 3, NULL, $4, $4, $4),
+			($3, 'EVENT_DELIVERY', 'QUEUED', $2, '{}', 0, 3, 'EVENT_DELIVERY:wrong-sub', $4, $4, $4)
+	`, missingID, payloadSeq1, mismatchedID, t0); err != nil {
+		t.Fatalf("insert invalid dedupe jobs: %v", err)
+	}
+
+	if err := runner.SetPoolSizes(map[domain.JobKind]int{domain.JobKindEventDelivery: 4}); err != nil {
+		t.Fatalf("SetPoolSizes: %v", err)
+	}
+	if err := runner.Start(ctx); err != nil {
+		t.Fatalf("runner.Start: %v", err)
+	}
+	defer runner.Stop()
+
+	// Wait until both non-canonical jobs fail without invoking Deliver or advancing the cursor.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		jMissing, err1 := jobRepo.GetJobByID(ctx, missingID)
+		jMismatch, err2 := jobRepo.GetJobByID(ctx, mismatchedID)
+		if err1 == nil && err2 == nil &&
+			jMissing.State == domain.JobStateFailed &&
+			jMismatch.State == domain.JobStateFailed {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	for _, badID := range []string{missingID, mismatchedID} {
+		gotBad, err := jobRepo.GetJobByID(ctx, badID)
+		if err != nil || gotBad.State != domain.JobStateFailed {
+			t.Fatalf("non-canonical job %s = (%+v, %v), want FAILED", badID, gotBad, err)
+		}
+	}
+	mu.Lock()
+	deliveredBeforeDrain := slices.Clone(deliveredSeqs)
+	mu.Unlock()
+	if len(deliveredBeforeDrain) != 0 {
+		t.Fatalf("non-canonical jobs invoked callback: %v", deliveredBeforeDrain)
+	}
+
+	// Now start DeliveryCoordinator; canonical EVENT_DELIVERY:sub:multi jobs deliver seq 1 and 2 sequentially.
+	if err := delivery.Start(ctx); err != nil {
+		t.Fatalf("delivery.Start: %v", err)
+	}
+	defer delivery.Stop()
+
+	waitSubscriberPosition(ctx, t, eventRepo, "sub:multi", 2)
+
+	if maxInFlight.Load() != 1 {
+		t.Fatalf("max concurrent callbacks for same subscriber = %d, want 1", maxInFlight.Load())
+	}
+	mu.Lock()
+	gotDelivered := slices.Clone(deliveredSeqs)
+	mu.Unlock()
+	if !slices.Equal(gotDelivered, []int64{1, 2}) {
+		t.Fatalf("delivered sequences = %v, want [1 2]", gotDelivered)
+	}
+	if countJobLifecycleEvents(ctx, t, db) != 0 {
+		t.Fatalf("expected 0 job.* events")
+	}
+}
+
+func TestDeliveryCoordinator_UnsetModuleCallbackRejectedAndNamedPreserved(t *testing.T) {
+	t.Parallel()
+	_, tx, eventRepo, jobRepo, _ := setupOutboxTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 1. Value and pointer EventSubscriberSpec with nil DeliverFunc are rejected at registration.
+	for _, tc := range []struct {
+		name string
+		sub  module.EventSubscriber
+	}{
+		{
+			name: "value spec with nil callback",
+			sub: module.EventSubscriberSpec{
+				ID:      "sub:nil-val",
+				SubKind: "webhook",
+			},
+		},
+		{
+			name: "pointer spec with nil callback",
+			sub: &module.EventSubscriberSpec{
+				ID:      "sub:nil-ptr",
+				SubKind: "webhook",
+			},
+		},
+	} {
+		reg := module.NewRegistry()
+		_ = reg.Register(&module.SimpleModule{
+			ModuleName:  "bad-sub-mod",
+			Subscribers: []module.EventSubscriber{tc.sub},
+		})
+		coord := events.NewDeliveryCoordinator(eventRepo, jobRepo, nil, events.DeliveryOptions{})
+		if err := coord.RegisterModuleSubscribers(reg); !errors.Is(err, events.ErrMissingSubscriberHandler) {
+			t.Fatalf("%s: RegisterModuleSubscribers err = %v, want ErrMissingSubscriberHandler", tc.name, err)
+		}
+	}
+
+	// Direct RegisterSubscriber with nil DeliverFn on SubscriberSpec is also rejected.
+	directCoord := events.NewDeliveryCoordinator(eventRepo, jobRepo, nil, events.DeliveryOptions{})
+	if err := directCoord.RegisterSubscriber(events.SubscriberSpec{
+		SubscriberID:   "sub:direct-nil",
+		SubscriberKind: "webhook",
+	}); !errors.Is(err, events.ErrMissingSubscriberHandler) {
+		t.Fatalf("direct nil DeliverFn err = %v, want ErrMissingSubscriberHandler", err)
+	}
+
+	// 2. NamedEventSubscriber descriptor preserves handler attachment and executes cleanly.
+	t0 := time.Date(2026, 11, 16, 18, 10, 0, 0, time.UTC)
+	nowFn := func() time.Time { return t0 }
+	appendPublishedCatalogEvents(ctx, t, tx, eventRepo, t0, "named-1")
+
+	reg := module.NewRegistry()
+	_ = reg.Register(&module.SimpleModule{
+		ModuleName:  "named-mod",
+		Subscribers: []module.EventSubscriber{module.NamedEventSubscriber("sub:named")},
+	})
+
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{Now: nowFn})
+	coord := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{Now: nowFn})
+	if err := coord.RegisterModuleSubscribers(reg); err != nil {
+		t.Fatalf("RegisterModuleSubscribers(named): %v", err)
+	}
+	var seen []string
+	if err := coord.RegisterSubscriber(events.SubscriberSpec{
+		SubscriberID:   "sub:named",
+		SubscriberKind: "sub:named",
+		DeliverFn: func(_ context.Context, ev domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+			seen = append(seen, ev.AggregateID)
+			return domain.DeliveryAcknowledged, nil
+		},
+	}); err != nil {
+		t.Fatalf("attach handler to NamedEventSubscriber: %v", err)
+	}
+	if err := coord.RegisterJobs(runner); err != nil {
+		t.Fatalf("RegisterJobs: %v", err)
+	}
+	if err := coord.SyncSubscribers(ctx); err != nil {
+		t.Fatalf("SyncSubscribers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if n, err := coord.DrainOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("DrainOnce = (%d, %v), want (1, nil)", n, err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindEventDelivery); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+	}
+	if !slices.Equal(seen, []string{"named-1"}) {
+		t.Fatalf("seen = %v, want [named-1]", seen)
 	}
 }

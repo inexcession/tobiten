@@ -1178,3 +1178,67 @@ func TestJobRepository_HasFailedEventDeliverySince(t *testing.T) {
 		t.Fatalf("other subscriber: has=%v err=%v, want false", has, err)
 	}
 }
+
+func TestJobRepository_EventDeliveryEnforcesCanonicalDedupeKey(t *testing.T) {
+	t.Parallel()
+	_, repo, _ := setupJobTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 16, 15, 30, 0, 0, time.UTC)
+	payloadBytes, err := json.Marshal(domain.EventDeliveryPayloadV1{
+		SubscriberID:      "sub:canon",
+		PublishedSequence: 1,
+		EventID:           1,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	// 1. Missing dedupe key rejected.
+	if _, err := repo.Enqueue(ctx, &domain.Job{
+		Kind:      domain.JobKindEventDelivery,
+		Payload:   payloadBytes,
+		CreatedAt: t0,
+		RunAfter:  t0,
+	}); !errors.Is(err, domain.ErrInvalidEventDeliveryDedupeKey) {
+		t.Fatalf("missing dedupe_key err = %v, want ErrInvalidEventDeliveryDedupeKey", err)
+	}
+
+	// 2. Mismatched dedupe key rejected.
+	wrongKey := "EVENT_DELIVERY:sub:other"
+	if _, err := repo.Enqueue(ctx, &domain.Job{
+		Kind:      domain.JobKindEventDelivery,
+		Payload:   payloadBytes,
+		DedupeKey: &wrongKey,
+		CreatedAt: t0,
+		RunAfter:  t0,
+	}); !errors.Is(err, domain.ErrInvalidEventDeliveryDedupeKey) {
+		t.Fatalf("mismatched dedupe_key err = %v, want ErrInvalidEventDeliveryDedupeKey", err)
+	}
+
+	// 3. Invalid payload rejected.
+	canonKey, _ := domain.EventDeliveryDedupeKey("sub:canon")
+	if _, err := repo.Enqueue(ctx, &domain.Job{
+		Kind:      domain.JobKindEventDelivery,
+		Payload:   json.RawMessage(`{"subscriber_id":"sub:canon"}`),
+		DedupeKey: &canonKey,
+		CreatedAt: t0,
+		RunAfter:  t0,
+	}); !errors.Is(err, domain.ErrInvalidDeliveryPayload) {
+		t.Fatalf("invalid payload err = %v, want ErrInvalidDeliveryPayload", err)
+	}
+
+	// 4. Canonical dedupe key succeeds.
+	created, err := repo.Enqueue(ctx, &domain.Job{
+		Kind:      domain.JobKindEventDelivery,
+		Payload:   payloadBytes,
+		DedupeKey: &canonKey,
+		CreatedAt: t0,
+		RunAfter:  t0,
+	})
+	if err != nil || !created {
+		t.Fatalf("canonical Enqueue = (%v, %v), want (true, nil)", created, err)
+	}
+}

@@ -394,4 +394,9 @@ func TestEventSubscriberSpec(t *testing.T) {
 	if err != nil || out2 != domain.DeliverySkipped {
 		t.Errorf("DeliverEvent(skip-me) = (%v, %v), want (DeliverySkipped, nil)", out2, err)
 	}
+
+	unsetSpec := EventSubscriberSpec{ID: "sub:unset", SubKind: "webhook"}
+	if _, err := unsetSpec.DeliverEvent(context.Background(), domain.DomainEvent{AggregateID: "ack-me"}); !errors.Is(err, ErrMissingSubscriberCallback) {
+		t.Errorf("DeliverEvent with nil DeliverFunc err = %v, want ErrMissingSubscriberCallback", err)
+	}
 }

@@ -64,4 +64,12 @@ type EventRepository interface {
 
 	// UpdateEventSubscriberState updates a durable subscriber's state (ACTIVE, PAUSED, STALLED).
 	UpdateEventSubscriberState(ctx context.Context, id string, state domain.SubscriberState, stalledAt *time.Time, now time.Time) (*domain.EventSubscriber, error)
+
+	// ScheduleNextEventDelivery atomically locks subscriberID's row FOR UPDATE, reads the
+	// next committed published event after its cursor, verifies no terminal FAILED
+	// EVENT_DELIVERY job exists since subscriber.updated_at, and enqueues at most one
+	// active EVENT_DELIVERY job with the canonical subscriber dedupe key.
+	// Returns (job, true, nil) when newly enqueued, (existing, false, nil) when an active
+	// job already exists, or (nil, false, nil) when caught up, inactive, or blocked by failure.
+	ScheduleNextEventDelivery(ctx context.Context, subscriberID string, maxAttempts int, now time.Time) (*domain.Job, bool, error)
 }

@@ -39,11 +39,12 @@ const (
 
 // Sentinel errors returned by the module registry.
 var (
-	ErrDuplicateModule       = errors.New("module already registered")
-	ErrModuleNotFound        = errors.New("module not found")
-	ErrInvalidMigrationRange = errors.New("invalid module migration range")
-	ErrCoreRangeConflict     = errors.New("module migration conflicts with core migration range (1..999)")
-	ErrDuplicateMigration    = errors.New("duplicate migration version across modules")
+	ErrDuplicateModule           = errors.New("module already registered")
+	ErrModuleNotFound            = errors.New("module not found")
+	ErrInvalidMigrationRange     = errors.New("invalid module migration range")
+	ErrCoreRangeConflict         = errors.New("module migration conflicts with core migration range (1..999)")
+	ErrDuplicateMigration        = errors.New("duplicate migration version across modules")
+	ErrMissingSubscriberCallback = errors.New("event subscriber delivery callback is not set")
 )
 
 // Module is the base interface that every protocol adapter and optional feature implements (ADR-0018 §1).
@@ -619,5 +620,8 @@ type EventSubscriberSpec struct {
 func (s EventSubscriberSpec) Name() string { return s.ID }
 func (s EventSubscriberSpec) Kind() string { return s.SubKind }
 func (s EventSubscriberSpec) DeliverEvent(ctx context.Context, event domain.DomainEvent) (domain.EventDeliveryOutcome, error) {
+	if s.DeliverFunc == nil {
+		return 0, ErrMissingSubscriberCallback
+	}
 	return s.DeliverFunc(ctx, event)
 }
