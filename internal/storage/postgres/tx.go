@@ -9,6 +9,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const txRollbackTimeout = 5 * time.Second
@@ -27,6 +28,7 @@ func NewTransactor(db TxBeginner) *Transactor {
 
 // WithTx executes fn inside a single PostgreSQL transaction (or nested savepoint when
 // backed by an existing pgx.Tx) and commits only when fn returns nil.
+// Unconfirmed savepoint cleanup may close the caller's connection to abort the transaction.
 func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	if t == nil {
 		return errors.New("transactor database handle is required")
@@ -36,7 +38,7 @@ func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) e
 	}
 	var parentScope *txScope
 	if extTx, ok := t.db.(pgx.Tx); ok {
-		parentScope = &txScope{tx: extTx}
+		parentScope = newCallerTxScope(extTx)
 	}
 	return runTx(ctx, t.db, parentScope, "storage", func(child *txScope) error {
 		return fn(&pgTx{scope: child, q: New(child.tx)})
@@ -44,10 +46,19 @@ func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) e
 }
 
 type txScope struct {
-	tx             pgx.Tx
-	parent         *txScope
-	mu             sync.Mutex
-	unconfirmedErr error
+	tx                     pgx.Tx
+	parent                 *txScope
+	closeOnRollbackFailure bool
+	mu                     sync.Mutex
+	unconfirmedErr         error
+}
+
+func newCallerTxScope(tx pgx.Tx) *txScope {
+	// A pgxpool.Tx is a root transaction. Its Rollback handles aborting the
+	// transaction and returns the connection to the pool. Other pgx.Tx handles
+	// can be savepoints whose ancestors are outside the tracked chain.
+	_, pooledRoot := tx.(*pgxpool.Tx)
+	return &txScope{tx: tx, closeOnRollbackFailure: !pooledRoot}
 }
 
 func (s *txScope) markUnconfirmed(err error) {
@@ -71,7 +82,7 @@ func (s *txScope) unconfirmed() error {
 }
 
 // abortAncestors walks upward from s.parent until an ancestor rollback succeeds
-// (discarding s and its savepoint on PostgreSQL) or the root transaction is reached.
+// (discarding s and its savepoint on PostgreSQL) or the tracked chain ends.
 // Every traversed ancestor is marked unconfirmed so it cannot return nil and commit.
 func (s *txScope) abortAncestors(rollbackCtx context.Context, cause error) error {
 	var errs []error
@@ -83,6 +94,15 @@ func (s *txScope) abortAncestors(rollbackCtx context.Context, cause error) error
 		}
 		if !errors.Is(ancErr, pgx.ErrTxClosed) {
 			errs = append(errs, ancErr)
+		}
+		if cur.closeOnRollbackFailure {
+			// pgx has no parent accessor for savepoints. Closing the connection
+			// aborts any untracked root, even if rollbackCtx has expired.
+			if conn := cur.tx.Conn(); conn != nil {
+				if err := conn.Close(rollbackCtx); err != nil {
+					errs = append(errs, fmt.Errorf("closing connection after unconfirmed savepoint rollback: %w", err))
+				}
+			}
 		}
 	}
 	return errors.Join(errs...)

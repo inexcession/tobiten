@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -645,6 +648,346 @@ func TestEventRepository_TwoLevelSavepointRollbackFailurePreventsRootCommit(t *t
 	}
 	if _, err := poolRepo.GetEventByID(ctx, rolledBackInnerID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected rolled-back inner event %d to be absent, got %v", rolledBackInnerID, err)
+	}
+}
+
+type sqlTracer struct {
+	mu  sync.Mutex
+	sql []string
+}
+
+func (t *sqlTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	t.mu.Lock()
+	t.sql = append(t.sql, data.SQL)
+	t.mu.Unlock()
+	return ctx
+}
+
+func (t *sqlTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (t *sqlTracer) statements() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.sql)
+}
+
+func connectTracedConn(ctx context.Context, t *testing.T, dbURL string) (*pgx.Conn, *sqlTracer) {
+	t.Helper()
+	tracer := &sqlTracer{}
+	cfg, err := pgx.ParseConfig(dbURL)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	cfg.Tracer = tracer
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("ConnectConfig: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close(context.Background())
+	})
+	return conn, tracer
+}
+
+func TestEventRepository_CallerSuppliedPgxSavepointRollbackFailurePreventsRawRootCommit(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	errInnerRB := errors.New("forced inner savepoint rollback failure")
+	errCallerSPRB := errors.New("forced caller savepoint rollback failure")
+
+	runFailureCase := func(t *testing.T, name string, invoke func(sp pgx.Tx) error) {
+		t.Helper()
+		conn, tracer := connectTracedConn(ctx, t, db.URL)
+
+		// Caller owns a raw pgx root tx and a caller-supplied pgx savepoint (level 1).
+		rawRoot, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatalf("%s: rawRoot Begin: %v", name, err)
+		}
+		defer func() { _ = rawRoot.Rollback(context.Background()) }()
+
+		rawSP1, err := rawRoot.Begin(ctx)
+		if err != nil {
+			t.Fatalf("%s: rawSP1 Begin: %v", name, err)
+		}
+
+		// Wrap rawSP1 at level 1 (caller-supplied savepoint) and level 2 (inner savepoint)
+		// so both Rollback calls fail before sending any SQL.
+		ctrl := &twoLevelRollbackControl{
+			errByLevel:    map[int]error{1: errCallerSPRB, 2: errInnerRB},
+			rollbackCalls: make(map[int]int),
+			commitCalls:   make(map[int]int),
+		}
+		wrappedSP1 := &twoLevelFaultTx{Tx: rawSP1, level: 1, ctrl: ctrl}
+
+		txErr := invoke(wrappedSP1)
+		if txErr == nil {
+			t.Fatalf("%s: expected error from failed inner+caller-savepoint rollback, got nil", name)
+		}
+		if ctrl.rollbackCalls[2] == 0 || ctrl.rollbackCalls[1] == 0 {
+			t.Fatalf("%s: expected both level-2 and level-1 Rollback attempts, got %+v", name, ctrl.rollbackCalls)
+		}
+		if ctrl.commitCalls[2] != 0 {
+			t.Fatalf("%s: expected zero inner commits, got %+v", name, ctrl.commitCalls)
+		}
+
+		// Verify neither rollback sent ROLLBACK / ROLLBACK TO SAVEPOINT SQL to PostgreSQL.
+		for _, stmt := range tracer.statements() {
+			lower := strings.ToLower(strings.TrimSpace(stmt))
+			if strings.HasPrefix(lower, "rollback") {
+				t.Fatalf("%s: unexpected rollback SQL sent on wire: %q (all=%v)", name, stmt, tracer.statements())
+			}
+		}
+
+		// Even if the caller ignores txErr and attempts to commit the raw pgx root, it must fail.
+		if commitErr := rawRoot.Commit(ctx); commitErr == nil {
+			t.Fatalf("%s: expected rawRoot.Commit to fail after unconfirmed savepoint rollback, but it succeeded", name)
+		}
+
+		var count int
+		if err := db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1`, name,
+		).Scan(&count); err != nil {
+			t.Fatalf("%s: counting domain_events: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s: expected 0 committed events after raw root commit failure, got %d", name, count)
+		}
+	}
+
+	runFailureCase(t, "caller-sp-new-transactor", func(sp pgx.Tx) error {
+		return postgres.NewTransactor(sp).WithTx(ctx, func(inner storage.Tx) error {
+			ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "caller-sp-new-transactor", nil, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if err := inner.Events().AppendEvent(ctx, &ev); err != nil {
+				return err
+			}
+			return errors.New("inner transactor failure")
+		})
+	})
+
+	runFailureCase(t, "caller-sp-new-event-repo", func(sp pgx.Tx) error {
+		return postgres.NewEventRepository(sp).WithTx(ctx, func(inner storage.EventRepository) error {
+			ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "caller-sp-new-event-repo", nil, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if err := inner.AppendEvent(ctx, &ev); err != nil {
+				return err
+			}
+			return errors.New("inner event-repo failure")
+		})
+	})
+
+	// Preserve raw pgx direct append and outer commit after confirmed savepoint rollback
+	// across both NewTransactor(sp1) and NewEventRepository(sp1).
+	conn, tracer := connectTracedConn(ctx, t, db.URL)
+	rawRoot, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("preservation rawRoot Begin: %v", err)
+	}
+	defer func() { _ = rawRoot.Rollback(context.Background()) }()
+
+	directRootEv, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "raw-pgx-direct-root", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("NewDomainEvent directRootEv: %v", err)
+	}
+	if err := postgres.NewEventRepository(rawRoot).AppendEvent(ctx, &directRootEv); err != nil {
+		t.Fatalf("rawRoot direct AppendEvent: %v", err)
+	}
+
+	rawSP1, err := rawRoot.Begin(ctx)
+	if err != nil {
+		t.Fatalf("preservation rawSP1 Begin: %v", err)
+	}
+	directSP1Ev, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "raw-pgx-direct-sp1", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("NewDomainEvent directSP1Ev: %v", err)
+	}
+	if err := postgres.NewEventRepository(rawSP1).AppendEvent(ctx, &directSP1Ev); err != nil {
+		t.Fatalf("rawSP1 direct AppendEvent: %v", err)
+	}
+
+	var rolledBackTransactorEvID, rolledBackRepoEvID int64
+	if err := postgres.NewTransactor(rawSP1).WithTx(ctx, func(inner storage.Tx) error {
+		ev, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "raw-sp-confirmed-rb-transactor", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := inner.Events().AppendEvent(ctx, &ev); err != nil {
+			return err
+		}
+		rolledBackTransactorEvID = ev.ID
+		return errors.New("confirm inner rollback via transactor")
+	}); err == nil {
+		t.Fatal("expected inner transactor error")
+	}
+
+	if err := postgres.NewEventRepository(rawSP1).WithTx(ctx, func(inner storage.EventRepository) error {
+		ev, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "raw-sp-confirmed-rb-repo", nil, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := inner.AppendEvent(ctx, &ev); err != nil {
+			return err
+		}
+		rolledBackRepoEvID = ev.ID
+		return errors.New("confirm inner rollback via event repo")
+	}); err == nil {
+		t.Fatal("expected inner event repo error")
+	}
+
+	if err := rawSP1.Commit(ctx); err != nil {
+		t.Fatalf("rawSP1.Commit after confirmed inner rollbacks: %v", err)
+	}
+	if err := rawRoot.Commit(ctx); err != nil {
+		t.Fatalf("rawRoot.Commit after confirmed inner rollbacks: %v", err)
+	}
+
+	var sawRollbackToSavepoint bool
+	for _, stmt := range tracer.statements() {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(stmt)), "rollback to savepoint") {
+			sawRollbackToSavepoint = true
+			break
+		}
+	}
+	if !sawRollbackToSavepoint {
+		t.Fatalf("expected confirmed rollback to savepoint SQL on wire, got %v", tracer.statements())
+	}
+
+	for _, id := range []int64{directRootEv.ID, directSP1Ev.ID} {
+		got, err := poolRepo.GetEventByID(ctx, id)
+		if err != nil {
+			t.Fatalf("expected direct raw-pgx event %d to commit, got %v", id, err)
+		}
+		if got.PublishedSequence != nil || got.PublishedAt != nil {
+			t.Fatalf("expected direct raw-pgx event %d unpublished, got seq=%v at=%v", id, got.PublishedSequence, got.PublishedAt)
+		}
+	}
+	for _, id := range []int64{rolledBackTransactorEvID, rolledBackRepoEvID} {
+		if _, err := poolRepo.GetEventByID(ctx, id); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected rolled-back inner event %d absent after rawRoot commit, got %v", id, err)
+		}
+	}
+}
+
+func TestEventRepository_CallerOwnedSavepointRollback(t *testing.T) {
+	t.Parallel()
+	db, poolRepo := setupEventTestDB(t)
+
+	entryPoints := []struct {
+		name   string
+		withTx func(context.Context, pgx.Tx, func(storage.EventRepository) error) error
+	}{
+		{
+			name: "NewTransactor",
+			withTx: func(ctx context.Context, tx pgx.Tx, fn func(storage.EventRepository) error) error {
+				return postgres.NewTransactor(tx).WithTx(ctx, func(inner storage.Tx) error {
+					return fn(inner.Events())
+				})
+			},
+		},
+		{
+			name: "NewEventRepository",
+			withTx: func(ctx context.Context, tx pgx.Tx, fn func(storage.EventRepository) error) error {
+				return postgres.NewEventRepository(tx).WithTx(ctx, fn)
+			},
+		},
+	}
+	errCallback := errors.New("inner callback failed")
+	errInnerRollback := errors.New("inner rollback failed before SQL")
+	errParentRollback := errors.New("parent rollback failed before SQL")
+	cases := []struct {
+		name           string
+		rollbackErrors map[int]error
+		wantRootCommit bool
+	}{
+		{"both_rollbacks_fail", map[int]error{1: errParentRollback, 2: errInnerRollback}, false},
+		{"parent_rollback_succeeds", map[int]error{2: errInnerRollback}, true},
+		{"inner_rollback_succeeds", nil, true},
+	}
+	for _, entry := range entryPoints {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+
+					root, err := db.Begin(ctx)
+					if err != nil {
+						t.Fatalf("beginning caller transaction: %v", err)
+					}
+					defer func() { _ = root.Rollback(context.Background()) }()
+
+					rootEvent, err := domain.NewDomainEvent(domain.EventAssetAdded, 1, domain.AggregateTypeAsset, "caller-root", nil, time.Time{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := postgres.NewEventRepository(root).AppendEvent(ctx, &rootEvent); err != nil {
+						t.Fatalf("appending directly to caller transaction: %v", err)
+					}
+
+					savepoint, err := root.Begin(ctx)
+					if err != nil {
+						t.Fatalf("beginning caller savepoint: %v", err)
+					}
+					ctrl := &twoLevelRollbackControl{
+						errByLevel:    tc.rollbackErrors,
+						rollbackCalls: make(map[int]int),
+					}
+					wrapped := &twoLevelFaultTx{Tx: savepoint, level: 1, ctrl: ctrl}
+					innerEvent, err := domain.NewDomainEvent(domain.EventAssetRemoved, 1, domain.AggregateTypeAsset, "caller-inner", nil, time.Time{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = entry.withTx(ctx, wrapped, func(repo storage.EventRepository) error {
+						if err := repo.AppendEvent(ctx, &innerEvent); err != nil {
+							return err
+						}
+						return errCallback
+					})
+					if !errors.Is(err, errCallback) || innerEvent.ID <= 0 {
+						t.Fatalf("expected inner callback error after appending an event, got event ID %d and error %v", innerEvent.ID, err)
+					}
+					for _, rollbackErr := range tc.rollbackErrors {
+						if !errors.Is(err, rollbackErr) {
+							t.Fatalf("expected rollback error %v, got %v", rollbackErr, err)
+						}
+					}
+					wantParentRollbacks := 1
+					if tc.rollbackErrors[2] == nil {
+						wantParentRollbacks = 0
+						if err := savepoint.Commit(ctx); err != nil {
+							t.Fatalf("releasing caller savepoint after confirmed inner rollback: %v", err)
+						}
+					}
+					if ctrl.rollbackCalls[2] != 1 || ctrl.rollbackCalls[1] != wantParentRollbacks {
+						t.Fatalf("expected one inner and %d parent rollback attempts, got %v", wantParentRollbacks, ctrl.rollbackCalls)
+					}
+
+					// Use the caller's raw pgx handle to commit regardless of the callback error.
+					if err := root.Commit(ctx); (err == nil) != tc.wantRootCommit {
+						t.Fatalf("caller root commit should succeed = %t, got %v", tc.wantRootCommit, err)
+					}
+					if _, err := poolRepo.GetEventByID(ctx, innerEvent.ID); !errors.Is(err, storage.ErrNotFound) {
+						t.Fatalf("expected inner event to be absent, got %v", err)
+					}
+					_, err = poolRepo.GetEventByID(ctx, rootEvent.ID)
+					if tc.wantRootCommit && err != nil {
+						t.Fatalf("expected caller root event to commit, got %v", err)
+					}
+					if !tc.wantRootCommit && !errors.Is(err, storage.ErrNotFound) {
+						t.Fatalf("expected caller root event to be absent, got %v", err)
+					}
+				})
+			}
+		})
 	}
 }
 

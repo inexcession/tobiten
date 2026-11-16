@@ -33,7 +33,7 @@ func NewEventRepository(db DBTX) *EventRepository {
 	var scope *txScope
 	extTx, inTx := db.(pgx.Tx)
 	if inTx {
-		scope = &txScope{tx: extTx}
+		scope = newCallerTxScope(extTx)
 	}
 	return &EventRepository{
 		q:     New(db),
@@ -49,6 +49,7 @@ func (r *EventRepository) InTx() bool {
 }
 
 // WithTx executes fn inside a transaction (or nested savepoint when already inside one).
+// Unconfirmed savepoint cleanup may close the caller's connection to abort the transaction.
 func (r *EventRepository) WithTx(ctx context.Context, fn func(repo storage.EventRepository) error) error {
 	if r == nil {
 		return errors.New("event repository is required")
