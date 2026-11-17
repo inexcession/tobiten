@@ -3,6 +3,7 @@ package cbz_test
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -553,4 +554,168 @@ func TestLocateDirectory_ConfinesReadsToTailWindow(t *testing.T) {
 			t.Errorf("read [%d,+%d) escapes the %d-byte tail window", q[0], q[1], window)
 		}
 	}
+}
+
+// fakeDirectoryRecord builds a central-directory record named "1.jpg" with the given
+// saturation, extra field, and (possibly lying) variable-length field sizes.
+func fakeDirectoryRecord(compressedSize uint32, extra []byte, nameLen, extraLen, commentLen uint16) []byte {
+	rec := make([]byte, 46)
+	copy(rec, "PK\x01\x02")
+	binary.LittleEndian.PutUint32(rec[20:], compressedSize)
+	binary.LittleEndian.PutUint16(rec[28:], nameLen)
+	binary.LittleEndian.PutUint16(rec[30:], extraLen)
+	binary.LittleEndian.PutUint16(rec[32:], commentLen)
+	rec = append(rec, "1.jpg"...)
+	return append(rec, extra...)
+}
+
+// TestLocateDirectory_PrependedDataSelectionMatchesArchiveZip covers archives
+// whose prepended data places directory-like bytes at the stored offset.
+// archive/zip trusts that offset only when a complete directory header parses
+// there; the locator must make the same choice or the fingerprinter would hash
+// the wrong bytes while the reader opens the real directory.
+func TestLocateDirectory_PrependedDataSelectionMatchesArchiveZip(t *testing.T) {
+	zipData := buildZip(t, "", store("1.jpg", "page"))
+	plain, err := cbz.LocateDirectory(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := plain.Offset // the offset the end record stores
+	saturatedExtra := func(size uint16, fill int) []byte {
+		e := []byte{0x01, 0x00, byte(size), byte(size >> 8)}
+		return append(e, make([]byte, fill)...)
+	}
+
+	cases := []struct {
+		name        string
+		record      []byte
+		literalWins bool // archive/zip reads the directory at the stored offset
+	}{
+		{
+			name:        "complete header at stored offset",
+			record:      fakeDirectoryRecord(4, nil, 5, 0, 0),
+			literalWins: true,
+		},
+		{
+			name:        "signature only, field lengths overrun the file",
+			record:      fakeDirectoryRecord(4, nil, 0xffff, 0xffff, 0xffff),
+			literalWins: false,
+		},
+		{
+			name:        "zip64 extra too short for saturated size",
+			record:      fakeDirectoryRecord(0xffffffff, saturatedExtra(0, 0), 5, 4, 0),
+			literalWins: false,
+		},
+		{
+			name:        "zip64 extra complete for saturated size",
+			record:      fakeDirectoryRecord(0xffffffff, saturatedExtra(8, 8), 5, 12, 0),
+			literalWins: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prefix := make([]byte, int(stored)+len(tc.record)+64)
+			copy(prefix[stored:], tc.record)
+			data := append(append([]byte(nil), prefix...), zipData...)
+
+			r, err := cbz.NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			if got := len(r.Entries()); got != 1 || r.Entries()[0].Name != "1.jpg" {
+				t.Fatalf("entries = %+v", r.Entries())
+			}
+
+			located, err := cbz.LocateDirectory(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if located != r.Directory() {
+				t.Errorf("LocateDirectory = %+v, Reader.Directory() = %+v", located, r.Directory())
+			}
+			want := stored + int64(len(prefix))
+			if tc.literalWins {
+				want = stored
+			}
+			if located.Offset != want {
+				t.Errorf("Offset = %d, want %d (literalWins=%v)", located.Offset, want, tc.literalWins)
+			}
+			if !bytes.HasPrefix(data[located.Offset:], []byte("PK\x01\x02")) {
+				t.Errorf("no directory record at located offset %d", located.Offset)
+			}
+		})
+	}
+}
+
+func TestLocateDirectory_ProbeReadsAreBounded(t *testing.T) {
+	zipData := buildZip(t, "", store("1.jpg", strings.Repeat("p", 1<<20)))
+	plain, err := cbz.LocateDirectory(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := plain.Offset
+	rec := fakeDirectoryRecord(4, nil, 0xffff, 0xffff, 0xffff)
+	prefix := make([]byte, int(stored)+len(rec)+64)
+	copy(prefix[stored:], rec)
+	// The archive body is large, so an unbounded probe would be visible.
+	data := append(append([]byte(nil), prefix...), zipData...)
+
+	spy := &spyReaderAt{data: data}
+	if _, err := cbz.LocateDirectory(spy, int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	const window = 65 * 1024
+	const maxProbe = 46 + 3*65535
+	for _, q := range spy.reqs {
+		inTail := q[0] >= int64(len(data))-window && q[1] <= window
+		inProbe := q[0] >= stored && q[0] <= stored+46 && q[1] <= maxProbe
+		if !inTail && !inProbe {
+			t.Errorf("read [%d,+%d) is neither in the tail window nor the bounded directory probe at %d", q[0], q[1], stored)
+		}
+	}
+}
+
+func TestReader_ReturnsIndependentEntryNames(t *testing.T) {
+	r := open(t, buildZip(t, "", store("ComicInfo.xml", "<ComicInfo/>"), store("1.jpg", "x"), store("2.jpg", "y")))
+
+	entries := r.Entries()
+	pages := r.Pages()
+	ci, ok := r.ComicInfo()
+	if !ok {
+		t.Fatal("ComicInfo.xml not found")
+	}
+	for _, name := range [][]byte{entries[0].NameBytes, entries[1].NameBytes, pages[0].NameBytes, ci.NameBytes} {
+		for i := range name {
+			name[i] = 'Z'
+		}
+	}
+
+	for label, got := range map[string][]byte{
+		"Entries":   r.Entries()[1].NameBytes,
+		"Pages":     r.Pages()[0].NameBytes,
+		"ComicInfo": mustComicInfo(t, r).NameBytes,
+	} {
+		if strings.Contains(string(got), "Z") {
+			t.Errorf("%s returned a name altered through another result: %q", label, got)
+		}
+	}
+	if got := r.Entries()[1]; string(got.NameBytes) != "1.jpg" || got.Name != "1.jpg" {
+		t.Errorf("entry = %q / %q, want raw and display names to agree", got.NameBytes, got.Name)
+	}
+	if got := mustComicInfo(t, r); string(got.NameBytes) != "ComicInfo.xml" {
+		t.Errorf("ComicInfo name = %q", got.NameBytes)
+	}
+	// Streaming must still work after the callers scribbled on their copies.
+	if got := readEntry(t, r, r.Pages()[1]); got != "y" {
+		t.Errorf("page content = %q", got)
+	}
+}
+
+func mustComicInfo(t testing.TB, r *cbz.Reader) container.Entry {
+	t.Helper()
+	e, ok := r.ComicInfo()
+	if !ok {
+		t.Fatal("ComicInfo.xml not found")
+	}
+	return e
 }

@@ -52,6 +52,12 @@ type Entry struct {
 	IsDir bool
 }
 
+// Clone returns a copy whose NameBytes does not share a backing array with e.
+func (e Entry) Clone() Entry {
+	e.NameBytes = append([]byte(nil), e.NameBytes...)
+	return e
+}
+
 // Diagnostics records non-fatal observations made while opening a container.
 // They are informative, not alarming: the files remain valid (ADR-0004 §4).
 type Diagnostics struct {

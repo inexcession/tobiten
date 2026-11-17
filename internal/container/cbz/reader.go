@@ -7,6 +7,7 @@ package cbz
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -75,6 +76,9 @@ func NewReader(ra io.ReaderAt, size int64) (*Reader, error) {
 	if err != nil && (!errors.Is(err, zip.ErrInsecurePath) || zr == nil) {
 		return nil, fmt.Errorf("%w: %v", container.ErrCorrupt, err)
 	}
+	if err := verifyDirectory(ra, dir, zr); err != nil {
+		return nil, err
+	}
 
 	r := &Reader{zr: zr, dir: dir, comicInfo: -1}
 	r.entries = make([]container.Entry, len(zr.File))
@@ -100,6 +104,25 @@ func NewReader(ra io.ReaderAt, size int64) (*Reader, error) {
 	return r, nil
 }
 
+// verifyDirectory proves the located central directory is the one archive/zip
+// parsed: its first record must carry the first listed entry's raw name. The
+// fingerprinter trusts Directory, so a disagreement fails the open instead of
+// reporting the wrong bytes.
+func verifyDirectory(ra io.ReaderAt, dir Directory, zr *zip.Reader) error {
+	if len(zr.File) == 0 {
+		return nil
+	}
+	want := zr.File[0].Name
+	buf := make([]byte, 46+len(want))
+	if dir.Size < int64(len(buf)) || container.ReadFullAt(ra, buf, dir.Offset) != nil ||
+		binary.LittleEndian.Uint32(buf) != cdHeaderSignature ||
+		int(binary.LittleEndian.Uint16(buf[28:30])) != len(want) ||
+		string(buf[46:]) != want {
+		return fmt.Errorf("%w: located central directory does not match the parsed entries", container.ErrCorrupt)
+	}
+	return nil
+}
+
 func isComicInfo(e container.Entry) bool {
 	if e.IsDir || container.IsHiddenPath(e.NameBytes) {
 		return false
@@ -115,12 +138,12 @@ func (r *Reader) Directory() Directory { return r.dir }
 
 // Entries implements container.ContainerReader.
 func (r *Reader) Entries() []container.Entry {
-	return append([]container.Entry(nil), r.entries...)
+	return cloneEntries(r.entries)
 }
 
 // Pages implements container.ContainerReader.
 func (r *Reader) Pages() []container.Entry {
-	return append([]container.Entry(nil), r.pages...)
+	return cloneEntries(r.pages)
 }
 
 // ComicInfo implements container.ContainerReader.
@@ -128,7 +151,17 @@ func (r *Reader) ComicInfo() (container.Entry, bool) {
 	if r.comicInfo < 0 {
 		return container.Entry{}, false
 	}
-	return r.entries[r.comicInfo], true
+	return r.entries[r.comicInfo].Clone(), true
+}
+
+// cloneEntries returns entries whose raw names are independent copies, so a
+// caller mutating one result cannot alter another or the reader's own state.
+func cloneEntries(entries []container.Entry) []container.Entry {
+	out := make([]container.Entry, len(entries))
+	for i, e := range entries {
+		out[i] = e.Clone()
+	}
+	return out
 }
 
 // Diagnostics implements container.ContainerReader.
