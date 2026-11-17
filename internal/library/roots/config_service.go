@@ -78,7 +78,7 @@ func (s *ConfigService) CreateLibrary(
 	}
 
 	var result *app.CreateLibraryResult
-	err = s.tx.WithTx(ctx, func(tx storage.Tx) error {
+	err = s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
 		if err := repo.LockConfiguration(ctx); err != nil {
 			return err
@@ -207,7 +207,7 @@ func (s *ConfigService) AddRoot(
 	}
 
 	var created *domain.LibraryRoot
-	err := s.tx.WithTx(ctx, func(tx storage.Tx) error {
+	err := s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
 		if err := repo.LockConfiguration(ctx); err != nil {
 			return err
@@ -267,7 +267,7 @@ func (s *ConfigService) SetManagedIntakePath(
 	}
 
 	var updated *domain.Library
-	err := s.tx.WithTx(ctx, func(tx storage.Tx) error {
+	err := s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
 		if err := repo.LockConfiguration(ctx); err != nil {
 			return err

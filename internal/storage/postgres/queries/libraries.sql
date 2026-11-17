@@ -118,5 +118,8 @@ WHERE id = $1;
 DELETE FROM library_roots
 WHERE id = $1;
 
+-- name: GetTransactionIsolation :one
+SELECT current_setting('transaction_isolation')::text AS isolation_level;
+
 -- name: AcquireLibraryConfigLock :exec
 SELECT pg_advisory_xact_lock($1::bigint);

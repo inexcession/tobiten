@@ -20,6 +20,8 @@ import (
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func setupConfigServiceTestDB(t *testing.T, opts roots.ConfigServiceOptions) (*testdb.TestDB, *postgres.Transactor, *roots.ConfigService, *domain.Principal) {
@@ -834,4 +836,542 @@ func TestConfigService_ConcurrentConflictingRequests(t *testing.T) {
 			t.Fatalf("expected both sibling prefix creates to commit, got errA=%v errB=%v", errA, errB)
 		}
 	})
+}
+
+func pollAdvisoryLockWaiter(ctx context.Context, db *testdb.TestDB, exited <-chan struct{}) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-exited:
+			return errors.New("waiting operation exited before hitting advisory lock")
+		default:
+		}
+		var waiting bool
+		if err := db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND wait_event = 'advisory'
+			)`).Scan(&waiting); err != nil {
+			return fmt.Errorf("polling advisory lock waiter: %w", err)
+		}
+		if waiting {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for PostgreSQL advisory lock contention")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestConfigService_IsolationContract(t *testing.T) {
+	t.Parallel()
+	db, transactor, _, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	t.Run("pool-backed service reads fresh snapshot after lock even under repeatable-read session default", func(t *testing.T) {
+		poolCfg, err := pgxpool.ParseConfig(db.URL)
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		poolCfg.MaxConns = 4
+		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			_, execErr := conn.Exec(ctx, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+			return execErr
+		}
+		rrPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+		if err != nil {
+			t.Fatalf("pgxpool.NewWithConfig: %v", err)
+		}
+		defer rrPool.Close()
+
+		rrSvc, err := roots.NewConfigService(postgres.NewTransactor(rrPool), roots.ConfigServiceOptions{})
+		if err != nil {
+			t.Fatalf("NewConfigService(rrPool): %v", err)
+		}
+
+		base := t.TempDir()
+		canonBase, err := paths.CanonicalPath(base)
+		if err != nil {
+			t.Fatalf("CanonicalPath: %v", err)
+		}
+		parentDir := filepath.Join(canonBase, "rr-parent")
+		childDir := filepath.Join(parentDir, "child")
+		if err := os.MkdirAll(childDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+
+		subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer subCancel()
+
+		tx1Locked := make(chan struct{})
+		releaseTx1 := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(releaseTx1) }) }
+
+		var tx1Err error
+		tx1Done := make(chan struct{})
+		go func() {
+			defer close(tx1Done)
+			tx1Err = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+				repo := tx.Libraries()
+				if err := repo.LockConfiguration(subCtx); err != nil {
+					return err
+				}
+				close(tx1Locked)
+				select {
+				case <-releaseTx1:
+					if err := subCtx.Err(); err != nil {
+						return err
+					}
+				case <-subCtx.Done():
+					return subCtx.Err()
+				}
+				pathID, err := domain.NewRootPathIdentity([]byte(parentDir))
+				if err != nil {
+					return err
+				}
+				lib := &domain.Library{Name: "RR Pool Winner", Mode: domain.LibraryModeVirtual}
+				if err := repo.CreateLibrary(subCtx, lib); err != nil {
+					return err
+				}
+				return repo.CreateLibraryRoot(subCtx, &domain.LibraryRoot{
+					LibraryID: lib.ID,
+					Path:      pathID,
+				})
+			})
+		}()
+
+		var req2Err error
+		req2Done := make(chan struct{})
+		req2Started := false
+		defer func() {
+			subCancel()
+			closeRelease()
+			<-tx1Done
+			if req2Started {
+				<-req2Done
+			}
+		}()
+
+		select {
+		case <-tx1Locked:
+		case <-tx1Done:
+			t.Fatalf("tx1 exited before lock: %v", tx1Err)
+		case <-subCtx.Done():
+			t.Fatalf("timed out waiting for tx1 lock: %v", subCtx.Err())
+		}
+
+		req2Started = true
+		go func() {
+			defer close(req2Done)
+			_, req2Err = rrSvc.CreateLibrary(subCtx, admin, app.CreateLibraryRequest{
+				Name:  "RR Pool Loser",
+				Roots: [][]byte{[]byte(childDir)},
+			})
+		}()
+
+		if err := pollAdvisoryLockWaiter(subCtx, db, req2Done); err != nil {
+			t.Fatalf("waiting for rrSvc lock: %v (req2Err=%v)", err, req2Err)
+		}
+		closeRelease()
+
+		<-tx1Done
+		if tx1Err != nil {
+			t.Fatalf("tx1 commit failed: %v", tx1Err)
+		}
+		<-req2Done
+		if !errors.Is(req2Err, app.ErrConflict) || !errors.Is(req2Err, roots.ErrPathOverlap) {
+			t.Fatalf("rrSvc CreateLibrary err = %v, want ErrConflict + ErrPathOverlap", req2Err)
+		}
+
+		repo := postgres.NewLibraryRepository(db.Pool)
+		libs, err := repo.ListLibraries(subCtx)
+		if err != nil {
+			t.Fatalf("ListLibraries: %v", err)
+		}
+		if len(libs) != 1 || libs[0].Name != "RR Pool Winner" {
+			t.Fatalf("persisted libraries = %+v, want only RR Pool Winner", libs)
+		}
+		storedRoots, err := repo.ListAllLibraryRoots(subCtx)
+		if err != nil {
+			t.Fatalf("ListAllLibraryRoots: %v", err)
+		}
+		if len(storedRoots) != 1 || string(storedRoots[0].Path.Bytes) != parentDir {
+			t.Fatalf("persisted roots = %+v, want only %q", storedRoots, parentDir)
+		}
+	})
+
+	t.Run("caller-owned repeatable-read and serializable transactions fail closed", func(t *testing.T) {
+		base := t.TempDir()
+		canonBase, err := paths.CanonicalPath(base)
+		if err != nil {
+			t.Fatalf("CanonicalPath: %v", err)
+		}
+		dirOK := filepath.Join(canonBase, "ok-root")
+		dirIn := filepath.Join(canonBase, "ok-intake")
+		for _, d := range []string{dirOK, dirIn} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q): %v", d, err)
+			}
+		}
+
+		// Seed a managed library so AddRoot and SetManagedIntakePath can also be probed.
+		baseSvc, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{})
+		if err != nil {
+			t.Fatalf("NewConfigService: %v", err)
+		}
+		seeded, err := baseSvc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+			Name:       "Caller Iso Seed",
+			Mode:       domain.LibraryModeManaged,
+			IntakePath: []byte(dirIn),
+		})
+		if err != nil {
+			t.Fatalf("CreateLibrary(seed): %v", err)
+		}
+
+		for _, iso := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+			callerTx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+			if err != nil {
+				t.Fatalf("BeginTx(%s): %v", iso, err)
+			}
+			txSvc, err := roots.NewConfigService(postgres.NewTransactor(callerTx), roots.ConfigServiceOptions{})
+			if err != nil {
+				_ = callerTx.Rollback(ctx)
+				t.Fatalf("NewConfigService(callerTx): %v", err)
+			}
+
+			if _, err := txSvc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+				Name:  "Should Fail " + string(iso),
+				Roots: [][]byte{[]byte(dirOK)},
+			}); !errors.Is(err, storage.ErrTransactionIsolation) {
+				_ = callerTx.Rollback(ctx)
+				t.Fatalf("CreateLibrary(%s) = %v, want ErrTransactionIsolation", iso, err)
+			}
+			if _, err := txSvc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+				LibraryID: seeded.Library.ID,
+				Path:      []byte(dirOK),
+			}); !errors.Is(err, storage.ErrTransactionIsolation) {
+				_ = callerTx.Rollback(ctx)
+				t.Fatalf("AddRoot(%s) = %v, want ErrTransactionIsolation", iso, err)
+			}
+			if _, err := txSvc.SetManagedIntakePath(ctx, admin, app.SetManagedIntakePathRequest{
+				LibraryID:  seeded.Library.ID,
+				IntakePath: []byte(filepath.Join(canonBase, "new-in")),
+			}); !errors.Is(err, storage.ErrTransactionIsolation) {
+				_ = callerTx.Rollback(ctx)
+				t.Fatalf("SetManagedIntakePath(%s) = %v, want ErrTransactionIsolation", iso, err)
+			}
+			_ = callerTx.Rollback(ctx)
+		}
+
+		storedRoots, err := postgres.NewLibraryRepository(db.Pool).ListAllLibraryRoots(ctx)
+		if err != nil {
+			t.Fatalf("ListAllLibraryRoots: %v", err)
+		}
+		for _, r := range storedRoots {
+			if string(r.Path.Bytes) == dirOK {
+				t.Fatalf("unexpected root persisted from failing isolation tx: %+v", r)
+			}
+		}
+	})
+
+	t.Run("caller-owned read-committed transaction sees fresh snapshot after advisory lock even after prior read", func(t *testing.T) {
+		base := t.TempDir()
+		canonBase, err := paths.CanonicalPath(base)
+		if err != nil {
+			t.Fatalf("CanonicalPath: %v", err)
+		}
+		parentDir := filepath.Join(canonBase, "rc-parent")
+		childDir := filepath.Join(parentDir, "nested")
+		if err := os.MkdirAll(childDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+
+		subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer subCancel()
+
+		// Caller begins a READ COMMITTED transaction and executes a read BEFORE tx1 commits.
+		callerTx, err := db.Pool.BeginTx(subCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatalf("BeginTx(ReadCommitted): %v", err)
+		}
+		defer func() { _ = callerTx.Rollback(context.Background()) }()
+		var initialCount int
+		if err := callerTx.QueryRow(subCtx, "SELECT COUNT(*) FROM library_roots").Scan(&initialCount); err != nil {
+			t.Fatalf("initial query on callerTx: %v", err)
+		}
+		callerSvc, err := roots.NewConfigService(postgres.NewTransactor(callerTx), roots.ConfigServiceOptions{})
+		if err != nil {
+			t.Fatalf("NewConfigService(callerTx): %v", err)
+		}
+
+		tx1Locked := make(chan struct{})
+		releaseTx1 := make(chan struct{})
+		var releaseOnce sync.Once
+		closeRelease := func() { releaseOnce.Do(func() { close(releaseTx1) }) }
+
+		var tx1Err error
+		tx1Done := make(chan struct{})
+		go func() {
+			defer close(tx1Done)
+			tx1Err = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+				repo := tx.Libraries()
+				if err := repo.LockConfiguration(subCtx); err != nil {
+					return err
+				}
+				close(tx1Locked)
+				select {
+				case <-releaseTx1:
+					if err := subCtx.Err(); err != nil {
+						return err
+					}
+				case <-subCtx.Done():
+					return subCtx.Err()
+				}
+				pathID, err := domain.NewRootPathIdentity([]byte(parentDir))
+				if err != nil {
+					return err
+				}
+				lib := &domain.Library{Name: "RC Caller Winner", Mode: domain.LibraryModeVirtual}
+				if err := repo.CreateLibrary(subCtx, lib); err != nil {
+					return err
+				}
+				return repo.CreateLibraryRoot(subCtx, &domain.LibraryRoot{
+					LibraryID: lib.ID,
+					Path:      pathID,
+				})
+			})
+		}()
+
+		var callerErr error
+		callerDone := make(chan struct{})
+		callerStarted := false
+		defer func() {
+			subCancel()
+			closeRelease()
+			<-tx1Done
+			if callerStarted {
+				<-callerDone
+			}
+		}()
+
+		select {
+		case <-tx1Locked:
+		case <-tx1Done:
+			t.Fatalf("tx1 exited before lock: %v", tx1Err)
+		case <-subCtx.Done():
+			t.Fatalf("timed out waiting for tx1 lock: %v", subCtx.Err())
+		}
+
+		callerStarted = true
+		go func() {
+			defer close(callerDone)
+			_, callerErr = callerSvc.CreateLibrary(subCtx, admin, app.CreateLibraryRequest{
+				Name:  "RC Caller Loser",
+				Roots: [][]byte{[]byte(childDir)},
+			})
+		}()
+
+		if err := pollAdvisoryLockWaiter(subCtx, db, callerDone); err != nil {
+			t.Fatalf("waiting for callerSvc lock: %v (callerErr=%v)", err, callerErr)
+		}
+		closeRelease()
+
+		<-tx1Done
+		if tx1Err != nil {
+			t.Fatalf("tx1 commit failed: %v", tx1Err)
+		}
+		<-callerDone
+		if !errors.Is(callerErr, app.ErrConflict) || !errors.Is(callerErr, roots.ErrPathOverlap) {
+			t.Fatalf("callerSvc CreateLibrary err = %v, want ErrConflict + ErrPathOverlap", callerErr)
+		}
+		_ = callerTx.Rollback(subCtx)
+
+		repo := postgres.NewLibraryRepository(db.Pool)
+		if _, err := repo.GetLibraryByName(subCtx, "RC Caller Loser"); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected RC Caller Loser absent, got err=%v", err)
+		}
+		winner, err := repo.GetLibraryByName(subCtx, "RC Caller Winner")
+		if err != nil {
+			t.Fatalf("GetLibraryByName(RC Caller Winner): %v", err)
+		}
+		winnerRoots, err := repo.ListLibraryRoots(subCtx, winner.ID)
+		if err != nil {
+			t.Fatalf("ListLibraryRoots(winner): %v", err)
+		}
+		if len(winnerRoots) != 1 || string(winnerRoots[0].Path.Bytes) != parentDir {
+			t.Fatalf("winnerRoots = %+v, want only %q", winnerRoots, parentDir)
+		}
+	})
+}
+
+func TestConfigService_CaseAndNormalizationAliases(t *testing.T) {
+	t.Parallel()
+	db, _, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath(base): %v", err)
+	}
+
+	dirUpper := filepath.Join(canonBase, "Manga")
+	dirUpperSub := filepath.Join(dirUpper, "existing-sub")
+	dirNFD := filepath.Join(canonBase, "Cafe\u0301")
+	dirNFDSub := filepath.Join(dirNFD, "existing-sub")
+	childTarget := filepath.Join(canonBase, "AncestorRoot", "Nested")
+	for _, d := range []string{dirUpperSub, dirNFDSub, childTarget} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+
+	dirLower := filepath.Join(canonBase, "manga")
+	dirNFC := filepath.Join(canonBase, "Caf\u00e9")
+
+	upperInfo, err := os.Lstat(dirUpper)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", dirUpper, err)
+	}
+	lowerInfo, lowerErr := os.Lstat(dirLower)
+	caseAliased := lowerErr == nil && os.SameFile(upperInfo, lowerInfo)
+
+	nfdInfo, err := os.Lstat(dirNFD)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", dirNFD, err)
+	}
+	nfcInfo, nfcErr := os.Lstat(dirNFC)
+	normAliased := nfcErr == nil && os.SameFile(nfdInfo, nfcInfo)
+
+	if !caseAliased {
+		if err := os.MkdirAll(filepath.Join(dirLower, "existing-sub"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(distinct lowercase): %v", err)
+		}
+	}
+	if !normAliased {
+		if err := os.MkdirAll(filepath.Join(dirNFC, "existing-sub"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(distinct NFC): %v", err)
+		}
+	}
+
+	before := captureSnapshot(t, canonBase)
+
+	libCase, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:       "Alias Case Lib",
+		Mode:       domain.LibraryModeManaged,
+		IntakePath: []byte(dirNFD),
+		Roots:      [][]byte{[]byte(dirUpper)},
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary(Alias Case Lib): %v", err)
+	}
+	if string(libCase.Roots[0].Path.Bytes) != dirUpper {
+		t.Fatalf("stored root bytes = %q, want %q", libCase.Roots[0].Path.Bytes, dirUpper)
+	}
+	if libCase.Library.IntakePath == nil || string(libCase.Library.IntakePath.Bytes) != dirNFD {
+		t.Fatalf("stored intake bytes = %+v, want %q", libCase.Library.IntakePath, dirNFD)
+	}
+
+	if caseAliased {
+		for _, aliasPath := range [][]byte{
+			[]byte(dirLower),
+			[]byte(filepath.Join(dirLower, "existing-sub")),
+			[]byte(filepath.Join(dirLower, "future-sub")),
+		} {
+			if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+				LibraryID: libCase.Library.ID,
+				Path:      aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("AddRoot(case alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+			if _, err := svc.SetManagedIntakePath(ctx, admin, app.SetManagedIntakePathRequest{
+				LibraryID:  libCase.Library.ID,
+				IntakePath: aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("SetManagedIntakePath(case alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+		}
+	} else {
+		distinctLower, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+			Name:  "Distinct Lower Lib",
+			Roots: [][]byte{[]byte(dirLower)},
+		})
+		if err != nil {
+			t.Fatalf("CreateLibrary(distinct lower on sensitive fs): %v", err)
+		}
+		if string(distinctLower.Roots[0].Path.Bytes) != dirLower {
+			t.Fatalf("distinct lower bytes = %q, want %q", distinctLower.Roots[0].Path.Bytes, dirLower)
+		}
+	}
+
+	if normAliased {
+		for _, aliasPath := range [][]byte{
+			[]byte(dirNFC),
+			[]byte(filepath.Join(dirNFC, "existing-sub")),
+			[]byte(filepath.Join(dirNFC, "future-sub")),
+		} {
+			if _, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+				Name:  fmt.Sprintf("Norm Conflict %s", aliasPath),
+				Roots: [][]byte{aliasPath},
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("CreateLibrary(norm alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+		}
+	} else {
+		distinctNFC, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+			Name:  "Distinct NFC Lib",
+			Roots: [][]byte{[]byte(dirNFC)},
+		})
+		if err != nil {
+			t.Fatalf("CreateLibrary(distinct NFC on sensitive fs): %v", err)
+		}
+		if string(distinctNFC.Roots[0].Path.Bytes) != dirNFC {
+			t.Fatalf("distinct NFC bytes = %q, want %q", distinctNFC.Roots[0].Path.Bytes, dirNFC)
+		}
+	}
+
+	// Verify ancestor case/norm alias is also rejected when child directory is the stored root.
+	childLib, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:  "Child Root Lib",
+		Roots: [][]byte{[]byte(childTarget)},
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary(Child Root Lib): %v", err)
+	}
+	if caseAliased {
+		if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+			LibraryID: childLib.Library.ID,
+			Path:      []byte(filepath.Join(canonBase, "ancestorroot")),
+		}); !errors.Is(err, roots.ErrPathOverlap) {
+			t.Fatalf("expected ancestor case alias to fail with ErrPathOverlap, got %v", err)
+		}
+	}
+
+	storedLibs, err := postgres.NewLibraryRepository(db.Pool).ListLibraries(ctx)
+	if err != nil {
+		t.Fatalf("ListLibraries: %v", err)
+	}
+	wantLibs := 2
+	if !caseAliased {
+		wantLibs++
+	}
+	if !normAliased {
+		wantLibs++
+	}
+	if len(storedLibs) != wantLibs {
+		t.Fatalf("storedLibs count = %d, want %d (%+v)", len(storedLibs), wantLibs, storedLibs)
+	}
+
+	assertSnapshotIdentical(t, canonBase, before)
 }

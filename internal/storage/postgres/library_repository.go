@@ -308,12 +308,22 @@ func (r *LibraryRepository) DeleteLibraryRoot(ctx context.Context, id string) er
 	return nil
 }
 
-// LockConfiguration acquires a transaction-scoped advisory lock that serializes
-// library root and intake path configuration checks and mutations. Pool-backed or
-// non-transactional repositories return storage.ErrTransactionRequired.
+// LockConfiguration verifies that the active transaction runs under READ COMMITTED
+// isolation (so reads executed after acquiring the lock observe a fresh snapshot) and
+// acquires a transaction-scoped advisory lock that serializes library root and intake
+// path configuration checks and mutations. Pool-backed or non-transactional repositories
+// return storage.ErrTransactionRequired; stricter isolation levels fail closed with
+// storage.ErrTransactionIsolation.
 func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
 	if r == nil || r.scope == nil {
 		return storage.ErrTransactionRequired
+	}
+	iso, err := r.q.GetTransactionIsolation(ctx)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(iso), "read committed") {
+		return fmt.Errorf("%w: got %q", storage.ErrTransactionIsolation, iso)
 	}
 	if err := r.q.AcquireLibraryConfigLock(ctx, libraryConfigLockID); err != nil {
 		return mapPgError(err)

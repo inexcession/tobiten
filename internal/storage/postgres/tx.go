@@ -30,6 +30,16 @@ func NewTransactor(db TxBeginner) *Transactor {
 // backed by an existing pgx.Tx) and commits only when fn returns nil.
 // Unconfirmed savepoint cleanup may close the caller's connection to abort the transaction.
 func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return t.withTx(ctx, false, fn)
+}
+
+// WithReadCommittedTx executes fn inside a READ COMMITTED PostgreSQL transaction when
+// backed by a pool, or a nested savepoint when backed by an existing pgx.Tx.
+func (t *Transactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return t.withTx(ctx, true, fn)
+}
+
+func (t *Transactor) withTx(ctx context.Context, forceReadCommitted bool, fn func(tx storage.Tx) error) error {
 	if t == nil {
 		return errors.New("transactor database handle is required")
 	}
@@ -40,7 +50,7 @@ func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) e
 	if extTx, ok := t.db.(pgx.Tx); ok {
 		parentScope = newCallerTxScope(extTx)
 	}
-	return runTx(ctx, t.db, parentScope, "storage", func(child *txScope) error {
+	return runTxWithOptions(ctx, t.db, parentScope, "storage", forceReadCommitted, func(child *txScope) error {
 		return fn(&pgTx{scope: child, q: New(child.tx)})
 	})
 }
@@ -108,14 +118,38 @@ func (s *txScope) abortAncestors(rollbackCtx context.Context, cause error) error
 	return errors.Join(errs...)
 }
 
-func runTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, fn func(scope *txScope) error) (retErr error) {
+func beginScopedTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, forceReadCommitted bool) (pgx.Tx, error) {
+	if forceReadCommitted && parentScope == nil {
+		if bt, ok := db.(readCommittedTxBeginner); ok {
+			return bt.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		}
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if _, isoErr := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); isoErr != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txRollbackTimeout)
+			_ = tx.Rollback(rollbackCtx)
+			cancel()
+			return nil, fmt.Errorf("setting READ COMMITTED isolation for %s transaction: %w", label, isoErr)
+		}
+		return tx, nil
+	}
+	return db.Begin(ctx)
+}
+
+func runTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, fn func(scope *txScope) error) error {
+	return runTxWithOptions(ctx, db, parentScope, label, false, fn)
+}
+
+func runTxWithOptions(ctx context.Context, db TxBeginner, parentScope *txScope, label string, forceReadCommitted bool, fn func(scope *txScope) error) (retErr error) {
 	if db == nil {
 		return errors.New("db connection does not support transactions")
 	}
 	if err := parentScope.unconfirmed(); err != nil {
 		return err
 	}
-	tx, err := db.Begin(ctx)
+	tx, err := beginScopedTx(ctx, db, parentScope, label, forceReadCommitted)
 	if err != nil {
 		return fmt.Errorf("beginning %s transaction: %w", label, err)
 	}
@@ -242,6 +276,10 @@ func (s *pgTx) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	return runTx(ctx, s.scope.tx, s.scope, "storage", func(child *txScope) error {
 		return fn(&pgTx{scope: child, q: New(child.tx)})
 	})
+}
+
+func (s *pgTx) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return s.WithTx(ctx, fn)
 }
 
 func (s *pgTx) Events() storage.EventRepository {

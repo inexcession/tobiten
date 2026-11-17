@@ -35,6 +35,11 @@ var (
 	// caller transaction (such as outbox append) is called on a non-transactional handle.
 	ErrTransactionRequired = errors.New("active caller transaction required")
 
+	// ErrTransactionIsolation is returned when an operation requiring READ COMMITTED
+	// isolation (to observe fresh snapshots after acquiring a lock) is invoked inside
+	// a transaction running at a stricter isolation level such as REPEATABLE READ.
+	ErrTransactionIsolation = errors.New("operation requires READ COMMITTED transaction isolation")
+
 	// ErrRootRepositoryRequired is returned when an operation that must own its own
 	// transaction (such as outbox publication sequencing) is called on a transaction-bound handle.
 	ErrRootRepositoryRequired = errors.New("non-transactional root repository required")

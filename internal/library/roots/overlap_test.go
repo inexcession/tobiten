@@ -246,3 +246,124 @@ func TestCheckPathOverlap_SymlinksRelativeDotDotAndTreeUntouched(t *testing.T) {
 
 	assertTreeUnchanged(t, canonBase, before)
 }
+
+func TestCheckPathOverlap_CaseAndNormalizationAliases(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath(base): %v", err)
+	}
+
+	dirCaseUpper := filepath.Join(canonBase, "Manga")
+	dirCaseUpperSub := filepath.Join(dirCaseUpper, "existing-sub")
+	dirNFD := filepath.Join(canonBase, "Cafe\u0301")
+	dirNFDSub := filepath.Join(dirNFD, "existing-sub")
+	for _, d := range []string{dirCaseUpperSub, dirNFDSub} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+
+	dirCaseLower := filepath.Join(canonBase, "manga")
+	dirNFC := filepath.Join(canonBase, "Caf\u00e9")
+
+	upperInfo, err := os.Lstat(dirCaseUpper)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", dirCaseUpper, err)
+	}
+	lowerInfo, lowerErr := os.Lstat(dirCaseLower)
+	caseAliased := lowerErr == nil && os.SameFile(upperInfo, lowerInfo)
+
+	nfdInfo, err := os.Lstat(dirNFD)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", dirNFD, err)
+	}
+	nfcInfo, nfcErr := os.Lstat(dirNFC)
+	normAliased := nfcErr == nil && os.SameFile(nfdInfo, nfcInfo)
+
+	if !caseAliased {
+		if err := os.MkdirAll(filepath.Join(dirCaseLower, "existing-sub"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(distinct lowercase): %v", err)
+		}
+	}
+	if !normAliased {
+		if err := os.MkdirAll(filepath.Join(dirNFC, "existing-sub"), 0o755); err != nil {
+			t.Fatalf("MkdirAll(distinct NFC): %v", err)
+		}
+	}
+
+	before := snapshotTree(t, canonBase)
+
+	existingParents := []ExistingPath{
+		{LibraryID: "lib-case", RootID: "r-case", Kind: PathKindRoot, Path: []byte(dirCaseUpper)},
+		{LibraryID: "lib-nfd", RootID: "r-nfd", Kind: PathKindRoot, Path: []byte(dirNFD)},
+	}
+	existingChildren := []ExistingPath{
+		{LibraryID: "lib-case-sub", RootID: "r-case-sub", Kind: PathKindRoot, Path: []byte(dirCaseUpperSub)},
+		{LibraryID: "lib-nfd-sub", RootID: "r-nfd-sub", Kind: PathKindRoot, Path: []byte(dirNFDSub)},
+	}
+
+	if caseAliased {
+		for _, candidate := range [][]byte{
+			[]byte(dirCaseLower),
+			[]byte(filepath.Join(dirCaseLower, "existing-sub")),
+			[]byte(filepath.Join(dirCaseLower, "future-sub")),
+		} {
+			if _, err := CheckPathOverlap(candidate, existingParents); !errors.Is(err, ErrPathOverlap) {
+				t.Fatalf("case-aliased candidate %q against parent: err = %v, want ErrPathOverlap", candidate, err)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(dirCaseLower), existingChildren); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("case-aliased ancestor %q against child: err = %v, want ErrPathOverlap", dirCaseLower, err)
+		}
+	} else {
+		canonLower, err := CheckPathOverlap([]byte(dirCaseLower), existingParents)
+		if err != nil {
+			t.Fatalf("distinct case directory %q rejected on case-sensitive fs: %v", dirCaseLower, err)
+		}
+		if string(canonLower) != dirCaseLower {
+			t.Fatalf("raw bytes changed: got %q want %q", canonLower, dirCaseLower)
+		}
+		if _, err := CheckPathOverlap([]byte(filepath.Join(dirCaseLower, "existing-sub")), []ExistingPath{
+			{LibraryID: "lib-lower", RootID: "r-lower", Kind: PathKindRoot, Path: canonLower},
+		}); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("descendant under distinct lowercase dir must still be rejected, got %v", err)
+		}
+	}
+
+	if normAliased {
+		for _, candidate := range [][]byte{
+			[]byte(dirNFC),
+			[]byte(filepath.Join(dirNFC, "existing-sub")),
+			[]byte(filepath.Join(dirNFC, "future-sub")),
+		} {
+			if _, err := CheckPathOverlap(candidate, existingParents); !errors.Is(err, ErrPathOverlap) {
+				t.Fatalf("normalization-aliased candidate %q against parent: err = %v, want ErrPathOverlap", candidate, err)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(dirNFC), existingChildren); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("normalization-aliased ancestor %q against child: err = %v, want ErrPathOverlap", dirNFC, err)
+		}
+	} else {
+		canonNFC, err := CheckPathOverlap([]byte(dirNFC), existingParents)
+		if err != nil {
+			t.Fatalf("distinct NFC directory %q rejected on normalization-sensitive fs: %v", dirNFC, err)
+		}
+		if string(canonNFC) != dirNFC {
+			t.Fatalf("raw bytes changed: got %q want %q", canonNFC, dirNFC)
+		}
+		if _, err := CheckPathOverlap([]byte(filepath.Join(dirNFC, "existing-sub")), []ExistingPath{
+			{LibraryID: "lib-nfc", RootID: "r-nfc", Kind: PathKindRoot, Path: canonNFC},
+		}); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("descendant under distinct NFC dir must still be rejected, got %v", err)
+		}
+	}
+
+	// Distinct sibling sharing a prefix remains accepted regardless of case/normalization behavior.
+	if _, err := CheckPathOverlap([]byte(filepath.Join(canonBase, "manga2")), existingParents); err != nil {
+		t.Fatalf("distinct sibling manga2 rejected: %v", err)
+	}
+
+	assertTreeUnchanged(t, canonBase, before)
+}

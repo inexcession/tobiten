@@ -92,24 +92,100 @@ func CollectExistingPaths(ctx context.Context, repo storage.LibraryRepository, o
 // through paths.CanonicalPathBytes without modifying the filesystem, and rejects any
 // existing non-directory path. Missing directories are permitted.
 func ResolveDirectoryPath(raw []byte) ([]byte, error) {
+	canon, _, err := resolveAndInspectDirectory(raw)
+	return canon, err
+}
+
+func resolveAndInspectDirectory(raw []byte) ([]byte, *pathIdentityInfo, error) {
 	if len(raw) == 0 || bytes.IndexByte(raw, 0) >= 0 {
-		return nil, fmt.Errorf("%w: %w", app.ErrInvalidInput, paths.ErrInvalidRawPath)
+		return nil, nil, fmt.Errorf("%w: %w", app.ErrInvalidInput, paths.ErrInvalidRawPath)
 	}
 	canon, err := paths.CanonicalPathBytes(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		return nil, nil, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 	}
-	fi, err := os.Lstat(string(canon))
+	info, err := inspectPathIdentity(canon, true)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return canon, nil
+		return nil, nil, err
+	}
+	return canon, info, nil
+}
+
+type pathIdentityInfo struct {
+	ancestors []os.FileInfo
+	tail      [][]byte
+}
+
+func (p *pathIdentityInfo) leaf() os.FileInfo {
+	return p.ancestors[len(p.ancestors)-1]
+}
+
+func inspectPathIdentity(canonicalPath []byte, requireDir bool) (*pathIdentityInfo, error) {
+	comps, err := SplitCanonicalComponents(canonicalPath)
+	if err != nil {
+		return nil, err
+	}
+
+	rootInfo, err := os.Lstat("/")
+	if err != nil {
+		return nil, fmt.Errorf("%w: inspecting root path %q: %w", app.ErrInvalidInput, "/", err)
+	}
+
+	ancestors := make([]os.FileInfo, 1, 1+len(comps))
+	ancestors[0] = rootInfo
+	cur := "/"
+	var tail [][]byte
+
+	for i, comp := range comps {
+		if cur == "/" {
+			cur = "/" + string(comp)
+		} else {
+			cur = cur + "/" + string(comp)
 		}
-		return nil, fmt.Errorf("%w: inspecting path %q: %w", app.ErrInvalidInput, string(canon), err)
+
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				tail = comps[i:]
+				break
+			}
+			return nil, fmt.Errorf("%w: inspecting path %q: %w", app.ErrInvalidInput, cur, err)
+		}
+		if requireDir && !fi.IsDir() {
+			return nil, fmt.Errorf("%w: path %q is not a directory", app.ErrInvalidInput, cur)
+		}
+		ancestors = append(ancestors, fi)
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("%w: path %q is not a directory", app.ErrInvalidInput, string(canon))
+
+	return &pathIdentityInfo{
+		ancestors: ancestors,
+		tail:      tail,
+	}, nil
+}
+
+func anySameFile(infos []os.FileInfo, target os.FileInfo) bool {
+	for _, fi := range infos {
+		if os.SameFile(fi, target) {
+			return true
+		}
 	}
-	return canon, nil
+	return false
+}
+
+func identitiesOverlap(a, b *pathIdentityInfo) bool {
+	switch {
+	case len(a.tail) == 0 && len(b.tail) == 0:
+		return anySameFile(a.ancestors, b.leaf()) || anySameFile(b.ancestors, a.leaf())
+	case len(a.tail) == 0:
+		return anySameFile(b.ancestors, a.leaf())
+	case len(b.tail) == 0:
+		return anySameFile(a.ancestors, b.leaf())
+	default:
+		if !os.SameFile(a.leaf(), b.leaf()) {
+			return false
+		}
+		return hasComponentPrefix(a.tail, b.tail) || hasComponentPrefix(b.tail, a.tail)
+	}
 }
 
 // SplitCanonicalComponents splits a clean canonical POSIX absolute path into its
@@ -141,18 +217,19 @@ func SplitCanonicalComponents(canonicalPath []byte) ([][]byte, error) {
 	return comps, nil
 }
 
-// CanonicalPathsOverlap reports whether two canonical absolute POSIX paths are equal,
-// or one contains the other, comparing by path component rather than string prefix.
+// CanonicalPathsOverlap reports whether two canonical absolute POSIX paths refer to the
+// same directory or one contains the other, using filesystem identity for existing
+// directories/ancestors and component-prefix comparison for non-existent suffixes.
 func CanonicalPathsOverlap(a, b []byte) (bool, error) {
-	ca, err := SplitCanonicalComponents(a)
+	infoA, err := inspectPathIdentity(a, false)
 	if err != nil {
 		return false, err
 	}
-	cb, err := SplitCanonicalComponents(b)
+	infoB, err := inspectPathIdentity(b, false)
 	if err != nil {
 		return false, err
 	}
-	return hasComponentPrefix(ca, cb) || hasComponentPrefix(cb, ca), nil
+	return identitiesOverlap(infoA, infoB), nil
 }
 
 func hasComponentPrefix(prefix, target [][]byte) bool {
@@ -169,9 +246,9 @@ func hasComponentPrefix(prefix, target [][]byte) bool {
 
 // CheckPathOverlap resolves candidateRaw to its canonical POSIX path and rejects it
 // with app.ErrConflict / ErrPathOverlap if it equals, lies inside, or contains any
-// canonicalized path in existing.
+// canonicalized path in existing (including filesystem case/normalization aliases).
 func CheckPathOverlap(candidateRaw []byte, existing []ExistingPath) ([]byte, error) {
-	canonCandidate, err := ResolveDirectoryPath(candidateRaw)
+	canonCandidate, candInfo, err := resolveAndInspectDirectory(candidateRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -181,11 +258,11 @@ func CheckPathOverlap(candidateRaw []byte, existing []ExistingPath) ([]byte, err
 		if err != nil {
 			return nil, fmt.Errorf("canonicalizing existing %s path for library %s: %w", item.Kind, item.LibraryID, err)
 		}
-		overlap, err := CanonicalPathsOverlap(canonCandidate, canonExisting)
+		itemInfo, err := inspectPathIdentity(canonExisting, false)
 		if err != nil {
 			return nil, err
 		}
-		if overlap {
+		if identitiesOverlap(candInfo, itemInfo) {
 			if item.LibraryID != "" {
 				return nil, fmt.Errorf("%w: %w (%s in library %s)", app.ErrConflict, ErrPathOverlap, item.Kind, item.LibraryID)
 			}

@@ -16,6 +16,7 @@ import (
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -1154,5 +1155,45 @@ func TestLibraryRepository_LockConfiguration(t *testing.T) {
 	<-tx2Done
 	if tx2Err != nil {
 		t.Fatalf("tx2 failed after tx1 released: %v", tx2Err)
+	}
+
+	// Caller-owned REPEATABLE READ and SERIALIZABLE transactions must fail closed.
+	for _, iso := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+		rawTx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+		if err != nil {
+			t.Fatalf("BeginTx(%s): %v", iso, err)
+		}
+		err = postgres.NewTransactor(rawTx).WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+			return tx.Libraries().LockConfiguration(ctx)
+		})
+		_ = rawTx.Rollback(ctx)
+		if !errors.Is(err, storage.ErrTransactionIsolation) {
+			t.Fatalf("LockConfiguration(%s) = %v, want ErrTransactionIsolation", iso, err)
+		}
+	}
+
+	// WithReadCommittedTx enforces READ COMMITTED even inside a REPEATABLE READ session.
+	conn, err := db.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatalf("SET SESSION CHARACTERISTICS: %v", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+	}()
+
+	connTx := postgres.NewTransactor(conn.Conn())
+	if err := connTx.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.Libraries().LockConfiguration(ctx)
+	}); !errors.Is(err, storage.ErrTransactionIsolation) {
+		t.Fatalf("WithTx under repeatable-read session = %v, want ErrTransactionIsolation", err)
+	}
+	if err := connTx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return tx.Libraries().LockConfiguration(ctx)
+	}); err != nil {
+		t.Fatalf("WithReadCommittedTx under repeatable-read session = %v, want nil", err)
 	}
 }

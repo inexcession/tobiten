@@ -234,6 +234,17 @@ func (q *Queries) GetLibraryRootByID(ctx context.Context, id string) (LibraryRoo
 	return i, err
 }
 
+const getTransactionIsolation = `-- name: GetTransactionIsolation :one
+SELECT current_setting('transaction_isolation')::text AS isolation_level
+`
+
+func (q *Queries) GetTransactionIsolation(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, getTransactionIsolation)
+	var isolation_level string
+	err := row.Scan(&isolation_level)
+	return isolation_level, err
+}
+
 const libraryHasCatalogueRows = `-- name: LibraryHasCatalogueRows :one
 SELECT (
     EXISTS (SELECT 1 FROM series s WHERE s.library_id = $1)

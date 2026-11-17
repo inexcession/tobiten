@@ -17,4 +17,9 @@ type Tx interface {
 // Transactor executes multi-repository work atomically in one database transaction.
 type Transactor interface {
 	WithTx(ctx context.Context, fn func(tx Tx) error) error
+	// WithReadCommittedTx executes fn in a READ COMMITTED transaction when opening
+	// a root transaction from a pool, or a savepoint inside an existing caller
+	// transaction (where repositories requiring fresh post-lock reads still verify
+	// READ COMMITTED isolation and fail closed on stricter levels).
+	WithReadCommittedTx(ctx context.Context, fn func(tx Tx) error) error
 }

@@ -60,6 +60,7 @@ type Querier interface {
 	GetSessionByID(ctx context.Context, id string) (Session, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetSystemSetting(ctx context.Context, key string) (SystemSetting, error)
+	GetTransactionIsolation(ctx context.Context) (string, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	GetUserLabelByName(ctx context.Context, arg GetUserLabelByNameParams) (Label, error)
