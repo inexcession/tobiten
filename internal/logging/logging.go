@@ -258,14 +258,18 @@ func (h *stdHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.inner.Enabled(ctx, level)
 }
 
-func (h *stdHandler) Handle(ctx context.Context, r slog.Record) error {
-	if h.timeFunc != nil {
-		r.Time = h.timeFunc().UTC()
-	} else if r.Time.IsZero() {
-		r.Time = time.Now().UTC()
-	} else {
-		r.Time = r.Time.UTC()
+func resolveRecordTime(timeFunc func() time.Time, t time.Time) time.Time {
+	if timeFunc != nil {
+		return timeFunc().UTC()
 	}
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t.UTC()
+}
+
+func (h *stdHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Time = resolveRecordTime(h.timeFunc, r.Time)
 
 	if !h.hasGroups() {
 		if overrideService, hasOverride := extractRecordService(r); hasOverride {
@@ -420,13 +424,7 @@ func (h *tableHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *tableHandler) Handle(_ context.Context, r slog.Record) error {
-	if h.timeFunc != nil {
-		r.Time = h.timeFunc().UTC()
-	} else if r.Time.IsZero() {
-		r.Time = time.Now().UTC()
-	} else {
-		r.Time = r.Time.UTC()
-	}
+	r.Time = resolveRecordTime(h.timeFunc, r.Time)
 
 	service := h.service
 	collected := make([]scopedAttr, 0, len(h.attrs)+r.NumAttrs())

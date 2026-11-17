@@ -373,7 +373,8 @@ func (s *Supervisor) setupSocketDir() error {
 		s.socketLock = sockLock
 
 		fi, statErr := os.Stat(s.socketDir)
-		if statErr == nil {
+		switch {
+		case statErr == nil:
 			// Directory exists. It was NOT created by this startup.
 			s.createdSocketDir = false
 			if !fi.IsDir() {
@@ -387,14 +388,14 @@ func (s *Supervisor) setupSocketDir() error {
 			if len(entries) > 0 {
 				s.socketHadPreExistingContents = true
 			}
-		} else if os.IsNotExist(statErr) {
+		case os.IsNotExist(statErr):
 			// Directory does not exist yet. Create it now.
 			if err := os.MkdirAll(s.socketDir, 0700); err != nil {
 				return fmt.Errorf("failed to create socket directory %q: %w", s.socketDir, err)
 			}
 			s.createdSocketDir = true
 			s.socketHadPreExistingContents = false
-		} else {
+		default:
 			// Unexpected stat error. Fail safely!
 			return fmt.Errorf("failed to stat socket directory %q: %w", s.socketDir, statErr)
 		}

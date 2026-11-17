@@ -234,7 +234,9 @@ func TestUpgradeSeeds_FailsOnBrokenMigration(t *testing.T) {
 		Checksum: "sha256:breakingnotnull",
 	}
 
-	migrationPlan := append(coreMigrations, breakingMigration)
+	migrationPlan := make([]migrations.Migration, len(coreMigrations), len(coreMigrations)+1)
+	copy(migrationPlan, coreMigrations)
+	migrationPlan = append(migrationPlan, breakingMigration)
 
 	// 3. Attempt to run the broken migration on the seeded database.
 	err = migrations.Run(ctx, db, migrationPlan)

@@ -31,10 +31,6 @@ linters:
       ignore-comments: true
     dupl:
       threshold: 100
-    gocritic:
-      disabled-checks:
-        - ifElseChain
-        - appendAssign
     revive:
       rules:
         - name: blank-imports

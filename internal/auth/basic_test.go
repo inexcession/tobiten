@@ -748,11 +748,12 @@ func TestBasicAuthenticator_ConcurrencyBoundsAndSingleflight(t *testing.T) {
 				defer wg.Done()
 				// Distinct passwords so singleflight does not merge them.
 				_, authErr := auth.AuthenticateBasic(t.Context(), "alice", fmt.Sprintf("wrong-%d", idx), fmt.Sprintf("10.20.0.%d", idx+1))
-				if errors.Is(authErr, ErrAuthBusy) {
+				switch {
+				case errors.Is(authErr, ErrAuthBusy):
 					busyCount.Add(1)
-				} else if errors.Is(authErr, ErrInvalidCredentials) {
+				case errors.Is(authErr, ErrInvalidCredentials):
 					badCredCount.Add(1)
-				} else {
+				default:
 					t.Errorf("unexpected error: %v", authErr)
 				}
 			}(i)

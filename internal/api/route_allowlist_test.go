@@ -124,12 +124,11 @@ func TestM1AC5_RouteAllowlistWalker(t *testing.T) {
 
 			// Check allowlist status
 			isAllowlisted := false
-			if prefix == "/healthz" && (method == http.MethodGet || method == http.MethodHead) {
-				isAllowlisted = true
-			} else if prefix == "/api/v1/auth/login" && method == http.MethodPost {
-				isAllowlisted = true
-			} else if prefix == "/api/v1/auth/setup" && method == http.MethodPost {
-				isAllowlisted = true
+			switch prefix {
+			case "/healthz":
+				isAllowlisted = method == http.MethodGet || method == http.MethodHead
+			case "/api/v1/auth/login", "/api/v1/auth/setup":
+				isAllowlisted = method == http.MethodPost
 			}
 
 			if isAllowlisted {
