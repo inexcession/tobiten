@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -620,27 +622,45 @@ func TestLibraryRepository_RootStatusDuplicatePathAndFK(t *testing.T) {
 	}
 }
 
-func waitForLockWaiter(ctx context.Context, t *testing.T, db *testdb.TestDB, pidQuery string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+func waitForLockWaiter(ctx context.Context, db *testdb.TestDB, pidQuery string, earlyExit <-chan struct{}) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-earlyExit:
+			return errors.New("raced operation exited before waiting on lock")
+		case <-waitCtx.Done():
+			return fmt.Errorf("waiting for PostgreSQL lock contention (%s): %w", pidQuery, waitCtx.Err())
+		default:
+		}
+
 		var waiting bool
-		if err := db.QueryRow(ctx, pidQuery).Scan(&waiting); err != nil {
-			t.Fatalf("polling lock waiter: %v", err)
+		if err := db.QueryRow(waitCtx, pidQuery).Scan(&waiting); err != nil {
+			return fmt.Errorf("polling lock waiter: %w", err)
 		}
 		if waiting {
-			return
+			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+
+		select {
+		case <-earlyExit:
+			return errors.New("raced operation exited before waiting on lock")
+		case <-waitCtx.Done():
+			return fmt.Errorf("waiting for PostgreSQL lock contention (%s): %w", pidQuery, waitCtx.Err())
+		case <-ticker.C:
+		}
 	}
-	t.Fatalf("timed out waiting for PostgreSQL lock contention (%s)", pidQuery)
 }
 
 func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.T) {
 	t.Parallel()
 	db, transactor := setupLibraryTestDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Create a user for reading_progress rows.
@@ -789,10 +809,13 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 	})
 
 	t.Run("concurrent volume and progress insert blocks DeleteLibrary and survives", func(t *testing.T) {
+		subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer subCancel()
+
 		var libID string
-		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		if err := transactor.WithTx(subCtx, func(tx storage.Tx) error {
 			lib := &domain.Library{Name: "Concurrent Insert Wins Lib", Mode: domain.LibraryModeVirtual}
-			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+			if err := tx.Libraries().CreateLibrary(subCtx, lib); err != nil {
 				return err
 			}
 			libID = lib.ID
@@ -801,17 +824,17 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 			t.Fatalf("setup concurrent insert library: %v", err)
 		}
 
-		insertTx, err := db.Begin(ctx)
+		insertTx, err := db.Begin(subCtx)
 		if err != nil {
 			t.Fatalf("begin insertTx: %v", err)
 		}
-		defer func() { _ = insertTx.Rollback(ctx) }()
+		defer func() { _ = insertTx.Rollback(context.Background()) }()
 
 		volID := domain.MustNewID()
-		if _, err := insertTx.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, volID, libID); err != nil {
+		if _, err := insertTx.Exec(subCtx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, volID, libID); err != nil {
 			t.Fatalf("insertTx insert volume: %v", err)
 		}
-		if _, err := insertTx.Exec(ctx, `
+		if _, err := insertTx.Exec(subCtx, `
 			INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
 			VALUES ($1, $2, '{"type":"page","page":3}'::jsonb, 0.25, 'REST', FALSE)`,
 			userID, volID,
@@ -819,14 +842,20 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 			t.Fatalf("insertTx insert reading_progress: %v", err)
 		}
 
-		deleteDone := make(chan error, 1)
+		var deleteErr error
+		deleteDone := make(chan struct{})
 		go func() {
-			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
-				return tx.Libraries().DeleteLibrary(ctx, libID)
+			defer close(deleteDone)
+			deleteErr = transactor.WithTx(subCtx, func(tx storage.Tx) error {
+				return tx.Libraries().DeleteLibrary(subCtx, libID)
 			})
 		}()
+		defer func() {
+			subCancel()
+			<-deleteDone
+		}()
 
-		waitForLockWaiter(ctx, t, db, `
+		if err := waitForLockWaiter(subCtx, db, `
 			SELECT EXISTS (
 				SELECT 1
 				FROM pg_stat_activity
@@ -835,25 +864,28 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 				  AND state = 'active'
 				  AND wait_event_type = 'Lock'
 				  AND query LIKE '%FOR UPDATE%'
-			)`)
+			)`, deleteDone); err != nil {
+			<-deleteDone
+			t.Fatalf("waiting for DeleteLibrary lock (deleteErr=%v): %v", deleteErr, err)
+		}
 
-		if err := insertTx.Commit(ctx); err != nil {
+		if err := insertTx.Commit(subCtx); err != nil {
 			t.Fatalf("commit insertTx: %v", err)
 		}
 
-		delErr := <-deleteDone
-		if !errors.Is(delErr, storage.ErrLibraryInUse) {
-			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", delErr)
+		<-deleteDone
+		if !errors.Is(deleteErr, storage.ErrLibraryInUse) {
+			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", deleteErr)
 		}
 
-		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, libID); err != nil {
+		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(subCtx, libID); err != nil {
 			t.Fatalf("library should remain after concurrent insert commit: %v", err)
 		}
 		var volCount, progCount int
-		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM volumes WHERE id = $1`, volID).Scan(&volCount); err != nil {
+		if err := db.QueryRow(subCtx, `SELECT COUNT(*) FROM volumes WHERE id = $1`, volID).Scan(&volCount); err != nil {
 			t.Fatalf("count volume: %v", err)
 		}
-		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM reading_progress WHERE user_id = $1 AND volume_id = $2`, userID, volID).Scan(&progCount); err != nil {
+		if err := db.QueryRow(subCtx, `SELECT COUNT(*) FROM reading_progress WHERE user_id = $1 AND volume_id = $2`, userID, volID).Scan(&progCount); err != nil {
 			t.Fatalf("count reading_progress: %v", err)
 		}
 		if volCount != 1 || progCount != 1 {
@@ -862,10 +894,13 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 	})
 
 	t.Run("concurrent series insert blocks DeleteLibrary and survives", func(t *testing.T) {
+		subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer subCancel()
+
 		var libID string
-		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		if err := transactor.WithTx(subCtx, func(tx storage.Tx) error {
 			lib := &domain.Library{Name: "Concurrent Series Insert Lib", Mode: domain.LibraryModeVirtual}
-			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+			if err := tx.Libraries().CreateLibrary(subCtx, lib); err != nil {
 				return err
 			}
 			libID = lib.ID
@@ -874,25 +909,31 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 			t.Fatalf("setup concurrent series insert library: %v", err)
 		}
 
-		insertTx, err := db.Begin(ctx)
+		insertTx, err := db.Begin(subCtx)
 		if err != nil {
 			t.Fatalf("begin insertTx: %v", err)
 		}
-		defer func() { _ = insertTx.Rollback(ctx) }()
+		defer func() { _ = insertTx.Rollback(context.Background()) }()
 
 		seriesID := domain.MustNewID()
-		if _, err := insertTx.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, $2, 'Akira', 'Akira')`, seriesID, libID); err != nil {
+		if _, err := insertTx.Exec(subCtx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, $2, 'Akira', 'Akira')`, seriesID, libID); err != nil {
 			t.Fatalf("insertTx insert series: %v", err)
 		}
 
-		deleteDone := make(chan error, 1)
+		var deleteErr error
+		deleteDone := make(chan struct{})
 		go func() {
-			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
-				return tx.Libraries().DeleteLibrary(ctx, libID)
+			defer close(deleteDone)
+			deleteErr = transactor.WithTx(subCtx, func(tx storage.Tx) error {
+				return tx.Libraries().DeleteLibrary(subCtx, libID)
 			})
 		}()
+		defer func() {
+			subCancel()
+			<-deleteDone
+		}()
 
-		waitForLockWaiter(ctx, t, db, `
+		if err := waitForLockWaiter(subCtx, db, `
 			SELECT EXISTS (
 				SELECT 1
 				FROM pg_stat_activity
@@ -901,18 +942,21 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 				  AND state = 'active'
 				  AND wait_event_type = 'Lock'
 				  AND query LIKE '%FOR UPDATE%'
-			)`)
+			)`, deleteDone); err != nil {
+			<-deleteDone
+			t.Fatalf("waiting for DeleteLibrary lock (deleteErr=%v): %v", deleteErr, err)
+		}
 
-		if err := insertTx.Commit(ctx); err != nil {
+		if err := insertTx.Commit(subCtx); err != nil {
 			t.Fatalf("commit insertTx: %v", err)
 		}
 
-		delErr := <-deleteDone
-		if !errors.Is(delErr, storage.ErrLibraryInUse) {
-			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", delErr)
+		<-deleteDone
+		if !errors.Is(deleteErr, storage.ErrLibraryInUse) {
+			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", deleteErr)
 		}
 		var seriesCount int
-		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM series WHERE id = $1`, seriesID).Scan(&seriesCount); err != nil {
+		if err := db.QueryRow(subCtx, `SELECT COUNT(*) FROM series WHERE id = $1`, seriesID).Scan(&seriesCount); err != nil {
 			t.Fatalf("count series: %v", err)
 		}
 		if seriesCount != 1 {
@@ -921,10 +965,13 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 	})
 
 	t.Run("DeleteLibrary lock blocks concurrent insert until commit then insert fails FK", func(t *testing.T) {
+		subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer subCancel()
+
 		var libID string
-		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		if err := transactor.WithTx(subCtx, func(tx storage.Tx) error {
 			lib := &domain.Library{Name: "Concurrent Delete Wins Lib", Mode: domain.LibraryModeVirtual}
-			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+			if err := tx.Libraries().CreateLibrary(subCtx, lib); err != nil {
 				return err
 			}
 			libID = lib.ID
@@ -935,27 +982,59 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 
 		deleteLocked := make(chan struct{})
 		releaseDelete := make(chan struct{})
-		deleteDone := make(chan error, 1)
+		var releaseOnce sync.Once
+		closeRelease := func() {
+			releaseOnce.Do(func() { close(releaseDelete) })
+		}
+
+		var deleteErr error
+		deleteDone := make(chan struct{})
 		go func() {
-			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
-				if err := tx.Libraries().DeleteLibrary(ctx, libID); err != nil {
+			defer close(deleteDone)
+			deleteErr = transactor.WithTx(subCtx, func(tx storage.Tx) error {
+				if err := tx.Libraries().DeleteLibrary(subCtx, libID); err != nil {
 					return err
 				}
 				close(deleteLocked)
-				<-releaseDelete
-				return nil
+				select {
+				case <-releaseDelete:
+					if err := subCtx.Err(); err != nil {
+						return err
+					}
+					return nil
+				case <-subCtx.Done():
+					return subCtx.Err()
+				}
 			})
 		}()
 
-		<-deleteLocked
-
-		insertDone := make(chan error, 1)
-		go func() {
-			_, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, domain.MustNewID(), libID)
-			insertDone <- err
+		var insertErr error
+		insertDone := make(chan struct{})
+		insertStarted := false
+		defer func() {
+			subCancel()
+			closeRelease()
+			<-deleteDone
+			if insertStarted {
+				<-insertDone
+			}
 		}()
 
-		waitForLockWaiter(ctx, t, db, `
+		select {
+		case <-deleteLocked:
+		case <-deleteDone:
+			t.Fatalf("DeleteLibrary returned before holding lock: %v", deleteErr)
+		case <-subCtx.Done():
+			t.Fatalf("timed out waiting for DeleteLibrary lock: %v", subCtx.Err())
+		}
+
+		insertStarted = true
+		go func() {
+			defer close(insertDone)
+			_, insertErr = db.Exec(subCtx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, domain.MustNewID(), libID)
+		}()
+
+		if err := waitForLockWaiter(subCtx, db, `
 			SELECT EXISTS (
 				SELECT 1
 				FROM pg_stat_activity
@@ -964,17 +1043,24 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 				  AND state = 'active'
 				  AND wait_event_type = 'Lock'
 				  AND query LIKE '%INSERT INTO volumes%'
-			)`)
-
-		close(releaseDelete)
-
-		if err := <-deleteDone; err != nil {
-			t.Fatalf("DeleteLibrary commit failed: %v", err)
+			)`, insertDone); err != nil {
+			subCancel()
+			closeRelease()
+			<-deleteDone
+			<-insertDone
+			t.Fatalf("waiting for concurrent insert lock (insertErr=%v): %v", insertErr, err)
 		}
-		insErr := <-insertDone
+
+		closeRelease()
+
+		<-deleteDone
+		if deleteErr != nil {
+			t.Fatalf("DeleteLibrary commit failed: %v", deleteErr)
+		}
+		<-insertDone
 		var pgErr *pgconn.PgError
-		if !errors.As(insErr, &pgErr) || pgErr.Code != "23503" {
-			t.Fatalf("expected FK violation 23503 for concurrent insert after committed delete, got %v", insErr)
+		if !errors.As(insertErr, &pgErr) || pgErr.Code != "23503" {
+			t.Fatalf("expected FK violation 23503 for concurrent insert after committed delete, got %v", insertErr)
 		}
 	})
 }
