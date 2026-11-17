@@ -23,11 +23,9 @@ linters:
   settings:
     govet:
       enable-all: false
-    gocognit:
-      min-complexity: 45
     funlen:
-      lines: 200
-      statements: 100
+      lines: 120
+      statements: 70
       ignore-comments: true
     dupl:
       threshold: 100
