@@ -452,73 +452,93 @@ func (r *registryImpl) MigrationSources() []fs.FS {
 
 var migrationFilenamePattern = regexp.MustCompile(`^([0-9]+)(?:_([a-zA-Z0-9_\-]+))?\.sql$`)
 
+func moduleMigrationRange(m Module) (int64, int64, bool) {
+	ranger, ok := m.(MigrationRanger)
+	if !ok {
+		return 0, 0, false
+	}
+	minRange, maxRange := ranger.MigrationRange()
+	if minRange == 0 && maxRange == 0 {
+		return 0, 0, false
+	}
+	return minRange, maxRange, true
+}
+
+func parseMigrationVersion(moduleName, filename string) (int64, error) {
+	matches := migrationFilenamePattern.FindStringSubmatch(filename)
+	if len(matches) == 0 {
+		return 0, fmt.Errorf("module %q: filename %q does not match pattern <version>_<description>.sql", moduleName, filename)
+	}
+	version, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("module %q: invalid version in %q: %w", moduleName, filename, err)
+	}
+	return version, nil
+}
+
+func validateMigrationFile(
+	moduleName, filename string,
+	minRange, maxRange int64,
+	hasRange bool,
+	seenVersions map[int64]string,
+) error {
+	version, err := parseMigrationVersion(moduleName, filename)
+	if err != nil {
+		return err
+	}
+	if version <= CoreMaxVersion {
+		return fmt.Errorf("%w: module %q migration %d (%s) must be >= %d",
+			ErrCoreRangeConflict, moduleName, version, filename, CoreMaxVersion+1)
+	}
+	if hasRange && (version < minRange || version > maxRange) {
+		return fmt.Errorf("%w: module %q migration %d (%s) outside declared range [%d, %d]",
+			ErrInvalidMigrationRange, moduleName, version, filename, minRange, maxRange)
+	}
+	if prevMod, exists := seenVersions[version]; exists {
+		return fmt.Errorf("%w: version %d found in both module %q and module %q",
+			ErrDuplicateMigration, version, prevMod, moduleName)
+	}
+	seenVersions[version] = moduleName
+	return nil
+}
+
+func validateModuleMigrations(m Module, seenVersions map[int64]string) error {
+	migratable, ok := m.(Migratable)
+	if !ok {
+		return nil
+	}
+	fsys := migratable.MigrationFS()
+	if fsys == nil {
+		return nil
+	}
+
+	minRange, maxRange, hasRange := moduleMigrationRange(m)
+	moduleName := m.Name()
+
+	return fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		filename := pathPkg.Base(p)
+		if !strings.HasSuffix(filename, ".sql") {
+			return nil
+		}
+
+		return validateMigrationFile(moduleName, filename, minRange, maxRange, hasRange, seenVersions)
+	})
+}
+
 func (r *registryImpl) ValidateMigrations() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	seenVersions := make(map[int64]string) // version -> moduleName
-
 	for _, m := range r.modules {
-		migratable, ok := m.(Migratable)
-		if !ok {
-			continue
-		}
-		fsys := migratable.MigrationFS()
-		if fsys == nil {
-			continue
-		}
-
-		var minRange, maxRange int64
-		hasRange := false
-		if ranger, ok := m.(MigrationRanger); ok {
-			minRange, maxRange = ranger.MigrationRange()
-			if minRange != 0 || maxRange != 0 {
-				hasRange = true
-			}
-		}
-
-		err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-
-			filename := pathPkg.Base(p)
-			if !strings.HasSuffix(filename, ".sql") {
-				return nil
-			}
-
-			matches := migrationFilenamePattern.FindStringSubmatch(filename)
-			if len(matches) == 0 {
-				return fmt.Errorf("module %q: filename %q does not match pattern <version>_<description>.sql", m.Name(), filename)
-			}
-
-			version, err := strconv.ParseInt(matches[1], 10, 64)
-			if err != nil {
-				return fmt.Errorf("module %q: invalid version in %q: %w", m.Name(), filename, err)
-			}
-
-			if version <= CoreMaxVersion {
-				return fmt.Errorf("%w: module %q migration %d (%s) must be >= %d",
-					ErrCoreRangeConflict, m.Name(), version, filename, CoreMaxVersion+1)
-			}
-
-			if hasRange && (version < minRange || version > maxRange) {
-				return fmt.Errorf("%w: module %q migration %d (%s) outside declared range [%d, %d]",
-					ErrInvalidMigrationRange, m.Name(), version, filename, minRange, maxRange)
-			}
-
-			if prevMod, exists := seenVersions[version]; exists {
-				return fmt.Errorf("%w: version %d found in both module %q and module %q",
-					ErrDuplicateMigration, version, prevMod, m.Name())
-			}
-
-			seenVersions[version] = m.Name()
-			return nil
-		})
-		if err != nil {
+		if err := validateModuleMigrations(m, seenVersions); err != nil {
 			return err
 		}
 	}

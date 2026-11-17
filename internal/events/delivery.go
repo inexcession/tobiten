@@ -200,6 +200,78 @@ func (d *DeliveryCoordinator) registerEntry(entry registeredSubscriber) error {
 	return nil
 }
 
+func moduleSubscriberKind(es module.EventSubscriber, defaultKind string) string {
+	typed, ok := es.(module.TypedEventSubscriber)
+	if !ok {
+		return defaultKind
+	}
+	if k := strings.TrimSpace(typed.Kind()); k != "" {
+		return k
+	}
+	return defaultKind
+}
+
+func moduleSubscriberHandler(es module.EventSubscriber, id, kind string) (Subscriber, error) {
+	switch spec := es.(type) {
+	case module.EventSubscriberSpec:
+		if spec.DeliverFunc == nil {
+			return nil, fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+		}
+	case *module.EventSubscriberSpec:
+		if spec == nil || spec.DeliverFunc == nil {
+			return nil, fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
+		}
+	}
+
+	delivering, ok := es.(module.DeliveringEventSubscriber)
+	if !ok {
+		return nil, nil
+	}
+	return SubscriberSpec{
+		SubscriberID:   id,
+		SubscriberKind: kind,
+		DeliverFn:      delivering.DeliverEvent,
+	}, nil
+}
+
+func buildModuleSubscriberEntry(es module.EventSubscriber, seenInRegistry map[string]struct{}) (registeredSubscriber, error) {
+	if isNilPointerInterface(es) {
+		return registeredSubscriber{}, fmt.Errorf("%w: nil module event subscriber", ErrInvalidSubscriber)
+	}
+	id := strings.TrimSpace(es.Name())
+	if id == "" || id != es.Name() {
+		return registeredSubscriber{}, fmt.Errorf("%w: invalid module subscriber name %q", ErrInvalidSubscriber, es.Name())
+	}
+	if _, dup := seenInRegistry[id]; dup {
+		return registeredSubscriber{}, fmt.Errorf("%w: module registry declares duplicate subscriber %q", ErrDuplicateSubscriber, id)
+	}
+	seenInRegistry[id] = struct{}{}
+
+	kind := moduleSubscriberKind(es, id)
+	handler, err := moduleSubscriberHandler(es, id, kind)
+	if err != nil {
+		return registeredSubscriber{}, err
+	}
+	return registeredSubscriber{
+		id:      id,
+		kind:    kind,
+		handler: handler,
+	}, nil
+}
+
+func (d *DeliveryCoordinator) registerModuleRegistrars(reg module.Registry) error {
+	for _, m := range reg.EnabledModules() {
+		registrar, ok := m.(SubscriberRegistrar)
+		if !ok {
+			continue
+		}
+		if err := registrar.RegisterSubscribers(d); err != nil {
+			return fmt.Errorf("registering event subscribers for module %q: %w", m.Name(), err)
+		}
+	}
+	return nil
+}
+
 // RegisterModuleSubscribers registers all durable EventSubscribers declared by enabled modules
 // in reg, and invokes RegisterSubscribers on modules implementing SubscriberRegistrar.
 func (d *DeliveryCoordinator) RegisterModuleSubscribers(reg module.Registry) error {
@@ -212,60 +284,16 @@ func (d *DeliveryCoordinator) RegisterModuleSubscribers(reg module.Registry) err
 
 	seenInRegistry := make(map[string]struct{})
 	for _, es := range reg.EventSubscribers() {
-		if isNilPointerInterface(es) {
-			return fmt.Errorf("%w: nil module event subscriber", ErrInvalidSubscriber)
+		entry, err := buildModuleSubscriberEntry(es, seenInRegistry)
+		if err != nil {
+			return err
 		}
-		id := strings.TrimSpace(es.Name())
-		if id == "" || id != es.Name() {
-			return fmt.Errorf("%w: invalid module subscriber name %q", ErrInvalidSubscriber, es.Name())
-		}
-		if _, dup := seenInRegistry[id]; dup {
-			return fmt.Errorf("%w: module registry declares duplicate subscriber %q", ErrDuplicateSubscriber, id)
-		}
-		seenInRegistry[id] = struct{}{}
-
-		kind := id
-		if typed, ok := es.(module.TypedEventSubscriber); ok {
-			if k := strings.TrimSpace(typed.Kind()); k != "" {
-				kind = k
-			}
-		}
-
-		var handler Subscriber
-		switch spec := es.(type) {
-		case module.EventSubscriberSpec:
-			if spec.DeliverFunc == nil {
-				return fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
-			}
-		case *module.EventSubscriberSpec:
-			if spec == nil || spec.DeliverFunc == nil {
-				return fmt.Errorf("%w: module subscriber %q has nil delivery callback", ErrMissingSubscriberHandler, id)
-			}
-		}
-		if delivering, ok := es.(module.DeliveringEventSubscriber); ok {
-			handler = SubscriberSpec{
-				SubscriberID:   id,
-				SubscriberKind: kind,
-				DeliverFn:      delivering.DeliverEvent,
-			}
-		}
-		if err := d.registerEntry(registeredSubscriber{
-			id:      id,
-			kind:    kind,
-			handler: handler,
-		}); err != nil {
+		if err := d.registerEntry(entry); err != nil {
 			return err
 		}
 	}
 
-	for _, m := range reg.EnabledModules() {
-		if registrar, ok := m.(SubscriberRegistrar); ok {
-			if err := registrar.RegisterSubscribers(d); err != nil {
-				return fmt.Errorf("registering event subscribers for module %q: %w", m.Name(), err)
-			}
-		}
-	}
-	return nil
+	return d.registerModuleRegistrars(reg)
 }
 
 func (d *DeliveryCoordinator) snapshotSubscribers() []registeredSubscriber {

@@ -297,6 +297,53 @@ func (s *StreamService) runLoop(
 	}
 }
 
+func (s *StreamService) refreshLivePrincipal(
+	ctx context.Context,
+	origin *domain.Principal,
+	updateProgress func(*domain.Principal),
+) (*domain.Principal, bool, error) {
+	live, valid, err := s.resolveLivePrincipal(ctx, origin)
+	if err != nil || !valid {
+		return nil, false, err
+	}
+	if updateProgress != nil {
+		updateProgress(live)
+	}
+	return live, true, nil
+}
+
+func (s *StreamService) emitCommittedEvent(
+	ctx context.Context,
+	origin *domain.Principal,
+	jobIDFilter string,
+	cursor *int64,
+	ev domain.DomainEvent,
+	updateProgress func(*domain.Principal),
+	emit func(app.StreamEvent) error,
+) (bool, error) {
+	seq, ok := ev.Cursor()
+	if !ok {
+		return true, nil
+	}
+	if seq > *cursor {
+		*cursor = seq
+	}
+	streamEv, visible, keepOpen, err := s.projectJobEvent(ctx, origin, jobIDFilter, ev, seq, updateProgress)
+	if err != nil {
+		return false, err
+	}
+	if !keepOpen {
+		return false, nil
+	}
+	if !visible {
+		return true, nil
+	}
+	if err := emit(streamEv); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *StreamService) drainCommitted(
 	ctx context.Context,
 	origin *domain.Principal,
@@ -305,15 +352,8 @@ func (s *StreamService) drainCommitted(
 	updateProgress func(*domain.Principal),
 	emit func(app.StreamEvent) error,
 ) (bool, error) {
-	live, valid, err := s.resolveLivePrincipal(ctx, origin)
-	if err != nil {
+	if _, valid, err := s.refreshLivePrincipal(ctx, origin, updateProgress); err != nil || !valid {
 		return false, err
-	}
-	if !valid {
-		return false, nil
-	}
-	if updateProgress != nil {
-		updateProgress(live)
 	}
 
 	for {
@@ -329,24 +369,8 @@ func (s *StreamService) drainCommitted(
 		}
 
 		for _, ev := range batch {
-			seq, ok := ev.Cursor()
-			if !ok {
-				continue
-			}
-			if seq > *cursor {
-				*cursor = seq
-			}
-			streamEv, visible, keepOpen, err := s.projectJobEvent(ctx, origin, jobIDFilter, ev, seq, updateProgress)
-			if err != nil {
-				return false, err
-			}
-			if !keepOpen {
-				return false, nil
-			}
-			if !visible {
-				continue
-			}
-			if err := emit(streamEv); err != nil {
+			keepOpen, err := s.emitCommittedEvent(ctx, origin, jobIDFilter, cursor, ev, updateProgress, emit)
+			if err != nil || !keepOpen {
 				return false, err
 			}
 		}
@@ -506,15 +530,9 @@ func (s *StreamService) projectJobEvent(
 		return app.StreamEvent{}, false, true, nil
 	}
 
-	live, valid, err := s.resolveLivePrincipal(ctx, origin)
-	if err != nil {
+	live, valid, err := s.refreshLivePrincipal(ctx, origin, updateProgress)
+	if err != nil || !valid {
 		return app.StreamEvent{}, false, false, err
-	}
-	if !valid {
-		return app.StreamEvent{}, false, false, nil
-	}
-	if updateProgress != nil {
-		updateProgress(live)
 	}
 
 	job, err := s.lookupJob(ctx, payload.JobID)
@@ -565,15 +583,9 @@ func (s *StreamService) handleProgressTick(
 		return true, nil
 	}
 
-	live, valid, err := s.resolveLivePrincipal(ctx, origin)
-	if err != nil {
+	live, valid, err := s.refreshLivePrincipal(ctx, origin, updateProgress)
+	if err != nil || !valid {
 		return false, err
-	}
-	if !valid {
-		return false, nil
-	}
-	if updateProgress != nil {
-		updateProgress(live)
 	}
 
 	job, err := s.lookupJob(ctx, tick.JobID)
