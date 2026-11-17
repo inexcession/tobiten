@@ -423,60 +423,41 @@ func (h *tableHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level
 }
 
-func (h *tableHandler) Handle(_ context.Context, r slog.Record) error {
-	r.Time = resolveRecordTime(h.timeFunc, r.Time)
-
-	service := h.service
-	collected := make([]scopedAttr, 0, len(h.attrs)+r.NumAttrs())
-	collected = append(collected, h.attrs...)
-
-	atRoot := len(h.groups) == 0
-	r.Attrs(func(a slog.Attr) bool {
-		h.collectAttr(&collected, &service, atRoot, h.groups, h.groupPrefix, a)
-		return true
-	})
-
-	timeStr := r.Time.Format(tableTimeFormat)
+func (h *tableHandler) formatTableTime(t time.Time) string {
 	if h.replaceAttr != nil {
-		ta := h.replaceAttr(nil, slog.Time(KeyTime, r.Time))
+		ta := h.replaceAttr(nil, slog.Time(KeyTime, t))
 		if ta.Key != "" {
 			if ta.Value.Kind() == slog.KindTime {
-				timeStr = ta.Value.Time().UTC().Format(tableTimeFormat)
-			} else {
-				timeStr = ta.Value.String()
+				return ta.Value.Time().UTC().Format(tableTimeFormat)
 			}
+			return ta.Value.String()
 		}
 	}
+	return t.Format(tableTimeFormat)
+}
 
-	lvl := r.Level
-	levelStr := levelLabel(lvl)
+func (h *tableHandler) formatTableLevel(lvl slog.Level) string {
 	if h.replaceAttr != nil {
 		la := h.replaceAttr(nil, slog.Any(KeyLevel, lvl))
 		if la.Key != "" && la.Value.String() != "" {
-			levelStr = la.Value.String()
+			return la.Value.String()
 		}
 	}
-	levelRaw := padRight(levelStr, tableLevelWidth)
+	return levelLabel(lvl)
+}
 
+func (h *tableHandler) formatTableStringAttr(key, val string) string {
 	if h.replaceAttr != nil {
-		sa := h.replaceAttr(nil, slog.String(KeyService, service))
-		if sa.Key != "" {
-			service = sa.Value.String()
+		a := h.replaceAttr(nil, slog.String(key, val))
+		if a.Key != "" {
+			val = a.Value.String()
 		}
 	}
-	serviceRaw := padRight(sanitizeSingleLine(service), tableServiceWidth)
+	return sanitizeSingleLine(val)
+}
 
-	msg := r.Message
-	if h.replaceAttr != nil {
-		ma := h.replaceAttr(nil, slog.String(KeyMsg, msg))
-		if ma.Key != "" {
-			msg = ma.Value.String()
-		}
-	}
-	msgClean := sanitizeSingleLine(msg)
-
-	// Render key=value pairs
-	renderedAttrs := make([]string, 0, len(collected))
+func (h *tableHandler) renderTableAttrs(collected []scopedAttr) []string {
+	rendered := make([]string, 0, len(collected))
 	for _, sa := range collected {
 		a := sa.attr
 		if h.replaceAttr != nil {
@@ -488,12 +469,20 @@ func (h *tableHandler) Handle(_ context.Context, r slog.Record) error {
 		key := sa.prefix + a.Key
 		val := formatAttrValue(a.Value.Resolve())
 		if h.noColor {
-			renderedAttrs = append(renderedAttrs, key+"="+val)
+			rendered = append(rendered, key+"="+val)
 		} else {
-			renderedAttrs = append(renderedAttrs, ansiDim+key+"="+ansiReset+val)
+			rendered = append(rendered, ansiDim+key+"="+ansiReset+val)
 		}
 	}
+	return rendered
+}
 
+func (h *tableHandler) buildTableLine(
+	timeStr string,
+	lvl slog.Level,
+	levelRaw, serviceRaw, msgClean string,
+	renderedAttrs []string,
+) []byte {
 	var buf bytes.Buffer
 	if h.noColor {
 		buf.WriteString(timeStr)
@@ -519,10 +508,32 @@ func (h *tableHandler) Handle(_ context.Context, r slog.Record) error {
 		buf.WriteString(msgClean)
 	}
 	buf.WriteByte('\n')
+	return buf.Bytes()
+}
+
+func (h *tableHandler) Handle(_ context.Context, r slog.Record) error {
+	r.Time = resolveRecordTime(h.timeFunc, r.Time)
+
+	service := h.service
+	collected := make([]scopedAttr, 0, len(h.attrs)+r.NumAttrs())
+	collected = append(collected, h.attrs...)
+
+	atRoot := len(h.groups) == 0
+	r.Attrs(func(a slog.Attr) bool {
+		h.collectAttr(&collected, &service, atRoot, h.groups, h.groupPrefix, a)
+		return true
+	})
+
+	timeStr := h.formatTableTime(r.Time)
+	levelRaw := padRight(h.formatTableLevel(r.Level), tableLevelWidth)
+	serviceRaw := padRight(h.formatTableStringAttr(KeyService, service), tableServiceWidth)
+	msgClean := h.formatTableStringAttr(KeyMsg, r.Message)
+	renderedAttrs := h.renderTableAttrs(collected)
+	line := h.buildTableLine(timeStr, r.Level, levelRaw, serviceRaw, msgClean, renderedAttrs)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	_, err := h.w.Write(buf.Bytes())
+	_, err := h.w.Write(line)
 	return err
 }
 

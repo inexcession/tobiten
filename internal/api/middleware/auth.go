@@ -629,6 +629,99 @@ func enforceAuthenticatedMutationPolicy(
 	return true, false
 }
 
+type allowlistRoute struct {
+	target        allowlistTarget
+	matched       bool
+	methodAllowed bool
+	ownerActive   bool
+}
+
+type authMiddleware struct {
+	opts           AuthOptions
+	subDecoded     string
+	subEscaped     string
+	expectedOrigin string
+}
+
+func (m *authMiddleware) inspectAllowlist(r *http.Request) allowlistRoute {
+	target, matched := matchRequestAllowlist(r, m.subDecoded, m.subEscaped)
+	return allowlistRoute{
+		target:        target,
+		matched:       matched,
+		methodAllowed: matched && isMethodAllowed(r.Method, target.allowedMethods),
+		ownerActive:   matched && publicAllowlistOwnerActive(m.opts.Registry, target.path),
+	}
+}
+
+func (m *authMiddleware) authenticateRequest(w http.ResponseWriter, r *http.Request, route allowlistRoute) (authOutcome, bool) {
+	outcome := authenticateChainOutcome(r, collectAuthenticators(m.opts))
+	if outcome.err == nil {
+		return outcome, true
+	}
+	// Allow stale/expired session cookies on active allowlisted routes (e.g. POST /api/v1/auth/login
+	// or GET /healthz) so users can always re-authenticate, while still blocking invalid
+	// explicit credentials and blocking invalid cookies on all protected routes.
+	if route.matched && route.ownerActive && outcome.tier == module.CredentialTierCookie {
+		return authOutcome{}, true
+	}
+	WriteUnauthorized(w, r)
+	return authOutcome{}, false
+}
+
+func (m *authMiddleware) serveAuthenticated(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.Handler,
+	res module.AuthResult,
+	deferPublicCSRF bool,
+) {
+	ok, csrfUnverified := enforceAuthenticatedMutationPolicy(w, r, m.expectedOrigin, res, deferPublicCSRF)
+	if !ok {
+		return
+	}
+	ctx := domain.ContextWithPrincipal(r.Context(), res.Principal)
+	if csrfUnverified {
+		ctx = WithCSRFUnverified(ctx)
+	}
+	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func (m *authMiddleware) serveAllowlisted(w http.ResponseWriter, r *http.Request, next http.Handler, route allowlistRoute) {
+	if !route.methodAllowed {
+		writeMethodNotAllowed(w, r, route.target.allowedMethods)
+		return
+	}
+	if !isSafeMethod(r.Method) && !validateBrowserOriginAndFetchMetadata(r, m.expectedOrigin) {
+		WriteForbidden(w, r, "forbidden")
+		return
+	}
+	next.ServeHTTP(w, r)
+}
+
+func (m *authMiddleware) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	if m.opts.OriginResolver != nil {
+		r = r.WithContext(WithOriginResolver(r.Context(), m.opts.OriginResolver))
+	}
+
+	route := m.inspectAllowlist(r)
+	outcome, ok := m.authenticateRequest(w, r, route)
+	if !ok {
+		return
+	}
+
+	if outcome.res.Handled && outcome.res.Principal != nil {
+		m.serveAuthenticated(w, r, next, outcome.res, route.methodAllowed && route.ownerActive)
+		return
+	}
+
+	if route.matched {
+		m.serveAllowlisted(w, r, next, route)
+		return
+	}
+
+	WriteUnauthorized(w, r)
+}
+
 // Auth returns HTTP middleware that enforces Tobiten's mandatory authentication contract
 // (ADR-0006 §1, ADR-0018 S1).
 //
@@ -637,71 +730,18 @@ func enforceAuthenticatedMutationPolicy(
 // Unauthenticated or invalid requests receive 401 Unauthorized with WWW-Authenticate: Basic
 // and never an empty 200.
 func Auth(opts AuthOptions) func(http.Handler) http.Handler {
-	var subDecoded, subEscaped, expectedOrigin string
+	m := &authMiddleware{opts: opts}
 	if opts.SubPathResolver != nil {
-		subDecoded = opts.SubPathResolver.SubPathDecoded()
-		subEscaped = opts.SubPathResolver.SubPath()
+		m.subDecoded = opts.SubPathResolver.SubPathDecoded()
+		m.subEscaped = opts.SubPathResolver.SubPath()
 	}
 	if opts.OriginResolver != nil {
-		expectedOrigin = opts.OriginResolver.Origin()
+		m.expectedOrigin = opts.OriginResolver.Origin()
 	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if opts.OriginResolver != nil {
-				r = r.WithContext(WithOriginResolver(r.Context(), opts.OriginResolver))
-			}
-
-			target, matched := matchRequestAllowlist(r, subDecoded, subEscaped)
-			methodAllowed := matched && isMethodAllowed(r.Method, target.allowedMethods)
-			ownerActive := matched && publicAllowlistOwnerActive(opts.Registry, target.path)
-
-			outcome := authenticateChainOutcome(r, collectAuthenticators(opts))
-			if outcome.err != nil {
-				// Allow stale/expired session cookies on active allowlisted routes (e.g. POST /api/v1/auth/login
-				// or GET /healthz) so users can always re-authenticate, while still blocking invalid
-				// explicit credentials and blocking invalid cookies on all protected routes.
-				if matched && ownerActive && outcome.tier == module.CredentialTierCookie {
-					outcome = authOutcome{}
-				} else {
-					WriteUnauthorized(w, r)
-					return
-				}
-			}
-
-			if outcome.res.Handled && outcome.res.Principal != nil {
-				ok, csrfUnverified := enforceAuthenticatedMutationPolicy(
-					w,
-					r,
-					expectedOrigin,
-					outcome.res,
-					methodAllowed && ownerActive,
-				)
-				if !ok {
-					return
-				}
-				ctx := domain.ContextWithPrincipal(r.Context(), outcome.res.Principal)
-				if csrfUnverified {
-					ctx = WithCSRFUnverified(ctx)
-				}
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
-
-			if matched {
-				if !methodAllowed {
-					writeMethodNotAllowed(w, r, target.allowedMethods)
-					return
-				}
-				if !isSafeMethod(r.Method) && !validateBrowserOriginAndFetchMetadata(r, expectedOrigin) {
-					WriteForbidden(w, r, "forbidden")
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			WriteUnauthorized(w, r)
+			m.serveHTTP(w, r, next)
 		})
 	}
 }

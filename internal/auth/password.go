@@ -192,18 +192,25 @@ func ParseArgon2idHash(encodedHash string) (*Argon2idParams, []byte, []byte, err
 	return params, salt, key, nil
 }
 
+func isASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func parseVersion(s string) (int, error) {
 	if !strings.HasPrefix(s, "v=") {
 		return 0, ErrInvalidHashFormat
 	}
 	verStr := strings.TrimPrefix(s, "v=")
-	if verStr == "" {
+	if !isASCIIDigits(verStr) {
 		return 0, ErrInvalidHashFormat
-	}
-	for _, r := range verStr {
-		if r < '0' || r > '9' {
-			return 0, ErrInvalidHashFormat
-		}
 	}
 	version, err := strconv.ParseUint(verStr, 10, 32)
 	if err != nil {
@@ -215,77 +222,88 @@ func parseVersion(s string) (int, error) {
 	return int(version), nil
 }
 
+type costParamsState struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	hasM        bool
+	hasT        bool
+	hasP        bool
+}
+
+func parseCostTuple(tuple string) (string, uint64, error) {
+	kv := strings.Split(tuple, "=")
+	if len(kv) != 2 || kv[0] == "" || !isASCIIDigits(kv[1]) {
+		return "", 0, ErrInvalidHashFormat
+	}
+	val, parseErr := strconv.ParseUint(kv[1], 10, 32)
+	if parseErr != nil {
+		return "", 0, fmt.Errorf("%w: invalid parameter %s: %v", ErrInvalidHashFormat, kv[0], parseErr)
+	}
+	return kv[0], val, nil
+}
+
+func (s *costParamsState) apply(key string, val uint64) error {
+	switch key {
+	case "m":
+		if s.hasM {
+			return fmt.Errorf("%w: duplicate parameter m", ErrInvalidHashFormat)
+		}
+		if val > uint64(MaxMemory) {
+			return fmt.Errorf("%w: memory %d exceeds maximum %d", ErrInvalidHashFormat, val, MaxMemory)
+		}
+		s.memory = uint32(val)
+		s.hasM = true
+	case "t":
+		if s.hasT {
+			return fmt.Errorf("%w: duplicate parameter t", ErrInvalidHashFormat)
+		}
+		if val < uint64(MinIterations) || val > uint64(MaxIterations) {
+			return fmt.Errorf("%w: iterations %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinIterations, MaxIterations)
+		}
+		s.iterations = uint32(val)
+		s.hasT = true
+	case "p":
+		if s.hasP {
+			return fmt.Errorf("%w: duplicate parameter p", ErrInvalidHashFormat)
+		}
+		if val < uint64(MinParallelism) || val > uint64(MaxParallelism) {
+			return fmt.Errorf("%w: parallelism %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinParallelism, MaxParallelism)
+		}
+		s.parallelism = uint8(val)
+		s.hasP = true
+	default:
+		return fmt.Errorf("%w: unknown cost parameter %q", ErrInvalidHashFormat, key)
+	}
+	return nil
+}
+
 func parseCostParams(s string) (uint32, uint32, uint8, error) {
 	tuples := strings.Split(s, ",")
 	if len(tuples) != 3 {
 		return 0, 0, 0, ErrInvalidHashFormat
 	}
 
-	var (
-		memory      uint32
-		iterations  uint32
-		parallelism uint8
-		hasM, hasT  bool
-		hasP        bool
-	)
-
+	var state costParamsState
 	for _, tuple := range tuples {
-		kv := strings.Split(tuple, "=")
-		if len(kv) != 2 || kv[0] == "" || kv[1] == "" {
-			return 0, 0, 0, ErrInvalidHashFormat
+		key, val, err := parseCostTuple(tuple)
+		if err != nil {
+			return 0, 0, 0, err
 		}
-		for _, r := range kv[1] {
-			if r < '0' || r > '9' {
-				return 0, 0, 0, ErrInvalidHashFormat
-			}
-		}
-		val, parseErr := strconv.ParseUint(kv[1], 10, 32)
-		if parseErr != nil {
-			return 0, 0, 0, fmt.Errorf("%w: invalid parameter %s: %v", ErrInvalidHashFormat, kv[0], parseErr)
-		}
-
-		switch kv[0] {
-		case "m":
-			if hasM {
-				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter m", ErrInvalidHashFormat)
-			}
-			if val > uint64(MaxMemory) {
-				return 0, 0, 0, fmt.Errorf("%w: memory %d exceeds maximum %d", ErrInvalidHashFormat, val, MaxMemory)
-			}
-			memory = uint32(val)
-			hasM = true
-		case "t":
-			if hasT {
-				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter t", ErrInvalidHashFormat)
-			}
-			if val < uint64(MinIterations) || val > uint64(MaxIterations) {
-				return 0, 0, 0, fmt.Errorf("%w: iterations %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinIterations, MaxIterations)
-			}
-			iterations = uint32(val)
-			hasT = true
-		case "p":
-			if hasP {
-				return 0, 0, 0, fmt.Errorf("%w: duplicate parameter p", ErrInvalidHashFormat)
-			}
-			if val < uint64(MinParallelism) || val > uint64(MaxParallelism) {
-				return 0, 0, 0, fmt.Errorf("%w: parallelism %d out of bounds [%d, %d]", ErrInvalidHashFormat, val, MinParallelism, MaxParallelism)
-			}
-			parallelism = uint8(val)
-			hasP = true
-		default:
-			return 0, 0, 0, fmt.Errorf("%w: unknown cost parameter %q", ErrInvalidHashFormat, kv[0])
+		if err := state.apply(key, val); err != nil {
+			return 0, 0, 0, err
 		}
 	}
 
-	if !hasM || !hasT || !hasP {
+	if !state.hasM || !state.hasT || !state.hasP {
 		return 0, 0, 0, ErrInvalidHashFormat
 	}
 
-	if memory < 8*uint32(parallelism) {
-		return 0, 0, 0, fmt.Errorf("%w: memory %d below minimum %d for parallelism %d", ErrInvalidHashFormat, memory, 8*parallelism, parallelism)
+	if state.memory < 8*uint32(state.parallelism) {
+		return 0, 0, 0, fmt.Errorf("%w: memory %d below minimum %d for parallelism %d", ErrInvalidHashFormat, state.memory, 8*state.parallelism, state.parallelism)
 	}
 
-	return memory, iterations, parallelism, nil
+	return state.memory, state.iterations, state.parallelism, nil
 }
 
 func parseComponent(s string, minRaw, maxRaw int, name string) ([]byte, error) {
