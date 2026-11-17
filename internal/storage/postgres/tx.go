@@ -263,3 +263,7 @@ func (s *pgTx) Labels() storage.LabelRepository {
 func (s *pgTx) Settings() storage.SettingsRepository {
 	return &SettingsRepository{db: s.scope.tx, q: s.q}
 }
+
+func (s *pgTx) Libraries() storage.LibraryRepository {
+	return &LibraryRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}

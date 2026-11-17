@@ -38,6 +38,10 @@ var (
 	// ErrRootRepositoryRequired is returned when an operation that must own its own
 	// transaction (such as outbox publication sequencing) is called on a transaction-bound handle.
 	ErrRootRepositoryRequired = errors.New("non-transactional root repository required")
+
+	// ErrLibraryRootInUse is returned when deleting a library root that still owns
+	// media_assets rows (protected by the non-cascading foreign key on media_assets.library_root_id).
+	ErrLibraryRootInUse = errors.New("library root still owns media assets")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.

@@ -20,11 +20,15 @@ type Querier interface {
 	CountUsers(ctx context.Context) (int64, error)
 	CreateCredential(ctx context.Context, arg CreateCredentialParams) error
 	CreateLabel(ctx context.Context, arg CreateLabelParams) error
+	CreateLibrary(ctx context.Context, arg CreateLibraryParams) (Library, error)
+	CreateLibraryRoot(ctx context.Context, arg CreateLibraryRootParams) (LibraryRoot, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) error
 	DeleteCredential(ctx context.Context, id string) (int64, error)
 	DeleteExpiredSessions(ctx context.Context, expiresAt time.Time) (int64, error)
 	DeleteLabel(ctx context.Context, id string) (int64, error)
+	DeleteLibrary(ctx context.Context, id string) (int64, error)
+	DeleteLibraryRoot(ctx context.Context, id string) (int64, error)
 	DeleteSession(ctx context.Context, id string) (int64, error)
 	DeleteSessionsByCredentialID(ctx context.Context, credentialID string) (int64, error)
 	DeleteSystemSetting(ctx context.Context, key string) error
@@ -43,6 +47,9 @@ type Querier interface {
 	GetJobByIDForUpdate(ctx context.Context, id string) (Job, error)
 	GetLabelByID(ctx context.Context, id string) (Label, error)
 	GetLatestPublishedSequence(ctx context.Context) (int64, error)
+	GetLibraryByID(ctx context.Context, id string) (Library, error)
+	GetLibraryByName(ctx context.Context, name string) (Library, error)
+	GetLibraryRootByID(ctx context.Context, id string) (LibraryRoot, error)
 	GetNextPublishedDomainEventAfter(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)
 	GetNextRunnableJobIDForUpdate(ctx context.Context, arg GetNextRunnableJobIDForUpdateParams) (string, error)
 	GetPublishedDomainEventBySequence(ctx context.Context, publishedSequence pgtype.Int8) (DomainEvent, error)
@@ -59,6 +66,7 @@ type Querier interface {
 	InsertEventSubscriber(ctx context.Context, arg InsertEventSubscriberParams) (EventSubscriber, error)
 	IsJobCancelRequested(ctx context.Context, id string) (bool, error)
 	ListAllItemLabelsForMaintenance(ctx context.Context, arg ListAllItemLabelsForMaintenanceParams) ([]Label, error)
+	ListAllLibraryRoots(ctx context.Context) ([]LibraryRoot, error)
 	ListAllRolePermissions(ctx context.Context) ([]RolePermission, error)
 	ListCredentialsByUserID(ctx context.Context, userID string) ([]Credential, error)
 	ListEventSubscribers(ctx context.Context, state *string) ([]EventSubscriber, error)
@@ -66,6 +74,8 @@ type Querier interface {
 	ListItemLabels(ctx context.Context, arg ListItemLabelsParams) ([]Label, error)
 	ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, error)
 	ListLabelPoliciesByLabel(ctx context.Context, labelID string) ([]UserLabelPolicy, error)
+	ListLibraries(ctx context.Context) ([]Library, error)
+	ListLibraryRootsByLibrary(ctx context.Context, libraryID string) ([]LibraryRoot, error)
 	ListPermissionsForRole(ctx context.Context, roleID string) ([]string, error)
 	ListPublishedDomainEventsAfter(ctx context.Context, arg ListPublishedDomainEventsAfterParams) ([]DomainEvent, error)
 	ListRoles(ctx context.Context) ([]Role, error)
@@ -102,6 +112,9 @@ type Querier interface {
 	UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error
 	UpdateEventSubscriberCursor(ctx context.Context, arg UpdateEventSubscriberCursorParams) (EventSubscriber, error)
 	UpdateEventSubscriberState(ctx context.Context, arg UpdateEventSubscriberStateParams) (EventSubscriber, error)
+	UpdateLibrary(ctx context.Context, arg UpdateLibraryParams) (Library, error)
+	UpdateLibraryRoot(ctx context.Context, arg UpdateLibraryRootParams) (LibraryRoot, error)
+	UpdateLibraryRootStatus(ctx context.Context, arg UpdateLibraryRootStatusParams) (int64, error)
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
 	UpsertBuiltInServerLabel(ctx context.Context, arg UpsertBuiltInServerLabelParams) error
