@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"bytes"
 	"cmp"
 	"errors"
 	"fmt"
@@ -696,8 +695,8 @@ func (a *MediaAsset) Validate() error {
 	if strings.TrimSpace(a.LibraryRootID) == "" {
 		return ErrEmptyLibraryRootID
 	}
-	if !isSafeRelativePathBytes(a.RelPathBytes) {
-		return ErrInvalidAssetPath
+	if err := ValidateRelativePathBytes(a.RelPathBytes); err != nil {
+		return err
 	}
 	if a.FileSize < 0 {
 		return errors.New("asset file_size cannot be negative")
@@ -715,34 +714,6 @@ func (a *MediaAsset) Validate() error {
 		return ErrRetiredWithoutMissing
 	}
 	return nil
-}
-
-func isSafeRelativePathBytes(raw []byte) bool {
-	if len(raw) == 0 {
-		return false
-	}
-	if bytes.IndexByte(raw, 0) >= 0 {
-		return false
-	}
-	// Reject absolute POSIX paths.
-	if raw[0] == '/' {
-		return false
-	}
-	// Validate Unix path components directly on raw OS bytes: reject empty components,
-	// "." self-references, and ".." traversal while preserving legal Unix filename bytes
-	// such as colons and backslashes.
-	for _, seg := range bytes.Split(raw, []byte{'/'}) {
-		if len(seg) == 0 {
-			return false
-		}
-		if len(seg) == 1 && seg[0] == '.' {
-			return false
-		}
-		if len(seg) == 2 && seg[0] == '.' && seg[1] == '.' {
-			return false
-		}
-	}
-	return true
 }
 
 // IsMissing reports whether the asset is currently marked missing on disk.
