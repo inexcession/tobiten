@@ -140,16 +140,43 @@ func (r *LibraryRepository) UpdateLibrary(ctx context.Context, library *domain.L
 	return nil
 }
 
-// DeleteLibrary deletes a library by ID.
+func (r *LibraryRepository) runLibraryTx(ctx context.Context, label string, fn func(q *Queries) error) error {
+	if r == nil {
+		return errors.New("library repository is required")
+	}
+	if r.scope == nil {
+		return runReadCommittedTx(ctx, r.tx, label, func(_ pgx.Tx, q *Queries) error {
+			return fn(q)
+		})
+	}
+	return runTx(ctx, r.tx, r.scope, label, func(child *txScope) error {
+		return fn(New(child.tx))
+	})
+}
+
+// DeleteLibrary deletes a library by ID after locking its row and verifying it owns no
+// catalogue records (series or volumes), preserving standalone volumes and reading progress.
 func (r *LibraryRepository) DeleteLibrary(ctx context.Context, id string) error {
-	rows, err := r.q.DeleteLibrary(ctx, id)
-	if err != nil {
-		return mapRootDeleteError(err)
-	}
-	if rows == 0 {
-		return storage.ErrNotFound
-	}
-	return nil
+	return r.runLibraryTx(ctx, "library delete", func(q *Queries) error {
+		if _, err := q.LockLibraryForDelete(ctx, id); err != nil {
+			return mapPgError(err)
+		}
+		hasRows, err := q.LibraryHasCatalogueRows(ctx, id)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if hasRows {
+			return storage.ErrLibraryInUse
+		}
+		rows, err := q.DeleteLibrary(ctx, id)
+		if err != nil {
+			return mapRootDeleteError(err)
+		}
+		if rows == 0 {
+			return storage.ErrNotFound
+		}
+		return nil
+	})
 }
 
 // CreateLibraryRoot persists a new root directory for an existing library.

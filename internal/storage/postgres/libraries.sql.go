@@ -225,6 +225,20 @@ func (q *Queries) GetLibraryRootByID(ctx context.Context, id string) (LibraryRoo
 	return i, err
 }
 
+const libraryHasCatalogueRows = `-- name: LibraryHasCatalogueRows :one
+SELECT (
+    EXISTS (SELECT 1 FROM series s WHERE s.library_id = $1)
+    OR EXISTS (SELECT 1 FROM volumes v WHERE v.library_id = $1)
+)::boolean AS has_rows
+`
+
+func (q *Queries) LibraryHasCatalogueRows(ctx context.Context, libraryID string) (bool, error) {
+	row := q.db.QueryRow(ctx, libraryHasCatalogueRows, libraryID)
+	var has_rows bool
+	err := row.Scan(&has_rows)
+	return has_rows, err
+}
+
 const listAllLibraryRoots = `-- name: ListAllLibraryRoots :many
 SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
 FROM library_roots
@@ -333,6 +347,20 @@ func (q *Queries) ListLibraryRootsByLibrary(ctx context.Context, libraryID strin
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockLibraryForDelete = `-- name: LockLibraryForDelete :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR UPDATE
+`
+
+func (q *Queries) LockLibraryForDelete(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRow(ctx, lockLibraryForDelete, id)
+	var id_2 string
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const updateLibrary = `-- name: UpdateLibrary :one

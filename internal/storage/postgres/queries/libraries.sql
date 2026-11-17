@@ -49,6 +49,18 @@ WHERE id = $1
 RETURNING id, name, mode, intake_path_bytes, intake_path_display, intake_path_match,
           auto_metadata_writeback, resolver_chain, metadata_precedence, default_cover_policy, created_at;
 
+-- name: LockLibraryForDelete :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR UPDATE;
+
+-- name: LibraryHasCatalogueRows :one
+SELECT (
+    EXISTS (SELECT 1 FROM series s WHERE s.library_id = $1)
+    OR EXISTS (SELECT 1 FROM volumes v WHERE v.library_id = $1)
+)::boolean AS has_rows;
+
 -- name: DeleteLibrary :execrows
 DELETE FROM libraries
 WHERE id = $1;

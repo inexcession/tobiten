@@ -39,6 +39,10 @@ var (
 	// transaction (such as outbox publication sequencing) is called on a transaction-bound handle.
 	ErrRootRepositoryRequired = errors.New("non-transactional root repository required")
 
+	// ErrLibraryInUse is returned when deleting a library that still owns
+	// catalogue rows (series or volumes).
+	ErrLibraryInUse = errors.New("library still owns catalogue records")
+
 	// ErrLibraryRootInUse is returned when deleting a library root that still owns
 	// media_assets rows (protected by the non-cascading foreign key on media_assets.library_root_id).
 	ErrLibraryRootInUse = errors.New("library root still owns media assets")

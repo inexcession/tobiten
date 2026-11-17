@@ -14,6 +14,7 @@ import (
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func setupLibraryTestDB(t *testing.T) (*testdb.TestDB, *postgres.Transactor) {
@@ -617,4 +618,363 @@ func TestLibraryRepository_RootStatusDuplicatePathAndFK(t *testing.T) {
 	if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, rolledBackLibID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after transaction rollback, got %v", err)
 	}
+}
+
+func waitForLockWaiter(ctx context.Context, t *testing.T, db *testdb.TestDB, pidQuery string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := db.QueryRow(ctx, pidQuery).Scan(&waiting); err != nil {
+			t.Fatalf("polling lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for PostgreSQL lock contention (%s)", pidQuery)
+}
+
+func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupLibraryTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Create a user for reading_progress rows.
+	userID := domain.MustNewID()
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.Users().CreateUser(ctx, &domain.User{ID: userID, Username: "reader-delete-guard"})
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	t.Run("missing library returns ErrNotFound", func(t *testing.T) {
+		err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.Libraries().DeleteLibrary(ctx, domain.MustNewID())
+		})
+		if !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("DeleteLibrary(missing) = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("library with empty catalogue and empty roots deletes cleanly", func(t *testing.T) {
+		var libID, root1ID, root2ID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Empty With Roots", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			r1 := &domain.LibraryRoot{LibraryID: libID, Path: mustRootPath(t, []byte("/mnt/empty-1"))}
+			r2 := &domain.LibraryRoot{LibraryID: libID, Path: mustRootPath(t, []byte("/mnt/empty-2"))}
+			if err := tx.Libraries().CreateLibraryRoot(ctx, r1); err != nil {
+				return err
+			}
+			if err := tx.Libraries().CreateLibraryRoot(ctx, r2); err != nil {
+				return err
+			}
+			root1ID, root2ID = r1.ID, r2.ID
+			return nil
+		}); err != nil {
+			t.Fatalf("setup empty library with roots: %v", err)
+		}
+
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.Libraries().DeleteLibrary(ctx, libID)
+		}); err != nil {
+			t.Fatalf("DeleteLibrary(empty with roots): %v", err)
+		}
+
+		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, libID); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected deleted library ErrNotFound, got %v", err)
+		}
+		for _, rid := range []string{root1ID, root2ID} {
+			if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryRootByID(ctx, rid); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("expected cascaded empty root %s ErrNotFound, got %v", rid, err)
+			}
+		}
+	})
+
+	t.Run("refuses library with zero-asset standalone volume and reading progress", func(t *testing.T) {
+		var libID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Standalone Volume Lib", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			return tx.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+				LibraryID: libID,
+				Path:      mustRootPath(t, []byte("/mnt/standalone-vol")),
+			})
+		}); err != nil {
+			t.Fatalf("setup standalone library: %v", err)
+		}
+
+		volID := domain.MustNewID()
+		if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, volID, libID); err != nil {
+			t.Fatalf("insert standalone volume: %v", err)
+		}
+		if _, err := db.Exec(ctx, `
+			INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
+			VALUES ($1, $2, '{"type":"page","page":12}'::jsonb, 0.5, 'REST', FALSE)`,
+			userID, volID,
+		); err != nil {
+			t.Fatalf("insert reading_progress: %v", err)
+		}
+
+		err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.Libraries().DeleteLibrary(ctx, libID)
+		})
+		if !errors.Is(err, storage.ErrLibraryInUse) {
+			t.Fatalf("DeleteLibrary(standalone zero-asset volume) = %v, want ErrLibraryInUse", err)
+		}
+		if errors.Is(err, storage.ErrLibraryRootInUse) {
+			t.Fatalf("ErrLibraryInUse must be distinct from ErrLibraryRootInUse")
+		}
+
+		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, libID); err != nil {
+			t.Fatalf("library should remain after rejected delete: %v", err)
+		}
+		var volCount, progCount int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM volumes WHERE id = $1`, volID).Scan(&volCount); err != nil {
+			t.Fatalf("count volume: %v", err)
+		}
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM reading_progress WHERE user_id = $1 AND volume_id = $2`, userID, volID).Scan(&progCount); err != nil {
+			t.Fatalf("count reading_progress: %v", err)
+		}
+		if volCount != 1 || progCount != 1 {
+			t.Fatalf("expected volume and reading_progress preserved, got vol=%d prog=%d", volCount, progCount)
+		}
+	})
+
+	t.Run("refuses library with series without volumes", func(t *testing.T) {
+		var libID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Empty Series Lib", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			return nil
+		}); err != nil {
+			t.Fatalf("setup series-only library: %v", err)
+		}
+
+		seriesID := domain.MustNewID()
+		if _, err := db.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, $2, 'Dorohedoro', 'Dorohedoro')`, seriesID, libID); err != nil {
+			t.Fatalf("insert series: %v", err)
+		}
+
+		err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.Libraries().DeleteLibrary(ctx, libID)
+		})
+		if !errors.Is(err, storage.ErrLibraryInUse) {
+			t.Fatalf("DeleteLibrary(series without volumes) = %v, want ErrLibraryInUse", err)
+		}
+
+		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, libID); err != nil {
+			t.Fatalf("library should remain after rejected delete: %v", err)
+		}
+		var seriesCount int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM series WHERE id = $1`, seriesID).Scan(&seriesCount); err != nil {
+			t.Fatalf("count series: %v", err)
+		}
+		if seriesCount != 1 {
+			t.Fatalf("expected series preserved, got count=%d", seriesCount)
+		}
+	})
+
+	t.Run("concurrent volume and progress insert blocks DeleteLibrary and survives", func(t *testing.T) {
+		var libID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Concurrent Insert Wins Lib", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			return nil
+		}); err != nil {
+			t.Fatalf("setup concurrent insert library: %v", err)
+		}
+
+		insertTx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin insertTx: %v", err)
+		}
+		defer func() { _ = insertTx.Rollback(ctx) }()
+
+		volID := domain.MustNewID()
+		if _, err := insertTx.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, volID, libID); err != nil {
+			t.Fatalf("insertTx insert volume: %v", err)
+		}
+		if _, err := insertTx.Exec(ctx, `
+			INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
+			VALUES ($1, $2, '{"type":"page","page":3}'::jsonb, 0.25, 'REST', FALSE)`,
+			userID, volID,
+		); err != nil {
+			t.Fatalf("insertTx insert reading_progress: %v", err)
+		}
+
+		deleteDone := make(chan error, 1)
+		go func() {
+			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.Libraries().DeleteLibrary(ctx, libID)
+			})
+		}()
+
+		waitForLockWaiter(ctx, t, db, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%FOR UPDATE%'
+			)`)
+
+		if err := insertTx.Commit(ctx); err != nil {
+			t.Fatalf("commit insertTx: %v", err)
+		}
+
+		delErr := <-deleteDone
+		if !errors.Is(delErr, storage.ErrLibraryInUse) {
+			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", delErr)
+		}
+
+		if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryByID(ctx, libID); err != nil {
+			t.Fatalf("library should remain after concurrent insert commit: %v", err)
+		}
+		var volCount, progCount int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM volumes WHERE id = $1`, volID).Scan(&volCount); err != nil {
+			t.Fatalf("count volume: %v", err)
+		}
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM reading_progress WHERE user_id = $1 AND volume_id = $2`, userID, volID).Scan(&progCount); err != nil {
+			t.Fatalf("count reading_progress: %v", err)
+		}
+		if volCount != 1 || progCount != 1 {
+			t.Fatalf("expected volume and reading_progress preserved after race, got vol=%d prog=%d", volCount, progCount)
+		}
+	})
+
+	t.Run("concurrent series insert blocks DeleteLibrary and survives", func(t *testing.T) {
+		var libID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Concurrent Series Insert Lib", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			return nil
+		}); err != nil {
+			t.Fatalf("setup concurrent series insert library: %v", err)
+		}
+
+		insertTx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin insertTx: %v", err)
+		}
+		defer func() { _ = insertTx.Rollback(ctx) }()
+
+		seriesID := domain.MustNewID()
+		if _, err := insertTx.Exec(ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, $2, 'Akira', 'Akira')`, seriesID, libID); err != nil {
+			t.Fatalf("insertTx insert series: %v", err)
+		}
+
+		deleteDone := make(chan error, 1)
+		go func() {
+			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.Libraries().DeleteLibrary(ctx, libID)
+			})
+		}()
+
+		waitForLockWaiter(ctx, t, db, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%FOR UPDATE%'
+			)`)
+
+		if err := insertTx.Commit(ctx); err != nil {
+			t.Fatalf("commit insertTx: %v", err)
+		}
+
+		delErr := <-deleteDone
+		if !errors.Is(delErr, storage.ErrLibraryInUse) {
+			t.Fatalf("concurrent DeleteLibrary = %v, want ErrLibraryInUse", delErr)
+		}
+		var seriesCount int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM series WHERE id = $1`, seriesID).Scan(&seriesCount); err != nil {
+			t.Fatalf("count series: %v", err)
+		}
+		if seriesCount != 1 {
+			t.Fatalf("expected series preserved after race, got count=%d", seriesCount)
+		}
+	})
+
+	t.Run("DeleteLibrary lock blocks concurrent insert until commit then insert fails FK", func(t *testing.T) {
+		var libID string
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib := &domain.Library{Name: "Concurrent Delete Wins Lib", Mode: domain.LibraryModeVirtual}
+			if err := tx.Libraries().CreateLibrary(ctx, lib); err != nil {
+				return err
+			}
+			libID = lib.ID
+			return nil
+		}); err != nil {
+			t.Fatalf("setup concurrent delete-wins library: %v", err)
+		}
+
+		deleteLocked := make(chan struct{})
+		releaseDelete := make(chan struct{})
+		deleteDone := make(chan error, 1)
+		go func() {
+			deleteDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
+				if err := tx.Libraries().DeleteLibrary(ctx, libID); err != nil {
+					return err
+				}
+				close(deleteLocked)
+				<-releaseDelete
+				return nil
+			})
+		}()
+
+		<-deleteLocked
+
+		insertDone := make(chan error, 1)
+		go func() {
+			_, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, domain.MustNewID(), libID)
+			insertDone <- err
+		}()
+
+		waitForLockWaiter(ctx, t, db, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%INSERT INTO volumes%'
+			)`)
+
+		close(releaseDelete)
+
+		if err := <-deleteDone; err != nil {
+			t.Fatalf("DeleteLibrary commit failed: %v", err)
+		}
+		insErr := <-insertDone
+		var pgErr *pgconn.PgError
+		if !errors.As(insErr, &pgErr) || pgErr.Code != "23503" {
+			t.Fatalf("expected FK violation 23503 for concurrent insert after committed delete, got %v", insErr)
+		}
+	})
 }
