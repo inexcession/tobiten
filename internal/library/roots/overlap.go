@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/library/paths"
 	"github.com/inexcession/tobiten/internal/storage"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrPathOverlap is returned when a candidate root or intake path is equal to,
@@ -111,8 +114,14 @@ func resolveAndInspectDirectory(raw []byte) ([]byte, *pathIdentityInfo, error) {
 	return canon, info, nil
 }
 
+type lookupSemantics struct {
+	caseInsensitive bool
+	normInsensitive bool
+}
+
 type pathIdentityInfo struct {
 	ancestors []os.FileInfo
+	leafPath  string
 	tail      [][]byte
 }
 
@@ -134,6 +143,7 @@ func inspectPathIdentity(canonicalPath []byte, requireDir bool) (*pathIdentityIn
 	ancestors := make([]os.FileInfo, 1, 1+len(comps))
 	ancestors[0] = rootInfo
 	cur := "/"
+	leafPath := "/"
 	var tail [][]byte
 
 	for i, comp := range comps {
@@ -155,10 +165,12 @@ func inspectPathIdentity(canonicalPath []byte, requireDir bool) (*pathIdentityIn
 			return nil, fmt.Errorf("%w: path %q is not a directory", app.ErrInvalidInput, cur)
 		}
 		ancestors = append(ancestors, fi)
+		leafPath = cur
 	}
 
 	return &pathIdentityInfo{
 		ancestors: ancestors,
+		leafPath:  leafPath,
 		tail:      tail,
 	}, nil
 }
@@ -184,7 +196,8 @@ func identitiesOverlap(a, b *pathIdentityInfo) bool {
 		if !os.SameFile(a.leaf(), b.leaf()) {
 			return false
 		}
-		return hasComponentPrefix(a.tail, b.tail) || hasComponentPrefix(b.tail, a.tail)
+		sem := directoryLookupSemantics(a.leafPath)
+		return hasComponentPrefix(a.tail, b.tail, sem) || hasComponentPrefix(b.tail, a.tail, sem)
 	}
 }
 
@@ -232,12 +245,61 @@ func CanonicalPathsOverlap(a, b []byte) (bool, error) {
 	return identitiesOverlap(infoA, infoB), nil
 }
 
-func hasComponentPrefix(prefix, target [][]byte) bool {
+func hasComponentPrefix(prefix, target [][]byte, sem lookupSemantics) bool {
 	if len(prefix) > len(target) {
 		return false
 	}
 	for i := range prefix {
-		if !bytes.Equal(prefix[i], target[i]) {
+		if !componentEqual(prefix[i], target[i], sem) {
+			return false
+		}
+	}
+	return true
+}
+
+func componentEqual(a, b []byte, sem lookupSemantics) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	if !sem.caseInsensitive && !sem.normInsensitive {
+		return false
+	}
+	if !utf8.Valid(a) || !utf8.Valid(b) {
+		if sem.caseInsensitive {
+			return asciiFoldEqual(a, b)
+		}
+		return false
+	}
+	sa, sb := string(a), string(b)
+	if sem.normInsensitive {
+		sa = norm.NFC.String(sa)
+		sb = norm.NFC.String(sb)
+	}
+	if sem.caseInsensitive {
+		fold := cases.Fold()
+		sa = fold.String(sa)
+		sb = fold.String(sb)
+		if sem.normInsensitive {
+			sa = norm.NFC.String(sa)
+			sb = norm.NFC.String(sb)
+		}
+	}
+	return sa == sb
+}
+
+func asciiFoldEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
 			return false
 		}
 	}

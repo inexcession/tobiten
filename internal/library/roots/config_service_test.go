@@ -979,7 +979,11 @@ func TestConfigService_IsolationContract(t *testing.T) {
 		}()
 
 		if err := pollAdvisoryLockWaiter(subCtx, db, req2Done); err != nil {
-			t.Fatalf("waiting for rrSvc lock: %v (req2Err=%v)", err, req2Err)
+			subCancel()
+			closeRelease()
+			<-tx1Done
+			<-req2Done
+			t.Fatalf("waiting for rrSvc lock: %v (tx1Err=%v req2Err=%v)", err, tx1Err, req2Err)
 		}
 		closeRelease()
 
@@ -1181,7 +1185,11 @@ func TestConfigService_IsolationContract(t *testing.T) {
 		}()
 
 		if err := pollAdvisoryLockWaiter(subCtx, db, callerDone); err != nil {
-			t.Fatalf("waiting for callerSvc lock: %v (callerErr=%v)", err, callerErr)
+			subCancel()
+			closeRelease()
+			<-tx1Done
+			<-callerDone
+			t.Fatalf("waiting for callerSvc lock: %v (tx1Err=%v callerErr=%v)", err, tx1Err, callerErr)
 		}
 		closeRelease()
 
@@ -1371,6 +1379,169 @@ func TestConfigService_CaseAndNormalizationAliases(t *testing.T) {
 	}
 	if len(storedLibs) != wantLibs {
 		t.Fatalf("storedLibs count = %d, want %d (%+v)", len(storedLibs), wantLibs, storedLibs)
+	}
+
+	assertSnapshotIdentical(t, canonBase, before)
+}
+
+func TestConfigService_MissingDirectoryAliases(t *testing.T) {
+	t.Parallel()
+	db, _, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath(base): %v", err)
+	}
+	before := captureSnapshot(t, canonBase)
+
+	missingUpper := filepath.Join(canonBase, "Future")
+	missingLower := filepath.Join(canonBase, "future")
+	missingLowerChild := filepath.Join(missingLower, "child")
+	missingNFD := filepath.Join(canonBase, "MissingCafe\u0301")
+	missingNFC := filepath.Join(canonBase, "MissingCaf\u00e9")
+	missingNFCChild := filepath.Join(missingNFC, "child")
+
+	// Probe whether the mounted filesystem folds case or NFC/NFD by checking an already-existing
+	// probe pair in an isolated sibling directory, or testing via CheckPathOverlap-free probe?
+	// Wait: without write probes in canonBase, create an isolated probe dir outside canonBase to
+	// assert whether the host OS mount aliases case/NFC-NFD, while keeping canonBase untouched.
+	probeBase := t.TempDir()
+	probeUpper := filepath.Join(probeBase, "Probe")
+	probeNFD := filepath.Join(probeBase, "ProbeCafe\u0301")
+	for _, d := range []string{probeUpper, probeNFD} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+	uInfo, err := os.Lstat(probeUpper)
+	if err != nil {
+		t.Fatalf("Lstat(probeUpper): %v", err)
+	}
+	lInfo, lErr := os.Lstat(filepath.Join(probeBase, "probe"))
+	caseAliased := lErr == nil && os.SameFile(uInfo, lInfo)
+
+	nfdInfo, err := os.Lstat(probeNFD)
+	if err != nil {
+		t.Fatalf("Lstat(probeNFD): %v", err)
+	}
+	nfcInfo, nfcErr := os.Lstat(filepath.Join(probeBase, "ProbeCaf\u00e9"))
+	normAliased := nfcErr == nil && os.SameFile(nfdInfo, nfcInfo)
+
+	created, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:       "Missing Alias Lib",
+		Mode:       domain.LibraryModeManaged,
+		IntakePath: []byte(missingNFD),
+		Roots:      [][]byte{[]byte(missingUpper)},
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary(Missing Alias Lib): %v", err)
+	}
+	if string(created.Roots[0].Path.Bytes) != missingUpper {
+		t.Fatalf("stored root bytes = %q, want %q", created.Roots[0].Path.Bytes, missingUpper)
+	}
+	if created.Library.IntakePath == nil || string(created.Library.IntakePath.Bytes) != missingNFD {
+		t.Fatalf("stored intake bytes = %+v, want %q", created.Library.IntakePath, missingNFD)
+	}
+
+	otherManagedDir := filepath.Join(canonBase, "OtherManagedIntake")
+	created2, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:       "Missing Alias Lib 2",
+		Mode:       domain.LibraryModeManaged,
+		IntakePath: []byte(otherManagedDir),
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary(Missing Alias Lib 2): %v", err)
+	}
+
+	if caseAliased {
+		for _, aliasPath := range [][]byte{[]byte(missingLower), []byte(missingLowerChild)} {
+			if _, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+				Name:  fmt.Sprintf("Case Conflict %s", aliasPath),
+				Roots: [][]byte{aliasPath},
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("CreateLibrary(missing case alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+			if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+				LibraryID: created.Library.ID,
+				Path:      aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("AddRoot(missing case alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+			if _, err := svc.SetManagedIntakePath(ctx, admin, app.SetManagedIntakePathRequest{
+				LibraryID:  created.Library.ID,
+				IntakePath: aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("SetManagedIntakePath(missing case alias %q vs own root) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+		}
+	} else {
+		distinct, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+			Name:  "Distinct Missing Lower Lib",
+			Roots: [][]byte{[]byte(missingLowerChild)},
+		})
+		if err != nil {
+			t.Fatalf("CreateLibrary(distinct missing lower on sensitive fs): %v", err)
+		}
+		if string(distinct.Roots[0].Path.Bytes) != missingLowerChild {
+			t.Fatalf("stored distinct lower bytes = %q, want %q", distinct.Roots[0].Path.Bytes, missingLowerChild)
+		}
+	}
+
+	if normAliased {
+		for _, aliasPath := range [][]byte{[]byte(missingNFC), []byte(missingNFCChild)} {
+			if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+				LibraryID: created.Library.ID,
+				Path:      aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("AddRoot(missing norm alias %q) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+			if _, err := svc.SetManagedIntakePath(ctx, admin, app.SetManagedIntakePathRequest{
+				LibraryID:  created2.Library.ID,
+				IntakePath: aliasPath,
+			}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+				t.Fatalf("SetManagedIntakePath(missing norm alias %q vs other library intake) = %v, want ErrConflict + ErrPathOverlap", aliasPath, err)
+			}
+		}
+	} else {
+		distinctNFC, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+			Name:  "Distinct Missing NFC Lib",
+			Roots: [][]byte{[]byte(missingNFCChild)},
+		})
+		if err != nil {
+			t.Fatalf("CreateLibrary(distinct missing NFC on sensitive fs): %v", err)
+		}
+		if string(distinctNFC.Roots[0].Path.Bytes) != missingNFCChild {
+			t.Fatalf("stored distinct NFC bytes = %q, want %q", distinctNFC.Roots[0].Path.Bytes, missingNFCChild)
+		}
+	}
+
+	// Disjoint missing sibling succeeds on all filesystems.
+	disjointSibling := filepath.Join(canonBase, "Future2")
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      []byte(disjointSibling),
+	}); err != nil {
+		t.Fatalf("AddRoot(disjoint missing sibling): %v", err)
+	}
+
+	// Verify persisted libraries count matches expected sensitive/aliasing outcome.
+	storedLibs, err := postgres.NewLibraryRepository(db.Pool).ListLibraries(ctx)
+	if err != nil {
+		t.Fatalf("ListLibraries: %v", err)
+	}
+	wantLibs := 2
+	if !caseAliased {
+		wantLibs++
+	}
+	if !normAliased {
+		wantLibs++
+	}
+	if len(storedLibs) != wantLibs {
+		t.Fatalf("storedLibs = %d, want %d (%+v)", len(storedLibs), wantLibs, storedLibs)
 	}
 
 	assertSnapshotIdentical(t, canonBase, before)

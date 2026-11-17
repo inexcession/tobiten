@@ -367,3 +367,129 @@ func TestCheckPathOverlap_CaseAndNormalizationAliases(t *testing.T) {
 
 	assertTreeUnchanged(t, canonBase, before)
 }
+
+func TestComponentEqual_LookupSemantics(t *testing.T) {
+	t.Parallel()
+
+	sensitive := lookupSemantics{caseInsensitive: false, normInsensitive: false}
+	caseOnly := lookupSemantics{caseInsensitive: true, normInsensitive: false}
+	normOnly := lookupSemantics{caseInsensitive: false, normInsensitive: true}
+	both := lookupSemantics{caseInsensitive: true, normInsensitive: true}
+
+	if componentEqual([]byte("Future"), []byte("future"), sensitive) {
+		t.Fatal("sensitive should distinguish Future and future")
+	}
+	if !componentEqual([]byte("Future"), []byte("future"), caseOnly) {
+		t.Fatal("caseOnly should match Future and future")
+	}
+	if componentEqual([]byte("Cafe\u0301"), []byte("Caf\u00e9"), caseOnly) {
+		t.Fatal("caseOnly should distinguish NFD and NFC")
+	}
+	if !componentEqual([]byte("Cafe\u0301"), []byte("Caf\u00e9"), normOnly) {
+		t.Fatal("normOnly should match NFD and NFC")
+	}
+	if componentEqual([]byte("Cafe\u0301"), []byte("caf\u00e9"), normOnly) {
+		t.Fatal("normOnly should distinguish uppercase and lowercase")
+	}
+	if !componentEqual([]byte("Cafe\u0301"), []byte("caf\u00e9"), both) {
+		t.Fatal("both should match NFD uppercase and NFC lowercase")
+	}
+	if componentEqual([]byte{0xff}, []byte{0xfe}, both) {
+		t.Fatal("distinct invalid UTF-8 bytes must never falsely collide")
+	}
+	if !componentEqual([]byte{'A', 0xff}, []byte{'a', 0xff}, both) {
+		t.Fatal("matching invalid UTF-8 bytes with ASCII case fold should match under caseInsensitive")
+	}
+}
+
+func TestCheckPathOverlap_MissingDirectoryAliases(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath(base): %v", err)
+	}
+
+	before := snapshotTree(t, canonBase)
+	sem := directoryLookupSemantics(canonBase)
+
+	missingUpper := filepath.Join(canonBase, "Future")
+	missingLower := filepath.Join(canonBase, "future")
+	missingLowerChild := filepath.Join(missingLower, "child")
+	missingUpperChild := filepath.Join(missingUpper, "child")
+
+	missingNFD := filepath.Join(canonBase, "MissingCafe\u0301")
+	missingNFC := filepath.Join(canonBase, "MissingCaf\u00e9")
+	missingNFCChild := filepath.Join(missingNFC, "child")
+	missingNFDChild := filepath.Join(missingNFD, "child")
+
+	existing := []ExistingPath{
+		{LibraryID: "lib-miss-case", RootID: "r-miss-case", Kind: PathKindRoot, Path: []byte(missingUpper)},
+		{LibraryID: "lib-miss-norm", RootID: "r-miss-norm", Kind: PathKindRoot, Path: []byte(missingNFD)},
+	}
+
+	if sem.caseInsensitive {
+		for _, cand := range [][]byte{[]byte(missingLower), []byte(missingLowerChild)} {
+			if _, err := CheckPathOverlap(cand, existing); !errors.Is(err, app.ErrConflict) || !errors.Is(err, ErrPathOverlap) {
+				t.Fatalf("missing case alias %q: err = %v, want ErrConflict + ErrPathOverlap", cand, err)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(missingLower), []ExistingPath{
+			{LibraryID: "lib-miss-child", RootID: "r-miss-child", Kind: PathKindRoot, Path: []byte(missingUpperChild)},
+		}); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("missing case ancestor %q vs %q: want ErrPathOverlap, got %v", missingLower, missingUpperChild, err)
+		}
+	} else {
+		for _, cand := range [][]byte{[]byte(missingLower), []byte(missingLowerChild)} {
+			canon, err := CheckPathOverlap(cand, existing)
+			if err != nil {
+				t.Fatalf("distinct missing case path %q on sensitive fs rejected: %v", cand, err)
+			}
+			if !bytes.Equal(canon, cand) {
+				t.Fatalf("raw bytes changed: got %q want %q", canon, cand)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(missingUpperChild), existing); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("same-spelling missing child %q: want ErrPathOverlap, got %v", missingUpperChild, err)
+		}
+	}
+
+	if sem.normInsensitive {
+		for _, cand := range [][]byte{[]byte(missingNFC), []byte(missingNFCChild)} {
+			if _, err := CheckPathOverlap(cand, existing); !errors.Is(err, app.ErrConflict) || !errors.Is(err, ErrPathOverlap) {
+				t.Fatalf("missing norm alias %q: err = %v, want ErrConflict + ErrPathOverlap", cand, err)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(missingNFC), []ExistingPath{
+			{LibraryID: "lib-miss-norm-child", RootID: "r-miss-norm-child", Kind: PathKindRoot, Path: []byte(missingNFDChild)},
+		}); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("missing norm ancestor %q vs %q: want ErrPathOverlap, got %v", missingNFC, missingNFDChild, err)
+		}
+	} else {
+		for _, cand := range [][]byte{[]byte(missingNFC), []byte(missingNFCChild)} {
+			canon, err := CheckPathOverlap(cand, existing)
+			if err != nil {
+				t.Fatalf("distinct missing norm path %q on sensitive fs rejected: %v", cand, err)
+			}
+			if !bytes.Equal(canon, cand) {
+				t.Fatalf("raw bytes changed: got %q want %q", canon, cand)
+			}
+		}
+		if _, err := CheckPathOverlap([]byte(missingNFDChild), existing); !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("same-spelling missing norm child %q: want ErrPathOverlap, got %v", missingNFDChild, err)
+		}
+	}
+
+	// Disjoint missing siblings remain accepted on all mounts.
+	for _, sibling := range [][]byte{
+		[]byte(filepath.Join(canonBase, "Future2")),
+		[]byte(filepath.Join(canonBase, "future2", "child")),
+		[]byte(filepath.Join(canonBase, "MissingCaf\u00e92")),
+	} {
+		if _, err := CheckPathOverlap(sibling, existing); err != nil {
+			t.Fatalf("disjoint missing sibling %q rejected: %v", sibling, err)
+		}
+	}
+
+	assertTreeUnchanged(t, canonBase, before)
+}
