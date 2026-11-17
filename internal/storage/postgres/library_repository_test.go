@@ -1064,3 +1064,95 @@ func TestLibraryRepository_DeleteLibraryCatalogueGuardAndConcurrency(t *testing.
 		}
 	})
 }
+
+func TestLibraryRepository_LockConfiguration(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupLibraryTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Non-transactional pool repository must fail closed with ErrTransactionRequired.
+	if err := postgres.NewLibraryRepository(db.Pool).LockConfiguration(ctx); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("LockConfiguration(pool) = %v, want ErrTransactionRequired", err)
+	}
+
+	subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer subCancel()
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+
+	var tx1Err error
+	tx1Done := make(chan struct{})
+	go func() {
+		defer close(tx1Done)
+		tx1Err = transactor.WithTx(subCtx, func(tx storage.Tx) error {
+			if err := tx.Libraries().LockConfiguration(subCtx); err != nil {
+				return err
+			}
+			close(locked)
+			select {
+			case <-release:
+				return subCtx.Err()
+			case <-subCtx.Done():
+				return subCtx.Err()
+			}
+		})
+	}()
+
+	var tx2Err error
+	tx2Done := make(chan struct{})
+	tx2Started := false
+	defer func() {
+		subCancel()
+		closeRelease()
+		<-tx1Done
+		if tx2Started {
+			<-tx2Done
+		}
+	}()
+
+	select {
+	case <-locked:
+	case <-tx1Done:
+		t.Fatalf("tx1 exited before acquiring lock: %v", tx1Err)
+	case <-subCtx.Done():
+		t.Fatalf("timed out waiting for tx1 lock: %v", subCtx.Err())
+	}
+
+	tx2Started = true
+	go func() {
+		defer close(tx2Done)
+		tx2Err = transactor.WithTx(subCtx, func(tx storage.Tx) error {
+			return tx.Libraries().LockConfiguration(subCtx)
+		})
+	}()
+
+	if err := waitForLockWaiter(subCtx, db, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND wait_event = 'advisory'
+		)`, tx2Done); err != nil {
+		t.Fatalf("expected tx2 to block on advisory lock: %v", err)
+	}
+
+	closeRelease()
+	<-tx1Done
+	if tx1Err != nil {
+		t.Fatalf("tx1 failed: %v", tx1Err)
+	}
+	<-tx2Done
+	if tx2Err != nil {
+		t.Fatalf("tx2 failed after tx1 released: %v", tx2Err)
+	}
+}

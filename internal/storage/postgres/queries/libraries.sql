@@ -117,3 +117,6 @@ WHERE id = $1;
 -- name: DeleteLibraryRoot :execrows
 DELETE FROM library_roots
 WHERE id = $1;
+
+-- name: AcquireLibraryConfigLock :exec
+SELECT pg_advisory_xact_lock($1::bigint);

@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+const acquireLibraryConfigLock = `-- name: AcquireLibraryConfigLock :exec
+SELECT pg_advisory_xact_lock($1::bigint)
+`
+
+func (q *Queries) AcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) error {
+	_, err := q.db.Exec(ctx, acquireLibraryConfigLock, dollar_1)
+	return err
+}
+
 const createLibrary = `-- name: CreateLibrary :one
 INSERT INTO libraries (
     id,

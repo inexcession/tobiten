@@ -12,6 +12,7 @@ import (
 )
 
 type Querier interface {
+	AcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) error
 	AppendDomainEvent(ctx context.Context, arg AppendDomainEventParams) (DomainEvent, error)
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error

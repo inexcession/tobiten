@@ -25,4 +25,7 @@ type LibraryRepository interface {
 	UpdateLibraryRoot(ctx context.Context, root *domain.LibraryRoot) error
 	UpdateLibraryRootStatus(ctx context.Context, id string, state domain.LibraryRootState, checkedAt time.Time, lastError *string) error
 	DeleteLibraryRoot(ctx context.Context, id string) error
+
+	// Configuration serialization
+	LockConfiguration(ctx context.Context) error
 }

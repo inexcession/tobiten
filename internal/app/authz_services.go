@@ -28,6 +28,9 @@ func NewAuthorizingServices(next *Services) *Services {
 	if next.Library != nil {
 		out.Library = NewAuthorizingLibraryService(next.Library)
 	}
+	if next.LibraryConfig != nil {
+		out.LibraryConfig = NewAuthorizingLibraryConfigService(next.LibraryConfig)
+	}
 	if next.Reading != nil {
 		out.Reading = NewAuthorizingReadingService(next.Reading)
 	}
@@ -109,6 +112,42 @@ func (s *authorizingLibraryService) ScanLibrary(ctx context.Context, principal *
 			return "", ErrNotImplemented
 		}
 		return s.next.ScanLibrary(ctx, principal, libraryID)
+	})
+}
+
+type authorizingLibraryConfigService struct {
+	next LibraryConfigService
+}
+
+// NewAuthorizingLibraryConfigService wraps next with library:admin permission checks on every method.
+func NewAuthorizingLibraryConfigService(next LibraryConfigService) LibraryConfigService {
+	return &authorizingLibraryConfigService{next: next}
+}
+
+func (s *authorizingLibraryConfigService) CreateLibrary(ctx context.Context, principal *domain.Principal, req CreateLibraryRequest) (*CreateLibraryResult, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryAdmin, func() (*CreateLibraryResult, error) {
+		if s.next == nil {
+			return nil, ErrNotImplemented
+		}
+		return s.next.CreateLibrary(ctx, principal, req)
+	})
+}
+
+func (s *authorizingLibraryConfigService) AddRoot(ctx context.Context, principal *domain.Principal, req AddLibraryRootRequest) (*domain.LibraryRoot, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryAdmin, func() (*domain.LibraryRoot, error) {
+		if s.next == nil {
+			return nil, ErrNotImplemented
+		}
+		return s.next.AddRoot(ctx, principal, req)
+	})
+}
+
+func (s *authorizingLibraryConfigService) SetManagedIntakePath(ctx context.Context, principal *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryAdmin, func() (*domain.Library, error) {
+		if s.next == nil {
+			return nil, ErrNotImplemented
+		}
+		return s.next.SetManagedIntakePath(ctx, principal, req)
 	})
 }
 

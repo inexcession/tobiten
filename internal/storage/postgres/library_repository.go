@@ -17,6 +17,10 @@ import (
 
 var _ storage.LibraryRepository = (*LibraryRepository)(nil)
 
+// libraryConfigLockID is a dedicated transaction-scoped advisory lock key ("tobitenL")
+// serializing root and intake path configuration checks and mutations across transactions.
+const libraryConfigLockID int64 = 0x746f626974656e4c
+
 // LibraryRepository implements storage.LibraryRepository backed by PostgreSQL and sqlc.
 type LibraryRepository struct {
 	q     *Queries
@@ -300,6 +304,19 @@ func (r *LibraryRepository) DeleteLibraryRoot(ctx context.Context, id string) er
 	}
 	if rows == 0 {
 		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// LockConfiguration acquires a transaction-scoped advisory lock that serializes
+// library root and intake path configuration checks and mutations. Pool-backed or
+// non-transactional repositories return storage.ErrTransactionRequired.
+func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
+	if r == nil || r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	if err := r.q.AcquireLibraryConfigLock(ctx, libraryConfigLockID); err != nil {
+		return mapPgError(err)
 	}
 	return nil
 }

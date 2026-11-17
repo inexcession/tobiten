@@ -20,15 +20,16 @@ var (
 // Services groups all core application service interfaces.
 // Protocol adapters (Komga, OPDS, native REST, MCP) call these services exclusively (ADR-0018 §1).
 type Services struct {
-	Setup       SetupService
-	BasicAuth   BasicAuthenticator
-	PATAuth     PATAuthenticator
-	Session     SessionService
-	SessionAuth SessionAuthenticator
-	Jobs        JobService
-	Events      EventService
-	Library     LibraryService
-	Reading     ReadingService
-	Curation    CurationService
-	Admin       AdminService
+	Setup         SetupService
+	BasicAuth     BasicAuthenticator
+	PATAuth       PATAuthenticator
+	Session       SessionService
+	SessionAuth   SessionAuthenticator
+	Jobs          JobService
+	Events        EventService
+	Library       LibraryService
+	LibraryConfig LibraryConfigService
+	Reading       ReadingService
+	Curation      CurationService
+	Admin         AdminService
 }

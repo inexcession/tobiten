@@ -845,3 +845,76 @@ func TestAuthorizingEventService_RequiresPrincipalAndDelegates(t *testing.T) {
 		t.Fatalf("Stream against nil delegate = %v, want ErrNotImplemented", err)
 	}
 }
+
+type spyLibraryConfigService struct {
+	calls int
+}
+
+func (s *spyLibraryConfigService) CreateLibrary(_ context.Context, _ *domain.Principal, req CreateLibraryRequest) (*CreateLibraryResult, error) {
+	s.calls++
+	return &CreateLibraryResult{Library: domain.Library{ID: "lib-1", Name: req.Name}}, nil
+}
+
+func (s *spyLibraryConfigService) AddRoot(_ context.Context, _ *domain.Principal, req AddLibraryRootRequest) (*domain.LibraryRoot, error) {
+	s.calls++
+	return &domain.LibraryRoot{ID: "root-1", LibraryID: req.LibraryID}, nil
+}
+
+func (s *spyLibraryConfigService) SetManagedIntakePath(_ context.Context, _ *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error) {
+	s.calls++
+	return &domain.Library{ID: req.LibraryID, Mode: domain.LibraryModeManaged}, nil
+}
+
+func TestAuthorizingLibraryConfigService_RequiresLibraryAdmin(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	spy := &spyLibraryConfigService{}
+	svcs := NewAuthorizingServices(&Services{LibraryConfig: spy})
+	if svcs.LibraryConfig == nil {
+		t.Fatal("expected LibraryConfig decorator to be wired")
+	}
+
+	if _, err := svcs.LibraryConfig.CreateLibrary(ctx, nil, CreateLibraryRequest{Name: "Manga"}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("CreateLibrary(nil) = %v, want ErrUnauthorized", err)
+	}
+	if _, err := svcs.LibraryConfig.AddRoot(ctx, nil, AddLibraryRootRequest{LibraryID: "lib-1", Path: []byte("/mnt/a")}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("AddRoot(nil) = %v, want ErrUnauthorized", err)
+	}
+	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, nil, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("SetManagedIntakePath(nil) = %v, want ErrUnauthorized", err)
+	}
+
+	curator := domain.NewPrincipal(testUser("u-curator"), []domain.Role{builtInRoleByID(t, domain.RoleCuratorID)}, domain.CredentialKindPassword, "cred-c", nil)
+	if _, err := svcs.LibraryConfig.CreateLibrary(ctx, curator, CreateLibraryRequest{Name: "Manga"}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("CreateLibrary(curator) = %v, want ErrForbidden", err)
+	}
+	if _, err := svcs.LibraryConfig.AddRoot(ctx, curator, AddLibraryRootRequest{LibraryID: "lib-1", Path: []byte("/mnt/a")}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("AddRoot(curator) = %v, want ErrForbidden", err)
+	}
+	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, curator, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("SetManagedIntakePath(curator) = %v, want ErrForbidden", err)
+	}
+	if spy.calls != 0 {
+		t.Fatalf("unauthorized/forbidden calls reached delegate %d times, want 0", spy.calls)
+	}
+
+	admin := domain.NewPrincipal(testUser("u-admin"), []domain.Role{builtInRoleByID(t, domain.RoleAdminID)}, domain.CredentialKindPassword, "cred-a", nil)
+	if _, err := svcs.LibraryConfig.CreateLibrary(ctx, admin, CreateLibraryRequest{Name: "Manga"}); err != nil {
+		t.Fatalf("CreateLibrary(admin) = %v, want nil", err)
+	}
+	if _, err := svcs.LibraryConfig.AddRoot(ctx, admin, AddLibraryRootRequest{LibraryID: "lib-1", Path: []byte("/mnt/a")}); err != nil {
+		t.Fatalf("AddRoot(admin) = %v, want nil", err)
+	}
+	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, admin, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); err != nil {
+		t.Fatalf("SetManagedIntakePath(admin) = %v, want nil", err)
+	}
+	if spy.calls != 3 {
+		t.Fatalf("authorized LibraryConfig delegate calls = %d, want 3", spy.calls)
+	}
+
+	nilCfg := NewAuthorizingLibraryConfigService(nil)
+	if _, err := nilCfg.CreateLibrary(ctx, admin, CreateLibraryRequest{Name: "Manga"}); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("CreateLibrary against nil delegate = %v, want ErrNotImplemented", err)
+	}
+}
