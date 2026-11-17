@@ -9,6 +9,8 @@ import (
 	"testing/fstest"
 
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/container"
+	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
@@ -398,5 +400,41 @@ func TestEventSubscriberSpec(t *testing.T) {
 	unsetSpec := EventSubscriberSpec{ID: "sub:unset", SubKind: "webhook"}
 	if _, err := unsetSpec.DeliverEvent(context.Background(), domain.DomainEvent{AggregateID: "ack-me"}); !errors.Is(err, ErrMissingSubscriberCallback) {
 		t.Errorf("DeliverEvent with nil DeliverFunc err = %v, want ErrMissingSubscriberCallback", err)
+	}
+}
+
+func TestRegistry_ContainerFormats(t *testing.T) {
+	reg := NewRegistry()
+	if got := reg.ContainerFormats(); len(got) != 0 {
+		t.Fatalf("empty registry ContainerFormats() = %d formats, want 0", len(got))
+	}
+	if err := reg.Register(&SimpleModule{ModuleName: "plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&SimpleModule{
+		ModuleName: "cbz",
+		Formats:    []container.Format{cbz.Format()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	formats := reg.ContainerFormats()
+	if len(formats) != 1 || formats[0].Name != cbz.FormatName {
+		t.Fatalf("ContainerFormats() = %+v, want only %q", formats, cbz.FormatName)
+	}
+
+	formatReg := container.NewFormatRegistry()
+	for _, f := range formats {
+		if err := formatReg.Register(f); err != nil {
+			t.Fatalf("Register(%q): %v", f.Name, err)
+		}
+	}
+	if len(formatReg.Formats()) != 1 {
+		t.Fatalf("format registry holds %d formats, want 1", len(formatReg.Formats()))
+	}
+
+	reg.SetEnabled("cbz", false)
+	if got := reg.ContainerFormats(); len(got) != 0 {
+		t.Fatalf("disabled module still provides %d formats", len(got))
 	}
 }

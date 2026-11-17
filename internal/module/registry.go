@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/container"
 	"github.com/inexcession/tobiten/internal/domain"
 )
 
@@ -203,6 +204,12 @@ type DeliveringEventSubscriber interface {
 	DeliverEvent(ctx context.Context, event domain.DomainEvent) (domain.EventDeliveryOutcome, error)
 }
 
+// ContainerFormatProvider indicates a module provides container backends that
+// register by content sniffing (ADR-0018 S8).
+type ContainerFormatProvider interface {
+	ContainerFormats() []container.Format
+}
+
 // Registry manages compiled-in modules, their lifecycle, route mounts, and extension seams.
 type Registry interface {
 	// Register registers a compiled-in module. Returns ErrDuplicateModule if already registered.
@@ -237,6 +244,9 @@ type Registry interface {
 
 	// EventSubscribers returns all EventSubscribers from enabled modules.
 	EventSubscribers() []EventSubscriber
+
+	// ContainerFormats returns all container formats from enabled modules.
+	ContainerFormats() []container.Format
 
 	// MigrationSources returns migration filesystems from ALL registered modules
 	// (both enabled and disabled), ensuring applied migrations are never missing (ADR-0018 §2).
@@ -432,6 +442,22 @@ func (r *registryImpl) EventSubscribers() []EventSubscriber {
 	return subs
 }
 
+func (r *registryImpl) ContainerFormats() []container.Format {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var formats []container.Format
+	for _, m := range r.modules {
+		if r.disabled[canonicalName(m.Name())] {
+			continue
+		}
+		if provider, ok := m.(ContainerFormatProvider); ok {
+			formats = append(formats, provider.ContainerFormats()...)
+		}
+	}
+	return formats
+}
+
 // MigrationSources returns migration filesystems from ALL registered modules
 // (both enabled and disabled). Disabling a module must not remove its migrations
 // from the sequence (ADR-0018 §2).
@@ -556,6 +582,7 @@ type SimpleModule struct {
 	Auths       []Authenticator
 	Jobs        []JobKind
 	Subscribers []EventSubscriber
+	Formats     []container.Format
 }
 
 // NewSimpleModule creates a new SimpleModule.
@@ -591,6 +618,10 @@ func (s *SimpleModule) JobKinds() []JobKind {
 
 func (s *SimpleModule) EventSubscribers() []EventSubscriber {
 	return s.Subscribers
+}
+
+func (s *SimpleModule) ContainerFormats() []container.Format {
+	return s.Formats
 }
 
 // NamedAuthenticator is a simple string-backed Authenticator descriptor.
