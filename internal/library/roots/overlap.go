@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/inexcession/tobiten/internal/app"
@@ -114,9 +116,68 @@ func resolveAndInspectDirectory(raw []byte) ([]byte, *pathIdentityInfo, error) {
 	return canon, info, nil
 }
 
+const (
+	linuxExtSuperMagic   uint32 = 0xEF53
+	linuxTmpfsMagic      uint32 = 0x01021994
+	linuxBtrfsSuperMagic uint32 = 0x9123683E
+	linuxCasefoldFlag           = 0x40000000 // FS_CASEFOLD_FL
+)
+
 type lookupSemantics struct {
-	caseInsensitive bool
-	normInsensitive bool
+	caseInsensitive        bool
+	normInsensitive        bool
+	ignoreDefaultIgnorable bool
+}
+
+func linuxStatfsSemantics(magic uint32, extFlags int, extFlagsErr error) lookupSemantics {
+	switch magic {
+	case linuxExtSuperMagic:
+		if extFlagsErr != nil || (extFlags&linuxCasefoldFlag) != 0 {
+			return lookupSemantics{
+				caseInsensitive:        true,
+				normInsensitive:        true,
+				ignoreDefaultIgnorable: true,
+			}
+		}
+		return lookupSemantics{caseInsensitive: false, normInsensitive: false, ignoreDefaultIgnorable: false}
+	case linuxTmpfsMagic, linuxBtrfsSuperMagic:
+		return lookupSemantics{caseInsensitive: false, normInsensitive: false, ignoreDefaultIgnorable: false}
+	default:
+		// Network, FUSE, overlay, or foreign mounts can alias case, normalization,
+		// or default-ignorable code points depending on backing storage; fail closed.
+		return lookupSemantics{
+			caseInsensitive:        true,
+			normInsensitive:        true,
+			ignoreDefaultIgnorable: true,
+		}
+	}
+}
+
+// defaultIgnorableRangeTable enumerates Unicode Default_Ignorable_Code_Point ranges,
+// which Linux fs/unicode (utf8ncasefold) strips during ext4 casefold normalization.
+var defaultIgnorableRangeTable = &unicode.RangeTable{
+	R16: []unicode.Range16{
+		{Lo: 0x00AD, Hi: 0x00AD, Stride: 1},
+		{Lo: 0x034F, Hi: 0x034F, Stride: 1},
+		{Lo: 0x061C, Hi: 0x061C, Stride: 1},
+		{Lo: 0x115F, Hi: 0x1160, Stride: 1},
+		{Lo: 0x17B4, Hi: 0x17B5, Stride: 1},
+		{Lo: 0x180B, Hi: 0x180F, Stride: 1},
+		{Lo: 0x200B, Hi: 0x200F, Stride: 1},
+		{Lo: 0x202A, Hi: 0x202E, Stride: 1},
+		{Lo: 0x2060, Hi: 0x206F, Stride: 1},
+		{Lo: 0x3164, Hi: 0x3164, Stride: 1},
+		{Lo: 0xFE00, Hi: 0xFE0F, Stride: 1},
+		{Lo: 0xFEFF, Hi: 0xFEFF, Stride: 1},
+		{Lo: 0xFFA0, Hi: 0xFFA0, Stride: 1},
+		{Lo: 0xFFF0, Hi: 0xFFF8, Stride: 1},
+	},
+	R32: []unicode.Range32{
+		{Lo: 0x1BCA0, Hi: 0x1BCA3, Stride: 1},
+		{Lo: 0x1D173, Hi: 0x1D17A, Stride: 1},
+		{Lo: 0xE0000, Hi: 0xE0FFF, Stride: 1},
+	},
+	LatinOffset: 1,
 }
 
 type pathIdentityInfo struct {
@@ -261,49 +322,52 @@ func componentEqual(a, b []byte, sem lookupSemantics) bool {
 	if bytes.Equal(a, b) {
 		return true
 	}
-	if !sem.caseInsensitive && !sem.normInsensitive {
+	if !sem.caseInsensitive && !sem.normInsensitive && !sem.ignoreDefaultIgnorable {
 		return false
 	}
+	// Non-strict ext4 (including casefold directories) and POSIX filesystems compare
+	// malformed UTF-8 names byte-for-byte rather than folding ASCII bytes inside them.
 	if !utf8.Valid(a) || !utf8.Valid(b) {
-		if sem.caseInsensitive {
-			return asciiFoldEqual(a, b)
-		}
 		return false
 	}
-	sa, sb := string(a), string(b)
-	if sem.normInsensitive {
-		sa = norm.NFC.String(sa)
-		sb = norm.NFC.String(sb)
-	}
-	if sem.caseInsensitive {
-		fold := cases.Fold()
-		sa = fold.String(sa)
-		sb = fold.String(sb)
-		if sem.normInsensitive {
-			sa = norm.NFC.String(sa)
-			sb = norm.NFC.String(sb)
-		}
-	}
-	return sa == sb
+	return normalizeComponent(string(a), sem) == normalizeComponent(string(b), sem)
 }
 
-func asciiFoldEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+func normalizeComponent(s string, sem lookupSemantics) string {
+	if sem.ignoreDefaultIgnorable {
+		s = stripDefaultIgnorable(s)
 	}
-	for i := range a {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
+	if sem.normInsensitive {
+		s = norm.NFC.String(s)
+	}
+	if sem.caseInsensitive {
+		s = cases.Fold().String(s)
+		if sem.normInsensitive {
+			s = norm.NFC.String(s)
 		}
 	}
-	return true
+	return s
+}
+
+func stripDefaultIgnorable(s string) string {
+	hasIgnorable := false
+	for _, r := range s {
+		if unicode.Is(defaultIgnorableRangeTable, r) {
+			hasIgnorable = true
+			break
+		}
+	}
+	if !hasIgnorable {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if !unicode.Is(defaultIgnorableRangeTable, r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // CheckPathOverlap resolves candidateRaw to its canonical POSIX path and rejects it

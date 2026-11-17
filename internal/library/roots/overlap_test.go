@@ -371,10 +371,21 @@ func TestCheckPathOverlap_CaseAndNormalizationAliases(t *testing.T) {
 func TestComponentEqual_LookupSemantics(t *testing.T) {
 	t.Parallel()
 
-	sensitive := lookupSemantics{caseInsensitive: false, normInsensitive: false}
-	caseOnly := lookupSemantics{caseInsensitive: true, normInsensitive: false}
-	normOnly := lookupSemantics{caseInsensitive: false, normInsensitive: true}
-	both := lookupSemantics{caseInsensitive: true, normInsensitive: true}
+	sensitive := linuxStatfsSemantics(linuxExtSuperMagic, 0, nil)
+	caseOnly := lookupSemantics{caseInsensitive: true, normInsensitive: false, ignoreDefaultIgnorable: false}
+	normOnly := lookupSemantics{caseInsensitive: false, normInsensitive: true, ignoreDefaultIgnorable: false}
+	ext4Casefold := linuxStatfsSemantics(linuxExtSuperMagic, linuxCasefoldFlag, nil)
+	ext4IoctlErr := linuxStatfsSemantics(linuxExtSuperMagic, 0, errors.New("ioctl failed"))
+	unknownMount := linuxStatfsSemantics(0xFF534D42, 0, nil)
+
+	if sensitive.caseInsensitive || sensitive.normInsensitive || sensitive.ignoreDefaultIgnorable {
+		t.Fatalf("standard ext4 should be byte-exact, got %+v", sensitive)
+	}
+	for _, sem := range []lookupSemantics{ext4Casefold, ext4IoctlErr, unknownMount} {
+		if !sem.caseInsensitive || !sem.normInsensitive || !sem.ignoreDefaultIgnorable {
+			t.Fatalf("expected full casefold/norm/ignorable semantics, got %+v", sem)
+		}
+	}
 
 	if componentEqual([]byte("Future"), []byte("future"), sensitive) {
 		t.Fatal("sensitive should distinguish Future and future")
@@ -391,14 +402,48 @@ func TestComponentEqual_LookupSemantics(t *testing.T) {
 	if componentEqual([]byte("Cafe\u0301"), []byte("caf\u00e9"), normOnly) {
 		t.Fatal("normOnly should distinguish uppercase and lowercase")
 	}
-	if !componentEqual([]byte("Cafe\u0301"), []byte("caf\u00e9"), both) {
-		t.Fatal("both should match NFD uppercase and NFC lowercase")
+	if !componentEqual([]byte("Cafe\u0301"), []byte("caf\u00e9"), ext4Casefold) {
+		t.Fatal("ext4Casefold should match NFD uppercase and NFC lowercase")
 	}
-	if componentEqual([]byte{0xff}, []byte{0xfe}, both) {
-		t.Fatal("distinct invalid UTF-8 bytes must never falsely collide")
+
+	// Default-ignorable code points (variation selectors, ZWSP, soft hyphen, CGJ) are stripped
+	// under ext4 casefold lookup.
+	for _, alias := range [][]byte{
+		[]byte("Manga\uFE0F"),
+		[]byte("manga\uFE0E"),
+		[]byte("MANGA\U000E0100"),
+		[]byte("man\u200Bga"),
+		[]byte("man\u00ADga"),
+		[]byte("man\u034Fga"),
+	} {
+		if !componentEqual([]byte("Manga"), alias, ext4Casefold) {
+			t.Fatalf("ext4Casefold should match Manga and %q", alias)
+		}
+		if componentEqual([]byte("Manga"), alias, sensitive) {
+			t.Fatalf("sensitive should distinguish Manga and %q", alias)
+		}
 	}
-	if !componentEqual([]byte{'A', 0xff}, []byte{'a', 0xff}, both) {
-		t.Fatal("matching invalid UTF-8 bytes with ASCII case fold should match under caseInsensitive")
+	// Variation selector between base letter and combining mark still composes after stripping.
+	if !componentEqual([]byte("Cafe\uFE0F\u0301"), []byte("caf\u00e9"), ext4Casefold) {
+		t.Fatal("ext4Casefold should match Cafe+VS16+combining-acute and café")
+	}
+	if !hasComponentPrefix(
+		[][]byte{[]byte("Future\uFE0F")},
+		[][]byte{[]byte("future"), []byte("child")},
+		ext4Casefold,
+	) {
+		t.Fatal("ext4Casefold should treat Future+VS16 as prefix of future/child")
+	}
+
+	// Non-strict ext4 compares malformed UTF-8 names byte-for-byte (never ASCII-folding them).
+	if componentEqual([]byte{0xff}, []byte{0xfe}, ext4Casefold) {
+		t.Fatal("distinct invalid UTF-8 bytes must never collide")
+	}
+	if componentEqual([]byte{'A', 0xff}, []byte{'a', 0xff}, ext4Casefold) {
+		t.Fatal("distinct malformed UTF-8 names differing in ASCII case must remain distinct")
+	}
+	if !componentEqual([]byte{'A', 0xff}, []byte{'A', 0xff}, ext4Casefold) {
+		t.Fatal("identical malformed UTF-8 names must match")
 	}
 }
 
@@ -478,6 +523,28 @@ func TestCheckPathOverlap_MissingDirectoryAliases(t *testing.T) {
 		if _, err := CheckPathOverlap([]byte(missingNFDChild), existing); !errors.Is(err, ErrPathOverlap) {
 			t.Fatalf("same-spelling missing norm child %q: want ErrPathOverlap, got %v", missingNFDChild, err)
 		}
+	}
+
+	if sem.ignoreDefaultIgnorable {
+		vsAlias := []byte(filepath.Join(canonBase, "Future\uFE0F", "child"))
+		if _, err := CheckPathOverlap(vsAlias, existing); !errors.Is(err, app.ErrConflict) || !errors.Is(err, ErrPathOverlap) {
+			t.Fatalf("missing variation-selector alias %q: err = %v, want ErrConflict + ErrPathOverlap", vsAlias, err)
+		}
+	}
+
+	// Malformed UTF-8 names differing in ASCII case remain byte-exact (distinct) on all mounts,
+	// while identical malformed byte prefixes still overlap.
+	malUpper := append([]byte(canonBase+"/Mal-"), 0xff)
+	malLowerChild := append(append([]byte(canonBase+"/mal-"), 0xff), []byte("/child")...)
+	malUpperChild := append(append([]byte{}, malUpper...), []byte("/child")...)
+	malExisting := []ExistingPath{
+		{LibraryID: "lib-mal", RootID: "r-mal", Kind: PathKindRoot, Path: malUpper},
+	}
+	if _, err := CheckPathOverlap(malLowerChild, malExisting); err != nil {
+		t.Fatalf("distinct malformed UTF-8 path %x should be accepted, got %v", malLowerChild, err)
+	}
+	if _, err := CheckPathOverlap(malUpperChild, malExisting); !errors.Is(err, ErrPathOverlap) {
+		t.Fatalf("identical malformed UTF-8 prefix %x should be rejected, got %v", malUpperChild, err)
 	}
 
 	// Disjoint missing siblings remain accepted on all mounts.

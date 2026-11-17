@@ -3,5 +3,9 @@
 package roots
 
 func directoryLookupSemantics(_ string) lookupSemantics {
-	return lookupSemantics{caseInsensitive: true, normInsensitive: true}
+	return lookupSemantics{
+		caseInsensitive:        true,
+		normInsensitive:        true,
+		ignoreDefaultIgnorable: true,
+	}
 }

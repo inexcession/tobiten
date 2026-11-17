@@ -1528,6 +1528,30 @@ func TestConfigService_MissingDirectoryAliases(t *testing.T) {
 		t.Fatalf("AddRoot(disjoint missing sibling): %v", err)
 	}
 
+	// Distinct malformed UTF-8 missing paths differing in ASCII case succeed on all filesystems,
+	// while identical malformed byte prefixes are rejected.
+	malUpper := append([]byte(canonBase+"/Mal-"), 0xff)
+	malLowerChild := append(append([]byte(canonBase+"/mal-"), 0xff), []byte("/child")...)
+	malUpperChild := append(append([]byte{}, malUpper...), []byte("/child")...)
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      malUpper,
+	}); err != nil {
+		t.Fatalf("AddRoot(malUpper): %v", err)
+	}
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      malLowerChild,
+	}); err != nil {
+		t.Fatalf("AddRoot(distinct malLowerChild): %v", err)
+	}
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      malUpperChild,
+	}); !errors.Is(err, app.ErrConflict) || !errors.Is(err, roots.ErrPathOverlap) {
+		t.Fatalf("AddRoot(identical malUpperChild) = %v, want ErrConflict + ErrPathOverlap", err)
+	}
+
 	// Verify persisted libraries count matches expected sensitive/aliasing outcome.
 	storedLibs, err := postgres.NewLibraryRepository(db.Pool).ListLibraries(ctx)
 	if err != nil {
