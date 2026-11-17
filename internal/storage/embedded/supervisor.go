@@ -407,12 +407,7 @@ func (s *Supervisor) setupSocketDir() error {
 	return nil
 }
 
-// Start initializes the database cluster if necessary, writes the configuration,
-// and starts the supervised PostgreSQL instance on a UNIX domain socket.
-func (s *Supervisor) Start(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Supervisor) validateStartPreconditions() error {
 	if s.running || s.pendingLaunch {
 		return ErrAlreadyRunning
 	}
@@ -434,30 +429,23 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 
-	// 0. Acquire exclusive lifetime ownership of the data directory before any inspection, mutation, or launch (ADR-0001 §3).
-	lockPath := DataDirLockPath(s.dataDir)
-	dataLock, err := acquireFileLock(lockPath, ErrDataDirLocked, s.dataDir)
-	if err != nil {
-		return err
-	}
-	s.dataLock = dataLock
+	return nil
+}
 
+func (s *Supervisor) prepareClusterForStart(ctx context.Context) error {
 	// 1. Validate complete PostgreSQL 18 binary set (pg_ctl, initdb, postgres) before data mutation
 	if err := s.validateBinaries(); err != nil {
-		s.cleanupStartupFailure()
 		return err
 	}
 
 	// 2. Check for pre-existing running server before mutating data or configuration
 	prePID, _ := readPostmasterPID(s.dataDir)
 	if prePID > 0 && syscall.Kill(prePID, 0) == nil {
-		s.cleanupStartupFailure()
 		return fmt.Errorf("embedded postgresql cannot start: another server (PID %d) is already running in %s", prePID, s.dataDir)
 	}
 
 	// 3. Inspect existing cluster version before mutating configuration or starting PostgreSQL (ADR-0001 §4)
 	if err := ValidateClusterVersion(s.dataDir); err != nil {
-		s.cleanupStartupFailure()
 		return err
 	}
 
@@ -466,13 +454,11 @@ func (s *Supervisor) Start(ctx context.Context) error {
 
 	// 5. Initialize cluster into clean data directory BEFORE creating nested socket directories
 	if err := s.ensureClusterInitialized(ctx); err != nil {
-		s.cleanupStartupFailure()
 		return err
 	}
 
 	// 6. Set up and create socket directory (which may be nested in dataDir or fallback in os.TempDir())
 	if err := s.setupSocketDir(); err != nil {
-		s.cleanupStartupFailure()
 		return err
 	}
 
@@ -486,63 +472,43 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.applyCompressionSettings(ctx, &settings)
 	if err := WriteConfigFile(confPath, settings); err != nil {
-		s.cleanupStartupFailure()
 		return fmt.Errorf("failed to update postgresql.conf: %w", err)
 	}
 
-	// 8. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
-	if err := ctx.Err(); err != nil {
-		s.cleanupStartupFailure()
-		return err
-	}
+	return ctx.Err()
+}
 
-	logFile := s.logFile
-	if logFile == "" {
-		logFile = filepath.Join(s.dataDir, "postgresql.log")
-	}
+func (s *Supervisor) handleStartFailure(ctx context.Context, startErr error, out []byte) error {
+	// pg_ctl failed or was cancelled while running.
+	// A child process may have been forked by pg_ctl before it failed or was killed.
+	// One missing postmaster.pid read must not discard a possibly launched child!
+	// Resolve the pending launch with bounded, retryable cleanup until its child is accounted for.
+	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), s.resolvePIDTimeout+500*time.Millisecond)
+	postPID, resolveErr := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
+	resolveCancel()
 
-	// Mark launch as pending from the moment we initiate startCmd
-	s.pendingLaunch = true
-
-	startCmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "pg_ctl"),
-		"-w",
-		"-D", s.dataDir,
-		"-l", logFile,
-		"start",
-	)
-	out, startErr := startCmd.CombinedOutput()
-	if startErr != nil {
-		// pg_ctl failed or was cancelled while running.
-		// A child process may have been forked by pg_ctl before it failed or was killed.
-		// One missing postmaster.pid read must not discard a possibly launched child!
-		// Resolve the pending launch with bounded, retryable cleanup until its child is accounted for.
-		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), s.resolvePIDTimeout+500*time.Millisecond)
-		postPID, resolveErr := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
-		resolveCancel()
-
-		if postPID > 0 {
-			cleanupErr := s.cleanupLaunchedPostmaster(postPID)
-			if cleanupErr != nil {
-				return errors.Join(fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))), cleanupErr)
-			}
-			// Child has been accounted for and confirmed dead!
-			if ctx.Err() != nil {
-				return errors.Join(ctx.Err(), fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out))))
-			}
-			return fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
+	startFailure := fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
+	if postPID > 0 {
+		if cleanupErr := s.cleanupLaunchedPostmaster(postPID); cleanupErr != nil {
+			return errors.Join(startFailure, cleanupErr)
 		}
-
-		// Child not yet accounted for! Retain pending launch with retryable cleanup!
-		s.running = true
-		s.pendingLaunch = true
-		startFailure := fmt.Errorf("pg_ctl start failed: %w (output: %s)", startErr, strings.TrimSpace(string(out)))
+		// Child has been accounted for and confirmed dead!
 		if ctx.Err() != nil {
-			startFailure = errors.Join(ctx.Err(), startFailure)
+			return errors.Join(ctx.Err(), startFailure)
 		}
-		return errors.Join(startFailure, fmt.Errorf("pending postmaster launch not yet accounted for: %w", resolveErr))
+		return startFailure
 	}
 
-	// Read postmaster.pid after pg_ctl start succeeded
+	// Child not yet accounted for! Retain pending launch with retryable cleanup!
+	s.running = true
+	s.pendingLaunch = true
+	if ctx.Err() != nil {
+		startFailure = errors.Join(ctx.Err(), startFailure)
+	}
+	return errors.Join(startFailure, fmt.Errorf("pending postmaster launch not yet accounted for: %w", resolveErr))
+}
+
+func (s *Supervisor) finalizeLaunchedPostmaster(ctx context.Context) error {
 	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), s.resolvePIDTimeout+500*time.Millisecond)
 	pid, err := s.resolvePostmasterPID(resolveCtx, s.resolvePIDTimeout)
 	resolveCancel()
@@ -574,6 +540,52 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Start initializes the database cluster if necessary, writes the configuration,
+// and starts the supervised PostgreSQL instance on a UNIX domain socket.
+func (s *Supervisor) Start(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.validateStartPreconditions(); err != nil {
+		return err
+	}
+
+	// 0. Acquire exclusive lifetime ownership of the data directory before any inspection, mutation, or launch (ADR-0001 §3).
+	lockPath := DataDirLockPath(s.dataDir)
+	dataLock, err := acquireFileLock(lockPath, ErrDataDirLocked, s.dataDir)
+	if err != nil {
+		return err
+	}
+	s.dataLock = dataLock
+
+	if err := s.prepareClusterForStart(ctx); err != nil {
+		s.cleanupStartupFailure()
+		return err
+	}
+
+	// 8. Start PostgreSQL via pg_ctl with startup cleanup on error or cancellation
+	logFile := s.logFile
+	if logFile == "" {
+		logFile = filepath.Join(s.dataDir, "postgresql.log")
+	}
+
+	// Mark launch as pending from the moment we initiate startCmd
+	s.pendingLaunch = true
+
+	startCmd := exec.CommandContext(ctx, filepath.Join(s.binDir, "pg_ctl"),
+		"-w",
+		"-D", s.dataDir,
+		"-l", logFile,
+		"start",
+	)
+	out, startErr := startCmd.CombinedOutput()
+	if startErr != nil {
+		return s.handleStartFailure(ctx, startErr, out)
+	}
+
+	return s.finalizeLaunchedPostmaster(ctx)
 }
 
 // Stop shuts down the supervised PostgreSQL instance cleanly.

@@ -954,6 +954,113 @@ func resolveEnvMap(lo *loadOptions) map[string]string {
 	return envMap
 }
 
+type loadInputs struct {
+	fv             *flagValues
+	visited        map[string]bool
+	envMap         map[string]string
+	envFileMap     map[string]string
+	systemSettings map[string]string
+}
+
+func (in *loadInputs) str(flagName, flagVal, envKey, defaultVal string, sources map[string]Source) string {
+	return resolveString(in.visited[flagName], flagVal, envKey, in.envMap, in.envFileMap, in.systemSettings, defaultVal, sources)
+}
+
+func (in *loadInputs) integer(flagName string, flagVal int, envKey string, defaultVal int, sources map[string]Source) (int, error) {
+	return resolveInt(in.visited[flagName], flagVal, envKey, in.envMap, in.envFileMap, in.systemSettings, defaultVal, sources)
+}
+
+func (in *loadInputs) derivedDir(flagName, flagVal, envKey, dataDir, subdir string, sources map[string]Source) string {
+	raw := in.str(flagName, flagVal, envKey, "", sources)
+	if strings.TrimSpace(raw) == "" {
+		sources[envKey] = SourceDefault
+		return filepath.Join(dataDir, subdir)
+	}
+	return raw
+}
+
+func resolveNetworkAndStorage(cfg *Config, in *loadInputs) error {
+	var err error
+	cfg.Host = in.str("host", in.fv.host, "TOBITEN_HOST", DefaultHost, cfg.sources)
+	cfg.Port, err = in.integer("port", in.fv.port, "TOBITEN_PORT", DefaultPort, cfg.sources)
+	if err != nil {
+		return err
+	}
+
+	cfg.BaseURL = strings.TrimRight(in.str("base-url", in.fv.baseURL, "TOBITEN_BASE_URL", DefaultBaseURL, cfg.sources), "/")
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = DefaultBaseURL
+	}
+
+	// Storage Directories & Derived Paths (ADR-0014 §2, ADR-0015 §1, I-6)
+	cfg.DataDir = in.str("data-dir", in.fv.dataDir, "TOBITEN_DATA_DIR", DefaultDataDir, cfg.sources)
+	cfg.CoversDir = in.derivedDir("covers-dir", in.fv.coversDir, "TOBITEN_COVERS_DIR", cfg.DataDir, "covers", cfg.sources)
+	cfg.CacheDir = in.derivedDir("cache-dir", in.fv.cacheDir, "TOBITEN_CACHE_DIR", cfg.DataDir, "cache", cfg.sources)
+
+	// Derived paths fixed from DataDir (ADR-0001 §3, §5, ADR-0014 §2, §3)
+	cfg.PostgresDir = filepath.Join(cfg.DataDir, "postgres")
+	cfg.BackupsDir = filepath.Join(cfg.DataDir, "backups")
+	cfg.SecretKeyPath = filepath.Join(cfg.DataDir, "secret.key")
+
+	cfg.ThumbCacheMaxMB, err = in.integer("thumb-cache-max-mb", in.fv.thumbCacheMaxMB, "TOBITEN_THUMB_CACHE_MAX_MB", DefaultThumbCacheMaxMB, cfg.sources)
+	if err != nil {
+		return err
+	}
+	cfg.ExtractCacheMaxMB, err = in.integer("extract-cache-max-mb", in.fv.extractCacheMaxMB, "TOBITEN_EXTRACT_CACHE_MAX_MB", DefaultExtractCacheMaxMB, cfg.sources)
+	return err
+}
+
+func resolveSecurityAndEngine(cfg *Config, in *loadInputs) error {
+	var err error
+	// First-run admin & security
+	cfg.AdminUser = in.str("admin-user", in.fv.adminUser, "TOBITEN_ADMIN_USER", "", cfg.sources)
+
+	// Secrets have NO flags (I-7)
+	cfg.AdminPass = resolveSecret("TOBITEN_ADMIN_PASS", in.envMap, in.envFileMap, cfg.sources)
+	cfg.SecretKey = resolveSecret("TOBITEN_SECRET_KEY", in.envMap, in.envFileMap, cfg.sources)
+
+	cfg.TrustedProxies = in.str("trusted-proxies", in.fv.trustedProxies, "TOBITEN_TRUSTED_PROXIES", "", cfg.sources)
+	cfg.OIDCDefaultRole = in.str("oidc-default-role", in.fv.oidcDefaultRole, "TOBITEN_OIDC_DEFAULT_ROLE", "", cfg.sources)
+	cfg.OIDCDefaultLabels = in.str("oidc-default-labels", in.fv.oidcDefaultLabels, "TOBITEN_OIDC_DEFAULT_LABELS", "", cfg.sources)
+
+	// Logging
+	cfg.LogLevel = strings.ToLower(in.str("log-level", in.fv.logLevel, "TOBITEN_LOG_LEVEL", DefaultLogLevel, cfg.sources))
+	cfg.LogFormat = strings.ToLower(in.str("log-format", in.fv.logFormat, "TOBITEN_LOG_FORMAT", DefaultLogFormat, cfg.sources))
+
+	// Storage Engine
+	cfg.StorageMode = strings.ToLower(in.str("storage-mode", in.fv.storageMode, "TOBITEN_STORAGE_MODE", DefaultStorageMode, cfg.sources))
+	// DatabaseURL has NO flag (I-7)
+	cfg.DatabaseURL = resolveSecret("TOBITEN_DATABASE_URL", in.envMap, in.envFileMap, cfg.sources)
+	cfg.PgBin = in.str("pg-bin", in.fv.pgBin, "TOBITEN_PG_BIN", "", cfg.sources)
+
+	// Library & Scanner
+	cfg.LibraryMode = strings.ToLower(in.str("library-mode", in.fv.libraryMode, "TOBITEN_LIBRARY_MODE", DefaultLibraryMode, cfg.sources))
+	cfg.ScannerWorkers, err = in.integer("scanner-workers", in.fv.scannerWorkers, "TOBITEN_SCANNER_WORKERS", DefaultScannerWorkers, cfg.sources)
+	if err != nil {
+		return err
+	}
+	cfg.IntakeMode = strings.ToLower(in.str("intake-mode", in.fv.intakeMode, "TOBITEN_INTAKE_MODE", DefaultIntakeMode, cfg.sources))
+	return nil
+}
+
+func applyLoadMetadata(cfg *Config, lo *loadOptions) {
+	if len(lo.systemSettings) > 0 {
+		cfg.rawSystemSettings = make(map[string]string, len(lo.systemSettings))
+		for k, v := range lo.systemSettings {
+			cfg.rawSystemSettings[k] = v
+			if canonicalEnvKey(k) == "" {
+				if _, ok := cfg.sources[k]; !ok {
+					cfg.sources[k] = SourceSystemSettings
+				}
+			}
+		}
+	}
+
+	if len(lo.disabledModules) > 0 {
+		cfg.DisabledModules = append(cfg.DisabledModules, lo.disabledModules...)
+	}
+}
+
 // Load loads, resolves, and validates configuration according to precedence:
 // CLI Flags > Environment Variables / .env > Compiled Defaults.
 // Empty or whitespace-only values in env/.env are treated as absent (I-6).
@@ -979,117 +1086,29 @@ func Load(args []string, opts ...Option) (*Config, error) {
 		return nil, err
 	}
 
-	envMap := resolveEnvMap(lo)
-
 	cfg := &Config{
 		sources: make(map[string]Source),
 	}
+	in := &loadInputs{
+		fv:             fv,
+		visited:        visited,
+		envMap:         resolveEnvMap(lo),
+		envFileMap:     envFileMap,
+		systemSettings: lo.systemSettings,
+	}
 
-	// 4. Resolve settings by precedence: Flag > Env > EnvFile > SystemSettings > Default
+	// Resolve settings by precedence: Flag > Env > EnvFile > SystemSettings > Default.
 	// Blank values in env/.env/system_settings are treated as absent (I-6).
-	cfg.Host = resolveString(visited["host"], fv.host, "TOBITEN_HOST", envMap, envFileMap, lo.systemSettings, DefaultHost, cfg.sources)
-	cfg.Port, err = resolveInt(visited["port"], fv.port, "TOBITEN_PORT", envMap, envFileMap, lo.systemSettings, DefaultPort, cfg.sources)
-	if err != nil {
+	if err := resolveNetworkAndStorage(cfg, in); err != nil {
+		return nil, err
+	}
+	if err := resolveSecurityAndEngine(cfg, in); err != nil {
 		return nil, err
 	}
 
-	cfg.BaseURL = resolveString(visited["base-url"], fv.baseURL, "TOBITEN_BASE_URL", envMap, envFileMap, lo.systemSettings, DefaultBaseURL, cfg.sources)
-	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = DefaultBaseURL
-	}
+	applyLoadMetadata(cfg, lo)
 
-	// Storage Directories & Derived Paths (ADR-0014 §2, ADR-0015 §1, I-6)
-	cfg.DataDir = resolveString(visited["data-dir"], fv.dataDir, "TOBITEN_DATA_DIR", envMap, envFileMap, lo.systemSettings, DefaultDataDir, cfg.sources)
-
-	rawCoversDir := resolveString(visited["covers-dir"], fv.coversDir, "TOBITEN_COVERS_DIR", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-	if strings.TrimSpace(rawCoversDir) == "" {
-		cfg.CoversDir = filepath.Join(cfg.DataDir, "covers")
-		cfg.sources["TOBITEN_COVERS_DIR"] = SourceDefault
-	} else {
-		cfg.CoversDir = rawCoversDir
-	}
-
-	rawCacheDir := resolveString(visited["cache-dir"], fv.cacheDir, "TOBITEN_CACHE_DIR", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-	if strings.TrimSpace(rawCacheDir) == "" {
-		cfg.CacheDir = filepath.Join(cfg.DataDir, "cache")
-		cfg.sources["TOBITEN_CACHE_DIR"] = SourceDefault
-	} else {
-		cfg.CacheDir = rawCacheDir
-	}
-
-	// Derived paths fixed from DataDir (ADR-0001 §3, §5, ADR-0014 §2, §3)
-	cfg.PostgresDir = filepath.Join(cfg.DataDir, "postgres")
-	cfg.BackupsDir = filepath.Join(cfg.DataDir, "backups")
-	cfg.SecretKeyPath = filepath.Join(cfg.DataDir, "secret.key")
-
-	cfg.ThumbCacheMaxMB, err = resolveInt(visited["thumb-cache-max-mb"], fv.thumbCacheMaxMB, "TOBITEN_THUMB_CACHE_MAX_MB", envMap, envFileMap, lo.systemSettings, DefaultThumbCacheMaxMB, cfg.sources)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg.ExtractCacheMaxMB, err = resolveInt(visited["extract-cache-max-mb"], fv.extractCacheMaxMB, "TOBITEN_EXTRACT_CACHE_MAX_MB", envMap, envFileMap, lo.systemSettings, DefaultExtractCacheMaxMB, cfg.sources)
-	if err != nil {
-		return nil, err
-	}
-
-	// First-run admin & security
-	cfg.AdminUser = resolveString(visited["admin-user"], fv.adminUser, "TOBITEN_ADMIN_USER", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-
-	// Secrets have NO flags (I-7)
-	cfg.AdminPass = resolveSecret("TOBITEN_ADMIN_PASS", envMap, envFileMap, cfg.sources)
-	cfg.SecretKey = resolveSecret("TOBITEN_SECRET_KEY", envMap, envFileMap, cfg.sources)
-
-	cfg.TrustedProxies = resolveString(visited["trusted-proxies"], fv.trustedProxies, "TOBITEN_TRUSTED_PROXIES", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-	cfg.OIDCDefaultRole = resolveString(visited["oidc-default-role"], fv.oidcDefaultRole, "TOBITEN_OIDC_DEFAULT_ROLE", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-	cfg.OIDCDefaultLabels = resolveString(visited["oidc-default-labels"], fv.oidcDefaultLabels, "TOBITEN_OIDC_DEFAULT_LABELS", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-
-	// Logging
-	cfg.LogLevel = resolveString(visited["log-level"], fv.logLevel, "TOBITEN_LOG_LEVEL", envMap, envFileMap, lo.systemSettings, DefaultLogLevel, cfg.sources)
-	cfg.LogFormat = resolveString(visited["log-format"], fv.logFormat, "TOBITEN_LOG_FORMAT", envMap, envFileMap, lo.systemSettings, DefaultLogFormat, cfg.sources)
-
-	// Storage Engine
-	cfg.StorageMode = resolveString(visited["storage-mode"], fv.storageMode, "TOBITEN_STORAGE_MODE", envMap, envFileMap, lo.systemSettings, DefaultStorageMode, cfg.sources)
-	// DatabaseURL has NO flag (I-7)
-	cfg.DatabaseURL = resolveSecret("TOBITEN_DATABASE_URL", envMap, envFileMap, cfg.sources)
-	cfg.PgBin = resolveString(visited["pg-bin"], fv.pgBin, "TOBITEN_PG_BIN", envMap, envFileMap, lo.systemSettings, "", cfg.sources)
-
-	// Library & Scanner
-	cfg.LibraryMode = resolveString(visited["library-mode"], fv.libraryMode, "TOBITEN_LIBRARY_MODE", envMap, envFileMap, lo.systemSettings, DefaultLibraryMode, cfg.sources)
-	cfg.ScannerWorkers, err = resolveInt(visited["scanner-workers"], fv.scannerWorkers, "TOBITEN_SCANNER_WORKERS", envMap, envFileMap, lo.systemSettings, DefaultScannerWorkers, cfg.sources)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg.IntakeMode = resolveString(visited["intake-mode"], fv.intakeMode, "TOBITEN_INTAKE_MODE", envMap, envFileMap, lo.systemSettings, DefaultIntakeMode, cfg.sources)
-
-	// Normalize casing
-	cfg.StorageMode = strings.ToLower(cfg.StorageMode)
-	cfg.LibraryMode = strings.ToLower(cfg.LibraryMode)
-	cfg.IntakeMode = strings.ToLower(cfg.IntakeMode)
-	cfg.LogLevel = strings.ToLower(cfg.LogLevel)
-	cfg.LogFormat = strings.ToLower(cfg.LogFormat)
-
-	// Retain loaded system_settings map
-	if len(lo.systemSettings) > 0 {
-		cfg.rawSystemSettings = make(map[string]string, len(lo.systemSettings))
-		for k, v := range lo.systemSettings {
-			cfg.rawSystemSettings[k] = v
-			canonical := canonicalEnvKey(k)
-			if canonical == "" {
-				if _, ok := cfg.sources[k]; !ok {
-					cfg.sources[k] = SourceSystemSettings
-				}
-			}
-		}
-	}
-
-	// Disabled modules
-	if len(lo.disabledModules) > 0 {
-		cfg.DisabledModules = append(cfg.DisabledModules, lo.disabledModules...)
-	}
-
-	// 5. Semantic Validation
+	// Semantic Validation
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
