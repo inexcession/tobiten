@@ -7,7 +7,6 @@ package cbz
 import (
 	"archive/zip"
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -76,9 +75,6 @@ func NewReader(ra io.ReaderAt, size int64) (*Reader, error) {
 	if err != nil && (!errors.Is(err, zip.ErrInsecurePath) || zr == nil) {
 		return nil, fmt.Errorf("%w: %v", container.ErrCorrupt, err)
 	}
-	if err := verifyDirectory(ra, dir, zr); err != nil {
-		return nil, err
-	}
 
 	r := &Reader{zr: zr, dir: dir, comicInfo: -1}
 	r.entries = make([]container.Entry, len(zr.File))
@@ -102,25 +98,6 @@ func NewReader(ra io.ReaderAt, size int64) (*Reader, error) {
 	r.pages = container.SelectPages(r.entries)
 	r.diagnostics.ImageCodecs = container.DiagnoseCodecs(r.pages)
 	return r, nil
-}
-
-// verifyDirectory proves the located central directory is the one archive/zip
-// parsed: its first record must carry the first listed entry's raw name. The
-// fingerprinter trusts Directory, so a disagreement fails the open instead of
-// reporting the wrong bytes.
-func verifyDirectory(ra io.ReaderAt, dir Directory, zr *zip.Reader) error {
-	if len(zr.File) == 0 {
-		return nil
-	}
-	want := zr.File[0].Name
-	buf := make([]byte, 46+len(want))
-	if dir.Size < int64(len(buf)) || container.ReadFullAt(ra, buf, dir.Offset) != nil ||
-		binary.LittleEndian.Uint32(buf) != cdHeaderSignature ||
-		int(binary.LittleEndian.Uint16(buf[28:30])) != len(want) ||
-		string(buf[46:]) != want {
-		return fmt.Errorf("%w: located central directory does not match the parsed entries", container.ErrCorrupt)
-	}
-	return nil
 }
 
 func isComicInfo(e container.Entry) bool {

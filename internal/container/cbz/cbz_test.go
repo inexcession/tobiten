@@ -349,8 +349,7 @@ func TestReader_CorruptArchivesFailCleanly(t *testing.T) {
 
 	flipped := append([]byte(nil), good...)
 	// Make the central directory size in the end record larger than the file.
-	// (A wrong offset alone is tolerated: like archive/zip, the offset is
-	// derived from the end record's position to support prepended data.)
+	// The end record must describe a directory range within the file.
 	for i := len(flipped) - 10; i < len(flipped)-6; i++ {
 		flipped[i] = 0xee
 	}
@@ -501,22 +500,13 @@ func TestLocateDirectory_Zip64(t *testing.T) {
 }
 
 func TestLocateDirectory_PrependedData(t *testing.T) {
-	zipData := buildZip(t, "", store("1.jpg", "a"), store("2.jpg", "b"))
-	plain, err := cbz.LocateDirectory(bytes.NewReader(zipData), int64(len(zipData)))
-	if err != nil {
-		t.Fatal(err)
+	data := append(bytes.Repeat([]byte("#"), 37), buildZip(t, "", store("1.jpg", "a"))...)
+	if _, err := cbz.LocateDirectory(bytes.NewReader(data), int64(len(data))); !errors.Is(err, container.ErrCorrupt) {
+		t.Fatalf("ambiguous offset: %v", err)
 	}
-	prefix := bytes.Repeat([]byte("#"), 37)
-	data := append(append([]byte(nil), prefix...), zipData...)
-
-	d, err := cbz.LocateDirectory(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
+	if _, err := cbz.NewReader(bytes.NewReader(data), int64(len(data))); !errors.Is(err, container.ErrCorrupt) {
+		t.Fatalf("reader accepted ambiguous offset: %v", err)
 	}
-	if d.Offset != plain.Offset+37 || d.Size != plain.Size || d.EndOffset != plain.EndOffset+37 {
-		t.Errorf("directory = %+v, want shifted by 37 from %+v", d, plain)
-	}
-	checkDirectory(t, data, d, false)
 }
 
 func TestLocateDirectory_Errors(t *testing.T) {
@@ -569,108 +559,37 @@ func fakeDirectoryRecord(compressedSize uint32, extra []byte, nameLen, extraLen,
 	return append(rec, extra...)
 }
 
-// TestLocateDirectory_PrependedDataSelectionMatchesArchiveZip covers archives
-// whose prepended data places directory-like bytes at the stored offset.
-// archive/zip trusts that offset only when a complete directory header parses
-// there; the locator must make the same choice or the fingerprinter would hash
-// the wrong bytes while the reader opens the real directory.
-func TestLocateDirectory_PrependedDataSelectionMatchesArchiveZip(t *testing.T) {
-	zipData := buildZip(t, "", store("1.jpg", "page"))
-	plain, err := cbz.LocateDirectory(bytes.NewReader(zipData), int64(len(zipData)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored := plain.Offset // the offset the end record stores
-	saturatedExtra := func(size uint16, fill int) []byte {
-		e := []byte{0x01, 0x00, byte(size), byte(size >> 8)}
-		return append(e, make([]byte, fill)...)
-	}
-
-	cases := []struct {
-		name        string
-		record      []byte
-		literalWins bool // archive/zip reads the directory at the stored offset
-	}{
-		{
-			name:        "complete header at stored offset",
-			record:      fakeDirectoryRecord(4, nil, 5, 0, 0),
-			literalWins: true,
-		},
-		{
-			name:        "signature only, field lengths overrun the file",
-			record:      fakeDirectoryRecord(4, nil, 0xffff, 0xffff, 0xffff),
-			literalWins: false,
-		},
-		{
-			name:        "zip64 extra too short for saturated size",
-			record:      fakeDirectoryRecord(0xffffffff, saturatedExtra(0, 0), 5, 4, 0),
-			literalWins: false,
-		},
-		{
-			name:        "zip64 extra complete for saturated size",
-			record:      fakeDirectoryRecord(0xffffffff, saturatedExtra(8, 8), 5, 12, 0),
-			literalWins: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			prefix := make([]byte, int(stored)+len(tc.record)+64)
-			copy(prefix[stored:], tc.record)
-			data := append(append([]byte(nil), prefix...), zipData...)
-
-			r, err := cbz.NewReader(bytes.NewReader(data), int64(len(data)))
-			if err != nil {
-				t.Fatalf("NewReader: %v", err)
-			}
-			if got := len(r.Entries()); got != 1 || r.Entries()[0].Name != "1.jpg" {
-				t.Fatalf("entries = %+v", r.Entries())
-			}
-
-			located, err := cbz.LocateDirectory(bytes.NewReader(data), int64(len(data)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if located != r.Directory() {
-				t.Errorf("LocateDirectory = %+v, Reader.Directory() = %+v", located, r.Directory())
-			}
-			want := stored + int64(len(prefix))
-			if tc.literalWins {
-				want = stored
-			}
-			if located.Offset != want {
-				t.Errorf("Offset = %d, want %d (literalWins=%v)", located.Offset, want, tc.literalWins)
-			}
-			if !bytes.HasPrefix(data[located.Offset:], []byte("PK\x01\x02")) {
-				t.Errorf("no directory record at located offset %d", located.Offset)
-			}
-		})
-	}
-}
-
-func TestLocateDirectory_ProbeReadsAreBounded(t *testing.T) {
+// Repeated ZIP64 extras can make archive/zip accept the stored candidate even
+// though both candidate directories have the same first name. Rejection must
+// not depend on that name or probe the candidate inside the payload.
+func TestLocateDirectory_AmbiguousZIP64DoesNotProbePayload(t *testing.T) {
 	zipData := buildZip(t, "", store("1.jpg", strings.Repeat("p", 1<<20)))
 	plain, err := cbz.LocateDirectory(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored := plain.Offset
-	rec := fakeDirectoryRecord(4, nil, 0xffff, 0xffff, 0xffff)
-	prefix := make([]byte, int(stored)+len(rec)+64)
-	copy(prefix[stored:], rec)
-	// The archive body is large, so an unbounded probe would be visible.
-	data := append(append([]byte(nil), prefix...), zipData...)
-
+	extra := []byte{1, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0}
+	rec := fakeDirectoryRecord(4, extra, 5, uint16(len(extra)), 0)
+	binary.LittleEndian.PutUint32(rec[42:46], 0xffffffff)
+	prefix := make([]byte, int(plain.Offset)+len(rec)+64)
+	copy(prefix[plain.Offset:], rec)
+	prefix = append(prefix, zipData...)
+	data := prefix
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil || len(zr.File) != 1 || zr.File[0].Name != "1.jpg" || zr.File[0].CompressedSize64 != 4 {
+		t.Fatalf("archive/zip candidate: %v, %v", zr, err)
+	}
 	spy := &spyReaderAt{data: data}
-	if _, err := cbz.LocateDirectory(spy, int64(len(data))); err != nil {
-		t.Fatal(err)
+	if _, err := cbz.LocateDirectory(spy, int64(len(data))); !errors.Is(err, container.ErrCorrupt) {
+		t.Fatalf("locator accepted ambiguous offset: %v", err)
+	}
+	if _, err := cbz.NewReader(bytes.NewReader(data), int64(len(data))); !errors.Is(err, container.ErrCorrupt) {
+		t.Fatalf("reader accepted ambiguous offset: %v", err)
 	}
 	const window = 65 * 1024
-	const maxProbe = 46 + 3*65535
 	for _, q := range spy.reqs {
-		inTail := q[0] >= int64(len(data))-window && q[1] <= window
-		inProbe := q[0] >= stored && q[0] <= stored+46 && q[1] <= maxProbe
-		if !inTail && !inProbe {
-			t.Errorf("read [%d,+%d) is neither in the tail window nor the bounded directory probe at %d", q[0], q[1], stored)
+		if q[0] < int64(len(data))-window || q[0]+q[1] > int64(len(data)) {
+			t.Errorf("read outside tail: [%d,+%d)", q[0], q[1])
 		}
 	}
 }

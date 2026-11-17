@@ -16,8 +16,6 @@ const (
 	zip64LocLen         = 20
 	zip64EndSignature   = 0x06064b50
 	zip64EndLen         = 56
-	cdHeaderSignature   = 0x02014b50
-	zip64ExtraID        = 0x0001
 	maxEOCDSearchWindow = 65 * 1024 // same bounded window as archive/zip
 )
 
@@ -38,19 +36,11 @@ type Directory struct {
 	Zip64 bool
 }
 
-// LocateDirectory finds the central directory of the ZIP archive stored in the
-// size bytes of ra. It supports plain, ZIP64, and commented archives and
-// mirrors archive/zip's rules for choosing the end record, so a file that
-// Open accepts yields the range its entries are read from.
-//
-// Reads are confined to a bounded tail window (at most 65*1024 bytes) plus the
-// 20-byte ZIP64 locator and the 56-byte ZIP64 end record when present. One
-// further bounded probe happens only when the end record disagrees with the
-// stored directory offset (data prepended to the archive): like archive/zip,
-// the stored offset is trusted over the derived one only if a complete
-// central-directory header parses there, which reads at most 46+3*65535
-// bytes starting at that stored offset. The M1-T10.1 fingerprinter reuses
-// this function and hashes the located ranges.
+// LocateDirectory finds the ZIP central directory using only a bounded tail
+// window and, for ZIP64, the locator and end record. Archives whose stored
+// and derived offsets give archive/zip a choice of directories are rejected:
+// resolving that choice would require probing bytes that may be file payload.
+// Therefore every successful result identifies the range archive/zip reads.
 func LocateDirectory(ra io.ReaderAt, size int64) (Directory, error) {
 	if size < eocdLen {
 		return Directory{}, fmt.Errorf("%w: file too small for a zip end record", container.ErrCorrupt)
@@ -81,7 +71,7 @@ func LocateDirectory(ra io.ReaderAt, size int64) (Directory, error) {
 			}
 		}
 	}
-	return normalizeDirectory(ra, size, d)
+	return normalizeDirectory(size, d)
 }
 
 // findEOCD returns the absolute offset and bytes of the classic end record.
@@ -156,76 +146,16 @@ func readZip64End(ra io.ReaderAt, offset int64) (Directory, error) {
 	}, nil
 }
 
-// normalizeDirectory converts the stored (archive-relative) offset into an
-// absolute one and validates the range against the file size. It reproduces
-// archive/zip's choice of base offset so the located range is the one the
-// reader parses.
-func normalizeDirectory(ra io.ReaderAt, size int64, d Directory) (Directory, error) {
-	base := d.EndOffset - d.Size - d.Offset
-	if o := base + d.Offset; o < 0 || o >= size {
+// normalizeDirectory rejects a positive base: archive/zip may select either
+// the stored or derived offset depending on bytes at the stored offset.
+func normalizeDirectory(size int64, d Directory) (Directory, error) {
+	derived := d.EndOffset - d.Size
+	if derived < 0 || derived >= size {
 		return Directory{}, fmt.Errorf("%w: central directory offset outside file", container.ErrCorrupt)
 	}
-	// A positive base is only trusted when no complete directory header parses
-	// at the stored offset taken literally (data prepended to the archive).
-	if base > 0 && directoryHeaderParses(ra, d.Offset, size) {
-		base = 0
+	if derived > d.Offset {
+		return Directory{}, fmt.Errorf("%w: ambiguous central directory offset", container.ErrCorrupt)
 	}
-	d.Offset += base
-	if d.Offset < 0 || d.Size < 0 || d.Offset+d.Size > d.EndOffset {
-		return Directory{}, fmt.Errorf("%w: central directory overlaps the end record", container.ErrCorrupt)
-	}
+	d.Offset = derived
 	return d, nil
-}
-
-// directoryHeaderParses reports whether archive/zip's directory-header parser
-// would accept the bytes at off: the fixed 46-byte header with the central
-// directory signature, its complete name, extra, and comment fields, and
-// well-formed ZIP64 extended information for every saturated field.
-func directoryHeaderParses(ra io.ReaderAt, off, size int64) bool {
-	if off < 0 || off >= size {
-		return false
-	}
-	r := io.NewSectionReader(ra, off, size-off)
-	var hdr [46]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return false
-	}
-	if binary.LittleEndian.Uint32(hdr[0:4]) != cdHeaderSignature {
-		return false
-	}
-	nameLen := int(binary.LittleEndian.Uint16(hdr[28:30]))
-	extraLen := int(binary.LittleEndian.Uint16(hdr[30:32]))
-	commentLen := int(binary.LittleEndian.Uint16(hdr[32:34]))
-	variable := make([]byte, nameLen+extraLen+commentLen)
-	if _, err := io.ReadFull(r, variable); err != nil {
-		return false
-	}
-	return zip64ExtraWellFormed(hdr[:], variable[nameLen:nameLen+extraLen])
-}
-
-// zip64ExtraWellFormed mirrors the only parse failure archive/zip raises for
-// extra data: a ZIP64 extended-information field that is too short for the
-// header fields that are saturated at 0xffffffff.
-func zip64ExtraWellFormed(hdr, extra []byte) bool {
-	need := 0
-	for _, field := range [][]byte{hdr[24:28], hdr[20:24], hdr[42:46]} { // uncompressed, compressed, header offset
-		if binary.LittleEndian.Uint32(field) == math.MaxUint32 {
-			need += 8
-		}
-	}
-	for len(extra) >= 4 {
-		tag := binary.LittleEndian.Uint16(extra[0:2])
-		fieldSize := int(binary.LittleEndian.Uint16(extra[2:4]))
-		extra = extra[4:]
-		if len(extra) < fieldSize {
-			break
-		}
-		// archive/zip consumes 8 bytes per saturated field, in order, and
-		// fails as soon as fewer than 8 bytes remain; every ZIP64 field counts.
-		if tag == zip64ExtraID && fieldSize < need {
-			return false
-		}
-		extra = extra[fieldSize:]
-	}
-	return true
 }
