@@ -37,10 +37,10 @@ var (
 //
 // Reads are confined to:
 //   - the head [0, min(size, 4096)),
-//   - for ZIP-sniffed inputs, the bounded tail search and any ZIP64 metadata
-//     and central-directory ranges located by cbz.LocateDirectory, and
-//   - otherwise (non-ZIP inputs, or ZIPs whose central directory cannot be
-//     located) the trailing [max(0, size-4096), size) fallback range.
+//   - the bounded ZIP end-of-central-directory tail search and any ZIP64
+//     metadata and central-directory ranges located by cbz.LocateDirectory, and
+//   - for non-ZIP inputs or ZIPs whose central directory cannot be located, the
+//     trailing [max(0, size-4096), size) fallback range.
 //
 // Exact byte layout fed to XXH3-64 (compatibility contract; persisted in
 // asset_digests with kind XXH3_64_PARTIAL):
@@ -74,17 +74,15 @@ func PartialFingerprint(ra io.ReaderAt, size int64) (string, error) {
 	h := xxh3.New()
 	writePartialHeader(h, size, head)
 
-	if cbz.Sniff(head) {
-		dir, err := cbz.LocateDirectory(ra, size)
-		if err == nil {
-			if err := writeZIPCentralDirectory(h, ra, size, head, dir); err != nil {
-				return "", err
-			}
-			return formatXXH364(h.Sum64()), nil
+	dir, err := cbz.LocateDirectory(ra, size)
+	if err == nil {
+		if err := writeZIPCentralDirectory(h, ra, size, head, dir); err != nil {
+			return "", err
 		}
-		if !errors.Is(err, container.ErrCorrupt) {
-			return "", fmt.Errorf("scanner: locate zip central directory: %w", err)
-		}
+		return formatXXH364(h.Sum64()), nil
+	}
+	if !errors.Is(err, container.ErrCorrupt) {
+		return "", fmt.Errorf("scanner: locate zip central directory: %w", err)
 	}
 
 	if err := writeTrailingFallback(h, ra, size, head); err != nil {

@@ -119,7 +119,7 @@ func findZip64End(ra io.ReaderAt, eocdOffset int64) (offset int64, found bool, e
 		return 0, false, nil
 	}
 	p := binary.LittleEndian.Uint64(loc[8:16])
-	if p > math.MaxInt64 {
+	if locStart < zip64EndLen || p > uint64(locStart-zip64EndLen) {
 		return 0, false, fmt.Errorf("%w: zip64 end record offset out of range", container.ErrCorrupt)
 	}
 	return int64(p), true, nil
@@ -128,7 +128,7 @@ func findZip64End(ra io.ReaderAt, eocdOffset int64) (offset int64, found bool, e
 func readZip64End(ra io.ReaderAt, offset int64) (Directory, error) {
 	rec := make([]byte, zip64EndLen)
 	if err := container.ReadFullAt(ra, rec, offset); err != nil {
-		return Directory{}, fmt.Errorf("%w: read zip64 end record: %v", container.ErrCorrupt, err)
+		return Directory{}, fmt.Errorf("container: read zip64 end record: %w", err)
 	}
 	if binary.LittleEndian.Uint32(rec[0:4]) != zip64EndSignature {
 		return Directory{}, fmt.Errorf("%w: bad zip64 end record signature", container.ErrCorrupt)

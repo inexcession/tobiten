@@ -454,7 +454,7 @@ func TestPartialFingerprint_ConfinesReads(t *testing.T) {
 		}
 		spy.assertRanges(t, [][2]int64{
 			{0, scanner.PartialSegmentBytes},
-			{size - scanner.PartialSegmentBytes, size},
+			{size - 65*1024, size},
 		})
 	})
 
@@ -507,6 +507,111 @@ func TestPartialFingerprint_ConfinesReads(t *testing.T) {
 	})
 }
 
+type failOnZip64EndReaderAt struct {
+	data         []byte
+	z64EndOffset int64
+	err          error
+}
+
+func (f *failOnZip64EndReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off == f.z64EndOffset && len(p) == 56 {
+		return 0, f.err
+	}
+	return bytes.NewReader(f.data).ReadAt(p, off)
+}
+
+func TestPartialFingerprint_PrefixedReadableZIP(t *testing.T) {
+	// Non-ZIP preamble (8 KB) + zip.Writer with SetOffset + 5000-byte trailing comment
+	// so head[0:4096] has no ZIP magic and the central directory precedes the trailing 4 KB.
+	preamble := bytes.Repeat([]byte("PREAMBLE"), 1024)
+	var buf bytes.Buffer
+	buf.Write(preamble)
+	zw := zip.NewWriter(&buf)
+	zw.SetOffset(int64(len(preamble)))
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: "001.jpg", Method: zip.Store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(deterministicPattern(16*1024, 29)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.SetComment(strings.Repeat("C", 5000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := buf.Bytes()
+	size := int64(len(data))
+
+	r, err := cbz.NewReader(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("cbz.NewReader failed on prefixed ZIP: %v", err)
+	}
+	dir := r.Directory()
+	if dir.Offset+dir.Size >= size-scanner.PartialSegmentBytes {
+		t.Fatalf("expected central directory before trailing 4 KB, got dir=%+v size=%d", dir, size)
+	}
+
+	spy := &spyReaderAt{data: data}
+	base, err := scanner.PartialFingerprint(spy, size)
+	if err != nil {
+		t.Fatalf("PartialFingerprint: %v", err)
+	}
+	if want := referenceLayoutHex(t, data, true); base != want {
+		t.Fatalf("prefixed ZIP did not use central directory: got %s, want %s", base, want)
+	}
+	spy.assertRanges(t, [][2]int64{
+		{0, scanner.PartialSegmentBytes},
+		{max(0, size-65*1024), size},
+		{dir.Offset, dir.Offset + dir.Size},
+	})
+
+	// Mutating the central directory (which precedes the trailing 4 KB) must change the fingerprint.
+	mutCD := append([]byte(nil), data...)
+	mutCD[dir.Offset] ^= 0x01
+	gotCD, err := scanner.PartialFingerprint(bytes.NewReader(mutCD), size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCD == base {
+		t.Fatalf("central directory mutation on prefixed ZIP did not change fingerprint %s", base)
+	}
+
+	// Mutating entry payload between preamble/local-header and central directory must NOT change it.
+	payloadOff := int64(len(preamble)) + 1024
+	mutPayload := append([]byte(nil), data...)
+	mutPayload[payloadOff] ^= 0xff
+	gotPayload, err := scanner.PartialFingerprint(bytes.NewReader(mutPayload), size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPayload != base {
+		t.Fatalf("prefixed ZIP payload mutation changed fingerprint: got %s, want %s", gotPayload, base)
+	}
+
+	// Ambiguous unadjusted prepended ZIP (without SetOffset) remains rejected and falls back cleanly.
+	unadjusted := append(bytes.Repeat([]byte("#"), 64), buildDeterministicZip(t, strings.Repeat("C", 5000),
+		zipEntry{name: "001.jpg", data: deterministicPattern(16*1024, 31), method: zip.Store},
+	)...)
+	unadjSize := int64(len(unadjusted))
+	if _, err := cbz.LocateDirectory(bytes.NewReader(unadjusted), unadjSize); err == nil {
+		t.Fatal("expected ambiguous unadjusted prepended ZIP to fail LocateDirectory")
+	}
+	unadjSpy := &spyReaderAt{data: unadjusted}
+	gotUnadj, err := scanner.PartialFingerprint(unadjSpy, unadjSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantFallback := referenceLayoutHex(t, unadjusted, false); gotUnadj != wantFallback {
+		t.Fatalf("ambiguous prepended ZIP did not fall back: got %s, want %s", gotUnadj, wantFallback)
+	}
+	unadjSpy.assertRanges(t, [][2]int64{
+		{0, scanner.PartialSegmentBytes},
+		{max(0, unadjSize-65*1024), unadjSize},
+	})
+}
+
 func TestPartialFingerprint_Errors(t *testing.T) {
 	if _, err := scanner.PartialFingerprint(nil, 0); !errors.Is(err, scanner.ErrNilReader) {
 		t.Fatalf("nil reader error = %v, want ErrNilReader", err)
@@ -524,6 +629,38 @@ func TestPartialFingerprint_Errors(t *testing.T) {
 	if _, err := scanner.PartialFingerprint(tailFail, int64(len(zipData))); !errors.Is(err, ioErr) {
 		t.Fatalf("tail I/O error = %v, want %v", err, ioErr)
 	}
+
+	// Underlying ReadAt failures at the ZIP64 end record must propagate rather than falling back.
+	z64Data := buildMinimalDeterministicZIP64(t)
+	z64Dir, err := cbz.LocateDirectory(bytes.NewReader(z64Data), int64(len(z64Data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	z64Fail := &failOnZip64EndReaderAt{
+		data:         z64Data,
+		z64EndOffset: z64Dir.EndOffset,
+		err:          ioErr,
+	}
+	if _, err := scanner.PartialFingerprint(z64Fail, int64(len(z64Data))); !errors.Is(err, ioErr) {
+		t.Fatalf("zip64 end-record I/O error = %v, want %v", err, ioErr)
+	}
+
+	// Out-of-bounds ZIP64 end-record offset must fall back to trailing 4 KB without out-of-bounds reads.
+	badZ64 := append([]byte(nil), z64Data...)
+	locOffset := len(badZ64) - 22 - len("z64") - 20
+	binary.LittleEndian.PutUint64(badZ64[locOffset+8:locOffset+16], uint64(len(badZ64))+1024)
+	badSpy := &spyReaderAt{data: badZ64}
+	gotBadZ64, err := scanner.PartialFingerprint(badSpy, int64(len(badZ64)))
+	if err != nil {
+		t.Fatalf("out-of-bounds zip64 fallback failed: %v", err)
+	}
+	if want := referenceLayoutHex(t, badZ64, false); gotBadZ64 != want {
+		t.Fatalf("out-of-bounds zip64 got %s, want fallback %s", gotBadZ64, want)
+	}
+	badSpy.assertRanges(t, [][2]int64{
+		{0, scanner.PartialSegmentBytes},
+		{max(0, int64(len(badZ64))-65*1024), int64(len(badZ64))},
+	})
 
 	// Short ReadAt returning EOF before size must fail.
 	if _, err := scanner.PartialFingerprint(bytes.NewReader([]byte("short")), 100); !errors.Is(err, io.ErrUnexpectedEOF) {

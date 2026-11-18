@@ -638,3 +638,152 @@ func mustComicInfo(t testing.TB, r *cbz.Reader) container.Entry {
 	}
 	return e
 }
+
+type failOnZip64EndReaderAt struct {
+	data         []byte
+	z64EndOffset int64
+	err          error
+}
+
+func (f *failOnZip64EndReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off == f.z64EndOffset && len(p) == 56 {
+		return 0, f.err
+	}
+	return bytes.NewReader(f.data).ReadAt(p, off)
+}
+
+func buildMinimalZIP64Bytes(t testing.TB) (data []byte, z64EndOffset int64, locStart int64) {
+	t.Helper()
+	payload := strings.Repeat("p", 128)
+	name := "1.jpg"
+	var buf bytes.Buffer
+
+	var lh [30]byte
+	binary.LittleEndian.PutUint32(lh[0:4], 0x04034b50)
+	binary.LittleEndian.PutUint16(lh[4:6], 45)
+	binary.LittleEndian.PutUint32(lh[18:22], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(lh[22:26], uint32(len(payload)))
+	binary.LittleEndian.PutUint16(lh[26:28], uint16(len(name)))
+	buf.Write(lh[:])
+	buf.WriteString(name)
+	buf.WriteString(payload)
+
+	cdOffset := uint64(buf.Len())
+	var cd [46]byte
+	binary.LittleEndian.PutUint32(cd[0:4], 0x02014b50)
+	binary.LittleEndian.PutUint16(cd[4:6], 45)
+	binary.LittleEndian.PutUint16(cd[6:8], 45)
+	binary.LittleEndian.PutUint32(cd[20:24], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(cd[24:28], uint32(len(payload)))
+	binary.LittleEndian.PutUint16(cd[28:30], uint16(len(name)))
+	buf.Write(cd[:])
+	buf.WriteString(name)
+	cdSize := uint64(buf.Len()) - cdOffset
+
+	z64EndOffset = int64(buf.Len())
+	var z64End [56]byte
+	binary.LittleEndian.PutUint32(z64End[0:4], 0x06064b50)
+	binary.LittleEndian.PutUint64(z64End[4:12], 44)
+	binary.LittleEndian.PutUint16(z64End[12:14], 45)
+	binary.LittleEndian.PutUint16(z64End[14:16], 45)
+	binary.LittleEndian.PutUint64(z64End[24:32], 1)
+	binary.LittleEndian.PutUint64(z64End[32:40], 1)
+	binary.LittleEndian.PutUint64(z64End[40:48], cdSize)
+	binary.LittleEndian.PutUint64(z64End[48:56], cdOffset)
+	buf.Write(z64End[:])
+
+	locStart = int64(buf.Len())
+	var z64Loc [20]byte
+	binary.LittleEndian.PutUint32(z64Loc[0:4], 0x07064b50)
+	binary.LittleEndian.PutUint64(z64Loc[8:16], uint64(z64EndOffset))
+	binary.LittleEndian.PutUint32(z64Loc[16:20], 1)
+	buf.Write(z64Loc[:])
+
+	var eocd [22]byte
+	binary.LittleEndian.PutUint32(eocd[0:4], 0x06054b50)
+	binary.LittleEndian.PutUint16(eocd[8:10], 0xffff)
+	binary.LittleEndian.PutUint16(eocd[10:12], 0xffff)
+	binary.LittleEndian.PutUint32(eocd[12:16], 0xffffffff)
+	binary.LittleEndian.PutUint32(eocd[16:20], 0xffffffff)
+	buf.Write(eocd[:])
+
+	return buf.Bytes(), z64EndOffset, locStart
+}
+
+func TestLocateDirectory_ZIP64OutOfBoundsOffsetDoesNotRead(t *testing.T) {
+	base, _, locStart := buildMinimalZIP64Bytes(t)
+
+	// Short file where locStart < 56 (cannot hold a 56-byte ZIP64 end record before locator).
+	var shortBuf bytes.Buffer
+	var z64Loc [20]byte
+	binary.LittleEndian.PutUint32(z64Loc[0:4], 0x07064b50)
+	binary.LittleEndian.PutUint64(z64Loc[8:16], 0)
+	binary.LittleEndian.PutUint32(z64Loc[16:20], 1)
+	shortBuf.Write(make([]byte, 10))
+	shortBuf.Write(z64Loc[:])
+	var eocd [22]byte
+	binary.LittleEndian.PutUint32(eocd[0:4], 0x06054b50)
+	binary.LittleEndian.PutUint16(eocd[10:12], 0xffff)
+	shortBuf.Write(eocd[:])
+
+	cases := []struct {
+		name string
+		data []byte
+		bad  uint64
+	}{
+		{
+			name: "offset past EOF",
+			data: append([]byte(nil), base...),
+			bad:  uint64(len(base)) + 4096,
+		},
+		{
+			name: "offset overlapping locator",
+			data: append([]byte(nil), base...),
+			bad:  uint64(locStart - 10),
+		},
+		{
+			name: "insufficient space before locator",
+			data: shortBuf.Bytes(),
+			bad:  0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name != "insufficient space before locator" {
+				binary.LittleEndian.PutUint64(tc.data[locStart+8:locStart+16], tc.bad)
+			}
+			spy := &spyReaderAt{data: tc.data}
+			_, err := cbz.LocateDirectory(spy, int64(len(tc.data)))
+			if !errors.Is(err, container.ErrCorrupt) {
+				t.Fatalf("error = %v, want ErrCorrupt", err)
+			}
+			for _, q := range spy.reqs {
+				if q[0]+q[1] > int64(len(tc.data)) || q[0] < 0 {
+					t.Errorf("out-of-bounds ReadAt [%d,+%d) for size %d", q[0], q[1], len(tc.data))
+				}
+				if tc.name != "insufficient space before locator" && q[0] == int64(tc.bad) && q[1] == 56 {
+					t.Errorf("ReadAt probed invalid ZIP64 end offset %d", tc.bad)
+				}
+			}
+		})
+	}
+}
+
+func TestLocateDirectory_ZIP64EndRecordIOErrorPropagates(t *testing.T) {
+	data, z64EndOffset, _ := buildMinimalZIP64Bytes(t)
+	ioErr := errors.New("simulated zip64 end read error")
+	r := &failOnZip64EndReaderAt{
+		data:         data,
+		z64EndOffset: z64EndOffset,
+		err:          ioErr,
+	}
+
+	_, err := cbz.LocateDirectory(r, int64(len(data)))
+	if !errors.Is(err, ioErr) {
+		t.Fatalf("error = %v, want %v", err, ioErr)
+	}
+	if errors.Is(err, container.ErrCorrupt) {
+		t.Fatalf("I/O error was wrongly wrapped as ErrCorrupt: %v", err)
+	}
+}
