@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="ComicInfo.xsd">
+  <Series>Example</Series><Title> First </Title><Number>10.5</Number><Volume>0</Volume><Count>20</Count>
+  <Summary>Synopsis</Summary><Publisher>Pub</Publisher><Imprint>Imprint</Imprint><LanguageISO>ja</LanguageISO>
+  <AgeRating>Teen</AgeRating><Manga>YesAndRightToLeft</Manga><Year>2024</Year><Month>2</Month><Day>29</Day>
+  <Web>https://example.org</Web><Writer>A, B, , C</Writer><Penciller>D</Penciller><Inker>E</Inker>
+  <Colorist>F</Colorist><Letterer>G</Letterer><CoverArtist>H</CoverArtist><Editor>I</Editor>
+  <Characters>X, Y</Characters><Teams>T</Teams><Locations>L</Locations><Genre>Action, Drama</Genre>
+  <Pages><Page Image="0" Type="FrontCover Story"/><Page Image="2" Type="Deleted"/><Page Image="3"/></Pages>
+</ComicInfo>
