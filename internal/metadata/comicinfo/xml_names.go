@@ -68,6 +68,9 @@ func skipAttribute(tag []byte, i int) (int, error) {
 	if end < 0 {
 		return 0, errStartTag
 	}
+	if err := validateCharRefs(tag[i : i+end]); err != nil {
+		return 0, err
+	}
 	return i + end + 1, nil
 }
 

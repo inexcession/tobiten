@@ -189,3 +189,46 @@ func TestStartTagAndQualifiedNames(t *testing.T) {
 		})
 	}
 }
+
+func TestCharactersAndProcessingInstructions(t *testing.T) {
+	cases := []struct {
+		name, doc, wantTitle string
+		valid                bool
+	}{
+		{"hex surrogate in title", `<ComicInfo><Title>&#xD800;</Title></ComicInfo>`, "", false},
+		{"hex low surrogate with leading zeros", `<ComicInfo><Title>&#x00DFFF;</Title></ComicInfo>`, "", false},
+		{"decimal surrogate in title", `<ComicInfo><Title>&#55296;</Title></ComicInfo>`, "", false},
+		{"surrogate in attribute", `<ComicInfo note="&#xD800;"><Title>retained</Title></ComicInfo>`, "", false},
+		{"noncharacter ref", `<ComicInfo><Title>&#xFFFE;</Title></ComicInfo>`, "", false},
+		{"out of range ref", `<ComicInfo><Title>&#x110000;</Title></ComicInfo>`, "", false},
+		{"nul in comment", "<!-- \x00 --><ComicInfo><Title>retained</Title></ComicInfo>", "", false},
+		{"vertical tab in comment", "<!-- \x0b --><ComicInfo><Title>retained</Title></ComicInfo>", "", false},
+		{"control char in comment", "<!-- \x1f --><ComicInfo><Title>retained</Title></ComicInfo>", "", false},
+		{"noncharacter in comment", "<!-- \ufffe --><ComicInfo><Title>retained</Title></ComicInfo>", "", false},
+		{"control char in PI", "<?tool \x0c?><ComicInfo><Title>retained</Title></ComicInfo>", "", false},
+		{"PI missing separator", `<?tool!data?><ComicInfo><Title>retained</Title></ComicInfo>`, "", false},
+		{"PI equals without separator", `<?tool=1?><ComicInfo><Title>retained</Title></ComicInfo>`, "", false},
+		{"xmlversion without separator", `<?xmlversion="1.0"?><ComicInfo><Title>retained</Title></ComicInfo>`, "", false},
+		{"PI target with colon", `<?ns:tool ok?><ComicInfo><Title>retained</Title></ComicInfo>`, "", false},
+		{
+			"valid U+FFFD, legal refs, literal ref-like text, and valid PIs",
+			"<?tool?><?tool   ?><?tool &#xD800; &#0; ?>\n<!-- &#xD800; &#0; \ufffd -->\n<ComicInfo note=\"\ufffd&#xFFFD;\"><Title>\ufffd&#xFFFD;&#65533;&#xD7FF;&#xE000;&#x10FFFF;&#9;&amp;#xD800;<![CDATA[&#xD800;&#0;\ufffd]]></Title></ComicInfo>",
+			"\ufffd\ufffd\ufffd\uD7FF\uE000\U0010FFFF\t&#xD800;&#xD800;&#0;\ufffd",
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []Mode{Strict, Lenient} {
+				got, diagnostics, err := parse(t, tc.doc, mode)
+				if tc.valid {
+					if err != nil || got.Title != tc.wantTitle || len(diagnostics) != 0 {
+						t.Fatalf("mode %v: %+v %v %v", mode, got, diagnostics, err)
+					}
+				} else if err == nil || !reflect.DeepEqual(got, Metadata{}) || diagnostics != nil {
+					t.Fatalf("mode %v: %+v %v %v", mode, got, diagnostics, err)
+				}
+			}
+		})
+	}
+}
