@@ -40,6 +40,7 @@ type SeriesMembershipRepository interface {
 
 	// SyncResolverMemberships reconciles automatically resolved memberships for
 	// volumeID against existing rows while preserving MANUAL and locked
-	// memberships and locked fields. Desired memberships must not use MANUAL source.
+	// memberships and locked fields. Desired memberships must not use MANUAL source
+	// or supply locked_fields.
 	SyncResolverMemberships(ctx context.Context, volumeID string, desired []domain.SeriesMembership) error
 }

@@ -929,7 +929,7 @@ func TestSeriesMembershipRepository_SyncResolverMembershipsPreservesManualAndLoc
 		})
 	})
 
-	t.Run("locked_fields on non-MANUAL rows protect locked fields and survive divergent sync", func(t *testing.T) {
+	t.Run("locked_fields on non-MANUAL rows protect locked fields and allow position-locked primary replacement", func(t *testing.T) {
 		var vol domain.Volume
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
 			vol = seedMembershipVolume(ctx, t, tx, lib.ID, domain.VolumeKindVolume, 5)
@@ -957,7 +957,7 @@ func TestSeriesMembershipRepository_SyncResolverMembershipsPreservesManualAndLoc
 			t.Fatalf("seed locked memberships: %v", err)
 		}
 
-		// Same series s1 in desired: locked position (5) survives while unlocked fields update; s2 survives absent from desired.
+		// 1. Same series s1 in desired: locked position (5) survives while unlocked fields update; s2 survives absent from desired.
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
 			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
 				{
@@ -997,7 +997,19 @@ func TestSeriesMembershipRepository_SyncResolverMembershipsPreservesManualAndLoc
 			},
 		})
 
-		// Divergent desired primary s3 (omitting s1) must NOT evict locked s1 or locked s2.
+		// 2. Standalone sync when no eligible replacement primary exists preserves position-locked s1 as primary.
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, nil)
+		}); err != nil {
+			t.Fatalf("sync standalone over position-locked primary: %v", err)
+		}
+		gotStandalone, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
+		if err != nil {
+			t.Fatalf("ListMembershipsByVolume(standalone): %v", err)
+		}
+		assertMembershipsMatch(t, gotStandalone, got)
+
+		// 3. Replacement primary s3 WITHOUT s1 in desired: s3 becomes primary and s1 is retained as secondary with locked position.
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
 			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
 				{
@@ -1010,15 +1022,134 @@ func TestSeriesMembershipRepository_SyncResolverMembershipsPreservesManualAndLoc
 				},
 			})
 		}); err != nil {
-			t.Fatalf("sync divergent primary over locked s1: %v", err)
+			t.Fatalf("sync replacing position-locked primary without s1 in desired: %v", err)
 		}
-		gotDivergent, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
+		gotReplacedWithoutS1, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
 		if err != nil {
-			t.Fatalf("ListMembershipsByVolume(divergent): %v", err)
+			t.Fatalf("ListMembershipsByVolume(replaced without s1): %v", err)
 		}
-		assertMembershipsMatch(t, gotDivergent, got)
+		assertMembershipsMatch(t, gotReplacedWithoutS1, []domain.SeriesMembership{
+			{
+				VolumeID:  vol.ID,
+				SeriesID:  s3.ID,
+				IsPrimary: true,
+				Kind:      domain.MembershipKindSeries,
+				Position:  membershipFloatPtr(1),
+				Source:    domain.MembershipSourceResolver,
+			},
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s1.ID,
+				IsPrimary:    false,
+				Kind:         domain.MembershipKindOther,
+				Position:     membershipFloatPtr(5),
+				Source:       domain.MembershipSourceMetadata,
+				LockedFields: domain.FieldLocks{"position": true},
+			},
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s2.ID,
+				IsPrimary:    false,
+				Kind:         domain.MembershipKindSubSeries,
+				Position:     membershipFloatPtr(12),
+				Source:       domain.MembershipSourceMetadata,
+				LockedFields: domain.FieldLocks{"is_primary": true},
+			},
+		})
 
-		// Reject MANUAL source in automatic sync input.
+		// 4. Reset primary to position-locked s1, then replace primary with s3 WITH s1 in desired as secondary.
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().PromotePrimary(ctx, vol.ID, s1.ID)
+		}); err != nil {
+			t.Fatalf("PromotePrimary(s1): %v", err)
+		}
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
+				{
+					VolumeID:  vol.ID,
+					SeriesID:  s3.ID,
+					IsPrimary: true,
+					Kind:      domain.MembershipKindSeries,
+					Position:  membershipFloatPtr(7),
+					Source:    domain.MembershipSourceResolver,
+				},
+				{
+					VolumeID:  vol.ID,
+					SeriesID:  s1.ID,
+					IsPrimary: false,
+					Kind:      domain.MembershipKindSeries,
+					Position:  membershipFloatPtr(777),
+					Source:    domain.MembershipSourceResolver,
+				},
+			})
+		}); err != nil {
+			t.Fatalf("sync replacing position-locked primary with s1 in desired: %v", err)
+		}
+		gotReplacedWithS1, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
+		if err != nil {
+			t.Fatalf("ListMembershipsByVolume(replaced with s1): %v", err)
+		}
+		assertMembershipsMatch(t, gotReplacedWithS1, []domain.SeriesMembership{
+			{
+				VolumeID:  vol.ID,
+				SeriesID:  s3.ID,
+				IsPrimary: true,
+				Kind:      domain.MembershipKindSeries,
+				Position:  membershipFloatPtr(7),
+				Source:    domain.MembershipSourceResolver,
+			},
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s1.ID,
+				IsPrimary:    false,
+				Kind:         domain.MembershipKindSeries,
+				Position:     membershipFloatPtr(5),
+				Source:       domain.MembershipSourceResolver,
+				LockedFields: domain.FieldLocks{"position": true},
+			},
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s2.ID,
+				IsPrimary:    false,
+				Kind:         domain.MembershipKindSubSeries,
+				Position:     membershipFloatPtr(12),
+				Source:       domain.MembershipSourceMetadata,
+				LockedFields: domain.FieldLocks{"is_primary": true},
+			},
+		})
+
+		// 5. Primary with is_primary lock cannot be replaced by divergent automatic sync.
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().PromotePrimary(ctx, vol.ID, s2.ID)
+		}); err != nil {
+			t.Fatalf("PromotePrimary(s2): %v", err)
+		}
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
+				{
+					VolumeID:  vol.ID,
+					SeriesID:  s4.ID,
+					IsPrimary: true,
+					Kind:      domain.MembershipKindSeries,
+					Position:  membershipFloatPtr(1),
+					Source:    domain.MembershipSourceResolver,
+				},
+			})
+		}); err != nil {
+			t.Fatalf("sync over is_primary-locked primary s2: %v", err)
+		}
+		gotProtectedPrimary, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
+		if err != nil {
+			t.Fatalf("ListMembershipsByVolume(protected primary): %v", err)
+		}
+		if !gotProtectedPrimary[0].IsPrimary || gotProtectedPrimary[0].SeriesID != s2.ID {
+			t.Fatalf("expected is_primary-locked s2 to remain primary, got %+v", gotProtectedPrimary)
+		}
+		if _, err := smRepo.GetMembership(ctx, vol.ID, s4.ID); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected overridden primary s4 not to be added, got %v", err)
+		}
+
+		// 6. Reject MANUAL source and non-empty LockedFields in automatic sync input.
 		err = transactor.WithTx(ctx, func(tx storage.Tx) error {
 			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
 				{
@@ -1032,6 +1163,84 @@ func TestSeriesMembershipRepository_SyncResolverMembershipsPreservesManualAndLoc
 		})
 		if !errors.Is(err, domain.ErrInvalidMembershipSource) {
 			t.Fatalf("SyncResolverMemberships(MANUAL input) = %v, want ErrInvalidMembershipSource", err)
+		}
+
+		err = transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
+				{
+					VolumeID:     vol.ID,
+					SeriesID:     s4.ID,
+					IsPrimary:    true,
+					Kind:         domain.MembershipKindSeries,
+					Source:       domain.MembershipSourceResolver,
+					LockedFields: domain.FieldLocks{"is_primary": true},
+				},
+			})
+		})
+		if !errors.Is(err, storage.ErrAutomaticSyncLockedFields) {
+			t.Fatalf("SyncResolverMemberships(LockedFields input) = %v, want ErrAutomaticSyncLockedFields", err)
+		}
+	})
+
+	t.Run("automatic sync cannot inject locks onto new or unlocked rows before standalone detach", func(t *testing.T) {
+		var vol domain.Volume
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			vol = seedMembershipVolume(ctx, t, tx, lib.ID, domain.VolumeKindVolume, 6)
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{
+				{
+					VolumeID:  vol.ID,
+					SeriesID:  s1.ID,
+					IsPrimary: true,
+					Kind:      domain.MembershipKindSeries,
+					Position:  membershipFloatPtr(6),
+					Source:    domain.MembershipSourceResolver,
+				},
+			})
+		}); err != nil {
+			t.Fatalf("initial sync: %v", err)
+		}
+
+		// Attempt to sneak a lock onto the existing unlocked row or a new row must fail and leave DB clean.
+		for _, cand := range []domain.SeriesMembership{
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s1.ID,
+				IsPrimary:    true,
+				Kind:         domain.MembershipKindSeries,
+				Position:     membershipFloatPtr(6),
+				Source:       domain.MembershipSourceResolver,
+				LockedFields: domain.FieldLocks{"is_primary": true},
+			},
+			{
+				VolumeID:     vol.ID,
+				SeriesID:     s2.ID,
+				IsPrimary:    true,
+				Kind:         domain.MembershipKindSeries,
+				Position:     membershipFloatPtr(6),
+				Source:       domain.MembershipSourceResolver,
+				LockedFields: domain.FieldLocks{"position": false},
+			},
+		} {
+			err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, []domain.SeriesMembership{cand})
+			})
+			if !errors.Is(err, storage.ErrAutomaticSyncLockedFields) {
+				t.Fatalf("SyncResolverMemberships(%+v) = %v, want ErrAutomaticSyncLockedFields", cand.LockedFields, err)
+			}
+		}
+
+		// Subsequent standalone sync detaches cleanly because no lock was created.
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.SeriesMemberships().SyncResolverMemberships(ctx, vol.ID, nil)
+		}); err != nil {
+			t.Fatalf("standalone sync: %v", err)
+		}
+		got, err := smRepo.ListMembershipsByVolume(ctx, vol.ID)
+		if err != nil {
+			t.Fatalf("ListMembershipsByVolume: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("expected 0 memberships after standalone detach, got %+v", got)
 		}
 	})
 

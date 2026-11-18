@@ -218,6 +218,9 @@ func (r *SeriesMembershipRepository) SyncResolverMemberships(
 		if desired[i].Source == domain.MembershipSourceManual {
 			return fmt.Errorf("%w: automatic resolver sync cannot supply MANUAL source", domain.ErrInvalidMembershipSource)
 		}
+		if len(desired[i].LockedFields) > 0 {
+			return storage.ErrAutomaticSyncLockedFields
+		}
 	}
 
 	return r.runWriteTx(ctx, "sync resolver memberships", func(q *Queries) error {
@@ -342,7 +345,7 @@ func reconcileAutomaticMemberships(
 	existingPrimary := findPrimaryMembership(existing)
 	desiredPrimary := findPrimaryMembership(desired)
 
-	primarySeriesID := resolveTargetPrimarySeriesID(existing, existingBySeries, desiredBySeries, existingPrimary, desiredPrimary)
+	primarySeriesID := resolveTargetPrimarySeriesID(existing, existingBySeries, existingPrimary, desiredPrimary)
 
 	targetBySeries := make(map[string]domain.SeriesMembership, len(existing)+len(desired))
 	for _, e := range existing {
@@ -354,7 +357,9 @@ func reconcileAutomaticMemberships(
 			if d, ok := desiredBySeries[e.SeriesID]; ok {
 				targetBySeries[e.SeriesID] = mergeLockedMembership(e, d, primarySeriesID == e.SeriesID)
 			} else {
-				targetBySeries[e.SeriesID] = cloneSeriesMembership(e)
+				m := cloneSeriesMembership(e)
+				m.IsPrimary = e.SeriesID == primarySeriesID
+				targetBySeries[e.SeriesID] = m
 			}
 			continue
 		}
@@ -378,6 +383,7 @@ func reconcileAutomaticMemberships(
 		m := cloneSeriesMembership(d)
 		m.VolumeID = volumeID
 		m.IsPrimary = d.SeriesID == primarySeriesID
+		m.LockedFields = nil
 		targetBySeries[d.SeriesID] = m
 	}
 
@@ -400,15 +406,11 @@ func reconcileAutomaticMemberships(
 func resolveTargetPrimarySeriesID(
 	existing []domain.SeriesMembership,
 	existingBySeries map[string]domain.SeriesMembership,
-	desiredBySeries map[string]domain.SeriesMembership,
 	existingPrimary *domain.SeriesMembership,
 	desiredPrimary *domain.SeriesMembership,
 ) string {
-	if existingPrimary != nil {
-		_, inDesired := desiredBySeries[existingPrimary.SeriesID]
-		if isImmutablePrimaryMembership(*existingPrimary, inDesired) {
-			return existingPrimary.SeriesID
-		}
+	if existingPrimary != nil && isImmutablePrimaryMembership(*existingPrimary) {
+		return existingPrimary.SeriesID
 	}
 
 	if desiredPrimary != nil {
@@ -441,14 +443,11 @@ func isPrimaryFieldLocked(locks domain.FieldLocks) bool {
 	return locks.IsLocked("is_primary") || locks.IsLocked("membership") || locks.IsLocked("*")
 }
 
-func isImmutablePrimaryMembership(m domain.SeriesMembership, inDesired bool) bool {
+func isImmutablePrimaryMembership(m domain.SeriesMembership) bool {
 	if !m.IsPrimary {
 		return false
 	}
-	if m.Source == domain.MembershipSourceManual || isPrimaryFieldLocked(m.LockedFields) {
-		return true
-	}
-	return m.LockedFields.HasAnyLock() && !inDesired
+	return m.Source == domain.MembershipSourceManual || isPrimaryFieldLocked(m.LockedFields)
 }
 
 func isPrimaryPromotionForbidden(m domain.SeriesMembership) bool {

@@ -51,6 +51,11 @@ var (
 	// ErrLibraryRootInUse is returned when deleting a library root that still owns
 	// media_assets rows (protected by the non-cascading foreign key on media_assets.library_root_id).
 	ErrLibraryRootInUse = errors.New("library root still owns media assets")
+
+	// ErrAutomaticSyncLockedFields is returned when automatic resolver sync
+	// receives non-empty locked_fields on proposed memberships; field locks belong
+	// strictly to stored curator edits.
+	ErrAutomaticSyncLockedFields = errors.New("automatic resolver sync cannot supply locked_fields")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.
