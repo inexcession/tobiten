@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -14,9 +15,19 @@ func TestFieldLocks(t *testing.T) {
 	if locks.IsLocked("title") {
 		t.Fatal("nil FieldLocks should not report any field locked")
 	}
+	if locks.HasAnyLock() {
+		t.Fatal("nil FieldLocks should not report HasAnyLock")
+	}
+	locks = FieldLocks{"title": false}
+	if locks.HasAnyLock() {
+		t.Fatal("false-only FieldLocks should not report HasAnyLock")
+	}
 	locks = locks.Lock("title")
 	if !locks.IsLocked("title") {
 		t.Fatal("expected title to be locked")
+	}
+	if !locks.HasAnyLock() {
+		t.Fatal("expected HasAnyLock to be true")
 	}
 	if locks.IsLocked("summary") {
 		t.Fatal("expected summary to remain unlocked")
@@ -24,6 +35,9 @@ func TestFieldLocks(t *testing.T) {
 	locks.Unlock("title")
 	if locks.IsLocked("title") {
 		t.Fatal("expected title to be unlocked after Unlock")
+	}
+	if locks.HasAnyLock() {
+		t.Fatal("expected HasAnyLock to be false after Unlock")
 	}
 }
 
@@ -199,6 +213,36 @@ func TestValidateSeriesMemberships(t *testing.T) {
 				},
 			},
 			wantErr: ErrDuplicateSeriesMember,
+		},
+		{
+			name:     "non-finite position NaN",
+			volumeID: "vol-1",
+			memberships: []SeriesMembership{
+				{
+					VolumeID:  "vol-1",
+					SeriesID:  "ser-1",
+					IsPrimary: true,
+					Kind:      MembershipKindSeries,
+					Position:  floatPtr(math.NaN()),
+					Source:    MembershipSourceResolver,
+				},
+			},
+			wantErr: ErrInvalidMembershipPosition,
+		},
+		{
+			name:     "non-finite position Inf",
+			volumeID: "vol-1",
+			memberships: []SeriesMembership{
+				{
+					VolumeID:  "vol-1",
+					SeriesID:  "ser-1",
+					IsPrimary: true,
+					Kind:      MembershipKindSeries,
+					Position:  floatPtr(math.Inf(1)),
+					Source:    MembershipSourceResolver,
+				},
+			},
+			wantErr: ErrInvalidMembershipPosition,
 		},
 	}
 

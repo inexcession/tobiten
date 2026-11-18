@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -11,28 +12,29 @@ import (
 
 // Common domain errors for catalogue types.
 var (
-	ErrEmptySeriesID           = errors.New("series ID cannot be empty")
-	ErrEmptyLibraryID          = errors.New("library ID cannot be empty")
-	ErrEmptySeriesTitle        = errors.New("series title cannot be empty")
-	ErrConflictingManualCover  = errors.New("manual series cover cannot set both cover_volume_id and cover_image_digest")
-	ErrInvalidCoverPolicy      = errors.New("invalid cover policy")
-	ErrEmptyVolumeID           = errors.New("volume ID cannot be empty")
-	ErrInvalidVolumeKind       = errors.New("invalid volume kind")
-	ErrInvalidChapterRange     = errors.New("chapter range must set start, end, and source together with start <= end")
-	ErrInvalidRangeSource      = errors.New("invalid chapter range source")
-	ErrInvalidMembershipKind   = errors.New("invalid series membership kind")
-	ErrInvalidMembershipSource = errors.New("invalid series membership source")
-	ErrMultiplePrimarySeries   = errors.New("volume cannot have more than one primary series membership")
-	ErrMissingPrimarySeries    = errors.New("non-standalone volume must have exactly one primary series membership")
-	ErrDuplicateSeriesMember   = errors.New("volume cannot have duplicate memberships in the same series")
-	ErrEmptyAssetID            = errors.New("asset ID cannot be empty")
-	ErrEmptyLibraryRootID      = errors.New("library root ID cannot be empty")
-	ErrInvalidAssetPath        = errors.New("asset relative path must be non-empty, relative, and non-escaping")
-	ErrInvalidMediaFormat      = errors.New("invalid media format")
-	ErrRetiredWithoutMissing   = errors.New("retired asset must have missing_since set")
-	ErrInvalidDigestKind       = errors.New("digest kind cannot be empty")
-	ErrEmptyDigestValue        = errors.New("digest value cannot be empty")
-	ErrInvalidDigestReason     = errors.New("invalid digest reason")
+	ErrEmptySeriesID             = errors.New("series ID cannot be empty")
+	ErrEmptyLibraryID            = errors.New("library ID cannot be empty")
+	ErrEmptySeriesTitle          = errors.New("series title cannot be empty")
+	ErrConflictingManualCover    = errors.New("manual series cover cannot set both cover_volume_id and cover_image_digest")
+	ErrInvalidCoverPolicy        = errors.New("invalid cover policy")
+	ErrEmptyVolumeID             = errors.New("volume ID cannot be empty")
+	ErrInvalidVolumeKind         = errors.New("invalid volume kind")
+	ErrInvalidChapterRange       = errors.New("chapter range must set start, end, and source together with start <= end")
+	ErrInvalidRangeSource        = errors.New("invalid chapter range source")
+	ErrInvalidMembershipKind     = errors.New("invalid series membership kind")
+	ErrInvalidMembershipSource   = errors.New("invalid series membership source")
+	ErrInvalidMembershipPosition = errors.New("series membership position must be finite")
+	ErrMultiplePrimarySeries     = errors.New("volume cannot have more than one primary series membership")
+	ErrMissingPrimarySeries      = errors.New("non-standalone volume must have exactly one primary series membership")
+	ErrDuplicateSeriesMember     = errors.New("volume cannot have duplicate memberships in the same series")
+	ErrEmptyAssetID              = errors.New("asset ID cannot be empty")
+	ErrEmptyLibraryRootID        = errors.New("library root ID cannot be empty")
+	ErrInvalidAssetPath          = errors.New("asset relative path must be non-empty, relative, and non-escaping")
+	ErrInvalidMediaFormat        = errors.New("invalid media format")
+	ErrRetiredWithoutMissing     = errors.New("retired asset must have missing_since set")
+	ErrInvalidDigestKind         = errors.New("digest kind cannot be empty")
+	ErrEmptyDigestValue          = errors.New("digest value cannot be empty")
+	ErrInvalidDigestReason       = errors.New("invalid digest reason")
 )
 
 // FieldLocks tracks Plex-style manually locked metadata fields (ADR-0007, ADR-0008).
@@ -58,6 +60,16 @@ func (l FieldLocks) Lock(field string) FieldLocks {
 // Unlock removes a manual lock from field.
 func (l FieldLocks) Unlock(field string) {
 	delete(l, field)
+}
+
+// HasAnyLock reports whether any field is marked locked.
+func (l FieldLocks) HasAnyLock() bool {
+	for _, locked := range l {
+		if locked {
+			return true
+		}
+	}
+	return false
 }
 
 // SeriesStatus represents the publication status of a series.
@@ -289,7 +301,16 @@ func (m *SeriesMembership) Validate() error {
 	if !m.Source.IsValid() {
 		return ErrInvalidMembershipSource
 	}
+	if m.Position != nil && (math.IsNaN(*m.Position) || math.IsInf(*m.Position, 0)) {
+		return ErrInvalidMembershipPosition
+	}
 	return nil
+}
+
+// IsProtectedFromAutoSync reports whether this membership must survive automatic
+// resolver or metadata sync (ADR-0008 §5, ADR-0019 §1).
+func (m *SeriesMembership) IsProtectedFromAutoSync() bool {
+	return m.Source == MembershipSourceManual || m.LockedFields.HasAnyLock()
 }
 
 // ValidateSeriesMemberships checks the membership set invariants for a single volume (ADR-0008 §5):

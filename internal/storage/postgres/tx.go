@@ -309,3 +309,7 @@ func (s *pgTx) Libraries() storage.LibraryRepository {
 func (s *pgTx) CatalogueWrites() storage.CatalogueWriteRepository {
 	return &CatalogueWriteRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
 }
+
+func (s *pgTx) SeriesMemberships() storage.SeriesMembershipRepository {
+	return &SeriesMembershipRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
