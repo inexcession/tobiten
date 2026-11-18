@@ -1,0 +1,6 @@
+  <!-- before --><?tool before?>
+<ComicInfo xmlns:x="urn:example" xmlns:y="urn:outer" x:note="ok">
+  <Title>Retained</Title><x:extra><y:item xmlns:y="urn:inner" y:attr="ok"/></x:extra>
+  <Pages><Page Image="0" xml:lang="en"/></Pages>
+</ComicInfo>
+<?tool after?><!-- after -->

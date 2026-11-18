@@ -62,7 +62,7 @@ func TestLenientRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Volume == nil || *got.Volume != 2 || got.Manga != "YesAndRightToLeft" || got.Day != nil || len(got.Pages) != 2 || !reflect.DeepEqual(got.Pages[0].Type, []string{"FrontCover", "Deleted"}) || len(got.Pages[1].Type) != 0 || len(diags) != 7 {
+	if got.Volume == nil || *got.Volume != 2 || got.Manga != "YesAndRightToLeft" || got.Day != nil || len(got.Pages) != 2 || !reflect.DeepEqual(got.Pages[0].Type, []string{"FrontCover", "Deleted"}) || len(got.Pages[1].Type) != 0 || len(diags) != 8 {
 		t.Fatalf("%+v diagnostics %+v", got, diags)
 	}
 }
@@ -85,5 +85,76 @@ func TestBoundariesAndDuplicates(t *testing.T) {
 		if (err == nil) != tc.valid {
 			t.Errorf("%s: %v", tc.body, err)
 		}
+	}
+}
+
+func TestDocumentStructure(t *testing.T) {
+	fixtures := []struct {
+		name  string
+		valid bool
+	}{
+		{"document-valid.xml", true}, {"document-invalid-prefix.xml", false}, {"document-invalid-outside.xml", false},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			data, err := os.ReadFile("testdata/" + fixture.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, mode := range []Mode{Strict, Lenient} {
+				got, diags, err := parse(t, string(data), mode)
+				if fixture.valid {
+					if err != nil || len(diags) != 0 || got.Title != "Retained" {
+						t.Fatalf("mode %v: %+v %v %v", mode, got, diags, err)
+					}
+				} else if err == nil || !reflect.DeepEqual(got, Metadata{}) || diags != nil {
+					t.Fatalf("mode %v: %+v %v %v", mode, got, diags, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDocumentSyntaxCases(t *testing.T) {
+	cases := []struct {
+		name, doc string
+		valid     bool
+	}{
+		{"literal whitespace and comments", " \n<!-- hi --><ComicInfo/>\r\n<?end ok?>", true},
+		{"declared in place", `<ComicInfo><x:extension xmlns:x="urn:x" x:key="v"/></ComicInfo>`, true},
+		{"nested default namespace", `<ComicInfo><Unused xmlns="urn:x"><Any/></Unused><Title>ok</Title></ComicInfo>`, true},
+		{"character reference before", `&#32;<ComicInfo/>`, false},
+		{"character reference after", `<ComicInfo/>&#x20;`, false},
+		{"CDATA after", `<ComicInfo/><![CDATA[ ]]>`, false},
+		{"empty CDATA after", `<ComicInfo/><![CDATA[]]>`, false},
+		{"undeclared attribute", `<ComicInfo><Extra u:a="x"/></ComicInfo>`, false},
+		{"scope ends", `<ComicInfo><Extra xmlns:x="urn:x"/><x:Extra/></ComicInfo>`, false},
+		{"prefix cleared", `<ComicInfo xmlns:x="urn:x"><Extra xmlns:x=""><x:E/></Extra></ComicInfo>`, false},
+		{"reserved prefix", `<ComicInfo xmlns:xml="urn:wrong"/>`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []Mode{Strict, Lenient} {
+				got, diags, err := parse(t, tc.doc, mode)
+				if tc.valid {
+					if err != nil {
+						t.Fatalf("mode %v: %v", mode, err)
+					}
+				} else if err == nil || !reflect.DeepEqual(got, Metadata{}) || diags != nil {
+					t.Fatalf("mode %v: %+v %v %v", mode, got, diags, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLenientDuplicateAfterInvalid(t *testing.T) {
+	got, diags, err := parse(t, `<ComicInfo><Volume>invalid</Volume><Volume>2</Volume></ComicInfo>`, Lenient)
+	if err != nil || got.Volume == nil || *got.Volume != 2 {
+		t.Fatalf("metadata %+v: %v", got, err)
+	}
+	want := []Diagnostic{{Field: "Volume", Reason: "invalid integer"}, {Field: "Volume", Reason: "duplicate singleton"}}
+	if !reflect.DeepEqual(diags, want) {
+		t.Fatalf("diagnostics: got %+v, want %+v", diags, want)
 	}
 }

@@ -74,6 +74,9 @@ func readDocument(r io.Reader) (*element, error) {
 	if !utf8.Valid(data) {
 		return nil, errors.New("comicinfo: invalid UTF-8")
 	}
+	if err := validateDocumentSyntax(data); err != nil {
+		return nil, err
+	}
 	d := xml.NewDecoder(bytes.NewReader(data))
 	b := documentBuilder{}
 	for {
@@ -202,9 +205,11 @@ func (p *parser) field(n *element) {
 	if p.occurrences == nil {
 		p.occurrences = make(map[string]bool)
 	}
-	if p.seen[name] || (p.mode == Strict && p.occurrences[name]) {
+	if p.occurrences[name] {
 		p.problem(name, "duplicate singleton")
-		return
+		if p.mode == Strict || p.seen[name] {
+			return
+		}
 	}
 	p.occurrences[name] = true
 	if name == "Pages" {
