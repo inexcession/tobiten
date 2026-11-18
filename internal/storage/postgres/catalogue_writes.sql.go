@@ -333,56 +333,74 @@ func (q *Queries) DemoteCurrentAssetDigests(ctx context.Context, arg DemoteCurre
 	return err
 }
 
-const findMediaAssetsByDigestInLibrary = `-- name: FindMediaAssetsByDigestInLibrary :many
-SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match,
-       a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages,
-       a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at
+const findMediaAssetsWithDigestsByDigestInLibrary = `-- name: FindMediaAssetsWithDigestsByDigestInLibrary :many
+SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
+       d.kind AS digest_kind,
+       d.value AS digest_value,
+       d.is_current AS digest_is_current,
+       d.reason AS digest_reason,
+       d.recorded_at AS digest_recorded_at
 FROM media_assets a
 JOIN library_roots r ON r.id = a.library_root_id
+LEFT JOIN asset_digests d ON d.asset_id = a.id
 WHERE r.library_id = $1
   AND EXISTS (
       SELECT 1
-      FROM asset_digests d
-      WHERE d.asset_id = a.id
-        AND d.kind = $2
-        AND d.value = $3
+      FROM asset_digests match_d
+      WHERE match_d.asset_id = a.id
+        AND match_d.kind = $2
+        AND match_d.value = $3
   )
-ORDER BY a.created_at ASC, a.id ASC
+ORDER BY a.created_at ASC, a.id ASC, d.kind ASC, d.is_current DESC, d.recorded_at DESC, d.value ASC
 `
 
-type FindMediaAssetsByDigestInLibraryParams struct {
+type FindMediaAssetsWithDigestsByDigestInLibraryParams struct {
 	LibraryID string
 	Kind      string
 	Value     string
 }
 
-func (q *Queries) FindMediaAssetsByDigestInLibrary(ctx context.Context, arg FindMediaAssetsByDigestInLibraryParams) ([]MediaAsset, error) {
-	rows, err := q.db.Query(ctx, findMediaAssetsByDigestInLibrary, arg.LibraryID, arg.Kind, arg.Value)
+type FindMediaAssetsWithDigestsByDigestInLibraryRow struct {
+	MediaAsset       MediaAsset
+	DigestKind       *string
+	DigestValue      *string
+	DigestIsCurrent  pgtype.Bool
+	DigestReason     *string
+	DigestRecordedAt *time.Time
+}
+
+func (q *Queries) FindMediaAssetsWithDigestsByDigestInLibrary(ctx context.Context, arg FindMediaAssetsWithDigestsByDigestInLibraryParams) ([]FindMediaAssetsWithDigestsByDigestInLibraryRow, error) {
+	rows, err := q.db.Query(ctx, findMediaAssetsWithDigestsByDigestInLibrary, arg.LibraryID, arg.Kind, arg.Value)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []MediaAsset
+	var items []FindMediaAssetsWithDigestsByDigestInLibraryRow
 	for rows.Next() {
-		var i MediaAsset
+		var i FindMediaAssetsWithDigestsByDigestInLibraryRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.VolumeID,
-			&i.LibraryRootID,
-			&i.RelPathBytes,
-			&i.RelPathDisplay,
-			&i.RelPathMatch,
-			&i.FileSize,
-			&i.FileMtime,
-			&i.Format,
-			&i.PageCount,
-			&i.CoverPageIndex,
-			&i.SuppressedPages,
-			&i.Diagnostics,
-			&i.MissingSince,
-			&i.RetiredAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
+			&i.MediaAsset.ID,
+			&i.MediaAsset.VolumeID,
+			&i.MediaAsset.LibraryRootID,
+			&i.MediaAsset.RelPathBytes,
+			&i.MediaAsset.RelPathDisplay,
+			&i.MediaAsset.RelPathMatch,
+			&i.MediaAsset.FileSize,
+			&i.MediaAsset.FileMtime,
+			&i.MediaAsset.Format,
+			&i.MediaAsset.PageCount,
+			&i.MediaAsset.CoverPageIndex,
+			&i.MediaAsset.SuppressedPages,
+			&i.MediaAsset.Diagnostics,
+			&i.MediaAsset.MissingSince,
+			&i.MediaAsset.RetiredAt,
+			&i.MediaAsset.CreatedAt,
+			&i.MediaAsset.UpdatedAt,
+			&i.DigestKind,
+			&i.DigestValue,
+			&i.DigestIsCurrent,
+			&i.DigestReason,
+			&i.DigestRecordedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -394,37 +412,69 @@ func (q *Queries) FindMediaAssetsByDigestInLibrary(ctx context.Context, arg Find
 	return items, nil
 }
 
-const getMediaAssetByIDForWrite = `-- name: GetMediaAssetByIDForWrite :one
-SELECT id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match,
-       file_size, file_mtime, format, page_count, cover_page_index, suppressed_pages,
-       diagnostics, missing_since, retired_at, created_at, updated_at
-FROM media_assets
-WHERE id = $1
+const getMediaAssetWithDigestsByIDForWrite = `-- name: GetMediaAssetWithDigestsByIDForWrite :many
+SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
+       d.kind AS digest_kind,
+       d.value AS digest_value,
+       d.is_current AS digest_is_current,
+       d.reason AS digest_reason,
+       d.recorded_at AS digest_recorded_at
+FROM media_assets a
+LEFT JOIN asset_digests d ON d.asset_id = a.id
+WHERE a.id = $1
+ORDER BY d.kind ASC, d.is_current DESC, d.recorded_at DESC, d.value ASC
 `
 
-func (q *Queries) GetMediaAssetByIDForWrite(ctx context.Context, id string) (MediaAsset, error) {
-	row := q.db.QueryRow(ctx, getMediaAssetByIDForWrite, id)
-	var i MediaAsset
-	err := row.Scan(
-		&i.ID,
-		&i.VolumeID,
-		&i.LibraryRootID,
-		&i.RelPathBytes,
-		&i.RelPathDisplay,
-		&i.RelPathMatch,
-		&i.FileSize,
-		&i.FileMtime,
-		&i.Format,
-		&i.PageCount,
-		&i.CoverPageIndex,
-		&i.SuppressedPages,
-		&i.Diagnostics,
-		&i.MissingSince,
-		&i.RetiredAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
+type GetMediaAssetWithDigestsByIDForWriteRow struct {
+	MediaAsset       MediaAsset
+	DigestKind       *string
+	DigestValue      *string
+	DigestIsCurrent  pgtype.Bool
+	DigestReason     *string
+	DigestRecordedAt *time.Time
+}
+
+func (q *Queries) GetMediaAssetWithDigestsByIDForWrite(ctx context.Context, id string) ([]GetMediaAssetWithDigestsByIDForWriteRow, error) {
+	rows, err := q.db.Query(ctx, getMediaAssetWithDigestsByIDForWrite, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetMediaAssetWithDigestsByIDForWriteRow
+	for rows.Next() {
+		var i GetMediaAssetWithDigestsByIDForWriteRow
+		if err := rows.Scan(
+			&i.MediaAsset.ID,
+			&i.MediaAsset.VolumeID,
+			&i.MediaAsset.LibraryRootID,
+			&i.MediaAsset.RelPathBytes,
+			&i.MediaAsset.RelPathDisplay,
+			&i.MediaAsset.RelPathMatch,
+			&i.MediaAsset.FileSize,
+			&i.MediaAsset.FileMtime,
+			&i.MediaAsset.Format,
+			&i.MediaAsset.PageCount,
+			&i.MediaAsset.CoverPageIndex,
+			&i.MediaAsset.SuppressedPages,
+			&i.MediaAsset.Diagnostics,
+			&i.MediaAsset.MissingSince,
+			&i.MediaAsset.RetiredAt,
+			&i.MediaAsset.CreatedAt,
+			&i.MediaAsset.UpdatedAt,
+			&i.DigestKind,
+			&i.DigestValue,
+			&i.DigestIsCurrent,
+			&i.DigestReason,
+			&i.DigestRecordedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getSeriesByIDForWrite = `-- name: GetSeriesByIDForWrite :one
@@ -544,111 +594,60 @@ func (q *Queries) InsertAssetDigest(ctx context.Context, arg InsertAssetDigestPa
 	return i, err
 }
 
-const listAssetDigestsByAssetIDs = `-- name: ListAssetDigestsByAssetIDs :many
-SELECT asset_id, kind, value, is_current, reason, recorded_at
-FROM asset_digests
-WHERE asset_id = ANY($1::text[])
-ORDER BY asset_id ASC, kind ASC, is_current DESC, recorded_at DESC, value ASC
+const listMediaAssetsWithCurrentDigestsByRoot = `-- name: ListMediaAssetsWithCurrentDigestsByRoot :many
+SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
+       d.kind AS digest_kind,
+       d.value AS digest_value,
+       d.is_current AS digest_is_current,
+       d.reason AS digest_reason,
+       d.recorded_at AS digest_recorded_at
+FROM media_assets a
+LEFT JOIN asset_digests d ON d.asset_id = a.id AND d.is_current = TRUE
+WHERE a.library_root_id = $1
+ORDER BY a.rel_path_bytes ASC, a.id ASC, d.kind ASC
 `
 
-func (q *Queries) ListAssetDigestsByAssetIDs(ctx context.Context, dollar_1 []string) ([]AssetDigest, error) {
-	rows, err := q.db.Query(ctx, listAssetDigestsByAssetIDs, dollar_1)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []AssetDigest
-	for rows.Next() {
-		var i AssetDigest
-		if err := rows.Scan(
-			&i.AssetID,
-			&i.Kind,
-			&i.Value,
-			&i.IsCurrent,
-			&i.Reason,
-			&i.RecordedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+type ListMediaAssetsWithCurrentDigestsByRootRow struct {
+	MediaAsset       MediaAsset
+	DigestKind       *string
+	DigestValue      *string
+	DigestIsCurrent  pgtype.Bool
+	DigestReason     *string
+	DigestRecordedAt *time.Time
 }
 
-const listCurrentAssetDigestsByAssetIDs = `-- name: ListCurrentAssetDigestsByAssetIDs :many
-SELECT asset_id, kind, value, is_current, reason, recorded_at
-FROM asset_digests
-WHERE asset_id = ANY($1::text[])
-  AND is_current = TRUE
-ORDER BY asset_id ASC, kind ASC
-`
-
-func (q *Queries) ListCurrentAssetDigestsByAssetIDs(ctx context.Context, dollar_1 []string) ([]AssetDigest, error) {
-	rows, err := q.db.Query(ctx, listCurrentAssetDigestsByAssetIDs, dollar_1)
+func (q *Queries) ListMediaAssetsWithCurrentDigestsByRoot(ctx context.Context, libraryRootID string) ([]ListMediaAssetsWithCurrentDigestsByRootRow, error) {
+	rows, err := q.db.Query(ctx, listMediaAssetsWithCurrentDigestsByRoot, libraryRootID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []AssetDigest
+	var items []ListMediaAssetsWithCurrentDigestsByRootRow
 	for rows.Next() {
-		var i AssetDigest
+		var i ListMediaAssetsWithCurrentDigestsByRootRow
 		if err := rows.Scan(
-			&i.AssetID,
-			&i.Kind,
-			&i.Value,
-			&i.IsCurrent,
-			&i.Reason,
-			&i.RecordedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listMediaAssetsByRoot = `-- name: ListMediaAssetsByRoot :many
-SELECT id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match,
-       file_size, file_mtime, format, page_count, cover_page_index, suppressed_pages,
-       diagnostics, missing_since, retired_at, created_at, updated_at
-FROM media_assets
-WHERE library_root_id = $1
-ORDER BY rel_path_bytes ASC, id ASC
-`
-
-func (q *Queries) ListMediaAssetsByRoot(ctx context.Context, libraryRootID string) ([]MediaAsset, error) {
-	rows, err := q.db.Query(ctx, listMediaAssetsByRoot, libraryRootID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []MediaAsset
-	for rows.Next() {
-		var i MediaAsset
-		if err := rows.Scan(
-			&i.ID,
-			&i.VolumeID,
-			&i.LibraryRootID,
-			&i.RelPathBytes,
-			&i.RelPathDisplay,
-			&i.RelPathMatch,
-			&i.FileSize,
-			&i.FileMtime,
-			&i.Format,
-			&i.PageCount,
-			&i.CoverPageIndex,
-			&i.SuppressedPages,
-			&i.Diagnostics,
-			&i.MissingSince,
-			&i.RetiredAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
+			&i.MediaAsset.ID,
+			&i.MediaAsset.VolumeID,
+			&i.MediaAsset.LibraryRootID,
+			&i.MediaAsset.RelPathBytes,
+			&i.MediaAsset.RelPathDisplay,
+			&i.MediaAsset.RelPathMatch,
+			&i.MediaAsset.FileSize,
+			&i.MediaAsset.FileMtime,
+			&i.MediaAsset.Format,
+			&i.MediaAsset.PageCount,
+			&i.MediaAsset.CoverPageIndex,
+			&i.MediaAsset.SuppressedPages,
+			&i.MediaAsset.Diagnostics,
+			&i.MediaAsset.MissingSince,
+			&i.MediaAsset.RetiredAt,
+			&i.MediaAsset.CreatedAt,
+			&i.MediaAsset.UpdatedAt,
+			&i.DigestKind,
+			&i.DigestValue,
+			&i.DigestIsCurrent,
+			&i.DigestReason,
+			&i.DigestRecordedAt,
 		); err != nil {
 			return nil, err
 		}

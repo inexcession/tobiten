@@ -346,16 +346,24 @@ func (r *CatalogueWriteRepository) GetAssetByID(ctx context.Context, id string) 
 	if strings.TrimSpace(id) == "" {
 		return nil, domain.ErrEmptyAssetID
 	}
-	row, err := r.q.GetMediaAssetByIDForWrite(ctx, id)
+	rows, err := r.q.GetMediaAssetWithDigestsByIDForWrite(ctx, id)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	out, err := mediaAssetModelToDomain(row)
-	if err != nil {
-		return nil, err
+	if len(rows) == 0 {
+		return nil, storage.ErrNotFound
 	}
-	assets := []domain.MediaAsset{out}
-	if err := r.attachAssetDigests(ctx, assets, false); err != nil {
+	assets, err := mapJoinedAssetRows(rows, func(row GetMediaAssetWithDigestsByIDForWriteRow) joinedAssetDigestRow {
+		return joinedAssetDigestRow{
+			asset:            row.MediaAsset,
+			digestKind:       row.DigestKind,
+			digestValue:      row.DigestValue,
+			digestIsCurrent:  row.DigestIsCurrent,
+			digestReason:     row.DigestReason,
+			digestRecordedAt: row.DigestRecordedAt,
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &assets[0], nil
@@ -448,18 +456,20 @@ func (r *CatalogueWriteRepository) ListAssetsByRoot(ctx context.Context, library
 	if strings.TrimSpace(libraryRootID) == "" {
 		return nil, domain.ErrEmptyLibraryRootID
 	}
-	rows, err := r.q.ListMediaAssetsByRoot(ctx, libraryRootID)
+	rows, err := r.q.ListMediaAssetsWithCurrentDigestsByRoot(ctx, libraryRootID)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	out, err := mediaAssetModelsToDomain(rows)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.attachAssetDigests(ctx, out, true); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return mapJoinedAssetRows(rows, func(row ListMediaAssetsWithCurrentDigestsByRootRow) joinedAssetDigestRow {
+		return joinedAssetDigestRow{
+			asset:            row.MediaAsset,
+			digestKind:       row.DigestKind,
+			digestValue:      row.DigestValue,
+			digestIsCurrent:  row.DigestIsCurrent,
+			digestReason:     row.DigestReason,
+			digestRecordedAt: row.DigestRecordedAt,
+		}
+	})
 }
 
 // RecordAssetDigest records a new current digest for (digest.AssetID, digest.Kind),
@@ -524,7 +534,7 @@ func (r *CatalogueWriteRepository) FindAssetsByDigest(
 		return nil, domain.ErrEmptyDigestValue
 	}
 
-	rows, err := r.q.FindMediaAssetsByDigestInLibrary(ctx, FindMediaAssetsByDigestInLibraryParams{
+	rows, err := r.q.FindMediaAssetsWithDigestsByDigestInLibrary(ctx, FindMediaAssetsWithDigestsByDigestInLibraryParams{
 		LibraryID: libraryID,
 		Kind:      string(kind),
 		Value:     value,
@@ -532,46 +542,57 @@ func (r *CatalogueWriteRepository) FindAssetsByDigest(
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	out, err := mediaAssetModelsToDomain(rows)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.attachAssetDigests(ctx, out, false); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return mapJoinedAssetRows(rows, func(row FindMediaAssetsWithDigestsByDigestInLibraryRow) joinedAssetDigestRow {
+		return joinedAssetDigestRow{
+			asset:            row.MediaAsset,
+			digestKind:       row.DigestKind,
+			digestValue:      row.DigestValue,
+			digestIsCurrent:  row.DigestIsCurrent,
+			digestReason:     row.DigestReason,
+			digestRecordedAt: row.DigestRecordedAt,
+		}
+	})
 }
 
-func (r *CatalogueWriteRepository) attachAssetDigests(ctx context.Context, assets []domain.MediaAsset, currentOnly bool) error {
-	if len(assets) == 0 {
-		return nil
-	}
-	ids := make([]string, len(assets))
-	for i := range assets {
-		ids[i] = assets[i].ID
-	}
+type joinedAssetDigestRow struct {
+	asset            MediaAsset
+	digestKind       *string
+	digestValue      *string
+	digestIsCurrent  pgtype.Bool
+	digestReason     *string
+	digestRecordedAt *time.Time
+}
 
-	var (
-		rows []AssetDigest
-		err  error
-	)
-	if currentOnly {
-		rows, err = r.q.ListCurrentAssetDigestsByAssetIDs(ctx, ids)
-	} else {
-		rows, err = r.q.ListAssetDigestsByAssetIDs(ctx, ids)
+func mapJoinedAssetRows[R any](rows []R, convert func(R) joinedAssetDigestRow) ([]domain.MediaAsset, error) {
+	joined := make([]joinedAssetDigestRow, len(rows))
+	for i, row := range rows {
+		joined[i] = convert(row)
 	}
-	if err != nil {
-		return mapPgError(err)
-	}
+	return foldJoinedAssetDigests(joined)
+}
 
-	byAsset := make(map[string][]domain.AssetDigest, len(assets))
-	for _, row := range rows {
-		byAsset[row.AssetID] = append(byAsset[row.AssetID], assetDigestModelToDomain(row))
+func foldJoinedAssetDigests(rows []joinedAssetDigestRow) ([]domain.MediaAsset, error) {
+	out := make([]domain.MediaAsset, 0, len(rows))
+	for _, r := range rows {
+		if len(out) == 0 || out[len(out)-1].ID != r.asset.ID {
+			asset, err := mediaAssetModelToDomain(r.asset)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, asset)
+		}
+		if r.digestKind != nil && r.digestValue != nil && r.digestIsCurrent.Valid && r.digestReason != nil && r.digestRecordedAt != nil {
+			out[len(out)-1].Digests = append(out[len(out)-1].Digests, assetDigestModelToDomain(AssetDigest{
+				AssetID:    r.asset.ID,
+				Kind:       *r.digestKind,
+				Value:      *r.digestValue,
+				IsCurrent:  r.digestIsCurrent.Bool,
+				Reason:     *r.digestReason,
+				RecordedAt: *r.digestRecordedAt,
+			}))
+		}
 	}
-	for i := range assets {
-		assets[i].Digests = byAsset[assets[i].ID]
-	}
-	return nil
+	return out, nil
 }
 
 func prepareSeriesWrite(series *domain.Series, isCreate bool) (domain.Series, []byte, []byte, pgtype.Int4, pgtype.Int4, error) {
@@ -694,9 +715,7 @@ func prepareAssetWrite(asset *domain.MediaAsset, isCreate bool) (preparedAssetWr
 	candidate.RelPathBytes = resolvedPath.Bytes
 	candidate.RelPathDisplay = resolvedPath.Display
 	candidate.RelPathMatch = resolvedPath.Match
-	if resolvedPath.InvalidUTF8 {
-		candidate.Diagnostics.InvalidUTF8Path = true
-	}
+	candidate.Diagnostics.InvalidUTF8Path = resolvedPath.InvalidUTF8
 
 	if err := candidate.Validate(); err != nil {
 		return preparedAssetWrite{}, err
@@ -1012,18 +1031,6 @@ func mediaAssetModelToDomain(row MediaAsset) (domain.MediaAsset, error) {
 		CreatedAt:       row.CreatedAt.UTC(),
 		UpdatedAt:       row.UpdatedAt.UTC(),
 	}, nil
-}
-
-func mediaAssetModelsToDomain(rows []MediaAsset) ([]domain.MediaAsset, error) {
-	out := make([]domain.MediaAsset, len(rows))
-	for i, row := range rows {
-		asset, err := mediaAssetModelToDomain(row)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = asset
-	}
-	return out, nil
 }
 
 func assetDigestModelToDomain(row AssetDigest) domain.AssetDigest {

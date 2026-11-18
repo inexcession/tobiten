@@ -1,10 +1,12 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 
@@ -1087,12 +1089,19 @@ func decodeFieldLocks(raw []byte) (domain.FieldLocks, error) {
 }
 
 func decodeJSONMap(raw []byte) (map[string]any, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return map[string]any{}, nil
 	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
 	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := dec.Decode(&out); err != nil {
 		return nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New("unexpected trailing data in JSON map")
 	}
 	if out == nil {
 		out = map[string]any{}

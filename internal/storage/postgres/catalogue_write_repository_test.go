@@ -5,9 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
@@ -1367,5 +1375,502 @@ func TestCatalogueWriteRepository_UpdateAssetAndConcurrentDigestRotation(t *test
 	}
 	if currentCount != 1 || totalCount != workers+1 {
 		t.Fatalf("concurrent digest counts = (current=%d, total=%d), want (1, %d)", currentCount, totalCount, workers+1)
+	}
+}
+
+type countingDBTX struct {
+	inner postgres.DBTX
+	count atomic.Int32
+}
+
+func (c *countingDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.count.Add(1)
+	return c.inner.Exec(ctx, sql, args...)
+}
+
+func (c *countingDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	c.count.Add(1)
+	return c.inner.Query(ctx, sql, args...)
+}
+
+func (c *countingDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	c.count.Add(1)
+	return c.inner.QueryRow(ctx, sql, args...)
+}
+
+func TestCatalogueWriteRepository_AssetAndDigestReadsUseOneSnapshot(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		libID   string
+		rootID  string
+		volID   string
+		assetID string
+	)
+	const stableFullDigest = "stable-full-xxh3-128-snapshot-test"
+	t0 := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, root := seedTestLibraryAndRoot(ctx, t, tx, "Snapshot Lib", []byte("/srv/snapshot"))
+		libID, rootID = lib.ID, root.ID
+		cw := tx.CatalogueWrites()
+
+		vol := domain.Volume{LibraryID: lib.ID, Kind: domain.VolumeKindVolume}
+		if err := cw.CreateVolume(ctx, &vol); err != nil {
+			return err
+		}
+		volID = vol.ID
+
+		asset := domain.MediaAsset{
+			VolumeID:      volID,
+			LibraryRootID: rootID,
+			RelPathBytes:  []byte("step-0.cbz"),
+			FileSize:      100,
+			Format:        domain.MediaFormatCBZ,
+			Digests: []domain.AssetDigest{
+				{
+					Kind:       domain.DigestKindXXH364Partial,
+					Value:      "partial-0",
+					IsCurrent:  true,
+					Reason:     domain.DigestReasonScan,
+					RecordedAt: t0,
+				},
+				{
+					Kind:       domain.DigestKindXXH3128Full,
+					Value:      stableFullDigest,
+					IsCurrent:  true,
+					Reason:     domain.DigestReasonDedupe,
+					RecordedAt: t0,
+				},
+			},
+			CreatedAt: t0,
+			UpdatedAt: t0,
+		}
+		if err := cw.CreateAsset(ctx, &asset); err != nil {
+			return err
+		}
+		assetID = asset.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	// 1. Verify each read executes exactly one SQL statement so PostgreSQL Read Committed
+	// evaluates both media_assets and asset_digests against the same snapshot.
+	counter := &countingDBTX{inner: db.Pool}
+	countedRepo := postgres.NewCatalogueWriteRepository(counter)
+
+	counter.count.Store(0)
+	if _, err := countedRepo.GetAssetByID(ctx, assetID); err != nil {
+		t.Fatalf("GetAssetByID: %v", err)
+	}
+	if got := counter.count.Load(); got != 1 {
+		t.Fatalf("GetAssetByID executed %d queries, want 1", got)
+	}
+
+	counter.count.Store(0)
+	if _, err := countedRepo.ListAssetsByRoot(ctx, rootID); err != nil {
+		t.Fatalf("ListAssetsByRoot: %v", err)
+	}
+	if got := counter.count.Load(); got != 1 {
+		t.Fatalf("ListAssetsByRoot executed %d queries, want 1", got)
+	}
+
+	counter.count.Store(0)
+	if _, err := countedRepo.FindAssetsByDigest(ctx, libID, domain.DigestKindXXH3128Full, stableFullDigest); err != nil {
+		t.Fatalf("FindAssetsByDigest: %v", err)
+	}
+	if got := counter.count.Load(); got != 1 {
+		t.Fatalf("FindAssetsByDigest executed %d queries, want 1", got)
+	}
+
+	// 2. Concurrent asset update + digest rotation under PostgreSQL Read Committed:
+	// readers on both db.Pool and storage.Tx must never pair step N metadata with step M digests.
+	verifySnapshotCoherence := func(source string, a domain.MediaAsset, currentOnly bool) error {
+		stepStr, ok := strings.CutPrefix(string(a.RelPathBytes), "step-")
+		if !ok {
+			return fmt.Errorf("%s: unexpected RelPathBytes %q", source, a.RelPathBytes)
+		}
+		stepStr, ok = strings.CutSuffix(stepStr, ".cbz")
+		if !ok {
+			return fmt.Errorf("%s: unexpected RelPathBytes %q", source, a.RelPathBytes)
+		}
+		step, err := strconv.Atoi(stepStr)
+		if err != nil {
+			return fmt.Errorf("%s: parsing step from %q: %w", source, a.RelPathBytes, err)
+		}
+		if a.FileSize != int64(100+step) {
+			return fmt.Errorf("%s: FileSize=%d mismatched path step %d (%q)", source, a.FileSize, step, a.RelPathBytes)
+		}
+		partial, ok := a.CurrentDigest(domain.DigestKindXXH364Partial)
+		if !ok {
+			return fmt.Errorf("%s: missing current partial digest at step %d", source, step)
+		}
+		wantDigest := fmt.Sprintf("partial-%d", step)
+		if partial.Value != wantDigest {
+			return fmt.Errorf("%s: split snapshot detected: asset at step %d (size=%d, path=%q) had current partial digest %q, want %q",
+				source, step, a.FileSize, a.RelPathBytes, partial.Value, wantDigest)
+		}
+		if currentOnly {
+			for _, d := range a.Digests {
+				if !d.IsCurrent {
+					return fmt.Errorf("%s: expected only current digests, got %+v", source, d)
+				}
+			}
+		}
+		return nil
+	}
+
+	const steps = 80
+	writerDone := make(chan struct{})
+	errCh := make(chan error, 8)
+
+	var readersStarted sync.WaitGroup
+	readersStarted.Add(3)
+	var totalReads atomic.Int64
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(writerDone)
+		readersStarted.Wait()
+		for step := 1; step <= steps; step++ {
+			err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				cw := tx.CatalogueWrites()
+				a, err := cw.GetAssetByID(ctx, assetID)
+				if err != nil {
+					return err
+				}
+				a.RelPathBytes = fmt.Appendf(nil, "step-%d.cbz", step)
+				a.RelPathDisplay = ""
+				a.RelPathMatch = ""
+				a.FileSize = int64(100 + step)
+				a.UpdatedAt = t0.Add(time.Duration(step) * time.Second)
+				if err := cw.UpdateAsset(ctx, a); err != nil {
+					return err
+				}
+				return cw.RecordAssetDigest(ctx, &domain.AssetDigest{
+					AssetID:    assetID,
+					Kind:       domain.DigestKindXXH364Partial,
+					Value:      fmt.Sprintf("partial-%d", step),
+					Reason:     domain.DigestReasonExternalModify,
+					RecordedAt: t0.Add(time.Duration(step) * time.Second),
+				})
+			})
+			if err != nil {
+				errCh <- fmt.Errorf("writer step %d: %w", step, err)
+				return
+			}
+		}
+	}()
+
+	runReader := func(name string, readFn func(cw storage.CatalogueWriteRepository) error) {
+		defer wg.Done()
+		poolRepo := postgres.NewCatalogueWriteRepository(db.Pool)
+		useTx := false
+		signaled := false
+		for {
+			select {
+			case <-writerDone:
+				return
+			default:
+			}
+			var err error
+			if useTx {
+				err = transactor.WithTx(ctx, func(tx storage.Tx) error {
+					return readFn(tx.CatalogueWrites())
+				})
+			} else {
+				err = readFn(poolRepo)
+			}
+			useTx = !useTx
+			if err != nil {
+				if !signaled {
+					readersStarted.Done()
+				}
+				errCh <- fmt.Errorf("%s: %w", name, err)
+				return
+			}
+			totalReads.Add(1)
+			if !signaled {
+				signaled = true
+				readersStarted.Done()
+			}
+		}
+	}
+
+	wg.Add(3)
+	go runReader("GetAssetByID", func(cw storage.CatalogueWriteRepository) error {
+		a, err := cw.GetAssetByID(ctx, assetID)
+		if err != nil {
+			return err
+		}
+		return verifySnapshotCoherence("GetAssetByID", *a, false)
+	})
+	go runReader("ListAssetsByRoot", func(cw storage.CatalogueWriteRepository) error {
+		list, err := cw.ListAssetsByRoot(ctx, rootID)
+		if err != nil {
+			return err
+		}
+		if len(list) != 1 {
+			return fmt.Errorf("ListAssetsByRoot len = %d, want 1", len(list))
+		}
+		return verifySnapshotCoherence("ListAssetsByRoot", list[0], true)
+	})
+	go runReader("FindAssetsByDigest", func(cw storage.CatalogueWriteRepository) error {
+		matches, err := cw.FindAssetsByDigest(ctx, libID, domain.DigestKindXXH3128Full, stableFullDigest)
+		if err != nil {
+			return err
+		}
+		if len(matches) != 1 {
+			return fmt.Errorf("FindAssetsByDigest len = %d, want 1", len(matches))
+		}
+		return verifySnapshotCoherence("FindAssetsByDigest", matches[0], false)
+	})
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if totalReads.Load() < 3 {
+		t.Fatalf("expected concurrent reads during writer loop, got %d", totalReads.Load())
+	}
+}
+
+func TestCatalogueWriteRepository_PreserveLargeNumericExternalIDs(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 9007199254740993 = 2^53 + 1; float64 unmarshaling rounds it to 9007199254740992.
+	const (
+		largeSeriesID = "9007199254740993"
+		largeNestedID = "9007199254740999"
+		largeVolumeID = "9007199254740995"
+	)
+
+	var (
+		seriesID string
+		volID    string
+		reader   domain.User
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, _ := seedTestLibraryAndRoot(ctx, t, tx, "ExternalID Lib", []byte("/srv/extids"))
+		reader = domain.User{ID: domain.MustNewID(), Username: "extids-reader"}
+		if err := tx.Users().CreateUser(ctx, &reader); err != nil {
+			return err
+		}
+		cw := tx.CatalogueWrites()
+
+		series := domain.Series{
+			LibraryID: lib.ID,
+			Title:     "Precision Series",
+			ExternalIDs: map[string]any{
+				"anilist": json.Number(largeSeriesID),
+				"nested":  map[string]any{"id": json.Number(largeNestedID)},
+			},
+		}
+		if err := cw.CreateSeries(ctx, &series); err != nil {
+			return err
+		}
+		seriesID = series.ID
+
+		vol := domain.Volume{
+			LibraryID: lib.ID,
+			Kind:      domain.VolumeKindVolume,
+			ExternalIDs: map[string]any{
+				"comicvine": json.Number(largeVolumeID),
+				"isbn13":    "9784091882813",
+			},
+		}
+		if err := cw.CreateVolume(ctx, &vol); err != nil {
+			return err
+		}
+		volID = vol.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+
+	// Read-modify-write Series on an unrelated field and verify large numeric IDs stay exact.
+	gotSeries, err := cw.GetSeriesByID(ctx, seriesID)
+	if err != nil {
+		t.Fatalf("GetSeriesByID: %v", err)
+	}
+	if num, ok := gotSeries.ExternalIDs["anilist"].(json.Number); !ok || num.String() != largeSeriesID {
+		t.Fatalf("GetSeriesByID anilist = %T(%v), want json.Number(%s)", gotSeries.ExternalIDs["anilist"], gotSeries.ExternalIDs["anilist"], largeSeriesID)
+	}
+	gotSeries.Title = "Precision Series (Renamed)"
+	if err := cw.UpdateSeries(ctx, gotSeries); err != nil {
+		t.Fatalf("UpdateSeries: %v", err)
+	}
+	if num, ok := gotSeries.ExternalIDs["anilist"].(json.Number); !ok || num.String() != largeSeriesID {
+		t.Fatalf("UpdateSeries in-place anilist = %T(%v), want json.Number(%s)", gotSeries.ExternalIDs["anilist"], gotSeries.ExternalIDs["anilist"], largeSeriesID)
+	}
+
+	var rawSeriesAnilist, rawSeriesNested string
+	if err := db.QueryRow(ctx, `SELECT external_ids->>'anilist', external_ids->'nested'->>'id' FROM series WHERE id = $1`, seriesID).
+		Scan(&rawSeriesAnilist, &rawSeriesNested); err != nil {
+		t.Fatalf("querying series external_ids: %v", err)
+	}
+	if rawSeriesAnilist != largeSeriesID || rawSeriesNested != largeNestedID {
+		t.Fatalf("persisted series external_ids = (anilist=%q, nested.id=%q), want (%q, %q)",
+			rawSeriesAnilist, rawSeriesNested, largeSeriesID, largeNestedID)
+	}
+
+	// Read-modify-write Volume on an unrelated field and verify large numeric ID stays exact.
+	gotVol, err := cw.GetVolumeByID(ctx, volID)
+	if err != nil {
+		t.Fatalf("GetVolumeByID: %v", err)
+	}
+	if num, ok := gotVol.ExternalIDs["comicvine"].(json.Number); !ok || num.String() != largeVolumeID {
+		t.Fatalf("GetVolumeByID comicvine = %T(%v), want json.Number(%s)", gotVol.ExternalIDs["comicvine"], gotVol.ExternalIDs["comicvine"], largeVolumeID)
+	}
+	gotVol.PageCount = 250
+	if err := cw.UpdateVolume(ctx, gotVol); err != nil {
+		t.Fatalf("UpdateVolume: %v", err)
+	}
+	if num, ok := gotVol.ExternalIDs["comicvine"].(json.Number); !ok || num.String() != largeVolumeID {
+		t.Fatalf("UpdateVolume in-place comicvine = %T(%v), want json.Number(%s)", gotVol.ExternalIDs["comicvine"], gotVol.ExternalIDs["comicvine"], largeVolumeID)
+	}
+
+	var rawVolComicvine string
+	if err := db.QueryRow(ctx, `SELECT external_ids->>'comicvine' FROM volumes WHERE id = $1`, volID).
+		Scan(&rawVolComicvine); err != nil {
+		t.Fatalf("querying volume external_ids: %v", err)
+	}
+	if rawVolComicvine != largeVolumeID {
+		t.Fatalf("persisted volume external_ids.comicvine = %q, want %q", rawVolComicvine, largeVolumeID)
+	}
+
+	// Also verify CatalogueRepository reads using the shared JSON decoder preserve json.Number.
+	readerRole, ok := domain.BuiltInRoleByName(domain.RoleReaderName)
+	if !ok {
+		t.Fatal("Reader built-in role missing")
+	}
+	readRepo := postgres.NewCatalogueRepository(db.Pool)
+	scope := storage.CatalogueReadScope{
+		Principal: domain.NewPrincipal(reader, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-extids", nil),
+	}
+	readSeries, err := readRepo.GetSeriesByID(ctx, scope, seriesID)
+	if err != nil {
+		t.Fatalf("CatalogueRepository.GetSeriesByID: %v", err)
+	}
+	if num, ok := readSeries.ExternalIDs["anilist"].(json.Number); !ok || num.String() != largeSeriesID {
+		t.Fatalf("CatalogueRepository.GetSeriesByID anilist = %T(%v), want json.Number(%s)", readSeries.ExternalIDs["anilist"], readSeries.ExternalIDs["anilist"], largeSeriesID)
+	}
+	readVol, err := readRepo.GetVolumeByID(ctx, scope, volID)
+	if err != nil {
+		t.Fatalf("CatalogueRepository.GetVolumeByID: %v", err)
+	}
+	if num, ok := readVol.ExternalIDs["comicvine"].(json.Number); !ok || num.String() != largeVolumeID {
+		t.Fatalf("CatalogueRepository.GetVolumeByID comicvine = %T(%v), want json.Number(%s)", readVol.ExternalIDs["comicvine"], readVol.ExternalIDs["comicvine"], largeVolumeID)
+	}
+}
+
+func TestCatalogueWriteRepository_UpdateAssetRefreshesInvalidUTF8Diagnostic(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var rootID, volID string
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, root := seedTestLibraryAndRoot(ctx, t, tx, "UTF8 Diag Lib", []byte("/srv/utf8"))
+		rootID = root.ID
+		vol := domain.Volume{LibraryID: lib.ID, Kind: domain.VolumeKindVolume}
+		if err := tx.CatalogueWrites().CreateVolume(ctx, &vol); err != nil {
+			return err
+		}
+		volID = vol.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+
+	// Start with an invalid-UTF-8 path alongside other diagnostics.
+	asset := domain.MediaAsset{
+		VolumeID:      volID,
+		LibraryRootID: rootID,
+		RelPathBytes:  []byte{0xff, 0xfe, '/', 'v', '0', '1', '.', 'c', 'b', 'z'},
+		FileSize:      300,
+		Format:        domain.MediaFormatCBZ,
+		Diagnostics: domain.AssetDiagnostics{
+			SolidArchive: true,
+			ImageCodecs:  []string{"jxl"},
+		},
+	}
+	if err := cw.CreateAsset(ctx, &asset); err != nil {
+		t.Fatalf("CreateAsset: %v", err)
+	}
+	if !asset.Diagnostics.InvalidUTF8Path || !asset.Diagnostics.SolidArchive || len(asset.Diagnostics.ImageCodecs) != 1 || asset.Diagnostics.ImageCodecs[0] != "jxl" {
+		t.Fatalf("unexpected diagnostics after create: %+v", asset.Diagnostics)
+	}
+
+	// Full UpdateAsset to a valid UTF-8 path must clear InvalidUTF8Path while keeping other diagnostics.
+	loaded, err := cw.GetAssetByID(ctx, asset.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID: %v", err)
+	}
+	loaded.RelPathBytes = []byte("Clean/v01.cbz")
+	loaded.RelPathDisplay = ""
+	loaded.RelPathMatch = ""
+	if err := cw.UpdateAsset(ctx, loaded); err != nil {
+		t.Fatalf("UpdateAsset to valid path: %v", err)
+	}
+	if loaded.Diagnostics.InvalidUTF8Path {
+		t.Fatalf("expected UpdateAsset to clear InvalidUTF8Path in returned asset, got %+v", loaded.Diagnostics)
+	}
+	reloaded, err := cw.GetAssetByID(ctx, asset.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID after valid UpdateAsset: %v", err)
+	}
+	if reloaded.Diagnostics.InvalidUTF8Path || !reloaded.Diagnostics.SolidArchive || len(reloaded.Diagnostics.ImageCodecs) != 1 || reloaded.Diagnostics.ImageCodecs[0] != "jxl" {
+		t.Fatalf("expected InvalidUTF8Path=false and other diagnostics preserved, got %+v", reloaded.Diagnostics)
+	}
+
+	// Full UpdateAsset back to an invalid UTF-8 path must set InvalidUTF8Path while keeping other diagnostics.
+	reloaded.RelPathBytes = []byte{'D', 'i', 'r', 't', 'y', '/', 0xff, '.', 'c', 'b', 'z'}
+	reloaded.RelPathDisplay = ""
+	reloaded.RelPathMatch = ""
+	if err := cw.UpdateAsset(ctx, reloaded); err != nil {
+		t.Fatalf("UpdateAsset to invalid path: %v", err)
+	}
+	if !reloaded.Diagnostics.InvalidUTF8Path || !reloaded.Diagnostics.SolidArchive || len(reloaded.Diagnostics.ImageCodecs) != 1 || reloaded.Diagnostics.ImageCodecs[0] != "jxl" {
+		t.Fatalf("expected InvalidUTF8Path=true and other diagnostics preserved, got %+v", reloaded.Diagnostics)
+	}
+
+	// CreateAsset with a valid path clears any stale caller-supplied InvalidUTF8Path flag.
+	cleanCreate := domain.MediaAsset{
+		VolumeID:      volID,
+		LibraryRootID: rootID,
+		RelPathBytes:  []byte("Clean/v02.cbz"),
+		FileSize:      400,
+		Format:        domain.MediaFormatCBZ,
+		Diagnostics: domain.AssetDiagnostics{
+			InvalidUTF8Path: true,
+			ImageCodecs:     []string{"avif"},
+		},
+	}
+	if err := cw.CreateAsset(ctx, &cleanCreate); err != nil {
+		t.Fatalf("CreateAsset valid path: %v", err)
+	}
+	if cleanCreate.Diagnostics.InvalidUTF8Path || len(cleanCreate.Diagnostics.ImageCodecs) != 1 || cleanCreate.Diagnostics.ImageCodecs[0] != "avif" {
+		t.Fatalf("expected InvalidUTF8Path=false on clean CreateAsset, got %+v", cleanCreate.Diagnostics)
 	}
 }
