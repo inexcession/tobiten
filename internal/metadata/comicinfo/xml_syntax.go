@@ -33,6 +33,9 @@ func validateDocumentSyntax(data []byte) error {
 				return errors.New("comicinfo: nonliteral whitespace outside root")
 			}
 		case xml.StartElement:
+			if err := validateStartTag(data[start:d.InputOffset()]); err != nil {
+				return err
+			}
 			scope, err := validateStart(t, scopes[len(scopes)-1])
 			if err != nil {
 				return err
@@ -82,6 +85,9 @@ func namespaceScope(parent map[string]string, attrs []xml.Attr) (map[string]stri
 		switch {
 		case a.Name.Space == "xmlns":
 			prefix = a.Name.Local
+			if !validNCName(prefix) {
+				return nil, errors.New("comicinfo: invalid namespace prefix")
+			}
 		case a.Name.Space == "" && a.Name.Local == "xmlns":
 		default:
 			continue
@@ -99,7 +105,7 @@ func namespaceScope(parent map[string]string, attrs []xml.Attr) (map[string]stri
 }
 
 func checkPrefix(name xml.Name, scope map[string]string) error {
-	if strings.Contains(name.Local, ":") || strings.Contains(name.Space, ":") || name.Space == "xmlns" {
+	if !validNCName(name.Local) || (name.Space != "" && !validNCName(name.Space)) || name.Space == "xmlns" {
 		return errors.New("comicinfo: invalid qualified name")
 	}
 	if name.Space != "" && scope[name.Space] == "" {

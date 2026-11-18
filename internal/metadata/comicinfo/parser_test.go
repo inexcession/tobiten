@@ -158,3 +158,34 @@ func TestLenientDuplicateAfterInvalid(t *testing.T) {
 		t.Fatalf("diagnostics: got %+v, want %+v", diags, want)
 	}
 }
+
+func TestStartTagAndQualifiedNames(t *testing.T) {
+	cases := []struct {
+		name, doc string
+		valid     bool
+	}{
+		{"adjacent root attributes", `<ComicInfo a="x"b="y"><Title>retained</Title></ComicInfo>`, false},
+		{"adjacent nested attributes", `<ComicInfo><Title>retained</Title><Extension a='x'b='y'/></ComicInfo>`, false},
+		{"adjacent namespace declarations", `<ComicInfo xmlns:x="urn:x"xmlns:y="urn:y"><Title>retained</Title></ComicInfo>`, false},
+		{"invalid local element", `<ComicInfo xmlns:x="urn:x"><Title>retained</Title><x:1bad/></ComicInfo>`, false},
+		{"invalid local attribute", `<ComicInfo xmlns:x="urn:x"><Title>retained</Title><Other x:1bad="x"/></ComicInfo>`, false},
+		{"invalid namespace name", `<ComicInfo xmlns:1bad="urn:x"><Title>retained</Title></ComicInfo>`, false},
+		{"invalid prefix", `<ComicInfo xmlns:1x="urn:x"><Title>retained</Title><1x:ext/></ComicInfo>`, false},
+		{"valid declared unicode and separators", "<ComicInfo xmlns:画=\"urn:x\"\n a = 'x>y'\t画:題=\"'&quot;\"><Title>retained</Title><画:頁 画:番号='1'/></ComicInfo>", true},
+		{"valid prefixed name characters", `<ComicInfo xmlns:x="urn:x"><Title>retained</Title><x:_a-1.b x:a1="2" /></ComicInfo>`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range []Mode{Strict, Lenient} {
+				got, diagnostics, err := parse(t, tc.doc, mode)
+				if tc.valid {
+					if err != nil || got.Title != "retained" || len(diagnostics) != 0 {
+						t.Fatalf("mode %v: %+v %v %v", mode, got, diagnostics, err)
+					}
+				} else if err == nil || !reflect.DeepEqual(got, Metadata{}) || diagnostics != nil {
+					t.Fatalf("mode %v: %+v %v %v", mode, got, diagnostics, err)
+				}
+			}
+		})
+	}
+}
