@@ -12,6 +12,7 @@ type Tx interface {
 	Labels() LabelRepository
 	Settings() SettingsRepository
 	Libraries() LibraryRepository
+	CatalogueWrites() CatalogueWriteRepository
 }
 
 // Transactor executes multi-repository work atomically in one database transaction.

@@ -305,3 +305,7 @@ func (s *pgTx) Settings() storage.SettingsRepository {
 func (s *pgTx) Libraries() storage.LibraryRepository {
 	return &LibraryRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
 }
+
+func (s *pgTx) CatalogueWrites() storage.CatalogueWriteRepository {
+	return &CatalogueWriteRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
