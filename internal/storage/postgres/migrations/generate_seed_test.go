@@ -165,3 +165,127 @@ func TestGenerateSeed0001(t *testing.T) {
 	}
 	t.Logf("Successfully generated seed fixture: %s (%d bytes)", target, len(out))
 }
+
+const sampleCatalogue0007DataSQL = `
+-- 12. libraries & library_roots
+INSERT INTO libraries (id, name, mode, resolver_chain, metadata_precedence, default_cover_policy, created_at) VALUES
+    ('019318a0-0000-7000-8000-000000000080', 'Manga', 'VIRTUAL', '{metadata,folder,filename}', 'EMBEDDED_OVER_ONLINE', 'FIRST', '2026-11-10 12:00:00+00'),
+    ('019318a0-0000-7000-8000-000000000081', 'Comics', 'VIRTUAL', '{metadata,folder,filename}', 'EMBEDDED_OVER_ONLINE', 'FIRST', '2026-11-10 12:01:00+00');
+
+INSERT INTO library_roots (id, library_id, path_bytes, path_display, path_match, state) VALUES
+    ('019318a0-0000-7000-8000-000000000085', '019318a0-0000-7000-8000-000000000080', '\x2f7372762f6d616e6761', '/srv/manga', '/srv/manga', 'ONLINE'),
+    ('019318a0-0000-7000-8000-000000000086', '019318a0-0000-7000-8000-000000000081', '\x2f7372762f636f6d696373', '/srv/comics', '/srv/comics', 'ONLINE');
+
+-- 13. series & volumes & series_memberships
+INSERT INTO series (id, library_id, title, title_sort, status, created_at, updated_at) VALUES
+    ('019318a0-0000-7000-8000-000000000090', '019318a0-0000-7000-8000-000000000080', 'One Piece', 'One Piece', 'ONGOING', '2026-11-10 12:05:00+00', '2026-11-10 12:05:00+00'),
+    ('019318a0-0000-7000-8000-000000000091', '019318a0-0000-7000-8000-000000000081', 'Batman', 'Batman', 'ONGOING', '2026-11-10 12:06:00+00', '2026-11-10 12:06:00+00');
+
+INSERT INTO volumes (id, library_id, kind, number, title, page_count, created_at, updated_at) VALUES
+    ('019318a0-0000-7000-8000-000000000092', '019318a0-0000-7000-8000-000000000080', 'VOLUME', 1, 'Romance Dawn', 200, '2026-11-10 12:05:00+00', '2026-11-10 12:05:00+00'),
+    ('019318a0-0000-7000-8000-000000000093', '019318a0-0000-7000-8000-000000000081', 'ISSUE', 1, 'Year One', 32, '2026-11-10 12:06:00+00', '2026-11-10 12:06:00+00');
+
+INSERT INTO series_memberships (volume_id, series_id, is_primary, kind, position, source, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000092', '019318a0-0000-7000-8000-000000000090', true, 'SERIES', 1, 'RESOLVER', '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000093', '019318a0-0000-7000-8000-000000000091', true, 'SERIES', 1, 'RESOLVER', '{}'::jsonb);
+
+-- 14. media_assets & asset_digests
+INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format, page_count, created_at, updated_at) VALUES
+    ('019318a0-0000-7000-8000-000000000098', '019318a0-0000-7000-8000-000000000092', '019318a0-0000-7000-8000-000000000085', '\x4f6e65205069656365207630312e63627a', 'One Piece v01.cbz', 'One Piece v01.cbz', 1048576, 'CBZ', 200, '2026-11-10 12:05:00+00', '2026-11-10 12:05:00+00');
+
+INSERT INTO asset_digests (asset_id, kind, value, is_current, reason, recorded_at) VALUES
+    ('019318a0-0000-7000-8000-000000000098', 'XXH3_64_PARTIAL', '0123456789abcdef', true, 'SCAN', '2026-11-10 12:05:00+00');
+
+-- 15. people, credits, entities, volume_entities (including same-name pre-0008 rows and field locks)
+INSERT INTO people (id, name, name_native, name_romanized, aliases, external_ids, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000101', 'Eiichiro Oda', '尾田栄一郎', 'Oda Eiichiro', '{Oda}', '{"anilist": 1881}'::jsonb, '{"name": true, "name_native": true}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000102', 'John Smith', NULL, NULL, '{"J. Smith"}', '{"comicvine": 100}'::jsonb, '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000103', 'John Smith', NULL, NULL, '{}', '{"comicvine": 200}'::jsonb, '{"external_ids": true}'::jsonb);
+
+INSERT INTO credits (id, person_id, series_id, volume_id, role, position, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000201', '019318a0-0000-7000-8000-000000000101', '019318a0-0000-7000-8000-000000000090', NULL, 'AUTHOR', 0, '{"role": true}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000202', '019318a0-0000-7000-8000-000000000101', NULL, '019318a0-0000-7000-8000-000000000092', 'WRITER', 0, '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000203', '019318a0-0000-7000-8000-000000000102', NULL, '019318a0-0000-7000-8000-000000000093', 'PENCILLER', 0, '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000204', '019318a0-0000-7000-8000-000000000103', NULL, '019318a0-0000-7000-8000-000000000093', 'INKER', 1, '{}'::jsonb);
+
+INSERT INTO entities (id, kind, name, aliases, external_ids, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000301', 'CHARACTER', 'Monkey D. Luffy', '{Luffy}', '{"anilist": 40}'::jsonb, '{"name": true}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000302', 'TEAM', 'Straw Hat Pirates', '{}', '{}'::jsonb, '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000303', 'LOCATION', 'Gotham', '{"Gotham City"}', '{}'::jsonb, '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000304', 'CHARACTER', 'Gotham', '{}', '{}'::jsonb, '{}'::jsonb);
+
+INSERT INTO volume_entities (volume_id, entity_id, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000092', '019318a0-0000-7000-8000-000000000301', '{"entity": true}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000092', '019318a0-0000-7000-8000-000000000302', '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000093', '019318a0-0000-7000-8000-000000000303', '{}'::jsonb),
+    ('019318a0-0000-7000-8000-000000000093', '019318a0-0000-7000-8000-000000000304', '{}'::jsonb);
+`
+
+// TestGenerateSeed0007 is a maintenance generator invoked with:
+//
+//	go test -v -tags=generator -run TestGenerateSeed0007 ./internal/storage/postgres/migrations/...
+//
+// It boots a temporary PostgreSQL instance, applies 0001_init.sql + M1A seed data,
+// upgrades through 0007, inserts populated catalogue rows (including people, credits,
+// entities, volume_entities), dumps via pg_dump, and writes testdata/seeds/0007.sql.
+func TestGenerateSeed0007(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+
+	coreMigrations, err := migrations.Collect(migrations.CoreFS)
+	if err != nil {
+		t.Fatalf("collecting core migrations: %v", err)
+	}
+	var mig0001 []migrations.Migration
+	var migsUpTo7 []migrations.Migration
+	for _, m := range coreMigrations {
+		if m.Version == 1 {
+			mig0001 = append(mig0001, m)
+		}
+		if m.Version <= 7 {
+			migsUpTo7 = append(migsUpTo7, m)
+		}
+	}
+	if len(mig0001) != 1 || len(migsUpTo7) != 7 {
+		t.Fatalf("expected 1 migration at v1 and 7 up to v7, got %d and %d", len(mig0001), len(migsUpTo7))
+	}
+	if err := migrations.Run(ctx, db, mig0001); err != nil {
+		t.Fatalf("applying 0001_init.sql: %v", err)
+	}
+	if _, err := db.Exec(ctx, sampleSeedDataSQL); err != nil {
+		t.Fatalf("inserting sample M1A seed rows: %v", err)
+	}
+	if err := migrations.Run(ctx, db, migsUpTo7); err != nil {
+		t.Fatalf("applying migrations 0002..0007: %v", err)
+	}
+	if _, err := db.Exec(ctx, sampleCatalogue0007DataSQL); err != nil {
+		t.Fatalf("inserting sample catalogue 0007 seed rows: %v", err)
+	}
+
+	pgDumpPath, err := findPgDump()
+	if err != nil {
+		t.Fatalf("pg_dump not found: %v", err)
+	}
+
+	cmd := exec.Command(pgDumpPath,
+		"--no-owner",
+		"--no-privileges",
+		"--inserts",
+		db.URL,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_dump failed: %v\nOutput: %s", err, string(out))
+	}
+
+	seedsDir := filepath.Join("testdata", "seeds")
+	if err := os.MkdirAll(seedsDir, 0755); err != nil {
+		t.Fatalf("creating seeds dir: %v", err)
+	}
+
+	target := filepath.Join(seedsDir, "0007.sql")
+	if err := os.WriteFile(target, out, 0644); err != nil {
+		t.Fatalf("writing seed file %s: %v", target, err)
+	}
+	t.Logf("Successfully generated seed fixture: %s (%d bytes)", target, len(out))
+}

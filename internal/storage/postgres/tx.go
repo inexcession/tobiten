@@ -313,3 +313,15 @@ func (s *pgTx) CatalogueWrites() storage.CatalogueWriteRepository {
 func (s *pgTx) SeriesMemberships() storage.SeriesMembershipRepository {
 	return &SeriesMembershipRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
 }
+
+func (s *pgTx) People() storage.PersonRepository {
+	return &PersonRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
+
+func (s *pgTx) Credits() storage.CreditRepository {
+	return &CreditRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
+
+func (s *pgTx) Entities() storage.EntityRepository {
+	return &EntityRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}

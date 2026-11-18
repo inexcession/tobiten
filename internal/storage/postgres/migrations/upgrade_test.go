@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -28,6 +29,10 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 
 	for _, seedPath := range seeds {
 		seedName := filepath.Base(seedPath)
+		seedVersion, err := strconv.Atoi(strings.TrimSuffix(seedName, ".sql"))
+		if err != nil {
+			t.Fatalf("parsing seed version from %q: %v", seedName, err)
+		}
 		t.Run(seedName, func(t *testing.T) {
 			db := testdb.New(t)
 			ctx := context.Background()
@@ -37,8 +42,11 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 				t.Fatalf("failed to restore seed %q: %v", seedPath, err)
 			}
 
-			// 2. Verify all seeded M1A tables contain sample rows.
-			verifySeededData(ctx, t, db, 1)
+			// 2. Verify all seeded tables at the seed's starting version.
+			verifySeededData(ctx, t, db, seedVersion)
+			if seedVersion >= 7 {
+				verifySeededCatalogue0007Data(ctx, t, db, false)
+			}
 
 			// 3. Migrate the seeded database up to HEAD schema.
 			if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
@@ -70,6 +78,9 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 
 			// 5. Verify seeded data survived the migration to head intact.
 			verifySeededData(ctx, t, db, len(coreMigrations))
+			if seedVersion >= 7 {
+				verifySeededCatalogue0007Data(ctx, t, db, true)
+			}
 
 			// 6. Verify catalogue tables from 0004_catalogue.sql exist after upgrading from 0001.
 			for _, table := range []string{
@@ -358,9 +369,8 @@ func TestUpgradeSeeds_FailsOnIncompatibleConstraint(t *testing.T) {
 	}
 }
 
-func TestUpgradeSeeds_ChecksumMatchesHead0001(t *testing.T) {
-	// Verify that the seed fixture 0001.sql records the exact same checksum
-	// as CoreFS migration 0001_init.sql.
+func TestUpgradeSeeds_ChecksumMatchesHead(t *testing.T) {
+	// Verify that every seed fixture records exact checksums matching CoreFS.
 	coreMigrations, err := migrations.Collect(migrations.CoreFS)
 	if err != nil {
 		t.Fatalf("collecting core migrations: %v", err)
@@ -368,18 +378,31 @@ func TestUpgradeSeeds_ChecksumMatchesHead0001(t *testing.T) {
 	if len(coreMigrations) == 0 {
 		t.Fatal("expected core migrations to have at least version 1")
 	}
-	mig0001 := coreMigrations[0]
-
-	seedBytes, err := fs.ReadFile(migrations.SeedsFS, "testdata/seeds/0001.sql")
+	seeds, err := migrations.ListSeeds(migrations.SeedsFS, "testdata/seeds")
 	if err != nil {
-		t.Fatalf("reading seed 0001.sql: %v", err)
+		t.Fatalf("listing seeds: %v", err)
 	}
-
-	// The seed fixture has:
-	// INSERT INTO public.schema_migrations VALUES (1, '0001_init.sql', '<checksum>', ...)
-	expectedSnippet := fmt.Sprintf("(1, '0001_init.sql', '%s',", mig0001.Checksum)
-	if !strings.Contains(string(seedBytes), expectedSnippet) {
-		t.Errorf("seed fixture 0001.sql does not match current 0001_init.sql checksum %s", mig0001.Checksum)
+	for _, seedPath := range seeds {
+		seedName := filepath.Base(seedPath)
+		seedVersion, err := strconv.Atoi(strings.TrimSuffix(seedName, ".sql"))
+		if err != nil {
+			t.Fatalf("parsing seed version from %q: %v", seedName, err)
+		}
+		seedBytes, err := fs.ReadFile(migrations.SeedsFS, seedPath)
+		if err != nil {
+			t.Fatalf("reading seed %s: %v", seedName, err)
+		}
+		seedContent := string(seedBytes)
+		for _, mig := range coreMigrations {
+			if mig.Version > int64(seedVersion) {
+				continue
+			}
+			expectedSnippet := fmt.Sprintf("(%d, '%s', '%s',", mig.Version, mig.Name, mig.Checksum)
+			if !strings.Contains(seedContent, expectedSnippet) {
+				t.Errorf("seed fixture %s missing matching migration %d (%s) checksum %s",
+					seedName, mig.Version, mig.Name, mig.Checksum)
+			}
+		}
 	}
 }
 
@@ -461,6 +484,173 @@ func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expec
 	if roleCount < 5 {
 		t.Errorf("expected at least 5 roles, got %d", roleCount)
 	}
+}
+
+func verifySeededCatalogue0007Data(ctx context.Context, t testing.TB, db migrations.DB, postUpgrade bool) {
+	t.Helper()
+
+	checkCount := func(table string, expected int) {
+		t.Helper()
+		var count int
+		query := fmt.Sprintf("SELECT count(*) FROM %s", table)
+		if err := db.QueryRow(ctx, query).Scan(&count); err != nil {
+			t.Fatalf("counting %s: %v", table, err)
+		}
+		if count != expected {
+			t.Errorf("table %s: expected %d rows, got %d", table, expected, count)
+		}
+	}
+
+	checkCount("libraries", 2)
+	checkCount("library_roots", 2)
+	checkCount("series", 2)
+	checkCount("volumes", 2)
+	checkCount("series_memberships", 2)
+	checkCount("media_assets", 1)
+	checkCount("asset_digests", 1)
+	checkCount("people", 3)
+	checkCount("credits", 4)
+	checkCount("entities", 4)
+	checkCount("volume_entities", 4)
+
+	// Verify exact pre-existing people IDs, names, and duplicate-name preservation.
+	type wantPerson struct {
+		id         string
+		name       string
+		nameNative *string
+	}
+	odaNative := "尾田栄一郎"
+	for _, want := range []wantPerson{
+		{id: "019318a0-0000-7000-8000-000000000101", name: "Eiichiro Oda", nameNative: &odaNative},
+		{id: "019318a0-0000-7000-8000-000000000102", name: "John Smith"},
+		{id: "019318a0-0000-7000-8000-000000000103", name: "John Smith"},
+	} {
+		var (
+			gotName   string
+			gotNative *string
+		)
+		if err := db.QueryRow(ctx, `SELECT name, name_native FROM people WHERE id = $1`, want.id).Scan(&gotName, &gotNative); err != nil {
+			t.Fatalf("missing seeded person %s: %v", want.id, err)
+		}
+		if gotName != want.name {
+			t.Errorf("person %s name = %q, want %q", want.id, gotName, want.name)
+		}
+		if (gotNative == nil) != (want.nameNative == nil) || (gotNative != nil && *gotNative != *want.nameNative) {
+			t.Errorf("person %s name_native = %v, want %v", want.id, gotNative, want.nameNative)
+		}
+	}
+
+	// Verify exact pre-existing credit IDs and references survived.
+	for _, want := range []struct {
+		id       string
+		personID string
+		seriesID *string
+		volumeID *string
+		role     string
+	}{
+		{id: "019318a0-0000-7000-8000-000000000201", personID: "019318a0-0000-7000-8000-000000000101", seriesID: strPtr("019318a0-0000-7000-8000-000000000090"), role: "AUTHOR"},
+		{id: "019318a0-0000-7000-8000-000000000202", personID: "019318a0-0000-7000-8000-000000000101", volumeID: strPtr("019318a0-0000-7000-8000-000000000092"), role: "WRITER"},
+		{id: "019318a0-0000-7000-8000-000000000203", personID: "019318a0-0000-7000-8000-000000000102", volumeID: strPtr("019318a0-0000-7000-8000-000000000093"), role: "PENCILLER"},
+		{id: "019318a0-0000-7000-8000-000000000204", personID: "019318a0-0000-7000-8000-000000000103", volumeID: strPtr("019318a0-0000-7000-8000-000000000093"), role: "INKER"},
+	} {
+		var (
+			gotPerson string
+			gotSeries *string
+			gotVolume *string
+			gotRole   string
+		)
+		if err := db.QueryRow(ctx,
+			`SELECT person_id, series_id, volume_id, role FROM credits WHERE id = $1`,
+			want.id,
+		).Scan(&gotPerson, &gotSeries, &gotVolume, &gotRole); err != nil {
+			t.Fatalf("missing seeded credit %s: %v", want.id, err)
+		}
+		if gotPerson != want.personID || gotRole != want.role ||
+			!optStrEq(gotSeries, want.seriesID) || !optStrEq(gotVolume, want.volumeID) {
+			t.Errorf("credit %s = (%s, %v, %v, %s), want (%s, %v, %v, %s)",
+				want.id, gotPerson, gotSeries, gotVolume, gotRole,
+				want.personID, want.seriesID, want.volumeID, want.role)
+		}
+	}
+
+	// Verify exact pre-existing entity IDs and volume_entities links survived.
+	for _, want := range []struct {
+		id   string
+		kind string
+		name string
+	}{
+		{id: "019318a0-0000-7000-8000-000000000301", kind: "CHARACTER", name: "Monkey D. Luffy"},
+		{id: "019318a0-0000-7000-8000-000000000302", kind: "TEAM", name: "Straw Hat Pirates"},
+		{id: "019318a0-0000-7000-8000-000000000303", kind: "LOCATION", name: "Gotham"},
+		{id: "019318a0-0000-7000-8000-000000000304", kind: "CHARACTER", name: "Gotham"},
+	} {
+		var gotKind, gotName string
+		if err := db.QueryRow(ctx, `SELECT kind, name FROM entities WHERE id = $1`, want.id).Scan(&gotKind, &gotName); err != nil {
+			t.Fatalf("missing seeded entity %s: %v", want.id, err)
+		}
+		if gotKind != want.kind || gotName != want.name {
+			t.Errorf("entity %s = (%s, %q), want (%s, %q)", want.id, gotKind, gotName, want.kind, want.name)
+		}
+	}
+	for _, want := range []struct {
+		volID string
+		entID string
+	}{
+		{volID: "019318a0-0000-7000-8000-000000000092", entID: "019318a0-0000-7000-8000-000000000301"},
+		{volID: "019318a0-0000-7000-8000-000000000092", entID: "019318a0-0000-7000-8000-000000000302"},
+		{volID: "019318a0-0000-7000-8000-000000000093", entID: "019318a0-0000-7000-8000-000000000303"},
+		{volID: "019318a0-0000-7000-8000-000000000093", entID: "019318a0-0000-7000-8000-000000000304"},
+	} {
+		var exists bool
+		if err := db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM volume_entities WHERE volume_id = $1 AND entity_id = $2)`,
+			want.volID, want.entID,
+		).Scan(&exists); err != nil || !exists {
+			t.Fatalf("missing volume_entities (%s, %s): exists=%v err=%v", want.volID, want.entID, exists, err)
+		}
+	}
+
+	if !postUpgrade {
+		return
+	}
+
+	// Post-upgrade (0008): pre-existing rows have import_key NULL and coexist with new keyed imports,
+	// while duplicate keyed imports are rejected by idx_people_import_key and idx_entities_import_key.
+	var nonNullPeopleKeys, nonNullEntityKeys int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM people WHERE import_key IS NOT NULL`).Scan(&nonNullPeopleKeys); err != nil {
+		t.Fatalf("checking people import_key: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM entities WHERE import_key IS NOT NULL`).Scan(&nonNullEntityKeys); err != nil {
+		t.Fatalf("checking entities import_key: %v", err)
+	}
+	if nonNullPeopleKeys != 0 || nonNullEntityKeys != 0 {
+		t.Errorf("expected pre-existing rows to retain NULL import_key, got people=%d entities=%d", nonNullPeopleKeys, nonNullEntityKeys)
+	}
+
+	if _, err := db.Exec(ctx, `INSERT INTO people (id, name, import_key) VALUES ('post-p1', 'John Smith', 'john smith')`); err != nil {
+		t.Fatalf("inserting keyed person alongside pre-upgrade curated John Smith rows failed: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO people (id, name, import_key) VALUES ('post-p2', 'JOHN SMITH', 'john smith')`); !isUniqueViolation(err) {
+		t.Fatalf("expected unique violation on duplicate people.import_key after upgrade, got: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO entities (id, kind, name, import_key) VALUES ('post-e1', 'LOCATION', 'Gotham', 'gotham')`); err != nil {
+		t.Fatalf("inserting keyed LOCATION Gotham alongside pre-upgrade row failed: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO entities (id, kind, name, import_key) VALUES ('post-e2', 'CHARACTER', 'Gotham', 'gotham')`); err != nil {
+		t.Fatalf("inserting keyed CHARACTER Gotham alongside LOCATION Gotham failed: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO entities (id, kind, name, import_key) VALUES ('post-e3', 'LOCATION', 'GOTHAM', 'gotham')`); !isUniqueViolation(err) {
+		t.Fatalf("expected unique violation on duplicate entities(kind, import_key) after upgrade, got: %v", err)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func optStrEq(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func findPsql() string {

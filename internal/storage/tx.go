@@ -14,6 +14,9 @@ type Tx interface {
 	Libraries() LibraryRepository
 	CatalogueWrites() CatalogueWriteRepository
 	SeriesMemberships() SeriesMembershipRepository
+	People() PersonRepository
+	Credits() CreditRepository
+	Entities() EntityRepository
 }
 
 // Transactor executes multi-repository work atomically in one database transaction.

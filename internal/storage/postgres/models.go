@@ -68,6 +68,7 @@ type Entity struct {
 	Aliases      []string
 	ExternalIds  []byte
 	LockedFields []byte
+	ImportKey    *string
 }
 
 type EventSubscriber struct {
@@ -165,6 +166,7 @@ type Person struct {
 	Aliases       []string
 	ExternalIds   []byte
 	LockedFields  []byte
+	ImportKey     *string
 }
 
 type ReadingProgress struct {
