@@ -3,6 +3,7 @@
 package migrations_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -283,6 +284,7 @@ func TestGenerateSeed0007(t *testing.T) {
 		t.Fatalf("creating seeds dir: %v", err)
 	}
 
+	out = append(bytes.TrimRight(out, "\r\n"), '\n')
 	target := filepath.Join(seedsDir, "0007.sql")
 	if err := os.WriteFile(target, out, 0644); err != nil {
 		t.Fatalf("writing seed file %s: %v", target, err)

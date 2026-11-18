@@ -72,7 +72,8 @@ type EntityRepository interface {
 	UpdateEntity(ctx context.Context, entity *domain.Entity) error
 
 	// SyncEntity updates unlocked metadata fields on an existing entity while
-	// leaving locked fields, import_key, and locked_fields untouched.
+	// leaving locked fields, import_key, kind for keyed entities (import_key != nil),
+	// and locked_fields untouched.
 	// Supplied locked_fields on the input are rejected with ErrAutomaticSyncLockedFields.
 	SyncEntity(ctx context.Context, entity *domain.Entity) error
 

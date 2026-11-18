@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -347,6 +349,181 @@ func TestPeopleAndEntities_NormalizedReuseAndCoexistence(t *testing.T) {
 	}
 }
 
+func runConcurrentTxPair(
+	ctx context.Context,
+	transactor storage.Transactor,
+	fn func(idx int, tx storage.Tx) (string, error),
+) ([2]string, error) {
+	var (
+		wg        sync.WaitGroup
+		ready     sync.WaitGroup
+		startCh   = make(chan struct{})
+		startOnce sync.Once
+		setupErr  atomic.Bool
+		ids       [2]string
+		errs      [2]error
+	)
+	release := func() {
+		startOnce.Do(func() {
+			close(startCh)
+		})
+	}
+	defer release()
+
+	ready.Add(2)
+	wg.Add(2)
+	for i := range 2 {
+		go func(idx int) {
+			defer wg.Done()
+			var (
+				readyOnce sync.Once
+				entered   bool
+			)
+			markReady := func() {
+				readyOnce.Do(ready.Done)
+			}
+			defer func() {
+				if !entered {
+					setupErr.Store(true)
+				}
+				markReady()
+			}()
+
+			errs[idx] = transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+				entered = true
+				markReady()
+				select {
+				case <-startCh:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				if setupErr.Load() {
+					return errors.New("aborted due to peer transaction setup failure")
+				}
+				id, err := fn(idx, tx)
+				if err != nil {
+					return err
+				}
+				ids[idx] = id
+				return nil
+			})
+		}(i)
+	}
+
+	readyDone := make(chan struct{})
+	go func() {
+		ready.Wait()
+		close(readyDone)
+	}()
+
+	select {
+	case <-readyDone:
+	case <-ctx.Done():
+		release()
+		wg.Wait()
+		var joined []error
+		for i, err := range errs {
+			if err != nil {
+				joined = append(joined, fmt.Errorf("worker[%d]: %w", i, err))
+			}
+		}
+		if len(joined) > 0 {
+			return [2]string{}, fmt.Errorf("waiting for concurrent transactions: %w (%w)", ctx.Err(), errors.Join(joined...))
+		}
+		return [2]string{}, fmt.Errorf("waiting for concurrent transactions: %w", ctx.Err())
+	}
+
+	release()
+	wg.Wait()
+
+	var joined []error
+	for i, err := range errs {
+		if err != nil {
+			joined = append(joined, fmt.Errorf("worker[%d]: %w", i, err))
+		}
+	}
+	if len(joined) > 0 {
+		return [2]string{}, errors.Join(joined...)
+	}
+	return ids, nil
+}
+
+type stubTransactor struct {
+	withReadCommitted func(ctx context.Context, fn func(tx storage.Tx) error) error
+}
+
+func (s stubTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return s.withReadCommitted(ctx, fn)
+}
+
+func (s stubTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return s.withReadCommitted(ctx, fn)
+}
+
+func TestConcurrentTxPair_ReleasesBarrierOnSetupFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("releases peer immediately when transaction setup fails", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		beginErr := errors.New("begin tx failed")
+		var calls atomic.Int32
+		peerDone := make(chan struct{})
+		txr := stubTransactor{
+			withReadCommitted: func(ctx context.Context, fn func(tx storage.Tx) error) error {
+				if calls.Add(1) == 1 {
+					defer close(peerDone)
+					return fn(nil)
+				}
+				return beginErr
+			},
+		}
+
+		start := time.Now()
+		_, err := runConcurrentTxPair(ctx, txr, func(idx int, _ storage.Tx) (string, error) {
+			t.Errorf("worker[%d] callback should not run after peer setup failure", idx)
+			return "", nil
+		})
+		if !errors.Is(err, beginErr) {
+			t.Fatalf("runConcurrentTxPair err = %v, want %v", err, beginErr)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("runConcurrentTxPair took %v, expected immediate release on setup failure", elapsed)
+		}
+		select {
+		case <-peerDone:
+		case <-time.After(time.Second):
+			t.Fatal("peer worker remained blocked after setup failure")
+		}
+	})
+
+	t.Run("releases workers on context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var entered atomic.Int32
+		txr := stubTransactor{
+			withReadCommitted: func(ctx context.Context, fn func(tx storage.Tx) error) error {
+				if entered.Add(1) == 1 {
+					return fn(nil)
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}()
+
+		_, err := runConcurrentTxPair(ctx, txr, func(int, storage.Tx) (string, error) {
+			return "", nil
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runConcurrentTxPair err = %v, want context.Canceled", err)
+		}
+	})
+}
+
 func TestPeopleAndEntities_ConcurrentFindOrCreate(t *testing.T) {
 	t.Parallel()
 	db, transactor := setupCatalogueWriteTestDB(t)
@@ -355,39 +532,16 @@ func TestPeopleAndEntities_ConcurrentFindOrCreate(t *testing.T) {
 	defer cancel()
 
 	t.Run("person_concurrent_find_or_create", func(t *testing.T) {
-		var (
-			wg      sync.WaitGroup
-			ready   sync.WaitGroup
-			startCh = make(chan struct{})
-			ids     [2]string
-			errs    [2]error
-		)
 		variants := [2]string{"Stan Lee", "  STAN LEE\u3000"}
-		ready.Add(2)
-		wg.Add(2)
-		for i := range 2 {
-			go func(idx int) {
-				defer wg.Done()
-				errs[idx] = transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-					ready.Done()
-					<-startCh
-					p, err := tx.People().FindOrCreatePersonByName(ctx, variants[idx])
-					if err != nil {
-						return err
-					}
-					ids[idx] = p.ID
-					return nil
-				})
-			}(i)
-		}
-		ready.Wait()
-		close(startCh)
-		wg.Wait()
-
-		for i, err := range errs {
+		ids, err := runConcurrentTxPair(ctx, transactor, func(idx int, tx storage.Tx) (string, error) {
+			p, err := tx.People().FindOrCreatePersonByName(ctx, variants[idx])
 			if err != nil {
-				t.Fatalf("concurrent FindOrCreatePersonByName[%d] failed: %v", i, err)
+				return "", err
 			}
+			return p.ID, nil
+		})
+		if err != nil {
+			t.Fatalf("concurrent FindOrCreatePersonByName failed: %v", err)
 		}
 		if ids[0] == "" || ids[0] != ids[1] {
 			t.Fatalf("concurrent FindOrCreatePersonByName returned different IDs: %q vs %q", ids[0], ids[1])
@@ -403,39 +557,16 @@ func TestPeopleAndEntities_ConcurrentFindOrCreate(t *testing.T) {
 	})
 
 	t.Run("entity_concurrent_find_or_create", func(t *testing.T) {
-		var (
-			wg      sync.WaitGroup
-			ready   sync.WaitGroup
-			startCh = make(chan struct{})
-			ids     [2]string
-			errs    [2]error
-		)
 		variants := [2]string{"X-Men", "  x-men "}
-		ready.Add(2)
-		wg.Add(2)
-		for i := range 2 {
-			go func(idx int) {
-				defer wg.Done()
-				errs[idx] = transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-					ready.Done()
-					<-startCh
-					e, err := tx.Entities().FindOrCreateEntityByName(ctx, domain.EntityKindTeam, variants[idx])
-					if err != nil {
-						return err
-					}
-					ids[idx] = e.ID
-					return nil
-				})
-			}(i)
-		}
-		ready.Wait()
-		close(startCh)
-		wg.Wait()
-
-		for i, err := range errs {
+		ids, err := runConcurrentTxPair(ctx, transactor, func(idx int, tx storage.Tx) (string, error) {
+			e, err := tx.Entities().FindOrCreateEntityByName(ctx, domain.EntityKindTeam, variants[idx])
 			if err != nil {
-				t.Fatalf("concurrent FindOrCreateEntityByName[%d] failed: %v", i, err)
+				return "", err
 			}
+			return e.ID, nil
+		})
+		if err != nil {
+			t.Fatalf("concurrent FindOrCreateEntityByName failed: %v", err)
 		}
 		if ids[0] == "" || ids[0] != ids[1] {
 			t.Fatalf("concurrent FindOrCreateEntityByName returned different IDs: %q vs %q", ids[0], ids[1])
@@ -1012,5 +1143,248 @@ func TestPeopleCreditsEntities_IdempotentSyncAndCRUD(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("WithTx CRUD delete checks: %v", err)
+	}
+}
+
+func TestSyncHelpers_LockedCreditIDAndKeyedEntityKindPreservation(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var (
+		series           domain.Series
+		vol              domain.Volume
+		personLocked     domain.Person
+		personUnlocked   domain.Person
+		keyedEntity      domain.Entity
+		unkeyedEntity    domain.Entity
+		lockedSeriesID   string
+		unlockedSeriesID string
+		lockedVolID      string
+		unlockedVolID    string
+	)
+
+	err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, _ := seedTestLibraryAndRoot(ctx, t, tx, "Sync Protection", []byte("/srv/sync-protect"))
+		series = seedMembershipSeries(ctx, t, tx, lib.ID, "Protected Series")
+		vol = seedMembershipVolume(ctx, t, tx, lib.ID, domain.VolumeKindVolume, 1)
+
+		personLocked = domain.Person{Name: "Locked Creator"}
+		if err := tx.People().CreatePerson(ctx, &personLocked); err != nil {
+			return err
+		}
+		personUnlocked = domain.Person{Name: "Unlocked Creator"}
+		if err := tx.People().CreatePerson(ctx, &personUnlocked); err != nil {
+			return err
+		}
+
+		if err := tx.Credits().SetSeriesCredits(ctx, series.ID, []domain.Credit{
+			{
+				PersonID:     personLocked.ID,
+				SeriesID:     &series.ID,
+				Role:         domain.CreditRoleAuthor,
+				Position:     0,
+				LockedFields: domain.FieldLocks{"role": true},
+			},
+			{
+				PersonID: personUnlocked.ID,
+				SeriesID: &series.ID,
+				Role:     domain.CreditRoleWriter,
+				Position: 1,
+			},
+		}); err != nil {
+			return err
+		}
+		sc, err := tx.Credits().ListCreditsBySeries(ctx, series.ID)
+		if err != nil {
+			return err
+		}
+		for _, c := range sc {
+			if c.Role == domain.CreditRoleAuthor {
+				lockedSeriesID = c.ID
+			} else {
+				unlockedSeriesID = c.ID
+			}
+		}
+
+		if err := tx.Credits().SetVolumeCredits(ctx, vol.ID, []domain.Credit{
+			{
+				PersonID:     personLocked.ID,
+				VolumeID:     &vol.ID,
+				Role:         domain.CreditRoleWriter,
+				Position:     0,
+				LockedFields: domain.FieldLocks{"credit": true},
+			},
+			{
+				PersonID: personUnlocked.ID,
+				VolumeID: &vol.ID,
+				Role:     domain.CreditRoleTranslator,
+				Position: 1,
+			},
+		}); err != nil {
+			return err
+		}
+		vc, err := tx.Credits().ListCreditsByVolume(ctx, vol.ID)
+		if err != nil {
+			return err
+		}
+		for _, c := range vc {
+			if c.Role == domain.CreditRoleWriter {
+				lockedVolID = c.ID
+			} else {
+				unlockedVolID = c.ID
+			}
+		}
+
+		ke, err := tx.Entities().FindOrCreateEntityByName(ctx, domain.EntityKindCharacter, "Monkey D. Luffy")
+		if err != nil {
+			return err
+		}
+		keyedEntity = *ke
+
+		unkeyedEntity = domain.Entity{
+			Kind: domain.EntityKindCharacter,
+			Name: "Curated Character",
+		}
+		if err := tx.Entities().CreateEntity(ctx, &unkeyedEntity); err != nil {
+			return err
+		}
+
+		return tx.Entities().SetVolumeEntities(ctx, vol.ID, []domain.VolumeEntity{
+			{VolumeID: vol.ID, EntityID: keyedEntity.ID},
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithTx setup: %v", err)
+	}
+
+	// Automatic sync carrying a locked credit's ID under a different role must not
+	// overwrite the locked row or its locks on either series or volume credits.
+	err = transactor.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.Credits().SyncSeriesCredits(ctx, series.ID, []domain.Credit{
+			{ID: lockedSeriesID, PersonID: personLocked.ID, SeriesID: &series.ID, Role: domain.CreditRolePenciller, Position: 2},
+			{ID: lockedSeriesID, PersonID: personUnlocked.ID, SeriesID: &series.ID, Role: domain.CreditRoleWriter, Position: 1},
+		}); err != nil {
+			return err
+		}
+
+		if err := tx.Credits().SyncVolumeCredits(ctx, vol.ID, []domain.Credit{
+			{ID: lockedVolID, PersonID: personLocked.ID, VolumeID: &vol.ID, Role: domain.CreditRoleInker, Position: 2},
+			{ID: lockedVolID, PersonID: personUnlocked.ID, VolumeID: &vol.ID, Role: domain.CreditRoleTranslator, Position: 1},
+		}); err != nil {
+			return err
+		}
+
+		// SetSeriesCredits and SetVolumeCredits reject duplicate explicit credit IDs.
+		if err := tx.Credits().SetSeriesCredits(ctx, series.ID, []domain.Credit{
+			{ID: lockedSeriesID, PersonID: personLocked.ID, SeriesID: &series.ID, Role: domain.CreditRoleAuthor, Position: 0},
+			{ID: lockedSeriesID, PersonID: personUnlocked.ID, SeriesID: &series.ID, Role: domain.CreditRoleWriter, Position: 1},
+		}); err == nil {
+			t.Fatal("SetSeriesCredits accepted duplicate explicit credit IDs")
+		}
+		if err := tx.Credits().SetVolumeCredits(ctx, vol.ID, []domain.Credit{
+			{ID: lockedVolID, PersonID: personLocked.ID, VolumeID: &vol.ID, Role: domain.CreditRoleWriter, Position: 0},
+			{ID: lockedVolID, PersonID: personUnlocked.ID, VolumeID: &vol.ID, Role: domain.CreditRoleTranslator, Position: 1},
+		}); err == nil {
+			t.Fatal("SetVolumeCredits accepted duplicate explicit credit IDs")
+		}
+
+		// SyncEntity on a keyed entity preserves Kind even when "kind" is not in LockedFields
+		// and a conflicting Kind is proposed.
+		syncedKeyed := domain.Entity{
+			ID:      keyedEntity.ID,
+			Kind:    domain.EntityKindTeam,
+			Name:    keyedEntity.Name,
+			Aliases: []string{"Straw Hat"},
+		}
+		if err := tx.Entities().SyncEntity(ctx, &syncedKeyed); err != nil {
+			return err
+		}
+		if syncedKeyed.Kind != domain.EntityKindCharacter {
+			t.Fatalf("SyncEntity changed keyed entity kind to %q, want %q", syncedKeyed.Kind, domain.EntityKindCharacter)
+		}
+		if !slices.Equal(syncedKeyed.Aliases, []string{"Straw Hat"}) {
+			t.Fatalf("SyncEntity did not update unlocked aliases: %+v", syncedKeyed)
+		}
+
+		// Unkeyed entity without "kind" locked still allows SyncEntity to update Kind.
+		syncedUnkeyed := domain.Entity{
+			ID:   unkeyedEntity.ID,
+			Kind: domain.EntityKindTeam,
+			Name: unkeyedEntity.Name,
+		}
+		if err := tx.Entities().SyncEntity(ctx, &syncedUnkeyed); err != nil {
+			return err
+		}
+		if syncedUnkeyed.Kind != domain.EntityKindTeam {
+			t.Fatalf("SyncEntity on unkeyed entity did not update kind: got %q, want %q", syncedUnkeyed.Kind, domain.EntityKindTeam)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithTx sync checks: %v", err)
+	}
+
+	creditRepo := postgres.NewCreditRepository(db.Pool)
+	seriesCredits, err := creditRepo.ListCreditsBySeries(ctx, series.ID)
+	if err != nil {
+		t.Fatalf("ListCreditsBySeries: %v", err)
+	}
+	if len(seriesCredits) != 3 {
+		t.Fatalf("len(seriesCredits) = %d, want 3", len(seriesCredits))
+	}
+	if seriesCredits[0].ID != lockedSeriesID || seriesCredits[0].Role != domain.CreditRoleAuthor ||
+		seriesCredits[0].Position != 0 || !maps.Equal(seriesCredits[0].LockedFields, domain.FieldLocks{"role": true}) {
+		t.Fatalf("locked series credit altered: %+v", seriesCredits[0])
+	}
+	if seriesCredits[1].ID != unlockedSeriesID || seriesCredits[1].Role != domain.CreditRoleWriter {
+		t.Fatalf("unlocked series credit lost persisted ID: %+v (want %s)", seriesCredits[1], unlockedSeriesID)
+	}
+	if seriesCredits[2].Role != domain.CreditRolePenciller || seriesCredits[2].ID == lockedSeriesID || seriesCredits[2].ID == unlockedSeriesID {
+		t.Fatalf("new series credit invalid or collided: %+v", seriesCredits[2])
+	}
+
+	volCredits, err := creditRepo.ListCreditsByVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListCreditsByVolume: %v", err)
+	}
+	if len(volCredits) != 3 {
+		t.Fatalf("len(volCredits) = %d, want 3", len(volCredits))
+	}
+	if volCredits[0].ID != lockedVolID || volCredits[0].Role != domain.CreditRoleWriter ||
+		volCredits[0].Position != 0 || !maps.Equal(volCredits[0].LockedFields, domain.FieldLocks{"credit": true}) {
+		t.Fatalf("locked volume credit altered: %+v", volCredits[0])
+	}
+	if volCredits[1].ID != unlockedVolID || volCredits[1].Role != domain.CreditRoleTranslator {
+		t.Fatalf("unlocked volume credit lost persisted ID: %+v (want %s)", volCredits[1], unlockedVolID)
+	}
+	if volCredits[2].Role != domain.CreditRoleInker || volCredits[2].ID == lockedVolID || volCredits[2].ID == unlockedVolID {
+		t.Fatalf("new volume credit invalid or collided: %+v", volCredits[2])
+	}
+
+	// Verify the original kind + import_key + ID still resolve and no duplicate was created.
+	entRepo := postgres.NewEntityRepository(db.Pool)
+	byKey, err := entRepo.GetEntityByImportKey(ctx, domain.EntityKindCharacter, *keyedEntity.ImportKey)
+	if err != nil {
+		t.Fatalf("GetEntityByImportKey after conflicting SyncEntity: %v", err)
+	}
+	if byKey.ID != keyedEntity.ID || byKey.Kind != domain.EntityKindCharacter {
+		t.Fatalf("GetEntityByImportKey = %+v, want ID=%s Kind=CHARACTER", byKey, keyedEntity.ID)
+	}
+	reimported, err := entRepo.FindOrCreateEntityByName(ctx, domain.EntityKindCharacter, "  monkey d. luffy ")
+	if err != nil {
+		t.Fatalf("FindOrCreateEntityByName after conflicting SyncEntity: %v", err)
+	}
+	if reimported.ID != keyedEntity.ID {
+		t.Fatalf("FindOrCreateEntityByName created second ID %s, want %s", reimported.ID, keyedEntity.ID)
+	}
+	if _, err := entRepo.GetEntityByImportKey(ctx, domain.EntityKindTeam, *keyedEntity.ImportKey); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetEntityByImportKey(TEAM) = %v, want ErrNotFound", err)
+	}
+	links, err := entRepo.ListVolumeEntities(ctx, vol.ID)
+	if err != nil || len(links) != 1 || links[0].EntityID != keyedEntity.ID {
+		t.Fatalf("ListVolumeEntities = %+v, err=%v", links, err)
 	}
 }

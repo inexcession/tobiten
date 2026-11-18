@@ -557,7 +557,8 @@ func (r *EntityRepository) UpdateEntity(ctx context.Context, entity *domain.Enti
 }
 
 // SyncEntity updates unlocked metadata fields on an existing entity while
-// preserving locked fields, import_key, and locked_fields.
+// preserving locked fields, import_key, kind for keyed entities (import_key != nil),
+// and locked_fields.
 func (r *EntityRepository) SyncEntity(ctx context.Context, entity *domain.Entity) error {
 	if r == nil {
 		return errors.New("entity repository is required")
@@ -1001,7 +1002,9 @@ func mergeEntityFields(existing, proposed domain.Entity) domain.Entity {
 	out.LockedFields = maps.Clone(existing.LockedFields)
 
 	wholeLocked := existing.LockedFields.IsLocked("*")
-	if !wholeLocked && !existing.LockedFields.IsLocked("kind") {
+	// For keyed entities, (kind, import_key) is the full import key and must stay
+	// stable on automatic syncs even when "kind" is not explicitly locked.
+	if existing.ImportKey == nil && !wholeLocked && !existing.LockedFields.IsLocked("kind") {
 		out.Kind = proposed.Kind
 	}
 	if !wholeLocked && !existing.LockedFields.IsLocked("name") {
@@ -1094,6 +1097,9 @@ func reconcileCredits(existing, desired []domain.Credit) []domain.Credit {
 			continue
 		}
 		c := d
+		// Automatic sync reconciles by (person_id, role); never carry caller
+		// proposal IDs into the ID-keyed diff where they could target another row.
+		c.ID = ""
 		c.LockedFields = nil
 		targetByKey[key] = c
 	}
@@ -1109,18 +1115,35 @@ func resolveCreditIDs(existing, target []domain.Credit) ([]domain.Credit, error)
 	for _, e := range existing {
 		existingByKey[creditKey{personID: e.PersonID, role: e.Role}] = e
 	}
+	claimedIDs := make(map[string]struct{}, len(target))
+	for _, c := range target {
+		if c.ID == "" {
+			continue
+		}
+		if _, dup := claimedIDs[c.ID]; dup {
+			return nil, fmt.Errorf("duplicate credit ID %q", c.ID)
+		}
+		claimedIDs[c.ID] = struct{}{}
+	}
 	out := make([]domain.Credit, len(target))
 	for i, c := range target {
 		if c.ID == "" {
 			if e, ok := existingByKey[creditKey{personID: c.PersonID, role: c.Role}]; ok {
-				c.ID = e.ID
-			} else {
+				if _, claimed := claimedIDs[e.ID]; !claimed {
+					c.ID = e.ID
+				}
+			}
+			if c.ID == "" {
 				id, err := domain.NewID()
 				if err != nil {
 					return nil, fmt.Errorf("generating credit ID: %w", err)
 				}
 				c.ID = id
 			}
+			if _, dup := claimedIDs[c.ID]; dup {
+				return nil, fmt.Errorf("duplicate credit ID %q", c.ID)
+			}
+			claimedIDs[c.ID] = struct{}{}
 		}
 		out[i] = c
 	}
@@ -1149,19 +1172,27 @@ func applyCreditDiff(ctx context.Context, q *Queries, existing, target []domain.
 		}
 	}
 
+	var toUpdate []domain.Credit
+	var toCreate []domain.Credit
 	for i := range target {
 		t := target[i]
 		e, exists := existingByID[t.ID]
 		if !exists {
-			if err := saveCredit(ctx, q, &t, true); err != nil {
-				return err
-			}
+			toCreate = append(toCreate, t)
 			continue
 		}
 		if !creditsEqual(e, t) {
-			if err := saveCredit(ctx, q, &t, false); err != nil {
-				return err
-			}
+			toUpdate = append(toUpdate, t)
+		}
+	}
+	for i := range toUpdate {
+		if err := saveCredit(ctx, q, &toUpdate[i], false); err != nil {
+			return err
+		}
+	}
+	for i := range toCreate {
+		if err := saveCredit(ctx, q, &toCreate[i], true); err != nil {
+			return err
 		}
 	}
 	return nil
