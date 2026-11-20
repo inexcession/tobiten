@@ -1,8 +1,10 @@
 package comicinfo
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/inexcession/tobiten/internal/domain"
@@ -42,9 +44,11 @@ var entityFields = []entityField{
 // caller-supplied transaction tx.
 //
 // Comma-separated entries are split, trimmed, and deduplicated while preserving
-// per-role credit position order. Existing locked credits, locked entity links,
-// and locked person or entity fields are preserved. ComicInfo metadata is
-// per-volume, so series-level credits are not synthesized.
+// per-role credit position order. Shared person and entity import keys are
+// resolved in a canonical sorted order to prevent deadlocks across concurrent
+// volume imports. Existing locked credits, locked entity links, and locked person
+// or entity fields are preserved. ComicInfo metadata is per-volume, so
+// series-level credits are not synthesized.
 func ImportVolumeCreditsAndEntities(
 	ctx context.Context,
 	tx storage.Tx,
@@ -97,45 +101,67 @@ func buildVolumeCredits(
 	volumeID string,
 	meta Metadata,
 ) ([]domain.Credit, error) {
+	type pendingCredit struct {
+		role      domain.CreditRole
+		importKey string
+	}
 	type creditKey struct {
 		personID string
 		role     domain.CreditRole
 	}
 
-	peopleByKey := make(map[string]string)
-	seen := make(map[creditKey]struct{})
-	var desired []domain.Credit
-
+	firstDisplayName := make(map[string]string)
+	var pending []pendingCredit
 	for _, field := range creditFields {
-		pos := 0
 		for _, name := range splitCommaNames(field.names(meta)) {
 			importKey := domain.NormalizeImportName(name)
 			if importKey == "" {
 				continue
 			}
-			personID, ok := peopleByKey[importKey]
-			if !ok {
-				person, err := peopleRepo.FindOrCreatePersonByName(ctx, name)
-				if err != nil {
-					return nil, err
-				}
-				personID = person.ID
-				peopleByKey[importKey] = personID
+			if _, ok := firstDisplayName[importKey]; !ok {
+				firstDisplayName[importKey] = name
 			}
-			key := creditKey{personID: personID, role: field.role}
-			if _, dup := seen[key]; dup {
-				continue
-			}
-			seen[key] = struct{}{}
-			volID := volumeID
-			desired = append(desired, domain.Credit{
-				PersonID: personID,
-				VolumeID: &volID,
-				Role:     field.role,
-				Position: pos,
+			pending = append(pending, pendingCredit{
+				role:      field.role,
+				importKey: importKey,
 			})
-			pos++
 		}
+	}
+
+	sortedKeys := make([]string, 0, len(firstDisplayName))
+	for key := range firstDisplayName {
+		sortedKeys = append(sortedKeys, key)
+	}
+	slices.Sort(sortedKeys)
+
+	peopleByKey := make(map[string]string, len(sortedKeys))
+	for _, key := range sortedKeys {
+		person, err := peopleRepo.FindOrCreatePersonByName(ctx, firstDisplayName[key])
+		if err != nil {
+			return nil, err
+		}
+		peopleByKey[key] = person.ID
+	}
+
+	seen := make(map[creditKey]struct{}, len(pending))
+	posByRole := make(map[domain.CreditRole]int, len(creditFields))
+	desired := make([]domain.Credit, 0, len(pending))
+	for _, item := range pending {
+		personID := peopleByKey[item.importKey]
+		key := creditKey{personID: personID, role: item.role}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		pos := posByRole[item.role]
+		posByRole[item.role] = pos + 1
+		volID := volumeID
+		desired = append(desired, domain.Credit{
+			PersonID: personID,
+			VolumeID: &volID,
+			Role:     item.role,
+			Position: pos,
+		})
 	}
 	return desired, nil
 }
@@ -151,10 +177,7 @@ func buildVolumeEntities(
 		importKey string
 	}
 
-	entitiesByKey := make(map[entityKey]string)
-	seen := make(map[string]struct{})
-	var desired []domain.VolumeEntity
-
+	firstDisplayName := make(map[entityKey]string)
 	for _, field := range entityFields {
 		for _, name := range splitCommaNames(field.names(meta)) {
 			importKey := domain.NormalizeImportName(name)
@@ -162,24 +185,38 @@ func buildVolumeEntities(
 				continue
 			}
 			key := entityKey{kind: field.kind, importKey: importKey}
-			entityID, ok := entitiesByKey[key]
-			if !ok {
-				entity, err := entityRepo.FindOrCreateEntityByName(ctx, field.kind, name)
-				if err != nil {
-					return nil, err
-				}
-				entityID = entity.ID
-				entitiesByKey[key] = entityID
+			if _, ok := firstDisplayName[key]; !ok {
+				firstDisplayName[key] = name
 			}
-			if _, dup := seen[entityID]; dup {
-				continue
-			}
-			seen[entityID] = struct{}{}
-			desired = append(desired, domain.VolumeEntity{
-				VolumeID: volumeID,
-				EntityID: entityID,
-			})
 		}
+	}
+
+	sortedKeys := make([]entityKey, 0, len(firstDisplayName))
+	for key := range firstDisplayName {
+		sortedKeys = append(sortedKeys, key)
+	}
+	slices.SortFunc(sortedKeys, func(a, b entityKey) int {
+		if c := cmp.Compare(a.kind, b.kind); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.importKey, b.importKey)
+	})
+
+	seen := make(map[string]struct{}, len(sortedKeys))
+	desired := make([]domain.VolumeEntity, 0, len(sortedKeys))
+	for _, key := range sortedKeys {
+		entity, err := entityRepo.FindOrCreateEntityByName(ctx, key.kind, firstDisplayName[key])
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[entity.ID]; dup {
+			continue
+		}
+		seen[entity.ID] = struct{}{}
+		desired = append(desired, domain.VolumeEntity{
+			VolumeID: volumeID,
+			EntityID: entity.ID,
+		})
 	}
 	return desired, nil
 }

@@ -3,10 +3,12 @@ package comicinfo_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,12 +20,36 @@ import (
 	"github.com/inexcession/tobiten/internal/testdb"
 )
 
+var (
+	pkgDBOnce    sync.Once
+	pkgDBCleanup func()
+	pkgDBErr     error
+)
+
 func TestMain(m *testing.M) {
-	os.Exit(testdb.Run(m))
+	code := m.Run()
+	if pkgDBCleanup != nil {
+		pkgDBCleanup()
+	}
+	testdb.Stop()
+	os.Exit(code)
 }
 
 func setupImporterTestDB(t *testing.T) (*testdb.TestDB, *postgres.Transactor) {
 	t.Helper()
+	// Start the shared PostgreSQL instance lazily so parser-only test runs
+	// (e.g. go test -run TestFixtures) never invoke initdb.
+	pkgDBOnce.Do(func() {
+		var pkgDB *testdb.TestDB
+		pkgDB, pkgDBCleanup, pkgDBErr = testdb.NewPackageDB()
+		if pkgDB != nil {
+			pkgDB.Close()
+		}
+	})
+	if pkgDBErr != nil {
+		t.Fatalf("setupImporterTestDB: initializing testdb server: %v", pkgDBErr)
+	}
+
 	db := testdb.New(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -761,5 +787,318 @@ func TestImportVolumeCreditsAndEntities_CallerTxRollbackAndValidation(t *testing
 	if peopleCount != 0 || entityCount != 0 || creditCount != 0 || linkCount != 0 {
 		t.Fatalf("rollback leaked rows: people=%d entities=%d credits=%d links=%d",
 			peopleCount, entityCount, creditCount, linkCount)
+	}
+}
+
+type recordingTx struct {
+	storage.Tx
+	mu          *sync.Mutex
+	personCalls *[]string
+	entityCalls *[]string
+}
+
+func (r *recordingTx) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return r.Tx.WithTx(ctx, func(inner storage.Tx) error {
+		return fn(&recordingTx{
+			Tx:          inner,
+			mu:          r.mu,
+			personCalls: r.personCalls,
+			entityCalls: r.entityCalls,
+		})
+	})
+}
+
+func (r *recordingTx) People() storage.PersonRepository {
+	return &recordingPersonRepo{
+		PersonRepository: r.Tx.People(),
+		mu:               r.mu,
+		calls:            r.personCalls,
+	}
+}
+
+func (r *recordingTx) Entities() storage.EntityRepository {
+	return &recordingEntityRepo{
+		EntityRepository: r.Tx.Entities(),
+		mu:               r.mu,
+		calls:            r.entityCalls,
+	}
+}
+
+type recordingPersonRepo struct {
+	storage.PersonRepository
+	mu    *sync.Mutex
+	calls *[]string
+}
+
+func (r *recordingPersonRepo) FindOrCreatePersonByName(ctx context.Context, name string) (*domain.Person, error) {
+	r.mu.Lock()
+	*r.calls = append(*r.calls, name)
+	r.mu.Unlock()
+	return r.PersonRepository.FindOrCreatePersonByName(ctx, name)
+}
+
+type recordingEntityRepo struct {
+	storage.EntityRepository
+	mu    *sync.Mutex
+	calls *[]string
+}
+
+func (r *recordingEntityRepo) FindOrCreateEntityByName(ctx context.Context, kind domain.EntityKind, name string) (*domain.Entity, error) {
+	r.mu.Lock()
+	*r.calls = append(*r.calls, string(kind)+":"+name)
+	r.mu.Unlock()
+	return r.EntityRepository.FindOrCreateEntityByName(ctx, kind, name)
+}
+
+func TestImportVolumeCreditsAndEntities_CanonicalKeyAcquisitionOrder(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupImporterTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Reverse / mixed input ordering across credit roles and entity kinds.
+	meta := parseStrictXML(t, `<ComicInfo>
+		<Writer>Zed, Alpha</Writer>
+		<Penciller>Middle, alpha</Penciller>
+		<Translator>Beta</Translator>
+		<Characters>Zorro, Ace</Characters>
+		<Teams>Zeta, AlphaTeam</Teams>
+		<Locations>Zion, Atlantis</Locations>
+	</ComicInfo>`)
+
+	var (
+		mu          sync.Mutex
+		personCalls []string
+		entityCalls []string
+		vol         domain.Volume
+	)
+
+	err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		_, vol = seedTestSeriesAndVolume(ctx, t, tx)
+		wrapped := &recordingTx{
+			Tx:          tx,
+			mu:          &mu,
+			personCalls: &personCalls,
+			entityCalls: &entityCalls,
+		}
+		return comicinfo.ImportVolumeCreditsAndEntities(ctx, wrapped, vol.ID, meta)
+	})
+	if err != nil {
+		t.Fatalf("WithTx import failed: %v", err)
+	}
+
+	wantPeopleOrder := []string{"Alpha", "Beta", "Middle", "Zed"}
+	if !slices.Equal(personCalls, wantPeopleOrder) {
+		t.Fatalf("FindOrCreatePersonByName order = %v, want %v", personCalls, wantPeopleOrder)
+	}
+
+	wantEntityOrder := []string{
+		"CHARACTER:Ace",
+		"CHARACTER:Zorro",
+		"LOCATION:Atlantis",
+		"LOCATION:Zion",
+		"TEAM:AlphaTeam",
+		"TEAM:Zeta",
+	}
+	if !slices.Equal(entityCalls, wantEntityOrder) {
+		t.Fatalf("FindOrCreateEntityByName order = %v, want %v", entityCalls, wantEntityOrder)
+	}
+
+	// Verify original source positions remain intact despite sorted resolution order.
+	credits, err := postgres.NewCreditRepository(db.Pool).ListCreditsByVolume(ctx, vol.ID)
+	if err != nil {
+		t.Fatalf("ListCreditsByVolume: %v", err)
+	}
+	peopleRepo := postgres.NewPersonRepository(db.Pool)
+	byRole := make(map[domain.CreditRole][]string)
+	for _, c := range credits {
+		p, err := peopleRepo.GetPersonByID(ctx, c.PersonID)
+		if err != nil {
+			t.Fatalf("GetPersonByID(%s): %v", c.PersonID, err)
+		}
+		byRole[c.Role] = append(byRole[c.Role], p.Name)
+	}
+	if !slices.Equal(byRole[domain.CreditRoleWriter], []string{"Zed", "Alpha"}) {
+		t.Fatalf("Writer order = %v, want [Zed Alpha]", byRole[domain.CreditRoleWriter])
+	}
+	if !slices.Equal(byRole[domain.CreditRolePenciller], []string{"Middle", "Alpha"}) {
+		t.Fatalf("Penciller order = %v, want [Middle Alpha]", byRole[domain.CreditRolePenciller])
+	}
+	if !slices.Equal(byRole[domain.CreditRoleTranslator], []string{"Beta"}) {
+		t.Fatalf("Translator order = %v, want [Beta]", byRole[domain.CreditRoleTranslator])
+	}
+}
+
+func TestImportVolumeCreditsAndEntities_ConcurrentOppositeOrderImports(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupImporterTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		lib    domain.Library
+		series domain.Series
+	)
+	err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib = domain.Library{Name: "Concurrent Comics", Mode: domain.LibraryModeVirtual}
+		if err := tx.Libraries().CreateLibrary(ctx, &lib); err != nil {
+			return err
+		}
+		series = domain.Series{
+			LibraryID: lib.ID,
+			Title:     "Concurrent Series",
+			TitleSort: "Concurrent Series",
+			Status:    domain.SeriesStatusOngoing,
+		}
+		return tx.CatalogueWrites().CreateSeries(ctx, &series)
+	})
+	if err != nil {
+		t.Fatalf("seed library/series: %v", err)
+	}
+
+	const rounds = 5
+	for round := range rounds {
+		var vol1, vol2 domain.Volume
+		err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			createVol := func(num float64) (domain.Volume, error) {
+				n := num
+				v := domain.Volume{LibraryID: lib.ID, Kind: domain.VolumeKindVolume, Number: &n}
+				if err := tx.CatalogueWrites().CreateVolume(ctx, &v); err != nil {
+					return domain.Volume{}, err
+				}
+				if err := tx.SeriesMemberships().SetVolumeMemberships(ctx, v.ID, []domain.SeriesMembership{
+					{
+						VolumeID:  v.ID,
+						SeriesID:  series.ID,
+						IsPrimary: true,
+						Kind:      domain.MembershipKindSeries,
+						Position:  &n,
+						Source:    domain.MembershipSourceResolver,
+					},
+				}); err != nil {
+					return domain.Volume{}, err
+				}
+				return v, nil
+			}
+			var err error
+			if vol1, err = createVol(float64(round*2 + 1)); err != nil {
+				return err
+			}
+			vol2, err = createVol(float64(round*2 + 2))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("round %d seed volumes: %v", round, err)
+		}
+
+		prefix := fmt.Sprintf("R%d", round)
+		meta1 := comicinfo.Metadata{
+			Writer:     []string{prefix + " Zed", prefix + " Middle", prefix + " Alpha"},
+			Penciller:  []string{prefix + " Beta", prefix + " Alpha"},
+			Characters: []string{prefix + " Zorro", prefix + " Ace"},
+			Teams:      []string{prefix + " Zeta", prefix + " AlphaTeam"},
+			Locations:  []string{prefix + " Zion", prefix + " Atlantis"},
+		}
+		meta2 := comicinfo.Metadata{
+			Writer:     []string{prefix + " Alpha", prefix + " Middle", prefix + " Zed"},
+			Penciller:  []string{prefix + " Alpha", prefix + " Beta"},
+			Characters: []string{prefix + " Ace", prefix + " Zorro"},
+			Teams:      []string{prefix + " AlphaTeam", prefix + " Zeta"},
+			Locations:  []string{prefix + " Atlantis", prefix + " Zion"},
+		}
+
+		ready := make(chan struct{}, 2)
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+
+		runImport := func(volID string, meta comicinfo.Metadata) {
+			errs <- transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+				ready <- struct{}{}
+				select {
+				case <-start:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return comicinfo.ImportVolumeCreditsAndEntities(ctx, tx, volID, meta)
+			})
+		}
+
+		go runImport(vol1.ID, meta1)
+		go runImport(vol2.ID, meta2)
+
+		for range 2 {
+			select {
+			case <-ready:
+			case <-ctx.Done():
+				t.Fatalf("round %d timed out waiting for workers: %v", round, ctx.Err())
+			}
+		}
+		close(start)
+
+		for range 2 {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d concurrent opposite-order import failed: %v", round, err)
+			}
+		}
+
+		// Both volumes must share the same person and entity IDs while preserving
+		// each volume's own input credit positions.
+		creditRepo := postgres.NewCreditRepository(db.Pool)
+		c1, err := creditRepo.ListCreditsByVolume(ctx, vol1.ID)
+		if err != nil {
+			t.Fatalf("round %d ListCreditsByVolume(vol1): %v", round, err)
+		}
+		c2, err := creditRepo.ListCreditsByVolume(ctx, vol2.ID)
+		if err != nil {
+			t.Fatalf("round %d ListCreditsByVolume(vol2): %v", round, err)
+		}
+		if len(c1) != 5 || len(c2) != 5 {
+			t.Fatalf("round %d credit counts = (%d, %d), want (5, 5)", round, len(c1), len(c2))
+		}
+
+		peopleRepo := postgres.NewPersonRepository(db.Pool)
+		creditMap := func(credits []domain.Credit) map[domain.CreditRole][]string {
+			out := make(map[domain.CreditRole][]string)
+			for _, c := range credits {
+				p, pErr := peopleRepo.GetPersonByID(ctx, c.PersonID)
+				if pErr != nil {
+					t.Fatalf("GetPersonByID(%s): %v", c.PersonID, pErr)
+				}
+				out[c.Role] = append(out[c.Role], p.Name+":"+c.PersonID)
+			}
+			return out
+		}
+		m1 := creditMap(c1)
+		m2 := creditMap(c2)
+		if len(m1[domain.CreditRoleWriter]) != 3 || len(m2[domain.CreditRoleWriter]) != 3 {
+			t.Fatalf("round %d writer counts unexpected: %v vs %v", round, m1, m2)
+		}
+		// vol1 Writer is [Zed, Middle, Alpha]; vol2 Writer is [Alpha, Middle, Zed].
+		if m1[domain.CreditRoleWriter][0] != m2[domain.CreditRoleWriter][2] ||
+			m1[domain.CreditRoleWriter][1] != m2[domain.CreditRoleWriter][1] ||
+			m1[domain.CreditRoleWriter][2] != m2[domain.CreditRoleWriter][0] {
+			t.Fatalf("round %d Writer IDs/positions mismatch: vol1=%v vol2=%v",
+				round, m1[domain.CreditRoleWriter], m2[domain.CreditRoleWriter])
+		}
+
+		entRepo := postgres.NewEntityRepository(db.Pool)
+		l1, err := entRepo.ListVolumeEntities(ctx, vol1.ID)
+		if err != nil {
+			t.Fatalf("round %d ListVolumeEntities(vol1): %v", round, err)
+		}
+		l2, err := entRepo.ListVolumeEntities(ctx, vol2.ID)
+		if err != nil {
+			t.Fatalf("round %d ListVolumeEntities(vol2): %v", round, err)
+		}
+		if len(l1) != 6 || len(l2) != 6 {
+			t.Fatalf("round %d entity link counts = (%d, %d), want (6, 6)", round, len(l1), len(l2))
+		}
+		for i := range l1 {
+			if l1[i].EntityID != l2[i].EntityID {
+				t.Fatalf("round %d entity IDs differ: vol1=%+v vol2=%+v", round, l1, l2)
+			}
+		}
 	}
 }
