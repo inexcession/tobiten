@@ -23,6 +23,10 @@ const RootMarkerFilename = ".tobiten-root"
 // but contains no files and no .tobiten-root marker (ADR-0019 §5).
 var ErrRootEmpty = errors.New("scanner: root directory contains no files and no .tobiten-root marker")
 
+// ErrStalePreCheck is returned when a library's root set, root path, or newer
+// availability check supersedes an in-flight pre-check observation before commit.
+var ErrStalePreCheck = errors.New("scanner: library root snapshot changed during availability pre-check")
+
 // DirStream incrementally reads directory entries so root availability pre-checks
 // can stop at the first qualifying file without reading large directories in full.
 type DirStream interface {
@@ -71,6 +75,11 @@ type rootProbeHooks struct {
 	stat       func(rawPath []byte) (os.FileInfo, error)
 	openDir    func(rawDir []byte) (DirStream, error)
 	customStat bool
+}
+
+type checkedRootProbe struct {
+	root domain.LibraryRoot
+	err  error
 }
 
 type sliceDirStream struct {
@@ -124,17 +133,17 @@ func (s *Scanner) PreCheckLibrary(
 		return PreCheckResult{}, err
 	}
 
+	checkedAt := s.now().UTC().Truncate(time.Microsecond)
 	probe := newRootProbeHooks(opts)
-	checkedByID, err := probeAllRoots(ctx, roots, probe)
+	checkedRoots, err := probeAllRoots(ctx, roots, probe)
 	if err != nil {
 		return PreCheckResult{}, err
 	}
 
-	checkedAt := s.now().UTC()
 	var result PreCheckResult
 	err = s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		var txErr error
-		result, txErr = s.commitPreCheckTx(ctx, tx, lib.ID, checkedByID, probe, checkedAt)
+		result, txErr = s.commitPreCheckTx(ctx, tx, lib.ID, checkedRoots, checkedAt)
 		return txErr
 	})
 	if err != nil {
@@ -147,8 +156,7 @@ func (s *Scanner) commitPreCheckTx(
 	ctx context.Context,
 	tx storage.Tx,
 	libraryID string,
-	checkedByID map[string]error,
-	probe rootProbeHooks,
+	checkedRoots []checkedRootProbe,
 	checkedAt time.Time,
 ) (PreCheckResult, error) {
 	repo := tx.Libraries()
@@ -163,24 +171,22 @@ func (s *Scanner) commitPreCheckTx(
 		return PreCheckResult{}, err
 	}
 
+	matched, err := matchCheckedSnapshot(checkedRoots, currentRoots, checkedAt)
+	if err != nil {
+		return PreCheckResult{}, err
+	}
+
 	wasOnline := allRootsOnline(currentRoots)
-	rootResults := make([]RootCheckResult, 0, len(currentRoots))
+	rootResults := make([]RootCheckResult, 0, len(matched))
 	failedRootIDs := make([]string, 0)
 
-	for _, root := range currentRoots {
-		probeErr, ok := checkedByID[root.ID]
-		if !ok {
-			probeErr = probeRootAvailability(ctx, root.Path.Bytes, probe)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return PreCheckResult{}, ctxErr
-			}
-		}
-
+	for _, item := range matched {
+		root := item.root
 		nextState := domain.LibraryRootStateOnline
 		var lastErr *string
-		if probeErr != nil {
+		if item.err != nil {
 			nextState = domain.LibraryRootStateOffline
-			msg := probeErr.Error()
+			msg := formatSafeDiagnosticError(item.err)
 			lastErr = &msg
 			failedRootIDs = append(failedRootIDs, root.ID)
 		}
@@ -196,7 +202,7 @@ func (s *Scanner) commitPreCheckTx(
 			State:         nextState,
 			CheckedAt:     checkedAt,
 			LastError:     lastErr,
-			Err:           probeErr,
+			Err:           item.err,
 		})
 	}
 
@@ -228,6 +234,73 @@ func (s *Scanner) commitPreCheckTx(
 		FailedRootIDs: failedRootIDs,
 		Event:         transitionEv,
 	}, nil
+}
+
+func matchCheckedSnapshot(
+	checkedRoots []checkedRootProbe,
+	currentRoots []domain.LibraryRoot,
+	observedAt time.Time,
+) ([]checkedRootProbe, error) {
+	if len(checkedRoots) != len(currentRoots) {
+		return nil, ErrStalePreCheck
+	}
+	checkedByID := make(map[string]checkedRootProbe, len(checkedRoots))
+	for _, item := range checkedRoots {
+		checkedByID[item.root.ID] = item
+	}
+
+	matched := make([]checkedRootProbe, 0, len(currentRoots))
+	for _, cur := range currentRoots {
+		item, ok := checkedByID[cur.ID]
+		if !ok || !bytes.Equal(item.root.Path.Bytes, cur.Path.Bytes) {
+			return nil, ErrStalePreCheck
+		}
+		if rootStatusChanged(item.root, cur) {
+			if cur.LastCheckedAt == nil || !observedAt.After(cur.LastCheckedAt.UTC()) {
+				return nil, ErrStalePreCheck
+			}
+		}
+		matched = append(matched, checkedRootProbe{
+			root: cur,
+			err:  item.err,
+		})
+	}
+	return matched, nil
+}
+
+func rootStatusChanged(initial, current domain.LibraryRoot) bool {
+	if initial.State != current.State {
+		return true
+	}
+	if !equalOptionalTime(initial.LastCheckedAt, current.LastCheckedAt) {
+		return true
+	}
+	return !equalOptionalString(initial.LastError, current.LastError)
+}
+
+func equalOptionalTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.UTC().Equal(b.UTC())
+}
+
+func equalOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func formatSafeDiagnosticError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg, _ := domain.FormatPathDisplay([]byte(err.Error()))
+	if strings.IndexByte(msg, 0) >= 0 {
+		msg = strings.ReplaceAll(msg, "\x00", `\x00`)
+	}
+	return msg
 }
 
 func (s *Scanner) appendAvailabilityTransitionEvent(
@@ -324,8 +397,8 @@ func openRawDirStream(rawDir []byte) (DirStream, error) {
 	return f, nil
 }
 
-func probeAllRoots(ctx context.Context, roots []domain.LibraryRoot, probe rootProbeHooks) (map[string]error, error) {
-	outcomes := make(map[string]error, len(roots))
+func probeAllRoots(ctx context.Context, roots []domain.LibraryRoot, probe rootProbeHooks) ([]checkedRootProbe, error) {
+	outcomes := make([]checkedRootProbe, 0, len(roots))
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -334,7 +407,10 @@ func probeAllRoots(ctx context.Context, roots []domain.LibraryRoot, probe rootPr
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		outcomes[root.ID] = err
+		outcomes = append(outcomes, checkedRootProbe{
+			root: root,
+			err:  err,
+		})
 	}
 	return outcomes, nil
 }

@@ -162,7 +162,7 @@ func (r *LibraryRepository) runLibraryTx(ctx context.Context, label string, fn f
 // catalogue records (series or volumes), preserving standalone volumes and reading progress.
 func (r *LibraryRepository) DeleteLibrary(ctx context.Context, id string) error {
 	return r.runLibraryTx(ctx, "library delete", func(q *Queries) error {
-		if _, err := q.LockLibraryForDelete(ctx, id); err != nil {
+		if _, err := q.LockLibrary(ctx, id); err != nil {
 			return mapPgError(err)
 		}
 		hasRows, err := q.LibraryHasCatalogueRows(ctx, id)

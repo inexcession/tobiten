@@ -383,20 +383,6 @@ func (q *Queries) LockLibrary(ctx context.Context, id string) (string, error) {
 	return id_2, err
 }
 
-const lockLibraryForDelete = `-- name: LockLibraryForDelete :one
-SELECT id
-FROM libraries
-WHERE id = $1
-FOR UPDATE
-`
-
-func (q *Queries) LockLibraryForDelete(ctx context.Context, id string) (string, error) {
-	row := q.db.QueryRow(ctx, lockLibraryForDelete, id)
-	var id_2 string
-	err := row.Scan(&id_2)
-	return id_2, err
-}
-
 const updateLibrary = `-- name: UpdateLibrary :one
 UPDATE libraries
 SET name = $2,

@@ -142,7 +142,6 @@ type Querier interface {
 	ListVolumeEntitiesForUpdate(ctx context.Context, volumeID string) ([]VolumeEntity, error)
 	LockDomainEventSequence(ctx context.Context) (int64, error)
 	LockLibrary(ctx context.Context, id string) (string, error)
-	LockLibraryForDelete(ctx context.Context, id string) (string, error)
 	LockMediaAssetForUpdate(ctx context.Context, id string) (string, error)
 	LockSeriesForCreditUpdate(ctx context.Context, id string) (string, error)
 	LockVolumeForCreditUpdate(ctx context.Context, id string) (string, error)

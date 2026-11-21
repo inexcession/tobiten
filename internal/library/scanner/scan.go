@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -155,21 +156,30 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return res, nil
 	}
 
-	lib, roots, err := s.loadLibraryAndRoots(ctx, libraryID)
+	_, currentRoots, err := s.loadLibraryAndRoots(ctx, libraryID)
 	if err != nil {
 		return ScanResult{}, err
 	}
+	if !rootSnapshotPathsMatch(preCheck.Roots, currentRoots) {
+		return ScanResult{}, ErrStalePreCheck
+	}
 
 	res.Complete = true
-	res.Roots = make([]RootScanResult, 0, len(roots))
+	res.Roots = make([]RootScanResult, 0, len(preCheck.Roots))
 	var rootErrs []error
-	for _, root := range roots {
+	for _, checkedRoot := range preCheck.Roots {
 		if err := ctx.Err(); err != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
 			return res, err
 		}
-		rootRes, loadErr := s.scanOneRoot(ctx, lib.ID, root, opts)
+		root := domain.LibraryRoot{
+			ID:        checkedRoot.LibraryRootID,
+			LibraryID: preCheck.LibraryID,
+			Path:      checkedRoot.RootPath,
+			State:     checkedRoot.State,
+		}
+		rootRes, loadErr := s.scanOneRoot(ctx, preCheck.LibraryID, root, opts)
 		if loadErr != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
@@ -201,6 +211,23 @@ func (r *ScanResult) recordRoot(rootRes RootScanResult) {
 	if !rootRes.Complete {
 		r.Complete = false
 	}
+}
+
+func rootSnapshotPathsMatch(checked []RootCheckResult, current []domain.LibraryRoot) bool {
+	if len(checked) != len(current) {
+		return false
+	}
+	byID := make(map[string]domain.LibraryRoot, len(current))
+	for _, root := range current {
+		byID[root.ID] = root
+	}
+	for _, item := range checked {
+		cur, ok := byID[item.LibraryRootID]
+		if !ok || !bytes.Equal(item.RootPath.Bytes, cur.Path.Bytes) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Scanner) loadLibraryAndRoots(ctx context.Context, libraryID string) (*domain.Library, []domain.LibraryRoot, error) {
