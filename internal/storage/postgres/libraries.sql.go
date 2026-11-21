@@ -497,6 +497,8 @@ SET state = $2,
     last_checked_at = $3,
     last_error = $4
 WHERE id = $1
+  AND library_id = $5
+  AND path_bytes = $6
 `
 
 type UpdateLibraryRootStatusParams struct {
@@ -504,6 +506,8 @@ type UpdateLibraryRootStatusParams struct {
 	State         string
 	LastCheckedAt *time.Time
 	LastError     *string
+	LibraryID     string
+	PathBytes     []byte
 }
 
 func (q *Queries) UpdateLibraryRootStatus(ctx context.Context, arg UpdateLibraryRootStatusParams) (int64, error) {
@@ -512,6 +516,8 @@ func (q *Queries) UpdateLibraryRootStatus(ctx context.Context, arg UpdateLibrary
 		arg.State,
 		arg.LastCheckedAt,
 		arg.LastError,
+		arg.LibraryID,
+		arg.PathBytes,
 	)
 	if err != nil {
 		return 0, err

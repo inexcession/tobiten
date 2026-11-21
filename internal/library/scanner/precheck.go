@@ -191,7 +191,9 @@ func (s *Scanner) commitPreCheckTx(
 			failedRootIDs = append(failedRootIDs, root.ID)
 		}
 
-		if err := repo.UpdateLibraryRootStatus(ctx, root.ID, nextState, checkedAt, lastErr); err != nil {
+		if err := repo.UpdateLibraryRootStatus(ctx, root, nextState, checkedAt, lastErr); errors.Is(err, storage.ErrNotFound) {
+			return PreCheckResult{}, ErrStalePreCheck
+		} else if err != nil {
 			return PreCheckResult{}, err
 		}
 

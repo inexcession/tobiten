@@ -23,7 +23,8 @@ type LibraryRepository interface {
 	ListLibraryRoots(ctx context.Context, libraryID string) ([]domain.LibraryRoot, error)
 	ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error)
 	UpdateLibraryRoot(ctx context.Context, root *domain.LibraryRoot) error
-	UpdateLibraryRootStatus(ctx context.Context, id string, state domain.LibraryRootState, checkedAt time.Time, lastError *string) error
+	// UpdateLibraryRootStatus returns ErrNotFound if the root's identity changed since it was checked.
+	UpdateLibraryRootStatus(ctx context.Context, root domain.LibraryRoot, state domain.LibraryRootState, checkedAt time.Time, lastError *string) error
 	DeleteLibraryRoot(ctx context.Context, id string) error
 
 	// Configuration serialization

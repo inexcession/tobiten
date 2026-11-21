@@ -531,8 +531,9 @@ func TestLibraryRepository_RootStatusDuplicatePathAndFK(t *testing.T) {
 
 	err = transactor.WithTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
+		checkedRoot := domain.LibraryRoot{ID: root1ID, LibraryID: lib1ID, Path: pathA}
 
-		if err := repo.UpdateLibraryRootStatus(ctx, root1ID, domain.LibraryRootStateOffline, t1, &offlineMsg); err != nil {
+		if err := repo.UpdateLibraryRootStatus(ctx, checkedRoot, domain.LibraryRootStateOffline, t1, &offlineMsg); err != nil {
 			t.Fatalf("UpdateLibraryRootStatus(OFFLINE): %v", err)
 		}
 		got, err := repo.GetLibraryRootByID(ctx, root1ID)
@@ -549,7 +550,7 @@ func TestLibraryRepository_RootStatusDuplicatePathAndFK(t *testing.T) {
 			t.Fatalf("LastError = %v, want %q", got.LastError, offlineMsg)
 		}
 
-		if err := repo.UpdateLibraryRootStatus(ctx, root1ID, domain.LibraryRootStateOnline, t2, nil); err != nil {
+		if err := repo.UpdateLibraryRootStatus(ctx, checkedRoot, domain.LibraryRootStateOnline, t2, nil); err != nil {
 			t.Fatalf("UpdateLibraryRootStatus(ONLINE): %v", err)
 		}
 		recovered, err := repo.GetLibraryRootByID(ctx, root1ID)
@@ -562,7 +563,8 @@ func TestLibraryRepository_RootStatusDuplicatePathAndFK(t *testing.T) {
 			t.Fatalf("expected recovered ONLINE root with cleared LastError, got %+v", recovered)
 		}
 
-		if err := repo.UpdateLibraryRootStatus(ctx, domain.MustNewID(), domain.LibraryRootStateOffline, t1, &offlineMsg); !errors.Is(err, storage.ErrNotFound) {
+		checkedRoot.ID = domain.MustNewID()
+		if err := repo.UpdateLibraryRootStatus(ctx, checkedRoot, domain.LibraryRootStateOffline, t1, &offlineMsg); !errors.Is(err, storage.ErrNotFound) {
 			t.Fatalf("expected ErrNotFound for unknown root status update, got %v", err)
 		}
 

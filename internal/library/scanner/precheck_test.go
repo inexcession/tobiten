@@ -1007,73 +1007,98 @@ func TestPreCheckLibrary_AtomicRollbackConcurrencyAndScanStop(t *testing.T) {
 		}
 	})
 
-	t.Run("ScanLibrary rejects root snapshot changed after pre-check without walking unchecked root", func(t *testing.T) {
-		t.Parallel()
-		_, transactor := setupIndexerTestDB(t)
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
+	for _, tc := range []struct {
+		name        string
+		markOffline bool
+	}{
+		{name: "ScanLibrary stops when a root is added after pre-check"},
+		{name: "ScanLibrary stops when a newer pre-check marks the same path offline", markOffline: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, transactor := setupIndexerTestDB(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
 
-		base := t.TempDir()
-		rootA := filepath.Join(base, "root-a")
-		rootB := filepath.Join(base, "root-b")
-		bookA := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("a"), method: zip.Store})
-		bookB := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("b"), method: zip.Store})
-		writeDiskFile(t, filepath.Join(rootA, "a.cbz"), bookA)
-		writeDiskFile(t, filepath.Join(rootB, "b.cbz"), bookB)
+			base := t.TempDir()
+			rootA := filepath.Join(base, "root-a")
+			rootB := filepath.Join(base, "root-b")
+			bookA := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("a"), method: zip.Store})
+			bookB := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("b"), method: zip.Store})
+			writeDiskFile(t, filepath.Join(rootA, "a.cbz"), bookA)
+			writeDiskFile(t, filepath.Join(rootB, "b.cbz"), bookB)
 
-		var (
-			lib   domain.Library
-			roots []domain.LibraryRoot
-		)
-		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
-			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Post-Check Root Drift Lib", nil, []byte(rootA))
-			return nil
-		}); err != nil {
-			t.Fatalf("seed failed: %v", err)
-		}
+			var (
+				lib   domain.Library
+				roots []domain.LibraryRoot
+			)
+			if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				lib, roots = seedLibraryAndRoots(ctx, t, tx, "Post-Check Root Drift Lib", nil, []byte(rootA))
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed: %v", err)
+			}
 
-		var rootBAdded atomic.Bool
-		driftTx := &postPreCheckRootAddTransactor{
-			inner: transactor,
-			onPostPreCheck: func() error {
-				if !rootBAdded.CompareAndSwap(false, true) {
-					return nil
-				}
-				return transactor.WithTx(ctx, func(tx storage.Tx) error {
-					rp, err := domain.NewRootPathIdentity([]byte(rootB))
-					if err != nil {
-						return err
+			driftTx := &postPreCheckTransactor{
+				inner: transactor,
+				onPostPreCheck: func() error {
+					if tc.markOffline {
+						sc, err := scanner.NewScanner(transactor, scanner.Options{})
+						if err != nil {
+							return err
+						}
+						// Keep the archive readable by the older scan so it would
+						// open and index it if it ignored the newer verdict.
+						verdict, err := sc.PreCheckLibrary(ctx, lib.ID, scanner.PreCheckOptions{
+							Stat: func([]byte) (os.FileInfo, error) { return nil, os.ErrPermission },
+						})
+						if err != nil {
+							return err
+						}
+						if verdict.State != domain.LibraryRootStateOffline {
+							return fmt.Errorf("newer pre-check state = %s, want OFFLINE", verdict.State)
+						}
+						return nil
 					}
-					return tx.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
-						LibraryID: lib.ID,
-						Path:      rp,
-						State:     domain.LibraryRootStateOnline,
+					return transactor.WithTx(ctx, func(tx storage.Tx) error {
+						rp, err := domain.NewRootPathIdentity([]byte(rootB))
+						if err != nil {
+							return err
+						}
+						return tx.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+							LibraryID: lib.ID,
+							Path:      rp,
+							State:     domain.LibraryRootStateOnline,
+						})
 					})
-				})
-			},
-		}
+				},
+			}
 
-		sc, err := scanner.NewScanner(driftTx, scanner.Options{})
-		if err != nil {
-			t.Fatalf("NewScanner: %v", err)
-		}
-		var openCalls atomic.Int32
-		_, err = sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
-			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
-				openCalls.Add(1)
-				return os.Open(string(rawPath))
-			},
+			sc, err := scanner.NewScanner(driftTx, scanner.Options{})
+			if err != nil {
+				t.Fatalf("NewScanner: %v", err)
+			}
+			var openCalls atomic.Int32
+			res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+				Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+					openCalls.Add(1)
+					return os.Open(string(rawPath))
+				},
+			})
+			if !errors.Is(err, scanner.ErrStalePreCheck) {
+				t.Fatalf("ScanLibrary after root snapshot drift err = %v, want ErrStalePreCheck", err)
+			}
+			if openCalls.Load() != 0 {
+				t.Fatalf("expected 0 archive opens when snapshot drifted after pre-check, got %d", openCalls.Load())
+			}
+			if res.Complete || res.ApplyRemovals || res.IndexedCount != 0 {
+				t.Fatalf("superseded pre-check authorized a scan or removals: %+v", res)
+			}
+			if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 {
+				t.Fatal("expected 0 indexed assets after ErrStalePreCheck")
+			}
 		})
-		if !errors.Is(err, scanner.ErrStalePreCheck) {
-			t.Fatalf("ScanLibrary after root snapshot drift err = %v, want ErrStalePreCheck", err)
-		}
-		if openCalls.Load() != 0 {
-			t.Fatalf("expected 0 archive opens when snapshot drifted after pre-check, got %d", openCalls.Load())
-		}
-		if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 {
-			t.Fatal("expected 0 indexed assets after ErrStalePreCheck")
-		}
-	})
+	}
 
 	t.Run("missing raw-byte root path with invalid UTF-8 commits valid UTF-8 diagnostic and offline event", func(t *testing.T) {
 		t.Parallel()
@@ -1147,13 +1172,115 @@ func (s *hookAfterCloseDirStream) Close() error {
 	return err
 }
 
-type postPreCheckRootAddTransactor struct {
+func TestPreCheckLibrary_RootChangesBeforeStatusWrite(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	replacement, err := domain.NewRootPathIdentity([]byte(filepath.Join(base, "replacement")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDiskFile(t, filepath.Join(replacement.Display, scanner.RootMarkerFilename), nil)
+
+	var lib domain.Library
+	var roots []domain.LibraryRoot
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Status Write Race", nil,
+			[]byte(filepath.Join(base, "a-missing")), []byte(filepath.Join(base, "b-missing")))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed library: %v", err)
+	}
+
+	var writes []string
+	sc, err := scanner.NewScanner(rootStatusWriteTransactor{
+		Transactor: transactor,
+		beforeWrite: func(root domain.LibraryRoot) error {
+			writes = append(writes, root.ID)
+			if root.ID != roots[1].ID {
+				return nil
+			}
+			// Change only the root path in a separate transaction, after the
+			// pre-check validated the snapshot and wrote the first root status.
+			_, err := db.Exec(ctx, `UPDATE library_roots
+				SET path_bytes = $2, path_display = $3, path_match = $4 WHERE id = $1`,
+				root.ID, replacement.Bytes, replacement.Display, replacement.Match)
+			return err
+		},
+	}, scanner.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := sc.PreCheckLibrary(ctx, lib.ID, scanner.PreCheckOptions{})
+	if !errors.Is(err, scanner.ErrStalePreCheck) || res.ShouldScan || res.ApplyRemovals {
+		t.Fatalf("PreCheckLibrary = (%+v, %v), want stale verdict", res, err)
+	}
+	if !slices.Equal(writes, []string{roots[0].ID, roots[1].ID}) {
+		t.Fatalf("status writes attempted for %v, want both roots in walk order", writes)
+	}
+	gotRoots := loadRootsForLibrary(ctx, t, transactor, lib.ID)
+	for _, root := range gotRoots {
+		if root.State != domain.LibraryRootStateOnline || root.LastCheckedAt != nil || root.LastError != nil {
+			t.Fatalf("pre-check status was not rolled back: %+v", root)
+		}
+		if root.ID == roots[1].ID && !slices.Equal(root.Path.Bytes, replacement.Bytes) {
+			t.Fatalf("root replacement was lost: %+v", root)
+		}
+	}
+	if got := loadOutboxEventsDetailed(ctx, t, db); len(got) != 0 {
+		t.Fatalf("unexpected outbox events: %+v", got)
+	}
+}
+
+type rootStatusWriteTransactor struct {
+	storage.Transactor
+	beforeWrite func(domain.LibraryRoot) error
+}
+
+func (h rootStatusWriteTransactor) WithReadCommittedTx(ctx context.Context, fn func(storage.Tx) error) error {
+	return h.Transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return fn(rootStatusWriteTx{Tx: tx, beforeWrite: h.beforeWrite})
+	})
+}
+
+type rootStatusWriteTx struct {
+	storage.Tx
+	beforeWrite func(domain.LibraryRoot) error
+}
+
+func (h rootStatusWriteTx) Libraries() storage.LibraryRepository {
+	return rootStatusWriteRepo{LibraryRepository: h.Tx.Libraries(), beforeWrite: h.beforeWrite}
+}
+
+type rootStatusWriteRepo struct {
+	storage.LibraryRepository
+	beforeWrite func(domain.LibraryRoot) error
+}
+
+func (h rootStatusWriteRepo) UpdateLibraryRootStatus(
+	ctx context.Context,
+	root domain.LibraryRoot,
+	state domain.LibraryRootState,
+	checkedAt time.Time,
+	lastError *string,
+) error {
+	if err := h.beforeWrite(root); err != nil {
+		return err
+	}
+	return h.LibraryRepository.UpdateLibraryRootStatus(ctx, root, state, checkedAt, lastError)
+}
+
+type postPreCheckTransactor struct {
 	inner          storage.Transactor
 	withTxCalls    atomic.Int32
 	onPostPreCheck func() error
 }
 
-func (p *postPreCheckRootAddTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+func (p *postPreCheckTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	// Call 1: PreCheckLibrary initial load; Call 2: ScanLibrary snapshot recheck right after pre-check commit.
 	if p.withTxCalls.Add(1) == 2 && p.onPostPreCheck != nil {
 		if err := p.onPostPreCheck(); err != nil {
@@ -1163,7 +1290,7 @@ func (p *postPreCheckRootAddTransactor) WithTx(ctx context.Context, fn func(tx s
 	return p.inner.WithTx(ctx, fn)
 }
 
-func (p *postPreCheckRootAddTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+func (p *postPreCheckTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	return p.inner.WithReadCommittedTx(ctx, fn)
 }
 

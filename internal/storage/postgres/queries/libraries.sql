@@ -112,7 +112,9 @@ UPDATE library_roots
 SET state = $2,
     last_checked_at = $3,
     last_error = $4
-WHERE id = $1;
+WHERE id = $1
+  AND library_id = $5
+  AND path_bytes = $6;
 
 -- name: DeleteLibraryRoot :execrows
 DELETE FROM library_roots

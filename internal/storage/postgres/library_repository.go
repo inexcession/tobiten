@@ -261,15 +261,15 @@ func (r *LibraryRepository) UpdateLibraryRoot(ctx context.Context, root *domain.
 	return nil
 }
 
-// UpdateLibraryRootStatus updates the availability state, check timestamp, and error message for a root.
+// UpdateLibraryRootStatus records availability for the checked root identity.
 func (r *LibraryRepository) UpdateLibraryRootStatus(
 	ctx context.Context,
-	id string,
+	root domain.LibraryRoot,
 	state domain.LibraryRootState,
 	checkedAt time.Time,
 	lastError *string,
 ) error {
-	if strings.TrimSpace(id) == "" {
+	if strings.TrimSpace(root.ID) == "" {
 		return domain.ErrEmptyLibraryRootID
 	}
 	if !state.IsValid() {
@@ -282,10 +282,12 @@ func (r *LibraryRepository) UpdateLibraryRootStatus(
 	}
 
 	rows, err := r.q.UpdateLibraryRootStatus(ctx, UpdateLibraryRootStatusParams{
-		ID:            id,
+		ID:            root.ID,
 		State:         string(state),
 		LastCheckedAt: &checkedAt,
 		LastError:     cloneStringPtr(lastError),
+		LibraryID:     root.LibraryID,
+		PathBytes:     root.Path.Bytes,
 	})
 	if err != nil {
 		return mapPgError(err)

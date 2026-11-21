@@ -160,7 +160,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if !rootSnapshotPathsMatch(preCheck.Roots, currentRoots) {
+	if !rootSnapshotPathsMatch(preCheck.Roots, currentRoots) || !allRootsOnline(currentRoots) {
 		return ScanResult{}, ErrStalePreCheck
 	}
 
