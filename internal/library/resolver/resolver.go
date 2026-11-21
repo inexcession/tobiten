@@ -23,7 +23,8 @@ import (
 // metadata when a resolver chain yields a series (ADR-0019 §1, M1B-D5).
 type SeriesResolution struct {
 	// Key is the library-scoped canonical series match key. Metadata and
-	// filename winners share the title/run namespace; folder winners use a
+	// valid-UTF-8 filename winners share the title/run namespace; invalid-UTF-8
+	// filename titles use a raw-byte title namespace; folder winners use a
 	// separate namespace keyed by the complete root-relative parent path.
 	Key string
 
@@ -37,7 +38,8 @@ type SeriesResolution struct {
 	TitleSort string
 
 	// NormalizedTitle is the NFC, Unicode case-folded, whitespace-collapsed
-	// series title for metadata and filename winners (empty for folder winners).
+	// series title for valid-UTF-8 metadata and filename winners (empty for
+	// folder winners and invalid-UTF-8 filename titles).
 	NormalizedTitle string
 
 	// MetadataRun is the nonnegative ComicInfo Volume when Source is
@@ -80,7 +82,8 @@ type candidate struct {
 // Resolve executes chain as a pure function over meta and relPath (ADR-0019 §1,
 // M1B-D5). The first resolver in chain that yields a series wins; later
 // resolvers may only fill item numbering left unset by the winning resolver and
-// never replace the series or alter its key.
+// never replace the series or alter its key. For standalone results, numbering
+// comes from the first usable candidate in chain order.
 func Resolve(meta *comicinfo.Metadata, relPath domain.PathIdentity, chain []domain.ResolverName) (Result, error) {
 	if err := domain.ValidateRelativePathBytes(relPath.Bytes); err != nil {
 		return Result{}, err
@@ -102,22 +105,17 @@ func Resolve(meta *comicinfo.Metadata, relPath domain.PathIdentity, chain []doma
 		Standalone: winnerIdx < 0,
 		VolumeKind: domain.VolumeKindVolume,
 	}
+	startIdx := 0
 	if winnerIdx >= 0 {
 		out.Series = candidates[winnerIdx].series
-		if candidates[winnerIdx].number != nil {
-			num := *candidates[winnerIdx].number
-			out.Number = &num
-			out.VolumeKind = candidates[winnerIdx].volumeKind
-			out.NumberSource = chain[winnerIdx]
-			return out, nil
-		}
+		startIdx = winnerIdx
 	}
 
-	for i, cand := range candidates {
-		if cand.number != nil {
-			num := *cand.number
+	for i := startIdx; i < len(candidates); i++ {
+		if candidates[i].number != nil {
+			num := *candidates[i].number
 			out.Number = &num
-			out.VolumeKind = cand.volumeKind
+			out.VolumeKind = candidates[i].volumeKind
 			out.NumberSource = chain[i]
 			break
 		}
@@ -232,13 +230,12 @@ func resolveFilename(relBytes []byte) candidate {
 		baseBytes = relBytes[lastSlash+1:]
 	}
 
-	displayName, _ := domain.FormatPathDisplay(baseBytes)
-	stem := cleanFilenameStem(displayName)
-	if stem == "" {
+	stemBytes := cleanFilenameStemBytes(baseBytes)
+	if len(stemBytes) == 0 {
 		return candidate{}
 	}
 
-	match, ok := findFilenameMarker(stem)
+	match, ok := findFilenameMarker(stemBytes)
 	if !ok {
 		return candidate{}
 	}
@@ -248,16 +245,31 @@ func resolveFilename(relBytes []byte) candidate {
 		number:     &match.number,
 	}
 
-	prefix := stem[:match.start]
-	if match.start > 0 && (stem[match.start-1] == '-' || stem[match.start-1] == '_') {
-		prefix = stem[:match.start-1]
+	prefixBytes := stemBytes[:match.start]
+	if match.start > 0 && (stemBytes[match.start-1] == '-' || stemBytes[match.start-1] == '_') {
+		prefixBytes = stemBytes[:match.start-1]
 	}
 
-	seriesTitle := cleanSeriesPrefix(prefix)
-	if seriesTitle == "" {
+	seriesBytes := cleanSeriesPrefixBytes(prefixBytes)
+	if len(seriesBytes) == 0 {
 		return cand
 	}
 
+	if !utf8.Valid(seriesBytes) {
+		displayTitle, _ := domain.FormatPathDisplay(seriesBytes)
+		if strings.TrimSpace(displayTitle) == "" {
+			return cand
+		}
+		cand.series = &SeriesResolution{
+			Key:       "title:raw:" + hex.EncodeToString(seriesBytes),
+			Source:    domain.ResolverFilename,
+			Title:     displayTitle,
+			TitleSort: BaselineTitleSort(displayTitle),
+		}
+		return cand
+	}
+
+	seriesTitle := string(seriesBytes)
 	normTitle := NormalizeSeriesTitle(seriesTitle)
 	if normTitle == "" {
 		return cand
@@ -322,14 +334,14 @@ func isASCIIDigits(s string) bool {
 	return true
 }
 
-func cleanFilenameStem(name string) string {
-	stem := stripFileExtension(name)
-	stem = stripBracketedTags(stem)
-	return strings.Join(strings.Fields(stem), " ")
+func cleanFilenameStemBytes(name []byte) []byte {
+	stem := stripFileExtensionBytes(name)
+	stem = stripBracketedTagsBytes(stem)
+	return collapseWhitespaceBytes(stem)
 }
 
-func stripFileExtension(name string) string {
-	dot := strings.LastIndexByte(name, '.')
+func stripFileExtensionBytes(name []byte) []byte {
+	dot := bytes.LastIndexByte(name, '.')
 	if dot <= 0 || dot == len(name)-1 {
 		return name
 	}
@@ -339,7 +351,7 @@ func stripFileExtension(name string) string {
 	return name[:dot]
 }
 
-func isPlausibleExtension(ext string) bool {
+func isPlausibleExtension(ext []byte) bool {
 	if !isASCIILetter(ext[0]) {
 		return false
 	}
@@ -356,8 +368,8 @@ func isASCIILetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
-func stripBracketedTags(s string) string {
-	var b strings.Builder
+func stripBracketedTagsBytes(s []byte) []byte {
+	var b bytes.Buffer
 	b.Grow(len(s))
 	depth := 0
 	groupStart := -1
@@ -385,9 +397,44 @@ func stripBracketedTags(s string) string {
 		}
 	}
 	if depth > 0 && groupStart >= 0 {
-		b.WriteString(s[groupStart:])
+		b.Write(s[groupStart:])
 	}
-	return b.String()
+	return b.Bytes()
+}
+
+// collapseWhitespaceBytes trims leading/trailing Unicode whitespace and
+// collapses whitespace runs to a single ASCII space while preserving raw
+// invalid UTF-8 bytes verbatim.
+func collapseWhitespaceBytes(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	pendingSpace := false
+	rest := raw
+	for len(rest) > 0 {
+		r, size := utf8.DecodeRune(rest)
+		if r == utf8.RuneError && size == 1 {
+			if pendingSpace && len(out) > 0 {
+				out = append(out, ' ')
+			}
+			pendingSpace = false
+			out = append(out, rest[0])
+			rest = rest[1:]
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if len(out) > 0 {
+				pendingSpace = true
+			}
+			rest = rest[size:]
+			continue
+		}
+		if pendingSpace {
+			out = append(out, ' ')
+			pendingSpace = false
+		}
+		out = append(out, rest[:size]...)
+		rest = rest[size:]
+	}
+	return out
 }
 
 type filenameMarkerMatch struct {
@@ -396,7 +443,7 @@ type filenameMarkerMatch struct {
 	number float64
 }
 
-func findFilenameMarker(stem string) (filenameMarkerMatch, bool) {
+func findFilenameMarker(stem []byte) (filenameMarkerMatch, bool) {
 	for i := range len(stem) {
 		if i > 0 && !isMarkerLeftBoundary(stem[i-1]) {
 			continue
@@ -413,7 +460,7 @@ func findFilenameMarker(stem string) (filenameMarkerMatch, bool) {
 		if !isMarkerRightBoundary(stem[end:]) {
 			continue
 		}
-		val, err := strconv.ParseFloat(stem[i+prefixLen:end], 64)
+		val, err := strconv.ParseFloat(string(stem[i+prefixLen:end]), 64)
 		if err != nil || math.IsNaN(val) || math.IsInf(val, 0) {
 			continue
 		}
@@ -430,7 +477,7 @@ func isMarkerLeftBoundary(b byte) bool {
 	return b == ' ' || b == '_' || b == '-'
 }
 
-func matchMarkerPrefix(rest string) (domain.VolumeKind, int, bool) {
+func matchMarkerPrefix(rest []byte) (domain.VolumeKind, int, bool) {
 	if len(rest) >= 2 && (rest[0] == 's' || rest[0] == 'S') && (rest[1] == 'p' || rest[1] == 'P') {
 		return domain.VolumeKindSpecial, 2, true
 	}
@@ -447,7 +494,7 @@ func matchMarkerPrefix(rest string) (domain.VolumeKind, int, bool) {
 	return "", 0, false
 }
 
-func scanUnsignedDecimal(s string) (int, bool) {
+func scanUnsignedDecimal(s []byte) (int, bool) {
 	i := 0
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 		i++
@@ -468,22 +515,25 @@ func scanUnsignedDecimal(s string) (int, bool) {
 	return i, true
 }
 
-func isMarkerRightBoundary(rest string) bool {
-	if rest == "" {
+func isMarkerRightBoundary(rest []byte) bool {
+	if len(rest) == 0 {
 		return true
 	}
-	r, _ := utf8.DecodeRuneInString(rest)
+	r, size := utf8.DecodeRune(rest)
+	if r == utf8.RuneError && size == 1 {
+		return false
+	}
 	return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '.'
 }
 
-func cleanSeriesPrefix(raw string) string {
-	trimmed := strings.TrimSpace(raw)
+func cleanSeriesPrefixBytes(raw []byte) []byte {
+	trimmed := collapseWhitespaceBytes(raw)
 	for {
 		switch {
-		case strings.HasSuffix(trimmed, " -"), strings.HasSuffix(trimmed, " _"):
-			trimmed = strings.TrimSpace(trimmed[:len(trimmed)-2])
-		case strings.HasSuffix(trimmed, "_"):
-			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "_"))
+		case bytes.HasSuffix(trimmed, []byte(" -")), bytes.HasSuffix(trimmed, []byte(" _")):
+			trimmed = collapseWhitespaceBytes(trimmed[:len(trimmed)-2])
+		case bytes.HasSuffix(trimmed, []byte("_")):
+			trimmed = collapseWhitespaceBytes(trimmed[:len(trimmed)-1])
 		default:
 			return trimmed
 		}

@@ -239,7 +239,7 @@ func TestResolve_ChainPrecedenceAndFallback(t *testing.T) {
 			wantNumSource: domain.ResolverFilename,
 		},
 		{
-			name:          "filename-first falls through marker-only filename to folder and keeps filename number",
+			name:          "filename-first falls through marker-only filename to folder without borrowing earlier filename number",
 			meta:          nil,
 			relPath:       "Example/v05.cbz",
 			chain:         filenameFirst,
@@ -247,11 +247,11 @@ func TestResolve_ChainPrecedenceAndFallback(t *testing.T) {
 			wantTitle:     "Example",
 			wantRunNil:    true,
 			wantKind:      domain.VolumeKindVolume,
-			wantNum:       5,
-			wantNumSource: domain.ResolverFilename,
+			wantNumNil:    true,
+			wantNumSource: "",
 		},
 		{
-			name: "metadata number fills folder winner even when metadata precedes folder without series",
+			name: "folder winner ignores earlier metadata number and falls back to later filename number",
 			meta: &comicinfo.Metadata{
 				Number: "42",
 			},
@@ -261,8 +261,22 @@ func TestResolve_ChainPrecedenceAndFallback(t *testing.T) {
 			wantTitle:     "Example",
 			wantRunNil:    true,
 			wantKind:      domain.VolumeKindVolume,
-			wantNum:       42,
-			wantNumSource: domain.ResolverMetadata,
+			wantNum:       5,
+			wantNumSource: domain.ResolverFilename,
+		},
+		{
+			name: "folder winner ignores earlier metadata number and stays unnumbered without later fallback",
+			meta: &comicinfo.Metadata{
+				Number: "42",
+			},
+			relPath:       "Example/Example.cbz",
+			chain:         domain.DefaultResolverChain(),
+			wantSource:    domain.ResolverFolder,
+			wantTitle:     "Example",
+			wantRunNil:    true,
+			wantKind:      domain.VolumeKindVolume,
+			wantNumNil:    true,
+			wantNumSource: "",
 		},
 	}
 
@@ -742,6 +756,68 @@ func TestResolve_M1BD5SeriesKeys(t *testing.T) {
 		}
 		if invalidFF.Series.Title != `\xff` {
 			t.Errorf("invalid-UTF-8 leaf display title = %q, want %q", invalidFF.Series.Title, `\xff`)
+		}
+	})
+
+	t.Run("filename invalid UTF-8 bytes keep display escaping without colliding with literal UTF-8 spellings", func(t *testing.T) {
+		rawBytes := append([]byte("Series"), 0xff)
+		rawBytes = append(rawBytes, []byte(" v01.cbz")...)
+		rawFile, err := Resolve(nil, relPathID(t, rawBytes), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rawBytesV2 := append([]byte("Series"), 0xff)
+		rawBytesV2 = append(rawBytesV2, []byte(" v02.cbz")...)
+		rawFileV2, err := Resolve(nil, relPathID(t, rawBytesV2), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rawOtherBytes := append([]byte("Series"), 0xfe)
+		rawOtherBytes = append(rawOtherBytes, []byte(" v01.cbz")...)
+		rawOtherFile, err := Resolve(nil, relPathID(t, rawOtherBytes), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		literalFile, err := Resolve(nil, relPathID(t, []byte(`Series\xff v01.cbz`)), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if rawFile.Standalone || literalFile.Standalone {
+			t.Fatalf("expected filename series results, got raw=%+v literal=%+v", rawFile, literalFile)
+		}
+		if rawFile.Series.Title != `Series\xff` {
+			t.Errorf("rawFile.Series.Title = %q, want %q", rawFile.Series.Title, `Series\xff`)
+		}
+		if literalFile.Series.Title != `Series\xff` {
+			t.Errorf("literalFile.Series.Title = %q, want %q", literalFile.Series.Title, `Series\xff`)
+		}
+		if rawFile.Series.Key == literalFile.Series.Key {
+			t.Errorf("invalid-UTF-8 filename series key collided with literal escaped UTF-8: %q", rawFile.Series.Key)
+		}
+		if rawFile.Series.Key != rawFileV2.Series.Key {
+			t.Errorf("identical invalid-UTF-8 filename series should share key: %q vs %q", rawFile.Series.Key, rawFileV2.Series.Key)
+		}
+		if rawFile.Series.Key == rawOtherFile.Series.Key {
+			t.Errorf("distinct invalid-UTF-8 filename series keys collided: %q", rawFile.Series.Key)
+		}
+
+		// Invalid UTF-8 confined to an ignored bracketed tag still yields the valid UTF-8 series key.
+		tagWithInvalid := append([]byte("Series v01 ["), 0xff)
+		tagWithInvalid = append(tagWithInvalid, []byte("].cbz")...)
+		validFromTag, err := Resolve(nil, relPathID(t, tagWithInvalid), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plainValid, err := Resolve(nil, relPathID(t, []byte("Series v01.cbz")), defaultChain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if validFromTag.Series.Key != plainValid.Series.Key {
+			t.Errorf("invalid bytes in ignored bracketed tag should not alter valid series key: %q vs %q", validFromTag.Series.Key, plainValid.Series.Key)
 		}
 	})
 }
