@@ -148,6 +148,38 @@ RETURNING id, library_id, title, title_sort, language, original_title, romaji_ti
           locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
           resolver_key, resolver_key_hash;
 
+-- name: UpdateSeriesMetadata :one
+UPDATE series
+SET title = $2,
+    title_sort = $3,
+    language = $4,
+    original_title = $5,
+    romaji_title = $6,
+    franchise = $7,
+    edition_name = $8,
+    publisher = $9,
+    imprint = $10,
+    status = $11,
+    summary = $12,
+    age_rating = $13,
+    genres = $14,
+    tags = $15,
+    cover_policy = $16,
+    cover_image_digest = $17,
+    locked_fields = $18,
+    external_ids = $19,
+    total_volumes = $20,
+    release_year = $21,
+    updated_at = $22,
+    resolver_key = $23,
+    resolver_key_hash = $24
+WHERE id = $1
+RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
+          franchise, edition_name, publisher, imprint, status, summary, age_rating,
+          genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key, resolver_key_hash;
+
 -- name: CreateVolume :one
 INSERT INTO volumes (
     id,

@@ -294,7 +294,7 @@ func syncExistingSeries(
 	if !changed {
 		return locked, nil
 	}
-	if err := cw.UpdateSeries(ctx, &merged); err != nil {
+	if err := cw.UpdateSeriesMetadata(ctx, &merged); err != nil {
 		return nil, err
 	}
 	return &merged, nil

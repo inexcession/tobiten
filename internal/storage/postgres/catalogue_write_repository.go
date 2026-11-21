@@ -333,6 +333,76 @@ func buildCreateSeriesParams(series *domain.Series) (CreateSeriesParams, error) 
 
 // UpdateSeries persists changes to an existing series record.
 func (r *CatalogueWriteRepository) UpdateSeries(ctx context.Context, series *domain.Series) error {
+	return r.mutateSeries(series, func(candidate domain.Series, lockedBytes, externalBytes []byte, totalVols, releaseYear pgtype.Int4) (Series, error) {
+		return r.q.UpdateSeries(ctx, UpdateSeriesParams{
+			ID:               candidate.ID,
+			LibraryID:        candidate.LibraryID,
+			ResolverKey:      cloneStringPtr(candidate.ResolverKey),
+			ResolverKeyHash:  seriesResolverKeyHash(candidate.ResolverKey),
+			Title:            candidate.Title,
+			TitleSort:        candidate.TitleSort,
+			Language:         cloneStringPtr(candidate.Language),
+			OriginalTitle:    cloneStringPtr(candidate.OriginalTitle),
+			RomajiTitle:      cloneStringPtr(candidate.RomajiTitle),
+			Franchise:        cloneStringPtr(candidate.Franchise),
+			EditionName:      cloneStringPtr(candidate.EditionName),
+			Publisher:        cloneStringPtr(candidate.Publisher),
+			Imprint:          cloneStringPtr(candidate.Imprint),
+			Status:           string(candidate.Status),
+			Summary:          cloneStringPtr(candidate.Summary),
+			AgeRating:        cloneStringPtr(candidate.AgeRating),
+			Genres:           candidate.Genres,
+			Tags:             candidate.Tags,
+			CoverPolicy:      coverPolicyPtrToStringPtr(candidate.CoverPolicy),
+			CoverVolumeID:    cloneStringPtr(candidate.CoverVolumeID),
+			CoverImageDigest: cloneStringPtr(candidate.CoverImageDigest),
+			LockedFields:     lockedBytes,
+			ExternalIds:      externalBytes,
+			TotalVolumes:     totalVols,
+			ReleaseYear:      releaseYear,
+			UpdatedAt:        candidate.UpdatedAt,
+		})
+	})
+}
+
+// UpdateSeriesMetadata updates unlocked metadata columns on an existing series
+// without modifying library_id or cover_volume_id, avoiding queuing the deferred
+// structural trigger that takes shared locks across all member volumes.
+func (r *CatalogueWriteRepository) UpdateSeriesMetadata(ctx context.Context, series *domain.Series) error {
+	return r.mutateSeries(series, func(candidate domain.Series, lockedBytes, externalBytes []byte, totalVols, releaseYear pgtype.Int4) (Series, error) {
+		return r.q.UpdateSeriesMetadata(ctx, UpdateSeriesMetadataParams{
+			ID:               candidate.ID,
+			ResolverKey:      cloneStringPtr(candidate.ResolverKey),
+			ResolverKeyHash:  seriesResolverKeyHash(candidate.ResolverKey),
+			Title:            candidate.Title,
+			TitleSort:        candidate.TitleSort,
+			Language:         cloneStringPtr(candidate.Language),
+			OriginalTitle:    cloneStringPtr(candidate.OriginalTitle),
+			RomajiTitle:      cloneStringPtr(candidate.RomajiTitle),
+			Franchise:        cloneStringPtr(candidate.Franchise),
+			EditionName:      cloneStringPtr(candidate.EditionName),
+			Publisher:        cloneStringPtr(candidate.Publisher),
+			Imprint:          cloneStringPtr(candidate.Imprint),
+			Status:           string(candidate.Status),
+			Summary:          cloneStringPtr(candidate.Summary),
+			AgeRating:        cloneStringPtr(candidate.AgeRating),
+			Genres:           candidate.Genres,
+			Tags:             candidate.Tags,
+			CoverPolicy:      coverPolicyPtrToStringPtr(candidate.CoverPolicy),
+			CoverImageDigest: cloneStringPtr(candidate.CoverImageDigest),
+			LockedFields:     lockedBytes,
+			ExternalIds:      externalBytes,
+			TotalVolumes:     totalVols,
+			ReleaseYear:      releaseYear,
+			UpdatedAt:        candidate.UpdatedAt,
+		})
+	})
+}
+
+func (r *CatalogueWriteRepository) mutateSeries(
+	series *domain.Series,
+	exec func(candidate domain.Series, lockedBytes, externalBytes []byte, totalVols, releaseYear pgtype.Int4) (Series, error),
+) error {
 	if r == nil {
 		return errors.New("catalogue write repository is required")
 	}
@@ -341,34 +411,7 @@ func (r *CatalogueWriteRepository) UpdateSeries(ctx context.Context, series *dom
 		return err
 	}
 
-	row, err := r.q.UpdateSeries(ctx, UpdateSeriesParams{
-		ID:               candidate.ID,
-		LibraryID:        candidate.LibraryID,
-		ResolverKey:      cloneStringPtr(candidate.ResolverKey),
-		ResolverKeyHash:  seriesResolverKeyHash(candidate.ResolverKey),
-		Title:            candidate.Title,
-		TitleSort:        candidate.TitleSort,
-		Language:         cloneStringPtr(candidate.Language),
-		OriginalTitle:    cloneStringPtr(candidate.OriginalTitle),
-		RomajiTitle:      cloneStringPtr(candidate.RomajiTitle),
-		Franchise:        cloneStringPtr(candidate.Franchise),
-		EditionName:      cloneStringPtr(candidate.EditionName),
-		Publisher:        cloneStringPtr(candidate.Publisher),
-		Imprint:          cloneStringPtr(candidate.Imprint),
-		Status:           string(candidate.Status),
-		Summary:          cloneStringPtr(candidate.Summary),
-		AgeRating:        cloneStringPtr(candidate.AgeRating),
-		Genres:           candidate.Genres,
-		Tags:             candidate.Tags,
-		CoverPolicy:      coverPolicyPtrToStringPtr(candidate.CoverPolicy),
-		CoverVolumeID:    cloneStringPtr(candidate.CoverVolumeID),
-		CoverImageDigest: cloneStringPtr(candidate.CoverImageDigest),
-		LockedFields:     lockedBytes,
-		ExternalIds:      externalBytes,
-		TotalVolumes:     totalVols,
-		ReleaseYear:      releaseYear,
-		UpdatedAt:        candidate.UpdatedAt,
-	})
+	row, err := exec(candidate, lockedBytes, externalBytes, totalVols, releaseYear)
 	if err != nil {
 		return mapCatalogueWriteError(err)
 	}

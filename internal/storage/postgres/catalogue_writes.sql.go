@@ -1344,6 +1344,126 @@ func (q *Queries) UpdateSeries(ctx context.Context, arg UpdateSeriesParams) (Ser
 	return i, err
 }
 
+const updateSeriesMetadata = `-- name: UpdateSeriesMetadata :one
+UPDATE series
+SET title = $2,
+    title_sort = $3,
+    language = $4,
+    original_title = $5,
+    romaji_title = $6,
+    franchise = $7,
+    edition_name = $8,
+    publisher = $9,
+    imprint = $10,
+    status = $11,
+    summary = $12,
+    age_rating = $13,
+    genres = $14,
+    tags = $15,
+    cover_policy = $16,
+    cover_image_digest = $17,
+    locked_fields = $18,
+    external_ids = $19,
+    total_volumes = $20,
+    release_year = $21,
+    updated_at = $22,
+    resolver_key = $23,
+    resolver_key_hash = $24
+WHERE id = $1
+RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
+          franchise, edition_name, publisher, imprint, status, summary, age_rating,
+          genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key, resolver_key_hash
+`
+
+type UpdateSeriesMetadataParams struct {
+	ID               string
+	Title            string
+	TitleSort        string
+	Language         *string
+	OriginalTitle    *string
+	RomajiTitle      *string
+	Franchise        *string
+	EditionName      *string
+	Publisher        *string
+	Imprint          *string
+	Status           string
+	Summary          *string
+	AgeRating        *string
+	Genres           []string
+	Tags             []string
+	CoverPolicy      *string
+	CoverImageDigest *string
+	LockedFields     []byte
+	ExternalIds      []byte
+	TotalVolumes     pgtype.Int4
+	ReleaseYear      pgtype.Int4
+	UpdatedAt        time.Time
+	ResolverKey      *string
+	ResolverKeyHash  []byte
+}
+
+func (q *Queries) UpdateSeriesMetadata(ctx context.Context, arg UpdateSeriesMetadataParams) (Series, error) {
+	row := q.db.QueryRow(ctx, updateSeriesMetadata,
+		arg.ID,
+		arg.Title,
+		arg.TitleSort,
+		arg.Language,
+		arg.OriginalTitle,
+		arg.RomajiTitle,
+		arg.Franchise,
+		arg.EditionName,
+		arg.Publisher,
+		arg.Imprint,
+		arg.Status,
+		arg.Summary,
+		arg.AgeRating,
+		arg.Genres,
+		arg.Tags,
+		arg.CoverPolicy,
+		arg.CoverImageDigest,
+		arg.LockedFields,
+		arg.ExternalIds,
+		arg.TotalVolumes,
+		arg.ReleaseYear,
+		arg.UpdatedAt,
+		arg.ResolverKey,
+		arg.ResolverKeyHash,
+	)
+	var i Series
+	err := row.Scan(
+		&i.ID,
+		&i.LibraryID,
+		&i.Title,
+		&i.TitleSort,
+		&i.Language,
+		&i.OriginalTitle,
+		&i.RomajiTitle,
+		&i.Franchise,
+		&i.EditionName,
+		&i.Publisher,
+		&i.Imprint,
+		&i.Status,
+		&i.Summary,
+		&i.AgeRating,
+		&i.Genres,
+		&i.Tags,
+		&i.CoverPolicy,
+		&i.CoverVolumeID,
+		&i.CoverImageDigest,
+		&i.LockedFields,
+		&i.ExternalIds,
+		&i.TotalVolumes,
+		&i.ReleaseYear,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ResolverKey,
+		&i.ResolverKeyHash,
+	)
+	return i, err
+}
+
 const updateVolume = `-- name: UpdateVolume :one
 UPDATE volumes
 SET library_id = $2,

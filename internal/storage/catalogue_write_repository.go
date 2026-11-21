@@ -20,6 +20,7 @@ type CatalogueWriteRepository interface {
 	FindOrCreateSeriesByResolverKey(ctx context.Context, series *domain.Series) (created bool, err error)
 	AcquireSeriesVariantLock(ctx context.Context, seriesID string, kind domain.VolumeKind, number float64) error
 	UpdateSeries(ctx context.Context, series *domain.Series) error
+	UpdateSeriesMetadata(ctx context.Context, series *domain.Series) error
 
 	// Volumes
 	CreateVolume(ctx context.Context, volume *domain.Volume) error

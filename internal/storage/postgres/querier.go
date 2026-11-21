@@ -181,6 +181,7 @@ type Querier interface {
 	UpdatePerson(ctx context.Context, arg UpdatePersonParams) (Person, error)
 	UpdateSeries(ctx context.Context, arg UpdateSeriesParams) (Series, error)
 	UpdateSeriesMembership(ctx context.Context, arg UpdateSeriesMembershipParams) (SeriesMembership, error)
+	UpdateSeriesMetadata(ctx context.Context, arg UpdateSeriesMetadataParams) (Series, error)
 	UpdateSessionLastUsed(ctx context.Context, arg UpdateSessionLastUsedParams) (int64, error)
 	UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error)
 	UpdateVolume(ctx context.Context, arg UpdateVolumeParams) (Volume, error)

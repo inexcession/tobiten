@@ -1547,25 +1547,39 @@ func TestIndexer_InputValidation(t *testing.T) {
 
 func waitForBlockedVolumeRowLock(ctx context.Context, t *testing.T, db *testdb.TestDB) {
 	t.Helper()
+	waitForBlockedTableRowLock(ctx, t, db, "volumes", "")
+}
+
+func waitForBlockedTableRowLock(ctx context.Context, t *testing.T, db *testdb.TestDB, relation, queryFilter string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var blocked int
 		err := db.QueryRow(ctx,
-			`SELECT COUNT(*) FROM pg_locks WHERE relation = 'volumes'::regclass AND locktype = 'tuple' AND NOT granted`,
+			`SELECT COUNT(*) FROM pg_locks WHERE relation = $1::regclass AND locktype = 'tuple' AND NOT granted`,
+			relation,
 		).Scan(&blocked)
 		if err == nil && blocked > 0 {
 			return
 		}
 		// Fallback check for transactionid lock when waiting on a row lock without tuple lock.
 		var waiting int
-		err2 := db.QueryRow(ctx,
-			`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`,
-		).Scan(&waiting)
+		var err2 error
+		if queryFilter != "" {
+			err2 = db.QueryRow(ctx,
+				`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE $1`,
+				queryFilter,
+			).Scan(&waiting)
+		} else {
+			err2 = db.QueryRow(ctx,
+				`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+			).Scan(&waiting)
+		}
 		if err2 == nil && waiting > 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for concurrent indexer to block on volume lock (err1=%v err2=%v)", err, err2)
+			t.Fatalf("timed out waiting for concurrent indexer to block on %s lock (err1=%v err2=%v)", relation, err, err2)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -2059,6 +2073,10 @@ func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testi
 	// rather than creating a second volume.
 	holdEntered := make(chan struct{})
 	releaseHold := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(releaseHold) }) }
+	defer closeRelease()
+
 	holderDone := make(chan error, 1)
 	go func() {
 		holderDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
@@ -2067,7 +2085,11 @@ func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testi
 				return err
 			}
 			close(holdEntered)
-			<-releaseHold
+			select {
+			case <-releaseHold:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 
 			num := 99.0
 			vol := domain.Volume{LibraryID: lib.ID, Kind: domain.VolumeKindVolume, Number: &num}
@@ -2079,10 +2101,20 @@ func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testi
 			})
 		})
 	}()
-	<-holdEntered
 
-	waiterResCh := make(chan *scanner.IndexFileResult, 1)
-	waiterErrCh := make(chan error, 1)
+	select {
+	case <-holdEntered:
+	case holderErr := <-holderDone:
+		t.Fatalf("holder exited before acquiring variant lock: %v", holderErr)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for holder to acquire variant lock: %v", ctx.Err())
+	}
+
+	type waiterOutcome struct {
+		res *scanner.IndexFileResult
+		err error
+	}
+	waiterDone := make(chan waiterOutcome, 1)
 	go func() {
 		r, err := idx.IndexFile(ctx, scanner.IndexFileInput{
 			LibraryID:     lib.ID,
@@ -2097,34 +2129,55 @@ func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testi
 				ComicInfo:  &comicinfo.Metadata{Series: "Variant Race", Number: "99"},
 			},
 		})
-		waiterResCh <- r
-		waiterErrCh <- err
+		waiterDone <- waiterOutcome{res: r, err: err}
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var waiting int
-		if err := db.QueryRow(ctx,
-			`SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
-		).Scan(&waiting); err == nil && waiting > 0 {
-			break
+	waitForAdvisoryBlock := func() error {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var waiting int
+			if err := db.QueryRow(ctx,
+				`SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+			).Scan(&waiting); err == nil && waiting > 0 {
+				return nil
+			}
+			select {
+			case err := <-holderDone:
+				return fmt.Errorf("holder exited prematurely while waiting for waiter: %w", err)
+			case <-ctx.Done():
+				return fmt.Errorf("context expired waiting for waiter to block on advisory lock: %w", ctx.Err())
+			default:
+			}
+			if time.Now().After(deadline) {
+				return errors.New("timed out waiting for IndexFile to block on AcquireSeriesVariantLock")
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			close(releaseHold)
-			t.Fatal("timed out waiting for IndexFile to block on AcquireSeriesVariantLock")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	close(releaseHold)
+	blockErr := waitForAdvisoryBlock()
+	closeRelease()
+	if blockErr != nil {
+		// Drain holderDone (if not already drained above) and join waiter before failing.
+		select {
+		case holderErr := <-holderDone:
+			if holderErr != nil {
+				t.Logf("holder tx error during cleanup: %v", holderErr)
+			}
+		default:
+		}
+		<-waiterDone
+		t.Fatal(blockErr)
+	}
 	if err := <-holderDone; err != nil {
+		<-waiterDone
 		t.Fatalf("holder tx: %v", err)
 	}
-	waiterRes := <-waiterResCh
-	if err := <-waiterErrCh; err != nil {
-		t.Fatalf("waiter IndexFile: %v", err)
+	waiterOut := <-waiterDone
+	if waiterOut.err != nil {
+		t.Fatalf("waiter IndexFile: %v", waiterOut.err)
 	}
-	if waiterRes.VolumeCreated {
-		t.Fatalf("expected waiter to attach to holder's committed #99 volume, got VolumeCreated=true (%s)", waiterRes.Volume.ID)
+	if waiterOut.res.VolumeCreated {
+		t.Fatalf("expected waiter to attach to holder's committed #99 volume, got VolumeCreated=true (%s)", waiterOut.res.Volume.ID)
 	}
 
 	// Concurrent race: two goroutines simultaneously index a previously unseen number (#2)
@@ -2200,5 +2253,189 @@ func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testi
 	}
 	if assetCount != workers {
 		t.Fatalf("volume #2 asset count = %d, want %d", assetCount, workers)
+	}
+}
+
+type commitHoldTransactor struct {
+	inner     storage.Transactor
+	readyOnce sync.Once
+	preCommit chan struct{}
+	release   <-chan struct{}
+}
+
+func (c *commitHoldTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return c.inner.WithTx(ctx, func(tx storage.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		c.readyOnce.Do(func() { close(c.preCommit) })
+		select {
+		case <-c.release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
+func (c *commitHoldTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return c.WithTx(ctx, fn)
+}
+
+func TestIndexer_ConcurrentExistingVolumesSeriesMetadataRefreshNoDeadlock(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Metadata Lock Cycle Lib", nil, []byte("/srv/lock-cycle"))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	baseIdx, err := scanner.NewIndexer(transactor, scanner.IndexerOptions{})
+	if err != nil {
+		t.Fatalf("NewIndexer base: %v", err)
+	}
+
+	// Seed one series with two existing distinct volumes (#1 and #2).
+	seedV1, err := baseIdx.IndexFile(ctx, scanner.IndexFileInput{
+		LibraryID:     lib.ID,
+		LibraryRootID: root.ID,
+		Inspected: scanner.InspectedFile{
+			RelPath:    mustRelIdentity(t, []byte("Lock Cycle v01-seed.cbz")),
+			Size:       1000,
+			Format:     domain.MediaFormatCBZ,
+			DigestKind: domain.DigestKindXXH364Partial,
+			Digest:     "8080808080808001",
+			PageCount:  100,
+			ComicInfo:  &comicinfo.Metadata{Series: "Lock Cycle", Number: "1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed v1: %v", err)
+	}
+	seedV2, err := baseIdx.IndexFile(ctx, scanner.IndexFileInput{
+		LibraryID:     lib.ID,
+		LibraryRootID: root.ID,
+		Inspected: scanner.InspectedFile{
+			RelPath:    mustRelIdentity(t, []byte("Lock Cycle v02-seed.cbz")),
+			Size:       1000,
+			Format:     domain.MediaFormatCBZ,
+			DigestKind: domain.DigestKindXXH364Partial,
+			Digest:     "8080808080808002",
+			PageCount:  100,
+			ComicInfo:  &comicinfo.Metadata{Series: "Lock Cycle", Number: "2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed v2: %v", err)
+	}
+
+	// Import A locks existing Volume #1, acquires the series lock, updates series metadata
+	// (Publisher), and pauses just before COMMIT so Import B can lock existing Volume #2
+	// and block waiting on the series lock. With UpdateSeriesMetadata, Import A does not
+	// queue trg_series_integrity (FOR SHARE across member volumes) at commit, preventing
+	// a volumes <-> series deadlock cycle.
+	aPreCommit := make(chan struct{})
+	releaseA := make(chan struct{})
+	var releaseOnce sync.Once
+	closeA := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	defer closeA()
+
+	holdTx := &commitHoldTransactor{
+		inner:     transactor,
+		preCommit: aPreCommit,
+		release:   releaseA,
+	}
+	idxA, err := scanner.NewIndexer(holdTx, scanner.IndexerOptions{})
+	if err != nil {
+		t.Fatalf("NewIndexer A: %v", err)
+	}
+
+	type outcome struct {
+		res *scanner.IndexFileResult
+		err error
+	}
+	outACh := make(chan outcome, 1)
+	go func() {
+		r, err := idxA.IndexFile(ctx, scanner.IndexFileInput{
+			LibraryID:     lib.ID,
+			LibraryRootID: root.ID,
+			Inspected: scanner.InspectedFile{
+				RelPath:    mustRelIdentity(t, []byte("Lock Cycle v01-alt.cbz")),
+				Size:       1100,
+				Format:     domain.MediaFormatCBZ,
+				DigestKind: domain.DigestKindXXH364Partial,
+				Digest:     "8080808080808011",
+				PageCount:  104,
+				ComicInfo:  &comicinfo.Metadata{Series: "Lock Cycle", Number: "1", Publisher: "Refreshed Publisher"},
+			},
+		})
+		outACh <- outcome{res: r, err: err}
+	}()
+
+	select {
+	case <-aPreCommit:
+	case outA := <-outACh:
+		t.Fatalf("import A finished before pre-commit barrier: res=%+v err=%v", outA.res, outA.err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for import A pre-commit barrier: %v", ctx.Err())
+	}
+
+	outBCh := make(chan outcome, 1)
+	go func() {
+		r, err := baseIdx.IndexFile(ctx, scanner.IndexFileInput{
+			LibraryID:     lib.ID,
+			LibraryRootID: root.ID,
+			Inspected: scanner.InspectedFile{
+				RelPath:    mustRelIdentity(t, []byte("Lock Cycle v02-alt.cbz")),
+				Size:       1200,
+				Format:     domain.MediaFormatCBZ,
+				DigestKind: domain.DigestKindXXH364Partial,
+				Digest:     "8080808080808022",
+				PageCount:  108,
+				ComicInfo:  &comicinfo.Metadata{Series: "Lock Cycle", Number: "2", Imprint: "Refreshed Imprint"},
+			},
+		})
+		outBCh <- outcome{res: r, err: err}
+	}()
+
+	// Wait until Import B holds Volume #2's lock and is blocked on GetSeriesByIDForWriteForUpdate.
+	waitForBlockedTableRowLock(ctx, t, db, "series", "%FROM series%FOR UPDATE%")
+	closeA()
+
+	outA := <-outACh
+	outB := <-outBCh
+	if outA.err != nil {
+		t.Fatalf("import A failed: %v", outA.err)
+	}
+	if outB.err != nil {
+		t.Fatalf("import B failed: %v", outB.err)
+	}
+	if outA.res.VolumeCreated || outA.res.Volume.ID != seedV1.Volume.ID {
+		t.Fatalf("import A = (created=%v, id=%s), want existing %s", outA.res.VolumeCreated, outA.res.Volume.ID, seedV1.Volume.ID)
+	}
+	if outB.res.VolumeCreated || outB.res.Volume.ID != seedV2.Volume.ID {
+		t.Fatalf("import B = (created=%v, id=%s), want existing %s", outB.res.VolumeCreated, outB.res.Volume.ID, seedV2.Volume.ID)
+	}
+
+	gotSeries, err := postgres.NewCatalogueWriteRepository(db.Pool).GetSeriesByID(ctx, seedV1.Series.ID)
+	if err != nil {
+		t.Fatalf("GetSeriesByID: %v", err)
+	}
+	if gotSeries.Publisher == nil || *gotSeries.Publisher != "Refreshed Publisher" {
+		t.Fatalf("series Publisher = %v, want %q", gotSeries.Publisher, "Refreshed Publisher")
+	}
+	if gotSeries.Imprint == nil || *gotSeries.Imprint != "Refreshed Imprint" {
+		t.Fatalf("series Imprint = %v, want %q", gotSeries.Imprint, "Refreshed Imprint")
 	}
 }
