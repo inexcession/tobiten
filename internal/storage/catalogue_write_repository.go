@@ -15,11 +15,14 @@ type CatalogueWriteRepository interface {
 	// Series
 	CreateSeries(ctx context.Context, series *domain.Series) error
 	GetSeriesByID(ctx context.Context, id string) (*domain.Series, error)
+	GetSeriesByResolverKey(ctx context.Context, libraryID, resolverKey string) (*domain.Series, error)
+	FindOrCreateSeriesByResolverKey(ctx context.Context, series *domain.Series) (created bool, err error)
 	UpdateSeries(ctx context.Context, series *domain.Series) error
 
 	// Volumes
 	CreateVolume(ctx context.Context, volume *domain.Volume) error
 	GetVolumeByID(ctx context.Context, id string) (*domain.Volume, error)
+	FindVolumesByPrimarySeriesKindNumber(ctx context.Context, libraryID, seriesID string, kind domain.VolumeKind, number float64) ([]domain.Volume, error)
 	UpdateVolume(ctx context.Context, volume *domain.Volume) error
 
 	// Media assets

@@ -60,38 +60,12 @@ func (r *CatalogueWriteRepository) CreateSeries(ctx context.Context, series *dom
 	if r == nil {
 		return errors.New("catalogue write repository is required")
 	}
-	candidate, lockedBytes, externalBytes, totalVols, releaseYear, err := prepareSeriesWrite(series, true)
+	params, err := buildCreateSeriesParams(series)
 	if err != nil {
 		return err
 	}
 
-	row, err := r.q.CreateSeries(ctx, CreateSeriesParams{
-		ID:               candidate.ID,
-		LibraryID:        candidate.LibraryID,
-		Title:            candidate.Title,
-		TitleSort:        candidate.TitleSort,
-		Language:         cloneStringPtr(candidate.Language),
-		OriginalTitle:    cloneStringPtr(candidate.OriginalTitle),
-		RomajiTitle:      cloneStringPtr(candidate.RomajiTitle),
-		Franchise:        cloneStringPtr(candidate.Franchise),
-		EditionName:      cloneStringPtr(candidate.EditionName),
-		Publisher:        cloneStringPtr(candidate.Publisher),
-		Imprint:          cloneStringPtr(candidate.Imprint),
-		Status:           string(candidate.Status),
-		Summary:          cloneStringPtr(candidate.Summary),
-		AgeRating:        cloneStringPtr(candidate.AgeRating),
-		Genres:           candidate.Genres,
-		Tags:             candidate.Tags,
-		CoverPolicy:      coverPolicyPtrToStringPtr(candidate.CoverPolicy),
-		CoverVolumeID:    cloneStringPtr(candidate.CoverVolumeID),
-		CoverImageDigest: cloneStringPtr(candidate.CoverImageDigest),
-		LockedFields:     lockedBytes,
-		ExternalIds:      externalBytes,
-		TotalVolumes:     totalVols,
-		ReleaseYear:      releaseYear,
-		CreatedAt:        candidate.CreatedAt,
-		UpdatedAt:        candidate.UpdatedAt,
-	})
+	row, err := r.q.CreateSeries(ctx, params)
 	if err != nil {
 		return mapCatalogueWriteError(err)
 	}
@@ -122,6 +96,162 @@ func (r *CatalogueWriteRepository) GetSeriesByID(ctx context.Context, id string)
 	return &out, nil
 }
 
+// GetSeriesByResolverKey retrieves a series by library ID and canonical resolver key.
+func (r *CatalogueWriteRepository) GetSeriesByResolverKey(ctx context.Context, libraryID, resolverKey string) (*domain.Series, error) {
+	if r == nil {
+		return nil, errors.New("catalogue write repository is required")
+	}
+	if strings.TrimSpace(libraryID) == "" {
+		return nil, domain.ErrEmptyLibraryID
+	}
+	if strings.TrimSpace(resolverKey) == "" {
+		return nil, domain.ErrEmptyResolverKey
+	}
+	row, err := r.q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
+		LibraryID:   libraryID,
+		ResolverKey: &resolverKey,
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out, err := seriesModelToDomain(row)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// FindOrCreateSeriesByResolverKey resolves or atomically creates a series scoped
+// by (series.LibraryID, *series.ResolverKey), returning created=true when newly
+// inserted or created=false with the existing locked row when already present.
+func (r *CatalogueWriteRepository) FindOrCreateSeriesByResolverKey(ctx context.Context, series *domain.Series) (bool, error) {
+	if r == nil {
+		return false, errors.New("catalogue write repository is required")
+	}
+	if series == nil {
+		return false, errors.New("series cannot be nil")
+	}
+	if strings.TrimSpace(series.LibraryID) == "" {
+		return false, domain.ErrEmptyLibraryID
+	}
+	if series.ResolverKey == nil || strings.TrimSpace(*series.ResolverKey) == "" {
+		return false, domain.ErrEmptyResolverKey
+	}
+
+	var (
+		out     domain.Series
+		created bool
+	)
+	err := r.runWriteTx(ctx, "find or create series by resolver key", func(q *Queries) error {
+		var txErr error
+		out, created, txErr = findOrCreateSeriesByResolverKeyInTx(ctx, q, series)
+		return txErr
+	})
+	if err != nil {
+		return false, err
+	}
+	*series = out
+	return created, nil
+}
+
+func findOrCreateSeriesByResolverKeyInTx(
+	ctx context.Context,
+	q *Queries,
+	series *domain.Series,
+) (domain.Series, bool, error) {
+	resolverKey := *series.ResolverKey
+	row, err := q.GetSeriesByResolverKeyForUpdate(ctx, GetSeriesByResolverKeyForUpdateParams{
+		LibraryID:   series.LibraryID,
+		ResolverKey: &resolverKey,
+	})
+	if err == nil {
+		out, convErr := seriesModelToDomain(row)
+		return out, false, convErr
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.Series{}, false, mapPgError(err)
+	}
+
+	for range maxFindOrCreateAttempts {
+		attempt := *series
+		params, prepErr := buildCreateSeriesParams(&attempt)
+		if prepErr != nil {
+			return domain.Series{}, false, prepErr
+		}
+		inserted, insErr := q.FindOrInsertSeriesByResolverKey(ctx, FindOrInsertSeriesByResolverKeyParams(params))
+		if insErr == nil {
+			out, convErr := seriesModelToDomain(inserted)
+			return out, true, convErr
+		}
+		if !errors.Is(insErr, pgx.ErrNoRows) {
+			return domain.Series{}, false, mapCatalogueWriteError(insErr)
+		}
+
+		existing, selErr := q.GetSeriesByResolverKeyForUpdate(ctx, GetSeriesByResolverKeyForUpdateParams{
+			LibraryID:   series.LibraryID,
+			ResolverKey: &resolverKey,
+		})
+		if selErr == nil {
+			out, convErr := seriesModelToDomain(existing)
+			return out, false, convErr
+		}
+		if !errors.Is(selErr, pgx.ErrNoRows) {
+			return domain.Series{}, false, mapPgError(selErr)
+		}
+
+		if isoErr := ensureReadCommittedIsolation(ctx, q); isoErr != nil {
+			return domain.Series{}, false, isoErr
+		}
+	}
+	return domain.Series{}, false, storage.ErrNotFound
+}
+
+func ensureReadCommittedIsolation(ctx context.Context, q *Queries) error {
+	iso, isoErr := q.GetTransactionIsolation(ctx)
+	if isoErr != nil {
+		return mapPgError(isoErr)
+	}
+	if !strings.EqualFold(strings.TrimSpace(iso), "read committed") {
+		return fmt.Errorf("%w: got %q", storage.ErrTransactionIsolation, iso)
+	}
+	return nil
+}
+
+func buildCreateSeriesParams(series *domain.Series) (CreateSeriesParams, error) {
+	candidate, lockedBytes, externalBytes, totalVols, releaseYear, err := prepareSeriesWrite(series, true)
+	if err != nil {
+		return CreateSeriesParams{}, err
+	}
+	return CreateSeriesParams{
+		ID:               candidate.ID,
+		LibraryID:        candidate.LibraryID,
+		ResolverKey:      cloneStringPtr(candidate.ResolverKey),
+		Title:            candidate.Title,
+		TitleSort:        candidate.TitleSort,
+		Language:         cloneStringPtr(candidate.Language),
+		OriginalTitle:    cloneStringPtr(candidate.OriginalTitle),
+		RomajiTitle:      cloneStringPtr(candidate.RomajiTitle),
+		Franchise:        cloneStringPtr(candidate.Franchise),
+		EditionName:      cloneStringPtr(candidate.EditionName),
+		Publisher:        cloneStringPtr(candidate.Publisher),
+		Imprint:          cloneStringPtr(candidate.Imprint),
+		Status:           string(candidate.Status),
+		Summary:          cloneStringPtr(candidate.Summary),
+		AgeRating:        cloneStringPtr(candidate.AgeRating),
+		Genres:           candidate.Genres,
+		Tags:             candidate.Tags,
+		CoverPolicy:      coverPolicyPtrToStringPtr(candidate.CoverPolicy),
+		CoverVolumeID:    cloneStringPtr(candidate.CoverVolumeID),
+		CoverImageDigest: cloneStringPtr(candidate.CoverImageDigest),
+		LockedFields:     lockedBytes,
+		ExternalIds:      externalBytes,
+		TotalVolumes:     totalVols,
+		ReleaseYear:      releaseYear,
+		CreatedAt:        candidate.CreatedAt,
+		UpdatedAt:        candidate.UpdatedAt,
+	}, nil
+}
+
 // UpdateSeries persists changes to an existing series record.
 func (r *CatalogueWriteRepository) UpdateSeries(ctx context.Context, series *domain.Series) error {
 	if r == nil {
@@ -135,6 +265,7 @@ func (r *CatalogueWriteRepository) UpdateSeries(ctx context.Context, series *dom
 	row, err := r.q.UpdateSeries(ctx, UpdateSeriesParams{
 		ID:               candidate.ID,
 		LibraryID:        candidate.LibraryID,
+		ResolverKey:      cloneStringPtr(candidate.ResolverKey),
 		Title:            candidate.Title,
 		TitleSort:        candidate.TitleSort,
 		Language:         cloneStringPtr(candidate.Language),
@@ -225,6 +356,53 @@ func (r *CatalogueWriteRepository) GetVolumeByID(ctx context.Context, id string)
 		return nil, err
 	}
 	return &out, nil
+}
+
+// FindVolumesByPrimarySeriesKindNumber returns volumes in libraryID whose primary
+// membership targets seriesID and whose kind and number match, locking them FOR UPDATE.
+func (r *CatalogueWriteRepository) FindVolumesByPrimarySeriesKindNumber(
+	ctx context.Context,
+	libraryID, seriesID string,
+	kind domain.VolumeKind,
+	number float64,
+) ([]domain.Volume, error) {
+	if r == nil {
+		return nil, errors.New("catalogue write repository is required")
+	}
+	if strings.TrimSpace(libraryID) == "" {
+		return nil, domain.ErrEmptyLibraryID
+	}
+	if strings.TrimSpace(seriesID) == "" {
+		return nil, domain.ErrEmptySeriesID
+	}
+	if !kind.IsValid() {
+		return nil, domain.ErrInvalidVolumeKind
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) {
+		return nil, errors.New("volume number must be finite")
+	}
+	if number == 0 {
+		number = 0
+	}
+
+	rows, err := r.q.FindVolumesByPrimarySeriesKindNumberForUpdate(ctx, FindVolumesByPrimarySeriesKindNumberForUpdateParams{
+		SeriesID:  seriesID,
+		LibraryID: libraryID,
+		Kind:      string(kind),
+		Number:    pgtype.Float8{Float64: number, Valid: true},
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := make([]domain.Volume, len(rows))
+	for i, row := range rows {
+		vol, convErr := volumeModelToDomain(row)
+		if convErr != nil {
+			return nil, convErr
+		}
+		out[i] = vol
+	}
+	return out, nil
 }
 
 // UpdateVolume persists changes to an existing volume record.
@@ -845,7 +1023,11 @@ func optFloat64ToFloat8(v *float64) pgtype.Float8 {
 	if v == nil {
 		return pgtype.Float8{}
 	}
-	return pgtype.Float8{Float64: *v, Valid: true}
+	val := *v
+	if val == 0 {
+		val = 0
+	}
+	return pgtype.Float8{Float64: val, Valid: true}
 }
 
 func optTimeToPgDate(t *time.Time) pgtype.Date {
@@ -927,6 +1109,7 @@ func seriesModelToDomain(row Series) (domain.Series, error) {
 	return domain.Series{
 		ID:               row.ID,
 		LibraryID:        row.LibraryID,
+		ResolverKey:      cloneStringPtr(row.ResolverKey),
 		Title:            row.Title,
 		TitleSort:        row.TitleSort,
 		Language:         cloneStringPtr(row.Language),

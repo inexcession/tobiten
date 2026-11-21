@@ -11,8 +11,8 @@ import (
 
 func TestValidEventKindsAndAggregateTypes(t *testing.T) {
 	kinds := ValidEventKinds()
-	if len(kinds) != 15 {
-		t.Fatalf("len(ValidEventKinds()) = %d, want 15", len(kinds))
+	if len(kinds) != 16 {
+		t.Fatalf("len(ValidEventKinds()) = %d, want 16", len(kinds))
 	}
 	seen := make(map[EventKind]bool, len(kinds))
 	for _, k := range kinds {
@@ -122,6 +122,22 @@ func TestNewDomainEventAndDecodeVersionedPayloads(t *testing.T) {
 		gotAsset, err := DecodeEventPayload[AssetEventPayloadV1](assetEv)
 		if err != nil || gotAsset.PreviousPathDisplay != "Series/v01.cbz" {
 			t.Fatalf("decoded asset = %+v, err = %v", gotAsset, err)
+		}
+
+		invalidUTF8Ev, err := NewDomainEvent(EventAssetInvalidUTF8Path, EventVersion1, AggregateTypeAsset, "asset-2", AssetEventPayloadV1{
+			AssetID:       "asset-2",
+			VolumeID:      "vol-2",
+			LibraryID:     "lib-1",
+			LibraryRootID: "root-1",
+			Format:        MediaFormatCBZ,
+			PathDisplay:   `Series\xff/v01.cbz`,
+		}, now)
+		if err != nil {
+			t.Fatalf("NewDomainEvent invalid_utf8_path: %v", err)
+		}
+		gotInvalidUTF8, err := DecodeEventPayload[AssetEventPayloadV1](invalidUTF8Ev)
+		if err != nil || gotInvalidUTF8.PathDisplay != `Series\xff/v01.cbz` {
+			t.Fatalf("decoded invalid_utf8_path = %+v, err = %v", gotInvalidUTF8, err)
 		}
 
 		volEv, err := NewDomainEvent(EventVolumeCompleted, EventVersion1, AggregateTypeVolume, "vol-1", VolumeEventPayloadV1{

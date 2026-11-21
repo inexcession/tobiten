@@ -15,6 +15,7 @@ var (
 	ErrEmptySeriesID             = errors.New("series ID cannot be empty")
 	ErrEmptyLibraryID            = errors.New("library ID cannot be empty")
 	ErrEmptySeriesTitle          = errors.New("series title cannot be empty")
+	ErrEmptyResolverKey          = errors.New("series resolver key cannot be empty")
 	ErrConflictingManualCover    = errors.New("manual series cover cannot set both cover_volume_id and cover_image_digest")
 	ErrInvalidCoverPolicy        = errors.New("invalid cover policy")
 	ErrEmptyVolumeID             = errors.New("volume ID cannot be empty")
@@ -111,6 +112,7 @@ func (p CoverPolicy) IsValid() bool {
 type Series struct {
 	ID               string         `json:"id"`
 	LibraryID        string         `json:"library_id"`
+	ResolverKey      *string        `json:"-"`
 	Title            string         `json:"title"`
 	TitleSort        string         `json:"title_sort"`
 	Language         *string        `json:"language,omitempty"`
@@ -146,6 +148,9 @@ func (s *Series) Validate() error {
 	}
 	if strings.TrimSpace(s.Title) == "" {
 		return ErrEmptySeriesTitle
+	}
+	if s.ResolverKey != nil && strings.TrimSpace(*s.ResolverKey) == "" {
+		return ErrEmptyResolverKey
 	}
 	if s.CoverPolicy != nil && !s.CoverPolicy.IsValid() {
 		return ErrInvalidCoverPolicy

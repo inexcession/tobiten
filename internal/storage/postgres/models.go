@@ -218,6 +218,7 @@ type Series struct {
 	ReleaseYear      pgtype.Int4
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	ResolverKey      *string
 }
 
 type SeriesMembership struct {

@@ -24,24 +24,88 @@ INSERT INTO series (
     total_volumes,
     release_year,
     created_at,
-    updated_at
+    updated_at,
+    resolver_key
 )
 VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23, $24, $25
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
 )
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,
           genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at;
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key;
+
+-- name: FindOrInsertSeriesByResolverKey :one
+INSERT INTO series (
+    id,
+    library_id,
+    title,
+    title_sort,
+    language,
+    original_title,
+    romaji_title,
+    franchise,
+    edition_name,
+    publisher,
+    imprint,
+    status,
+    summary,
+    age_rating,
+    genres,
+    tags,
+    cover_policy,
+    cover_volume_id,
+    cover_image_digest,
+    locked_fields,
+    external_ids,
+    total_volumes,
+    release_year,
+    created_at,
+    updated_at,
+    resolver_key
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+)
+ON CONFLICT (library_id, resolver_key) WHERE resolver_key IS NOT NULL DO NOTHING
+RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
+          franchise, edition_name, publisher, imprint, status, summary, age_rating,
+          genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key;
 
 -- name: GetSeriesByIDForWrite :one
 SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
        franchise, edition_name, publisher, imprint, status, summary, age_rating,
        genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
 FROM series
 WHERE id = $1;
+
+-- name: GetSeriesByResolverKey :one
+SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
+       franchise, edition_name, publisher, imprint, status, summary, age_rating,
+       genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
+FROM series
+WHERE library_id = $1
+  AND resolver_key = $2;
+
+-- name: GetSeriesByResolverKeyForUpdate :one
+SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
+       franchise, edition_name, publisher, imprint, status, summary, age_rating,
+       genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
+FROM series
+WHERE library_id = $1
+  AND resolver_key = $2
+FOR UPDATE;
 
 -- name: UpdateSeries :one
 UPDATE series
@@ -67,12 +131,14 @@ SET library_id = $2,
     external_ids = $21,
     total_volumes = $22,
     release_year = $23,
-    updated_at = $24
+    updated_at = $24,
+    resolver_key = $25
 WHERE id = $1
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,
           genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at;
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key;
 
 -- name: CreateVolume :one
 INSERT INTO volumes (
@@ -106,6 +172,20 @@ SELECT id, library_id, kind, number, chapter_start, chapter_end, chapter_range_s
        locked_fields, created_at, updated_at
 FROM volumes
 WHERE id = $1;
+
+-- name: FindVolumesByPrimarySeriesKindNumberForUpdate :many
+SELECT v.id, v.library_id, v.kind, v.number, v.chapter_start, v.chapter_end,
+       v.chapter_range_source, v.title, v.summary, v.release_date, v.page_count,
+       v.preferred_asset_id, v.external_ids, v.locked_fields, v.created_at, v.updated_at
+FROM volumes v
+JOIN series_memberships sm ON sm.volume_id = v.id
+WHERE sm.series_id = $1
+  AND sm.is_primary = TRUE
+  AND v.library_id = $2
+  AND v.kind = $3
+  AND v.number = $4
+ORDER BY v.created_at ASC, v.id ASC
+FOR UPDATE OF v;
 
 -- name: UpdateVolume :one
 UPDATE volumes

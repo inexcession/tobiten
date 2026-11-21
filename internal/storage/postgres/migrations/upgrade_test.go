@@ -642,6 +642,35 @@ func verifySeededCatalogue0007Data(ctx context.Context, t testing.TB, db migrati
 	if _, err := db.Exec(ctx, `INSERT INTO entities (id, kind, name, import_key) VALUES ('post-e3', 'LOCATION', 'GOTHAM', 'gotham')`); !isUniqueViolation(err) {
 		t.Fatalf("expected unique violation on duplicate entities(kind, import_key) after upgrade, got: %v", err)
 	}
+
+	// Post-upgrade (0009): pre-existing series retain resolver_key IS NULL and coexist
+	// with keyed series; idx_series_library_resolver_key scopes uniqueness per library.
+	var nonNullSeriesKeys int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE resolver_key IS NOT NULL`).Scan(&nonNullSeriesKeys); err != nil {
+		t.Fatalf("checking series resolver_key: %v", err)
+	}
+	if nonNullSeriesKeys != 0 {
+		t.Errorf("expected pre-existing series to retain NULL resolver_key, got %d", nonNullSeriesKeys)
+	}
+
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
+		 VALUES ('post-s1', '019318a0-0000-7000-8000-000000000080', 'One Piece', 'one piece', 'title:run=none:one piece')`,
+	); err != nil {
+		t.Fatalf("inserting keyed series alongside pre-upgrade One Piece failed: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
+		 VALUES ('post-s2', '019318a0-0000-7000-8000-000000000081', 'One Piece', 'one piece', 'title:run=none:one piece')`,
+	); err != nil {
+		t.Fatalf("inserting same resolver_key in another library failed: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
+		 VALUES ('post-s3', '019318a0-0000-7000-8000-000000000080', 'One Piece Dup', 'one piece', 'title:run=none:one piece')`,
+	); !isUniqueViolation(err) {
+		t.Fatalf("expected unique violation on duplicate series(library_id, resolver_key) after upgrade, got: %v", err)
+	}
 }
 
 func strPtr(s string) *string { return &s }

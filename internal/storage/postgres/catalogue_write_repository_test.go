@@ -1874,3 +1874,182 @@ func TestCatalogueWriteRepository_UpdateAssetRefreshesInvalidUTF8Diagnostic(t *t
 		t.Fatalf("expected InvalidUTF8Path=false on clean CreateAsset, got %+v", cleanCreate.Diagnostics)
 	}
 }
+
+func TestCatalogueWriteRepository_FindOrCreateSeriesByResolverKeyConcurrentAndScoped(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var libA, libB domain.Library
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		libA, _ = seedTestLibraryAndRoot(ctx, t, tx, "Keyed Lib A", []byte("/srv/keyed-a"))
+		libB, _ = seedTestLibraryAndRoot(ctx, t, tx, "Keyed Lib B", []byte("/srv/keyed-b"))
+		return nil
+	}); err != nil {
+		t.Fatalf("setup libraries: %v", err)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	if _, err := cw.GetSeriesByResolverKey(ctx, libA.ID, "title:run=none:missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetSeriesByResolverKey(missing) = %v, want storage.ErrNotFound", err)
+	}
+
+	const workers = 6
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(workers)
+
+	type outcome struct {
+		id      string
+		created bool
+		err     error
+	}
+	results := make(chan outcome, workers)
+	key := "title:run=2018:dorohedoro"
+
+	for i := range workers {
+		go func(idx int) {
+			ready.Done()
+			<-start
+
+			s := domain.Series{
+				LibraryID:   libA.ID,
+				ResolverKey: &key,
+				Title:       fmt.Sprintf("Dorohedoro %d", idx),
+				TitleSort:   "dorohedoro",
+				Status:      domain.SeriesStatusOngoing,
+			}
+			created, err := postgres.NewCatalogueWriteRepository(db.Pool).FindOrCreateSeriesByResolverKey(ctx, &s)
+			results <- outcome{id: s.ID, created: created, err: err}
+		}(i)
+	}
+
+	ready.Wait()
+	close(start)
+
+	var createdCount int
+	var sharedID string
+	for range workers {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("concurrent FindOrCreateSeriesByResolverKey error: %v", res.err)
+		}
+		if res.id == "" {
+			t.Fatal("expected non-empty series ID")
+		}
+		if sharedID == "" {
+			sharedID = res.id
+		} else if res.id != sharedID {
+			t.Fatalf("divergent series IDs %q vs %q for same (library_id, resolver_key)", res.id, sharedID)
+		}
+		if res.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("createdCount = %d, want 1", createdCount)
+	}
+
+	gotA, err := cw.GetSeriesByResolverKey(ctx, libA.ID, key)
+	if err != nil {
+		t.Fatalf("GetSeriesByResolverKey(libA): %v", err)
+	}
+	if gotA.ID != sharedID || gotA.ResolverKey == nil || *gotA.ResolverKey != key {
+		t.Fatalf("gotA = %+v, want ID=%s key=%s", gotA, sharedID, key)
+	}
+
+	// Same resolver key in library B creates a separate library-scoped series.
+	serB := domain.Series{
+		LibraryID:   libB.ID,
+		ResolverKey: &key,
+		Title:       "Dorohedoro",
+		TitleSort:   "dorohedoro",
+		Status:      domain.SeriesStatusOngoing,
+	}
+	createdB, err := cw.FindOrCreateSeriesByResolverKey(ctx, &serB)
+	if err != nil {
+		t.Fatalf("FindOrCreateSeriesByResolverKey(libB): %v", err)
+	}
+	if !createdB || serB.ID == sharedID {
+		t.Fatalf("expected separate series in libB, got created=%v id=%s (libA=%s)", createdB, serB.ID, sharedID)
+	}
+}
+
+func TestCatalogueWriteRepository_FindVolumesByPrimarySeriesKindNumber(t *testing.T) {
+	t.Parallel()
+	_, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var libID, primarySeriesID, otherSeriesID, matchVolID string
+	err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, _ := seedTestLibraryAndRoot(ctx, t, tx, "Match Lib", []byte("/srv/match"))
+		libID = lib.ID
+		cw := tx.CatalogueWrites()
+		sm := tx.SeriesMemberships()
+
+		sPrimary := domain.Series{LibraryID: libID, Title: "Primary", TitleSort: "primary", Status: domain.SeriesStatusOngoing}
+		if err := cw.CreateSeries(ctx, &sPrimary); err != nil {
+			return err
+		}
+		primarySeriesID = sPrimary.ID
+
+		sOther := domain.Series{LibraryID: libID, Title: "Other", TitleSort: "other", Status: domain.SeriesStatusOngoing}
+		if err := cw.CreateSeries(ctx, &sOther); err != nil {
+			return err
+		}
+		otherSeriesID = sOther.ID
+
+		zero := 0.0
+		matchVol := domain.Volume{LibraryID: libID, Kind: domain.VolumeKindVolume, Number: &zero}
+		if err := cw.CreateVolume(ctx, &matchVol); err != nil {
+			return err
+		}
+		matchVolID = matchVol.ID
+		if err := sm.SetVolumeMemberships(ctx, matchVol.ID, []domain.SeriesMembership{
+			{VolumeID: matchVol.ID, SeriesID: primarySeriesID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &zero, Source: domain.MembershipSourceResolver},
+		}); err != nil {
+			return err
+		}
+
+		// Same number, different kind (CHAPTER) -> must not match VOLUME query.
+		chapterVol := domain.Volume{LibraryID: libID, Kind: domain.VolumeKindChapter, Number: &zero}
+		if err := cw.CreateVolume(ctx, &chapterVol); err != nil {
+			return err
+		}
+		if err := sm.SetVolumeMemberships(ctx, chapterVol.ID, []domain.SeriesMembership{
+			{VolumeID: chapterVol.ID, SeriesID: primarySeriesID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &zero, Source: domain.MembershipSourceResolver},
+		}); err != nil {
+			return err
+		}
+
+		// Same kind & number, but primarySeriesID is only a SECONDARY membership -> must not match.
+		secondaryVol := domain.Volume{LibraryID: libID, Kind: domain.VolumeKindVolume, Number: &zero}
+		if err := cw.CreateVolume(ctx, &secondaryVol); err != nil {
+			return err
+		}
+		if err := sm.SetVolumeMemberships(ctx, secondaryVol.ID, []domain.SeriesMembership{
+			{VolumeID: secondaryVol.ID, SeriesID: otherSeriesID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &zero, Source: domain.MembershipSourceResolver},
+			{VolumeID: secondaryVol.ID, SeriesID: primarySeriesID, IsPrimary: false, Kind: domain.MembershipKindSubSeries, Position: &zero, Source: domain.MembershipSourceMetadata},
+		}); err != nil {
+			return err
+		}
+
+		// Query with -0.0 still finds the 0.0 volume.
+		negZero := math.Copysign(0, -1)
+		got, err := cw.FindVolumesByPrimarySeriesKindNumber(ctx, libID, primarySeriesID, domain.VolumeKindVolume, negZero)
+		if err != nil {
+			return err
+		}
+		if len(got) != 1 || got[0].ID != matchVolID {
+			t.Fatalf("FindVolumesByPrimarySeriesKindNumber = %+v, want [%s]", got, matchVolID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("transaction failed: %v", err)
+	}
+}

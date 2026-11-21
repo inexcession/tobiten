@@ -129,16 +129,18 @@ INSERT INTO series (
     total_volumes,
     release_year,
     created_at,
-    updated_at
+    updated_at,
+    resolver_key
 )
 VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23, $24, $25
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
 )
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,
           genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key
 `
 
 type CreateSeriesParams struct {
@@ -167,6 +169,7 @@ type CreateSeriesParams struct {
 	ReleaseYear      pgtype.Int4
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	ResolverKey      *string
 }
 
 func (q *Queries) CreateSeries(ctx context.Context, arg CreateSeriesParams) (Series, error) {
@@ -196,6 +199,7 @@ func (q *Queries) CreateSeries(ctx context.Context, arg CreateSeriesParams) (Ser
 		arg.ReleaseYear,
 		arg.CreatedAt,
 		arg.UpdatedAt,
+		arg.ResolverKey,
 	)
 	var i Series
 	err := row.Scan(
@@ -224,6 +228,7 @@ func (q *Queries) CreateSeries(ctx context.Context, arg CreateSeriesParams) (Ser
 		&i.ReleaseYear,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ResolverKey,
 	)
 	return i, err
 }
@@ -412,6 +417,201 @@ func (q *Queries) FindMediaAssetsWithDigestsByDigestInLibrary(ctx context.Contex
 	return items, nil
 }
 
+const findOrInsertSeriesByResolverKey = `-- name: FindOrInsertSeriesByResolverKey :one
+INSERT INTO series (
+    id,
+    library_id,
+    title,
+    title_sort,
+    language,
+    original_title,
+    romaji_title,
+    franchise,
+    edition_name,
+    publisher,
+    imprint,
+    status,
+    summary,
+    age_rating,
+    genres,
+    tags,
+    cover_policy,
+    cover_volume_id,
+    cover_image_digest,
+    locked_fields,
+    external_ids,
+    total_volumes,
+    release_year,
+    created_at,
+    updated_at,
+    resolver_key
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+)
+ON CONFLICT (library_id, resolver_key) WHERE resolver_key IS NOT NULL DO NOTHING
+RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
+          franchise, edition_name, publisher, imprint, status, summary, age_rating,
+          genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key
+`
+
+type FindOrInsertSeriesByResolverKeyParams struct {
+	ID               string
+	LibraryID        string
+	Title            string
+	TitleSort        string
+	Language         *string
+	OriginalTitle    *string
+	RomajiTitle      *string
+	Franchise        *string
+	EditionName      *string
+	Publisher        *string
+	Imprint          *string
+	Status           string
+	Summary          *string
+	AgeRating        *string
+	Genres           []string
+	Tags             []string
+	CoverPolicy      *string
+	CoverVolumeID    *string
+	CoverImageDigest *string
+	LockedFields     []byte
+	ExternalIds      []byte
+	TotalVolumes     pgtype.Int4
+	ReleaseYear      pgtype.Int4
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ResolverKey      *string
+}
+
+func (q *Queries) FindOrInsertSeriesByResolverKey(ctx context.Context, arg FindOrInsertSeriesByResolverKeyParams) (Series, error) {
+	row := q.db.QueryRow(ctx, findOrInsertSeriesByResolverKey,
+		arg.ID,
+		arg.LibraryID,
+		arg.Title,
+		arg.TitleSort,
+		arg.Language,
+		arg.OriginalTitle,
+		arg.RomajiTitle,
+		arg.Franchise,
+		arg.EditionName,
+		arg.Publisher,
+		arg.Imprint,
+		arg.Status,
+		arg.Summary,
+		arg.AgeRating,
+		arg.Genres,
+		arg.Tags,
+		arg.CoverPolicy,
+		arg.CoverVolumeID,
+		arg.CoverImageDigest,
+		arg.LockedFields,
+		arg.ExternalIds,
+		arg.TotalVolumes,
+		arg.ReleaseYear,
+		arg.CreatedAt,
+		arg.UpdatedAt,
+		arg.ResolverKey,
+	)
+	var i Series
+	err := row.Scan(
+		&i.ID,
+		&i.LibraryID,
+		&i.Title,
+		&i.TitleSort,
+		&i.Language,
+		&i.OriginalTitle,
+		&i.RomajiTitle,
+		&i.Franchise,
+		&i.EditionName,
+		&i.Publisher,
+		&i.Imprint,
+		&i.Status,
+		&i.Summary,
+		&i.AgeRating,
+		&i.Genres,
+		&i.Tags,
+		&i.CoverPolicy,
+		&i.CoverVolumeID,
+		&i.CoverImageDigest,
+		&i.LockedFields,
+		&i.ExternalIds,
+		&i.TotalVolumes,
+		&i.ReleaseYear,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ResolverKey,
+	)
+	return i, err
+}
+
+const findVolumesByPrimarySeriesKindNumberForUpdate = `-- name: FindVolumesByPrimarySeriesKindNumberForUpdate :many
+SELECT v.id, v.library_id, v.kind, v.number, v.chapter_start, v.chapter_end,
+       v.chapter_range_source, v.title, v.summary, v.release_date, v.page_count,
+       v.preferred_asset_id, v.external_ids, v.locked_fields, v.created_at, v.updated_at
+FROM volumes v
+JOIN series_memberships sm ON sm.volume_id = v.id
+WHERE sm.series_id = $1
+  AND sm.is_primary = TRUE
+  AND v.library_id = $2
+  AND v.kind = $3
+  AND v.number = $4
+ORDER BY v.created_at ASC, v.id ASC
+FOR UPDATE OF v
+`
+
+type FindVolumesByPrimarySeriesKindNumberForUpdateParams struct {
+	SeriesID  string
+	LibraryID string
+	Kind      string
+	Number    pgtype.Float8
+}
+
+func (q *Queries) FindVolumesByPrimarySeriesKindNumberForUpdate(ctx context.Context, arg FindVolumesByPrimarySeriesKindNumberForUpdateParams) ([]Volume, error) {
+	rows, err := q.db.Query(ctx, findVolumesByPrimarySeriesKindNumberForUpdate,
+		arg.SeriesID,
+		arg.LibraryID,
+		arg.Kind,
+		arg.Number,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Volume
+	for rows.Next() {
+		var i Volume
+		if err := rows.Scan(
+			&i.ID,
+			&i.LibraryID,
+			&i.Kind,
+			&i.Number,
+			&i.ChapterStart,
+			&i.ChapterEnd,
+			&i.ChapterRangeSource,
+			&i.Title,
+			&i.Summary,
+			&i.ReleaseDate,
+			&i.PageCount,
+			&i.PreferredAssetID,
+			&i.ExternalIds,
+			&i.LockedFields,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getMediaAssetWithDigestsByIDForWrite = `-- name: GetMediaAssetWithDigestsByIDForWrite :many
 SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
        d.kind AS digest_kind,
@@ -481,7 +681,8 @@ const getSeriesByIDForWrite = `-- name: GetSeriesByIDForWrite :one
 SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
        franchise, edition_name, publisher, imprint, status, summary, age_rating,
        genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
 FROM series
 WHERE id = $1
 `
@@ -515,6 +716,108 @@ func (q *Queries) GetSeriesByIDForWrite(ctx context.Context, id string) (Series,
 		&i.ReleaseYear,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ResolverKey,
+	)
+	return i, err
+}
+
+const getSeriesByResolverKey = `-- name: GetSeriesByResolverKey :one
+SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
+       franchise, edition_name, publisher, imprint, status, summary, age_rating,
+       genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
+FROM series
+WHERE library_id = $1
+  AND resolver_key = $2
+`
+
+type GetSeriesByResolverKeyParams struct {
+	LibraryID   string
+	ResolverKey *string
+}
+
+func (q *Queries) GetSeriesByResolverKey(ctx context.Context, arg GetSeriesByResolverKeyParams) (Series, error) {
+	row := q.db.QueryRow(ctx, getSeriesByResolverKey, arg.LibraryID, arg.ResolverKey)
+	var i Series
+	err := row.Scan(
+		&i.ID,
+		&i.LibraryID,
+		&i.Title,
+		&i.TitleSort,
+		&i.Language,
+		&i.OriginalTitle,
+		&i.RomajiTitle,
+		&i.Franchise,
+		&i.EditionName,
+		&i.Publisher,
+		&i.Imprint,
+		&i.Status,
+		&i.Summary,
+		&i.AgeRating,
+		&i.Genres,
+		&i.Tags,
+		&i.CoverPolicy,
+		&i.CoverVolumeID,
+		&i.CoverImageDigest,
+		&i.LockedFields,
+		&i.ExternalIds,
+		&i.TotalVolumes,
+		&i.ReleaseYear,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ResolverKey,
+	)
+	return i, err
+}
+
+const getSeriesByResolverKeyForUpdate = `-- name: GetSeriesByResolverKeyForUpdate :one
+SELECT id, library_id, title, title_sort, language, original_title, romaji_title,
+       franchise, edition_name, publisher, imprint, status, summary, age_rating,
+       genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+       locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+       resolver_key
+FROM series
+WHERE library_id = $1
+  AND resolver_key = $2
+FOR UPDATE
+`
+
+type GetSeriesByResolverKeyForUpdateParams struct {
+	LibraryID   string
+	ResolverKey *string
+}
+
+func (q *Queries) GetSeriesByResolverKeyForUpdate(ctx context.Context, arg GetSeriesByResolverKeyForUpdateParams) (Series, error) {
+	row := q.db.QueryRow(ctx, getSeriesByResolverKeyForUpdate, arg.LibraryID, arg.ResolverKey)
+	var i Series
+	err := row.Scan(
+		&i.ID,
+		&i.LibraryID,
+		&i.Title,
+		&i.TitleSort,
+		&i.Language,
+		&i.OriginalTitle,
+		&i.RomajiTitle,
+		&i.Franchise,
+		&i.EditionName,
+		&i.Publisher,
+		&i.Imprint,
+		&i.Status,
+		&i.Summary,
+		&i.AgeRating,
+		&i.Genres,
+		&i.Tags,
+		&i.CoverPolicy,
+		&i.CoverVolumeID,
+		&i.CoverImageDigest,
+		&i.LockedFields,
+		&i.ExternalIds,
+		&i.TotalVolumes,
+		&i.ReleaseYear,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ResolverKey,
 	)
 	return i, err
 }
@@ -841,12 +1144,14 @@ SET library_id = $2,
     external_ids = $21,
     total_volumes = $22,
     release_year = $23,
-    updated_at = $24
+    updated_at = $24,
+    resolver_key = $25
 WHERE id = $1
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,
           genres, tags, cover_policy, cover_volume_id, cover_image_digest,
-          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key
 `
 
 type UpdateSeriesParams struct {
@@ -874,6 +1179,7 @@ type UpdateSeriesParams struct {
 	TotalVolumes     pgtype.Int4
 	ReleaseYear      pgtype.Int4
 	UpdatedAt        time.Time
+	ResolverKey      *string
 }
 
 func (q *Queries) UpdateSeries(ctx context.Context, arg UpdateSeriesParams) (Series, error) {
@@ -902,6 +1208,7 @@ func (q *Queries) UpdateSeries(ctx context.Context, arg UpdateSeriesParams) (Ser
 		arg.TotalVolumes,
 		arg.ReleaseYear,
 		arg.UpdatedAt,
+		arg.ResolverKey,
 	)
 	var i Series
 	err := row.Scan(
@@ -930,6 +1237,7 @@ func (q *Queries) UpdateSeries(ctx context.Context, arg UpdateSeriesParams) (Ser
 		&i.ReleaseYear,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ResolverKey,
 	)
 	return i, err
 }

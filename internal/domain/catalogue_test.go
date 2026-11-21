@@ -110,6 +110,25 @@ func TestSeriesValidate(t *testing.T) {
 			},
 			wantErr: ErrConflictingManualCover,
 		},
+		{
+			name: "empty resolver key",
+			series: Series{
+				ID:          "ser-1",
+				LibraryID:   "lib-1",
+				ResolverKey: strPtr("   "),
+				Title:       "Dorohedoro",
+			},
+			wantErr: ErrEmptyResolverKey,
+		},
+		{
+			name: "valid series with resolver key",
+			series: Series{
+				ID:          "ser-1",
+				LibraryID:   "lib-1",
+				ResolverKey: strPtr("title:run=none:dorohedoro"),
+				Title:       "Dorohedoro",
+			},
+		},
 	}
 
 	for _, tc := range tests {
