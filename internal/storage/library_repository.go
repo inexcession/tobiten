@@ -28,4 +28,5 @@ type LibraryRepository interface {
 
 	// Configuration serialization
 	LockConfiguration(ctx context.Context) error
+	LockLibrary(ctx context.Context, id string) error
 }

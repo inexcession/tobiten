@@ -811,7 +811,7 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		}
 	})
 
-	t.Run("missing root marks incomplete and still walks surviving roots", func(t *testing.T) {
+	t.Run("missing root fails pre-check and stops scan before walking surviving roots", func(t *testing.T) {
 		t.Parallel()
 		_, transactor := setupIndexerTestDB(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -822,9 +822,12 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		healthyRoot := filepath.Join(base, "b-healthy")
 		writeDiskFile(t, filepath.Join(healthyRoot, "ok.cbz"), goodA)
 
-		var lib domain.Library
+		var (
+			lib   domain.Library
+			roots []domain.LibraryRoot
+		)
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
-			lib, _ = seedLibraryAndRoots(ctx, t, tx, "Missing Root Lib", nil, []byte(missingRoot), []byte(healthyRoot))
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Missing Root Lib", nil, []byte(missingRoot), []byte(healthyRoot))
 			return nil
 		}); err != nil {
 			t.Fatalf("seed failed: %v", err)
@@ -835,17 +838,71 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 			t.Fatalf("NewScanner: %v", err)
 		}
 		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
-		if err == nil {
-			t.Fatal("expected error when one root directory is missing")
+		if err != nil {
+			t.Fatalf("ScanLibrary(offline): %v", err)
 		}
-		if res.Complete {
-			t.Fatal("expected res.Complete=false when a root walk failed")
+		if !res.Offline || res.Complete || res.ApplyRemovals {
+			t.Fatalf("expected Offline=true Complete=false ApplyRemovals=false, got %+v", res)
+		}
+		if res.IndexedCount != 0 || len(res.Roots) != 0 {
+			t.Fatalf("expected scan to stop after pre-check with 0 walked roots, got %+v", res)
+		}
+		if len(res.PreCheck.Roots) != 2 ||
+			res.PreCheck.Roots[0].State != domain.LibraryRootStateOffline ||
+			res.PreCheck.Roots[1].State != domain.LibraryRootStateOnline {
+			t.Fatalf("expected both roots evaluated before stopping, got %+v", res.PreCheck.Roots)
+		}
+		if len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {
+			t.Fatal("expected surviving root not to be indexed when library is OFFLINE")
+		}
+	})
+
+	t.Run("walk error after passing pre-check marks incomplete and still walks surviving roots", func(t *testing.T) {
+		t.Parallel()
+		_, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		flakyRoot := filepath.Join(base, "a-flaky")
+		healthyRoot := filepath.Join(base, "b-healthy")
+		writeDiskFile(t, filepath.Join(flakyRoot, "precheck.cbz"), goodA)
+		writeDiskFile(t, filepath.Join(healthyRoot, "ok.cbz"), goodB)
+
+		var lib domain.Library
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			lib, _ = seedLibraryAndRoots(ctx, t, tx, "Walk Error Root Lib", nil, []byte(flakyRoot), []byte(healthyRoot))
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+			OpenDir: func(rawDir []byte) (scanner.DirStream, error) {
+				return os.Open(string(rawDir))
+			},
+			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+				if string(rawDir) == flakyRoot {
+					return nil, os.ErrPermission
+				}
+				return os.ReadDir(string(rawDir))
+			},
+		})
+		if err == nil {
+			t.Fatal("expected error when one root walk fails")
+		}
+		if res.Complete || res.ApplyRemovals {
+			t.Fatalf("expected Complete=false ApplyRemovals=false when a root walk failed, got %+v", res)
 		}
 		if len(res.Roots) != 2 {
 			t.Fatalf("expected 2 root results, got %d", len(res.Roots))
 		}
 		if res.Roots[0].Complete || res.Roots[0].Err == nil {
-			t.Fatalf("expected missing root error and Complete=false, got %+v", res.Roots[0])
+			t.Fatalf("expected root walk error and Complete=false, got %+v", res.Roots[0])
 		}
 		if !res.Roots[1].Complete || res.Roots[1].IndexedCount != 1 {
 			t.Fatalf("expected healthy root to complete and index 1 file, got %+v", res.Roots[1])

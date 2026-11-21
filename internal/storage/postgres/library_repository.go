@@ -331,6 +331,21 @@ func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
 	return nil
 }
 
+// LockLibrary acquires a row-level FOR UPDATE lock on library id inside an active
+// transaction so availability transitions and root status updates serialize per library.
+func (r *LibraryRepository) LockLibrary(ctx context.Context, id string) error {
+	if r == nil || r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(id) == "" {
+		return domain.ErrEmptyLibraryID
+	}
+	if _, err := r.q.LockLibrary(ctx, id); err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
 func prepareLibraryForCreate(library *domain.Library) (domain.Library, error) {
 	if library == nil {
 		return domain.Library{}, errors.New("library cannot be nil")

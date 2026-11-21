@@ -29,7 +29,10 @@ type ScanOptions struct {
 	// When nil, WalkRoot uses a default CBZ registry.
 	Formats *container.FormatRegistry
 
-	// ReadDir optionally overrides os.ReadDir during root traversal.
+	// OpenDir optionally overrides opening a directory for incremental pre-check reads.
+	OpenDir func(rawDir []byte) (DirStream, error)
+
+	// ReadDir optionally overrides os.ReadDir during root traversal and pre-checks.
 	ReadDir func(rawDir []byte) ([]os.DirEntry, error)
 
 	// Stat optionally overrides os.Stat during root traversal.
@@ -63,6 +66,9 @@ type RootScanResult struct {
 // ScanResult summarizes a multi-root library scan pass.
 type ScanResult struct {
 	LibraryID      string
+	PreCheck       PreCheckResult
+	Offline        bool
+	ApplyRemovals  bool
 	Complete       bool
 	Roots          []RootScanResult
 	IndexedCount   int
@@ -77,29 +83,45 @@ type ScanResult struct {
 type Scanner struct {
 	tx      storage.Transactor
 	indexer *Indexer
+	outbox  *events.Outbox
+	now     func() time.Time
 }
 
 // NewScanner constructs a Scanner backed by tx.
 func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
-	idx, err := NewIndexer(tx, IndexerOptions(opts))
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	outbox := opts.Outbox
+	if outbox == nil {
+		outbox = events.NewOutbox(events.WithClock(nowFn))
+	}
+	idx, err := NewIndexer(tx, IndexerOptions{
+		Outbox: outbox,
+		Now:    nowFn,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &Scanner{
 		tx:      tx,
 		indexer: idx,
+		outbox:  outbox,
+		now:     nowFn,
 	}, nil
 }
 
-// ScanLibrary walks every root configured for libraryID, skips files matching
-// recorded size and mtime without opening them, records inspection data for
-// changed existing paths, and indexes new CBZ files through Indexer from a
-// single sequential writer.
+// ScanLibrary pre-checks every root of libraryID and stops if any failed
+// (M1B-D10). When all roots are online, it walks every root, skips files
+// matching recorded size and mtime without opening them, records inspection
+// data for changed existing paths, and indexes new CBZ files through Indexer
+// from a single sequential writer.
 func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOptions) (ScanResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if s == nil || s.tx == nil || s.indexer == nil {
+	if s == nil || s.tx == nil || s.indexer == nil || s.outbox == nil || s.now == nil {
 		return ScanResult{}, errors.New("scanner: scanner is not initialized")
 	}
 	if err := ctx.Err(); err != nil {
@@ -112,36 +134,58 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return ScanResult{}, ErrInvalidWorkerCount
 	}
 
-	lib, roots, err := s.loadLibraryAndRoots(ctx, libraryID)
+	preCheck, err := s.PreCheckLibrary(ctx, libraryID, PreCheckOptions{
+		Stat:    opts.Stat,
+		OpenDir: opts.OpenDir,
+		ReadDir: opts.ReadDir,
+	})
 	if err != nil {
 		return ScanResult{}, err
 	}
 
 	res := ScanResult{
-		LibraryID: lib.ID,
-		Complete:  true,
-		Roots:     make([]RootScanResult, 0, len(roots)),
+		LibraryID:     preCheck.LibraryID,
+		PreCheck:      preCheck,
+		Offline:       !preCheck.ShouldScan,
+		ApplyRemovals: preCheck.ApplyRemovals,
 	}
+	if !preCheck.ShouldScan {
+		res.Complete = false
+		res.ApplyRemovals = false
+		return res, nil
+	}
+
+	lib, roots, err := s.loadLibraryAndRoots(ctx, libraryID)
+	if err != nil {
+		return ScanResult{}, err
+	}
+
+	res.Complete = true
+	res.Roots = make([]RootScanResult, 0, len(roots))
 	var rootErrs []error
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
 			res.Complete = false
+			res.ApplyRemovals = false
 			return res, err
 		}
 		rootRes, loadErr := s.scanOneRoot(ctx, lib.ID, root, opts)
 		if loadErr != nil {
 			res.Complete = false
+			res.ApplyRemovals = false
 			return res, loadErr
 		}
 		res.recordRoot(rootRes)
 		if rootRes.Err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				res.Complete = false
+				res.ApplyRemovals = false
 				return res, ctxErr
 			}
 			rootErrs = append(rootErrs, rootRes.Err)
 		}
 	}
+	res.ApplyRemovals = res.Complete && preCheck.ApplyRemovals
 	if len(rootErrs) > 0 {
 		return res, errors.Join(rootErrs...)
 	}

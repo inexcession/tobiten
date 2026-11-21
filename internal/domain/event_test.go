@@ -11,8 +11,8 @@ import (
 
 func TestValidEventKindsAndAggregateTypes(t *testing.T) {
 	kinds := ValidEventKinds()
-	if len(kinds) != 16 {
-		t.Fatalf("len(ValidEventKinds()) = %d, want 16", len(kinds))
+	if len(kinds) != 18 {
+		t.Fatalf("len(ValidEventKinds()) = %d, want 18", len(kinds))
 	}
 	seen := make(map[EventKind]bool, len(kinds))
 	for _, k := range kinds {
@@ -138,6 +138,29 @@ func TestNewDomainEventAndDecodeVersionedPayloads(t *testing.T) {
 		gotInvalidUTF8, err := DecodeEventPayload[AssetEventPayloadV1](invalidUTF8Ev)
 		if err != nil || gotInvalidUTF8.PathDisplay != `Series\xff/v01.cbz` {
 			t.Fatalf("decoded invalid_utf8_path = %+v, err = %v", gotInvalidUTF8, err)
+		}
+
+		libOfflineEv, err := NewDomainEvent(EventLibraryOffline, EventVersion1, AggregateTypeLibrary, "lib-1", LibraryEventPayloadV1{
+			LibraryID:     "lib-1",
+			FailedRootIDs: []string{"root-1", "root-2"},
+		}, now)
+		if err != nil {
+			t.Fatalf("NewDomainEvent library.offline: %v", err)
+		}
+		gotOffline, err := DecodeEventPayload[LibraryEventPayloadV1](libOfflineEv)
+		if err != nil || gotOffline.LibraryID != "lib-1" || !reflect.DeepEqual(gotOffline.FailedRootIDs, []string{"root-1", "root-2"}) {
+			t.Fatalf("decoded library.offline = %+v, err = %v", gotOffline, err)
+		}
+
+		libOnlineEv, err := NewDomainEvent(EventLibraryOnline, EventVersion1, AggregateTypeLibrary, "lib-1", LibraryEventPayloadV1{
+			LibraryID: "lib-1",
+		}, now)
+		if err != nil {
+			t.Fatalf("NewDomainEvent library.online: %v", err)
+		}
+		gotOnline, err := DecodeEventPayload[LibraryEventPayloadV1](libOnlineEv)
+		if err != nil || gotOnline.LibraryID != "lib-1" || len(gotOnline.FailedRootIDs) != 0 {
+			t.Fatalf("decoded library.online = %+v, err = %v", gotOnline, err)
 		}
 
 		volEv, err := NewDomainEvent(EventVolumeCompleted, EventVersion1, AggregateTypeVolume, "vol-1", VolumeEventPayloadV1{

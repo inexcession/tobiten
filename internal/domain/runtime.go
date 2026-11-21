@@ -283,6 +283,8 @@ const (
 	EventAssetMoved            EventKind = "asset.moved"
 	EventAssetRemoved          EventKind = "asset.removed"
 	EventAssetInvalidUTF8Path  EventKind = "asset.invalid_utf8_path"
+	EventLibraryOffline        EventKind = "library.offline"
+	EventLibraryOnline         EventKind = "library.online"
 	EventVolumeRemoved         EventKind = "volume.removed"
 	EventSeriesRemoved         EventKind = "series.removed"
 	EventVolumeMetadataChanged EventKind = "volume.metadata_changed"

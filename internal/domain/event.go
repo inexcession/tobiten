@@ -18,6 +18,7 @@ const ProgressTickEventName = "job.progress"
 
 // Canonical aggregate_type values for 1.0 domain_events rows.
 const (
+	AggregateTypeLibrary    = "library"
 	AggregateTypeAsset      = "asset"
 	AggregateTypeVolume     = "volume"
 	AggregateTypeSeries     = "series"
@@ -26,6 +27,8 @@ const (
 )
 
 var eventKindAggregateTypes = map[EventKind]string{
+	EventLibraryOffline:        AggregateTypeLibrary,
+	EventLibraryOnline:         AggregateTypeLibrary,
 	EventAssetAdded:            AggregateTypeAsset,
 	EventAssetModified:         AggregateTypeAsset,
 	EventAssetMoved:            AggregateTypeAsset,
@@ -47,6 +50,8 @@ var eventKindAggregateTypes = map[EventKind]string{
 // ValidEventKinds returns all defined 1.0 domain event kinds (ADR-0018 S3).
 func ValidEventKinds() []EventKind {
 	return []EventKind{
+		EventLibraryOffline,
+		EventLibraryOnline,
 		EventAssetAdded,
 		EventAssetModified,
 		EventAssetMoved,
@@ -75,6 +80,13 @@ func (k EventKind) IsValid() bool {
 func (k EventKind) DefaultAggregateType() (string, bool) {
 	agg, ok := eventKindAggregateTypes[k]
 	return agg, ok
+}
+
+// LibraryEventPayloadV1 is the version 1 payload for library.offline and
+// library.online domain events (ADR-0018 S3, ADR-0019 §5).
+type LibraryEventPayloadV1 struct {
+	LibraryID     string   `json:"library_id"`
+	FailedRootIDs []string `json:"failed_root_ids,omitempty"`
 }
 
 // JobEventPayloadV1 is the version 1 payload for job.started, job.finished,

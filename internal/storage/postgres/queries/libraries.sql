@@ -55,6 +55,12 @@ FROM libraries
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockLibrary :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR UPDATE;
+
 -- name: LibraryHasCatalogueRows :one
 SELECT (
     EXISTS (SELECT 1 FROM series s WHERE s.library_id = $1)

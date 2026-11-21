@@ -369,6 +369,20 @@ func (q *Queries) ListLibraryRootsByLibrary(ctx context.Context, libraryID strin
 	return items, nil
 }
 
+const lockLibrary = `-- name: LockLibrary :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR UPDATE
+`
+
+func (q *Queries) LockLibrary(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRow(ctx, lockLibrary, id)
+	var id_2 string
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const lockLibraryForDelete = `-- name: LockLibraryForDelete :one
 SELECT id
 FROM libraries
