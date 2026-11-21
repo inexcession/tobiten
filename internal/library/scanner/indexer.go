@@ -106,7 +106,8 @@ func (idx *Indexer) IndexFile(ctx context.Context, in IndexFileInput) (*IndexFil
 }
 
 // IndexFileInTx resolves and indexes one inspected file inside an active
-// caller-supplied transaction tx.
+// caller-supplied transaction tx using a savepoint so a failure rolls back
+// only this file's catalogue writes and outbox events without tainting tx.
 func (idx *Indexer) IndexFileInTx(ctx context.Context, tx storage.Tx, in IndexFileInput) (*IndexFileResult, error) {
 	if idx == nil {
 		return nil, errors.New("scanner: indexer is not initialized")
@@ -121,7 +122,17 @@ func (idx *Indexer) IndexFileInTx(ctx context.Context, tx storage.Tx, in IndexFi
 	if err != nil {
 		return nil, err
 	}
-	return idx.indexFileWithValidatedPath(ctx, tx, in, relPath)
+
+	var result *IndexFileResult
+	err = tx.WithTx(ctx, func(innerTx storage.Tx) error {
+		var txErr error
+		result, txErr = idx.indexFileWithValidatedPath(ctx, innerTx, in, relPath)
+		return txErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func validateIndexFileInput(in IndexFileInput) (domain.PathIdentity, error) {
@@ -189,7 +200,7 @@ func (idx *Indexer) indexFileWithValidatedPath(
 	res.Number = normalizeZeroFloatPtr(res.Number)
 
 	cw := tx.CatalogueWrites()
-	series, seriesCreated, err := resolveOrCreateSeries(ctx, cw, lib.ID, res, in.Inspected.ComicInfo, now)
+	series, proposedSeries, seriesCreated, err := resolveOrCreateSeries(ctx, cw, lib.ID, res, in.Inspected.ComicInfo, now)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +212,15 @@ func (idx *Indexer) indexFileWithValidatedPath(
 	vol, volCreated, err := resolveOrCreateVolume(ctx, cw, lib.ID, seriesID, res, in.Inspected, in.TargetVolumeID, now)
 	if err != nil {
 		return nil, err
+	}
+
+	// Lock and sync an already-existing series only AFTER resolving/locking the
+	// volume so the lock order matches volumes -> series_memberships -> series.
+	if !seriesCreated && series != nil {
+		series, err = syncExistingSeries(ctx, cw, series.ID, proposedSeries, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	memberships, err := syncIndexedVolumeMemberships(ctx, tx, vol.ID, seriesID, res, volCreated)
@@ -268,28 +288,38 @@ func resolveOrCreateSeries(
 	res resolver.Result,
 	meta *comicinfo.Metadata,
 	now time.Time,
-) (*domain.Series, bool, error) {
+) (*domain.Series, domain.Series, bool, error) {
 	if res.Standalone || res.Series == nil {
-		return nil, false, nil
+		return nil, domain.Series{}, false, nil
 	}
 	proposed := buildProposedSeries(libraryID, *res.Series, meta, now)
 	series := proposed
 	created, err := cw.FindOrCreateSeriesByResolverKey(ctx, &series)
 	if err != nil {
-		return nil, false, err
+		return nil, domain.Series{}, false, err
 	}
-	if created {
-		return &series, true, nil
-	}
+	return &series, proposed, created, nil
+}
 
-	merged, changed := mergeSeriesForIndex(series, proposed, now)
-	if changed {
-		if err := cw.UpdateSeries(ctx, &merged); err != nil {
-			return nil, false, err
-		}
-		series = merged
+func syncExistingSeries(
+	ctx context.Context,
+	cw storage.CatalogueWriteRepository,
+	seriesID string,
+	proposed domain.Series,
+	now time.Time,
+) (*domain.Series, error) {
+	locked, err := cw.GetSeriesByIDForUpdate(ctx, seriesID)
+	if err != nil {
+		return nil, err
 	}
-	return &series, false, nil
+	merged, changed := mergeSeriesForIndex(*locked, proposed, now)
+	if !changed {
+		return locked, nil
+	}
+	if err := cw.UpdateSeries(ctx, &merged); err != nil {
+		return nil, err
+	}
+	return &merged, nil
 }
 
 func resolveOrCreateVolume(
@@ -303,7 +333,7 @@ func resolveOrCreateVolume(
 ) (domain.Volume, bool, error) {
 	proposed := buildProposedVolume(libraryID, res, inspected, now)
 	if strings.TrimSpace(targetVolumeID) != "" {
-		existing, err := cw.GetVolumeByID(ctx, targetVolumeID)
+		existing, err := cw.GetVolumeByIDForUpdate(ctx, targetVolumeID)
 		if err != nil {
 			return domain.Volume{}, false, err
 		}

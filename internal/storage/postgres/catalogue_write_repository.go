@@ -82,10 +82,27 @@ func (r *CatalogueWriteRepository) GetSeriesByID(ctx context.Context, id string)
 	if r == nil {
 		return nil, errors.New("catalogue write repository is required")
 	}
+	return r.fetchSeriesByID(ctx, id, r.q.GetSeriesByIDForWrite)
+}
+
+// GetSeriesByIDForUpdate retrieves and locks a series row FOR UPDATE within an
+// active transaction.
+func (r *CatalogueWriteRepository) GetSeriesByIDForUpdate(ctx context.Context, id string) (*domain.Series, error) {
+	if r == nil {
+		return nil, errors.New("catalogue write repository is required")
+	}
+	return r.fetchSeriesByID(ctx, id, r.q.GetSeriesByIDForWriteForUpdate)
+}
+
+func (r *CatalogueWriteRepository) fetchSeriesByID(
+	ctx context.Context,
+	id string,
+	query func(context.Context, string) (Series, error),
+) (*domain.Series, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, domain.ErrEmptySeriesID
 	}
-	row, err := r.q.GetSeriesByIDForWrite(ctx, id)
+	row, err := query(ctx, id)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
@@ -98,18 +115,12 @@ func (r *CatalogueWriteRepository) GetSeriesByID(ctx context.Context, id string)
 
 // GetSeriesByResolverKey retrieves a series by library ID and canonical resolver key.
 func (r *CatalogueWriteRepository) GetSeriesByResolverKey(ctx context.Context, libraryID, resolverKey string) (*domain.Series, error) {
-	if r == nil {
-		return nil, errors.New("catalogue write repository is required")
-	}
-	if strings.TrimSpace(libraryID) == "" {
-		return nil, domain.ErrEmptyLibraryID
-	}
-	if strings.TrimSpace(resolverKey) == "" {
-		return nil, domain.ErrEmptyResolverKey
+	if err := validateSeriesResolverKeyArgs(r, libraryID, resolverKey); err != nil {
+		return nil, err
 	}
 	row, err := r.q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
 		LibraryID:   libraryID,
-		ResolverKey: &resolverKey,
+		ResolverKey: resolverKey,
 	})
 	if err != nil {
 		return nil, mapPgError(err)
@@ -119,6 +130,19 @@ func (r *CatalogueWriteRepository) GetSeriesByResolverKey(ctx context.Context, l
 		return nil, err
 	}
 	return &out, nil
+}
+
+func validateSeriesResolverKeyArgs(r *CatalogueWriteRepository, libraryID, resolverKey string) error {
+	if r == nil {
+		return errors.New("catalogue write repository is required")
+	}
+	if strings.TrimSpace(libraryID) == "" {
+		return domain.ErrEmptyLibraryID
+	}
+	if strings.TrimSpace(resolverKey) == "" {
+		return domain.ErrEmptyResolverKey
+	}
+	return nil
 }
 
 // FindOrCreateSeriesByResolverKey resolves or atomically creates a series scoped
@@ -160,9 +184,9 @@ func findOrCreateSeriesByResolverKeyInTx(
 	series *domain.Series,
 ) (domain.Series, bool, error) {
 	resolverKey := *series.ResolverKey
-	row, err := q.GetSeriesByResolverKeyForUpdate(ctx, GetSeriesByResolverKeyForUpdateParams{
+	row, err := q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
 		LibraryID:   series.LibraryID,
-		ResolverKey: &resolverKey,
+		ResolverKey: resolverKey,
 	})
 	if err == nil {
 		out, convErr := seriesModelToDomain(row)
@@ -172,24 +196,17 @@ func findOrCreateSeriesByResolverKeyInTx(
 		return domain.Series{}, false, mapPgError(err)
 	}
 
-	for range maxFindOrCreateAttempts {
-		attempt := *series
-		params, prepErr := buildCreateSeriesParams(&attempt)
-		if prepErr != nil {
-			return domain.Series{}, false, prepErr
-		}
-		inserted, insErr := q.FindOrInsertSeriesByResolverKey(ctx, FindOrInsertSeriesByResolverKeyParams(params))
-		if insErr == nil {
-			out, convErr := seriesModelToDomain(inserted)
-			return out, true, convErr
-		}
-		if !errors.Is(insErr, pgx.ErrNoRows) {
-			return domain.Series{}, false, mapCatalogueWriteError(insErr)
-		}
+	if lockErr := q.AcquireSeriesResolverKeyLock(ctx, AcquireSeriesResolverKeyLockParams{
+		LibraryID:   series.LibraryID,
+		ResolverKey: resolverKey,
+	}); lockErr != nil {
+		return domain.Series{}, false, mapPgError(lockErr)
+	}
 
-		existing, selErr := q.GetSeriesByResolverKeyForUpdate(ctx, GetSeriesByResolverKeyForUpdateParams{
+	for range maxFindOrCreateAttempts {
+		existing, selErr := q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
 			LibraryID:   series.LibraryID,
-			ResolverKey: &resolverKey,
+			ResolverKey: resolverKey,
 		})
 		if selErr == nil {
 			out, convErr := seriesModelToDomain(existing)
@@ -197,6 +214,21 @@ func findOrCreateSeriesByResolverKeyInTx(
 		}
 		if !errors.Is(selErr, pgx.ErrNoRows) {
 			return domain.Series{}, false, mapPgError(selErr)
+		}
+
+		attempt := *series
+		params, prepErr := buildCreateSeriesParams(&attempt)
+		if prepErr != nil {
+			return domain.Series{}, false, prepErr
+		}
+		inserted, insErr := q.CreateSeries(ctx, params)
+		if insErr == nil {
+			out, convErr := seriesModelToDomain(inserted)
+			return out, true, convErr
+		}
+		mappedErr := mapCatalogueWriteError(insErr)
+		if !errors.Is(mappedErr, storage.ErrAlreadyExists) {
+			return domain.Series{}, false, mappedErr
 		}
 
 		if isoErr := ensureReadCommittedIsolation(ctx, q); isoErr != nil {
@@ -344,10 +376,28 @@ func (r *CatalogueWriteRepository) GetVolumeByID(ctx context.Context, id string)
 	if r == nil {
 		return nil, errors.New("catalogue write repository is required")
 	}
+	return r.fetchVolumeByID(ctx, id, r.q.GetVolumeByIDForWrite)
+}
+
+// GetVolumeByIDForUpdate retrieves and locks a volume row FOR UPDATE within an
+// active transaction so concurrent curator edits and field locks are observed
+// before merging or updating.
+func (r *CatalogueWriteRepository) GetVolumeByIDForUpdate(ctx context.Context, id string) (*domain.Volume, error) {
+	if r == nil {
+		return nil, errors.New("catalogue write repository is required")
+	}
+	return r.fetchVolumeByID(ctx, id, r.q.GetVolumeByIDForWriteForUpdate)
+}
+
+func (r *CatalogueWriteRepository) fetchVolumeByID(
+	ctx context.Context,
+	id string,
+	query func(context.Context, string) (Volume, error),
+) (*domain.Volume, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, domain.ErrEmptyVolumeID
 	}
-	row, err := r.q.GetVolumeByIDForWrite(ctx, id)
+	row, err := query(ctx, id)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
@@ -359,7 +409,8 @@ func (r *CatalogueWriteRepository) GetVolumeByID(ctx context.Context, id string)
 }
 
 // FindVolumesByPrimarySeriesKindNumber returns volumes in libraryID whose primary
-// membership targets seriesID and whose kind and number match, locking them FOR UPDATE.
+// membership targets seriesID and whose kind and number match, locking them FOR UPDATE
+// and rechecking the primary membership and tuple under the acquired lock.
 func (r *CatalogueWriteRepository) FindVolumesByPrimarySeriesKindNumber(
 	ctx context.Context,
 	libraryID, seriesID string,
@@ -385,11 +436,26 @@ func (r *CatalogueWriteRepository) FindVolumesByPrimarySeriesKindNumber(
 		number = 0
 	}
 
-	rows, err := r.q.FindVolumesByPrimarySeriesKindNumberForUpdate(ctx, FindVolumesByPrimarySeriesKindNumberForUpdateParams{
+	numParam := pgtype.Float8{Float64: number, Valid: true}
+	candidateIDs, err := r.q.FindVolumesByPrimarySeriesKindNumberForUpdate(ctx, FindVolumesByPrimarySeriesKindNumberForUpdateParams{
 		SeriesID:  seriesID,
 		LibraryID: libraryID,
 		Kind:      string(kind),
-		Number:    pgtype.Float8{Float64: number, Valid: true},
+		Number:    numParam,
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	if len(candidateIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := r.q.GetVerifiedVolumesByPrimarySeriesKindNumberForUpdate(ctx, GetVerifiedVolumesByPrimarySeriesKindNumberForUpdateParams{
+		SeriesID:  seriesID,
+		LibraryID: libraryID,
+		Kind:      string(kind),
+		Number:    numParam,
+		VolumeIds: candidateIDs,
 	})
 	if err != nil {
 		return nil, mapPgError(err)

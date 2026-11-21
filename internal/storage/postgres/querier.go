@@ -13,6 +13,7 @@ import (
 
 type Querier interface {
 	AcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) error
+	AcquireSeriesResolverKeyLock(ctx context.Context, arg AcquireSeriesResolverKeyLockParams) error
 	AppendDomainEvent(ctx context.Context, arg AppendDomainEventParams) (DomainEvent, error)
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
@@ -53,8 +54,7 @@ type Querier interface {
 	FindMediaAssetsWithDigestsByDigestInLibrary(ctx context.Context, arg FindMediaAssetsWithDigestsByDigestInLibraryParams) ([]FindMediaAssetsWithDigestsByDigestInLibraryRow, error)
 	FindOrInsertEntityByImportKey(ctx context.Context, arg FindOrInsertEntityByImportKeyParams) (Entity, error)
 	FindOrInsertPersonByImportKey(ctx context.Context, arg FindOrInsertPersonByImportKeyParams) (Person, error)
-	FindOrInsertSeriesByResolverKey(ctx context.Context, arg FindOrInsertSeriesByResolverKeyParams) (Series, error)
-	FindVolumesByPrimarySeriesKindNumberForUpdate(ctx context.Context, arg FindVolumesByPrimarySeriesKindNumberForUpdateParams) ([]Volume, error)
+	FindVolumesByPrimarySeriesKindNumberForUpdate(ctx context.Context, arg FindVolumesByPrimarySeriesKindNumberForUpdateParams) ([]string, error)
 	GetActiveJobByDedupeKey(ctx context.Context, dedupeKey *string) (Job, error)
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)
 	GetActivePasswordCredentialByUserID(ctx context.Context, userID string) (Credential, error)
@@ -84,8 +84,8 @@ type Querier interface {
 	GetRoleByID(ctx context.Context, id string) (Role, error)
 	GetRoleByName(ctx context.Context, name string) (Role, error)
 	GetSeriesByIDForWrite(ctx context.Context, id string) (Series, error)
+	GetSeriesByIDForWriteForUpdate(ctx context.Context, id string) (Series, error)
 	GetSeriesByResolverKey(ctx context.Context, arg GetSeriesByResolverKeyParams) (Series, error)
-	GetSeriesByResolverKeyForUpdate(ctx context.Context, arg GetSeriesByResolverKeyForUpdateParams) (Series, error)
 	GetSeriesMembershipForWrite(ctx context.Context, arg GetSeriesMembershipForWriteParams) (SeriesMembership, error)
 	GetServerLabelByName(ctx context.Context, name string) (Label, error)
 	GetSessionByID(ctx context.Context, id string) (Session, error)
@@ -95,7 +95,9 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	GetUserLabelByName(ctx context.Context, arg GetUserLabelByNameParams) (Label, error)
+	GetVerifiedVolumesByPrimarySeriesKindNumberForUpdate(ctx context.Context, arg GetVerifiedVolumesByPrimarySeriesKindNumberForUpdateParams) ([]Volume, error)
 	GetVolumeByIDForWrite(ctx context.Context, id string) (Volume, error)
+	GetVolumeByIDForWriteForUpdate(ctx context.Context, id string) (Volume, error)
 	HasFailedEventDeliveryJobSince(ctx context.Context, arg HasFailedEventDeliveryJobSinceParams) (bool, error)
 	InsertAssetDigest(ctx context.Context, arg InsertAssetDigestParams) (AssetDigest, error)
 	InsertEventSubscriber(ctx context.Context, arg InsertEventSubscriberParams) (EventSubscriber, error)

@@ -219,6 +219,7 @@ type Series struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	ResolverKey      *string
+	ResolverKeyHash  []byte
 }
 
 type SeriesMembership struct {

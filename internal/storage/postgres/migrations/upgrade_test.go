@@ -644,13 +644,16 @@ func verifySeededCatalogue0007Data(ctx context.Context, t testing.TB, db migrati
 	}
 
 	// Post-upgrade (0009): pre-existing series retain resolver_key IS NULL and coexist
-	// with keyed series; idx_series_library_resolver_key scopes uniqueness per library.
-	var nonNullSeriesKeys int
+	// with keyed series; library-scoped uniqueness and bounded index keys are enforced.
+	var nonNullSeriesKeys, nonNullSeriesHashes int
 	if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE resolver_key IS NOT NULL`).Scan(&nonNullSeriesKeys); err != nil {
 		t.Fatalf("checking series resolver_key: %v", err)
 	}
-	if nonNullSeriesKeys != 0 {
-		t.Errorf("expected pre-existing series to retain NULL resolver_key, got %d", nonNullSeriesKeys)
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE resolver_key_hash IS NOT NULL`).Scan(&nonNullSeriesHashes); err != nil {
+		t.Fatalf("checking series resolver_key_hash: %v", err)
+	}
+	if nonNullSeriesKeys != 0 || nonNullSeriesHashes != 0 {
+		t.Errorf("expected pre-existing series to retain NULL resolver_key/hash, got keys=%d hashes=%d", nonNullSeriesKeys, nonNullSeriesHashes)
 	}
 
 	if _, err := db.Exec(ctx,
