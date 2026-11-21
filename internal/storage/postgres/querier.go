@@ -13,7 +13,7 @@ import (
 
 type Querier interface {
 	AcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) error
-	AcquireSeriesResolverKeyLock(ctx context.Context, arg AcquireSeriesResolverKeyLockParams) error
+	AcquireSeriesVariantLock(ctx context.Context, variantKey string) error
 	AppendDomainEvent(ctx context.Context, arg AppendDomainEventParams) (DomainEvent, error)
 	AssignItemLabel(ctx context.Context, arg AssignItemLabelParams) error
 	AssignUserRole(ctx context.Context, arg AssignUserRoleParams) error
@@ -54,6 +54,7 @@ type Querier interface {
 	FindMediaAssetsWithDigestsByDigestInLibrary(ctx context.Context, arg FindMediaAssetsWithDigestsByDigestInLibraryParams) ([]FindMediaAssetsWithDigestsByDigestInLibraryRow, error)
 	FindOrInsertEntityByImportKey(ctx context.Context, arg FindOrInsertEntityByImportKeyParams) (Entity, error)
 	FindOrInsertPersonByImportKey(ctx context.Context, arg FindOrInsertPersonByImportKeyParams) (Person, error)
+	FindOrInsertSeriesByResolverKey(ctx context.Context, arg FindOrInsertSeriesByResolverKeyParams) (Series, error)
 	FindVolumesByPrimarySeriesKindNumberForUpdate(ctx context.Context, arg FindVolumesByPrimarySeriesKindNumberForUpdateParams) ([]string, error)
 	GetActiveJobByDedupeKey(ctx context.Context, dedupeKey *string) (Job, error)
 	GetActiveOIDCCredentialBySubject(ctx context.Context, externalSubject *string) (Credential, error)

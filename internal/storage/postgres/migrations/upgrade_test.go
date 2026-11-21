@@ -43,8 +43,11 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			}
 
 			// 2. Verify all seeded tables at the seed's starting version.
-			verifySeededData(ctx, t, db, seedVersion)
-			if seedVersion >= 7 {
+			verifySeededData(ctx, t, db, seedVersion, seedVersion >= 9)
+			switch {
+			case seedVersion >= 9:
+				verifySeededCatalogue0009Data(ctx, t, db, false)
+			case seedVersion >= 7:
 				verifySeededCatalogue0007Data(ctx, t, db, false)
 			}
 
@@ -77,8 +80,11 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 			}
 
 			// 5. Verify seeded data survived the migration to head intact.
-			verifySeededData(ctx, t, db, len(coreMigrations))
-			if seedVersion >= 7 {
+			verifySeededData(ctx, t, db, len(coreMigrations), seedVersion >= 9)
+			switch {
+			case seedVersion >= 9:
+				verifySeededCatalogue0009Data(ctx, t, db, true)
+			case seedVersion >= 7:
 				verifySeededCatalogue0007Data(ctx, t, db, true)
 			}
 
@@ -443,7 +449,7 @@ func TestUpgradeSeeds_PsqlRestore(t *testing.T) {
 	}
 }
 
-func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expectedMigrations int) {
+func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expectedMigrations int, has0009Data bool) {
 	t.Helper()
 
 	checkCount := func(table string, expected int) {
@@ -468,7 +474,11 @@ func verifySeededData(ctx context.Context, t testing.TB, db migrations.DB, expec
 		// completes the 3 personal built-in USER labels for all 3 existing users (12 total).
 		checkCount("labels", 12)
 	}
-	checkCount("item_labels", 3)
+	if has0009Data {
+		checkCount("item_labels", 4)
+	} else {
+		checkCount("item_labels", 3)
+	}
 	checkCount("user_label_policies", 2)
 	checkCount("domain_events", 2)
 	checkCount("event_subscribers", 2)
@@ -643,8 +653,9 @@ func verifySeededCatalogue0007Data(ctx context.Context, t testing.TB, db migrati
 		t.Fatalf("expected unique violation on duplicate entities(kind, import_key) after upgrade, got: %v", err)
 	}
 
-	// Post-upgrade (0009): pre-existing series retain resolver_key IS NULL and coexist
-	// with keyed series; library-scoped uniqueness and bounded index keys are enforced.
+	// Post-upgrade (0009 + 0010): pre-existing series retain resolver_key IS NULL and
+	// resolver_key_hash IS NULL; DB-enforced uniqueness over (library_id, resolver_key_hash)
+	// accepts arbitrarily long keys and rejects mismatched key/hash pairs.
 	var nonNullSeriesKeys, nonNullSeriesHashes int
 	if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE resolver_key IS NOT NULL`).Scan(&nonNullSeriesKeys); err != nil {
 		t.Fatalf("checking series resolver_key: %v", err)
@@ -656,23 +667,146 @@ func verifySeededCatalogue0007Data(ctx context.Context, t testing.TB, db migrati
 		t.Errorf("expected pre-existing series to retain NULL resolver_key/hash, got keys=%d hashes=%d", nonNullSeriesKeys, nonNullSeriesHashes)
 	}
 
+	verifyPostUpgradeSeriesResolverKeyConstraints(ctx, t, db)
+}
+
+func verifySeededCatalogue0009Data(ctx context.Context, t testing.TB, db migrations.DB, postUpgrade bool) {
+	t.Helper()
+
+	checkCount := func(table string, expected int) {
+		t.Helper()
+		var count int
+		query := fmt.Sprintf("SELECT count(*) FROM %s", table)
+		if err := db.QueryRow(ctx, query).Scan(&count); err != nil {
+			t.Fatalf("counting %s: %v", table, err)
+		}
+		if count != expected {
+			t.Errorf("table %s: expected %d rows, got %d", table, expected, count)
+		}
+	}
+
+	checkCount("libraries", 2)
+	checkCount("library_roots", 2)
+	checkCount("series", 3)
+	checkCount("volumes", 3)
+	checkCount("series_memberships", 3)
+	checkCount("media_assets", 2)
+	checkCount("asset_digests", 2)
+	checkCount("people", 3)
+	checkCount("credits", 5)
+	checkCount("entities", 4)
+	checkCount("volume_entities", 4)
+
+	// Verify the 0009-seeded keyed series and all of its references survived.
+	const (
+		keyedSeriesID = "019318a0-0000-7000-8000-000000000094"
+		keyedVolumeID = "019318a0-0000-7000-8000-000000000095"
+		keyedAssetID  = "019318a0-0000-7000-8000-000000000099"
+		keyedCreditID = "019318a0-0000-7000-8000-000000000205"
+		wantKey       = "title:run=2018:dorohedoro"
+	)
+	var gotTitle string
+	var gotKey *string
+	if err := db.QueryRow(ctx,
+		`SELECT title, resolver_key FROM series WHERE id = $1`,
+		keyedSeriesID,
+	).Scan(&gotTitle, &gotKey); err != nil {
+		t.Fatalf("missing seeded keyed series %s: %v", keyedSeriesID, err)
+	}
+	if gotTitle != "Dorohedoro" || !optStrEq(gotKey, strPtr(wantKey)) {
+		t.Fatalf("seeded keyed series = (%q, %v), want (%q, %q)", gotTitle, gotKey, "Dorohedoro", wantKey)
+	}
+
+	var hasMembership, hasAsset, hasDigest, hasCredit, hasItemLabel bool
+	if err := db.QueryRow(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM series_memberships WHERE volume_id = $1 AND series_id = $2 AND is_primary = TRUE),
+			EXISTS(SELECT 1 FROM media_assets WHERE id = $3 AND volume_id = $1),
+			EXISTS(SELECT 1 FROM asset_digests WHERE asset_id = $3 AND kind = 'XXH3_64_PARTIAL' AND is_current = TRUE),
+			EXISTS(SELECT 1 FROM credits WHERE id = $4 AND series_id = $2 AND role = 'ARTIST'),
+			EXISTS(SELECT 1 FROM item_labels WHERE label_id = '019318a0-0000-7000-8000-000000000033' AND item_type = 'SERIES' AND item_id = $2)`,
+		keyedVolumeID, keyedSeriesID, keyedAssetID, keyedCreditID,
+	).Scan(&hasMembership, &hasAsset, &hasDigest, &hasCredit, &hasItemLabel); err != nil {
+		t.Fatalf("checking keyed series references: %v", err)
+	}
+	if !hasMembership || !hasAsset || !hasDigest || !hasCredit || !hasItemLabel {
+		t.Fatalf("missing keyed series references: membership=%v asset=%v digest=%v credit=%v item_label=%v",
+			hasMembership, hasAsset, hasDigest, hasCredit, hasItemLabel)
+	}
+
+	if !postUpgrade {
+		return
+	}
+
+	// Verify 0010 backfilled resolver_key_hash for pre-existing keyed series while
+	// leaving pre-existing unkeyed series (0090, 0091) with NULL resolver_key_hash.
+	var hashMatches bool
+	if err := db.QueryRow(ctx,
+		`SELECT resolver_key_hash IS NOT NULL
+		    AND octet_length(resolver_key_hash) = 32
+		    AND resolver_key_hash = sha256(convert_to($2, 'UTF8'))
+		 FROM series WHERE id = $1`,
+		keyedSeriesID, wantKey,
+	).Scan(&hashMatches); err != nil || !hashMatches {
+		t.Fatalf("expected backfilled 32-byte SHA-256 resolver_key_hash on seeded keyed series %s: matches=%v err=%v", keyedSeriesID, hashMatches, err)
+	}
+
+	var unkeyedNullCount int
+	if err := db.QueryRow(ctx,
+		`SELECT count(*) FROM series WHERE id IN ('019318a0-0000-7000-8000-000000000090', '019318a0-0000-7000-8000-000000000091') AND resolver_key IS NULL AND resolver_key_hash IS NULL`,
+	).Scan(&unkeyedNullCount); err != nil || unkeyedNullCount != 2 {
+		t.Fatalf("expected 2 unkeyed series to retain NULL key/hash, got %d (err=%v)", unkeyedNullCount, err)
+	}
+
+	// Duplicate of the 0009-seeded keyed series in library 0080 must fail with unique violation.
 	if _, err := db.Exec(ctx,
-		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
-		 VALUES ('post-s1', '019318a0-0000-7000-8000-000000000080', 'One Piece', 'one piece', 'title:run=none:one piece')`,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key, resolver_key_hash)
+		 VALUES ('post-s0', '019318a0-0000-7000-8000-000000000080', 'Dorohedoro Dup', 'dorohedoro', $1, sha256(convert_to($1, 'UTF8')))`,
+		wantKey,
+	); !isUniqueViolation(err) {
+		t.Fatalf("expected unique violation duplicating seeded keyed series across 0010 upgrade, got: %v", err)
+	}
+
+	verifyPostUpgradeSeriesResolverKeyConstraints(ctx, t, db)
+}
+
+func verifyPostUpgradeSeriesResolverKeyConstraints(ctx context.Context, t testing.TB, db migrations.DB) {
+	t.Helper()
+
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key, resolver_key_hash)
+		 VALUES ('post-s1', '019318a0-0000-7000-8000-000000000080', 'One Piece', 'one piece', 'title:run=none:one piece', sha256(convert_to('title:run=none:one piece', 'UTF8')))`,
 	); err != nil {
 		t.Fatalf("inserting keyed series alongside pre-upgrade One Piece failed: %v", err)
 	}
 	if _, err := db.Exec(ctx,
-		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
-		 VALUES ('post-s2', '019318a0-0000-7000-8000-000000000081', 'One Piece', 'one piece', 'title:run=none:one piece')`,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key, resolver_key_hash)
+		 VALUES ('post-s2', '019318a0-0000-7000-8000-000000000081', 'One Piece', 'one piece', 'title:run=none:one piece', sha256(convert_to('title:run=none:one piece', 'UTF8')))`,
 	); err != nil {
 		t.Fatalf("inserting same resolver_key in another library failed: %v", err)
 	}
 	if _, err := db.Exec(ctx,
-		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
-		 VALUES ('post-s3', '019318a0-0000-7000-8000-000000000080', 'One Piece Dup', 'one piece', 'title:run=none:one piece')`,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key, resolver_key_hash)
+		 VALUES ('post-s3', '019318a0-0000-7000-8000-000000000080', 'One Piece Dup', 'one piece', 'title:run=none:one piece', sha256(convert_to('title:run=none:one piece', 'UTF8')))`,
 	); !isUniqueViolation(err) {
-		t.Fatalf("expected unique violation on duplicate series(library_id, resolver_key) after upgrade, got: %v", err)
+		t.Fatalf("expected unique violation on duplicate series(library_id, resolver_key_hash) after upgrade, got: %v", err)
+	}
+
+	longKey := "title:run=2020:" + strings.Repeat("x", 4500)
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key, resolver_key_hash)
+		 VALUES ('post-s-long', '019318a0-0000-7000-8000-000000000080', 'Long Title', 'long title', $1, sha256(convert_to($1, 'UTF8')))`,
+		longKey,
+	); err != nil {
+		t.Fatalf("inserting >4000-byte resolver_key after 0010 failed: %v", err)
+	}
+
+	// CHECK constraint requires resolver_key and resolver_key_hash to stay paired.
+	if _, err := db.Exec(ctx,
+		`INSERT INTO series (id, library_id, title, title_sort, resolver_key)
+		 VALUES ('post-s-bad-pair', '019318a0-0000-7000-8000-000000000080', 'Bad', 'bad', 'title:run=none:bad')`,
+	); err == nil {
+		t.Fatal("expected CHECK violation when resolver_key is set without resolver_key_hash")
 	}
 }
 

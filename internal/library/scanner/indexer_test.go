@@ -1543,10 +1543,6 @@ func TestIndexer_InputValidation(t *testing.T) {
 			}
 		})
 	}
-
-	if _, err := idx.IndexFileInTx(ctx, nil, scanner.IndexFileInput{}); !errors.Is(err, storage.ErrTransactionRequired) {
-		t.Fatalf("IndexFileInTx(nil) = %v, want storage.ErrTransactionRequired", err)
-	}
 }
 
 func waitForBlockedVolumeRowLock(ctx context.Context, t *testing.T, db *testdb.TestDB) {
@@ -1843,131 +1839,6 @@ func TestIndexer_ConcurrentTargetAndAutoMatchObserveCuratorFieldLocks(t *testing
 
 func strPtrPtr(s string) *string { return &s }
 
-func TestIndexer_IndexFileInTxSavepointRollbackPreservesOuterWork(t *testing.T) {
-	t.Parallel()
-	db, transactor := setupIndexerTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	var (
-		lib  domain.Library
-		root domain.LibraryRoot
-	)
-	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
-		var roots []domain.LibraryRoot
-		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Savepoint Lib", nil, []byte("/srv/savepoint"))
-		root = roots[0]
-		return nil
-	}); err != nil {
-		t.Fatalf("seed failed: %v", err)
-	}
-
-	idx, err := scanner.NewIndexer(transactor, scanner.IndexerOptions{})
-	if err != nil {
-		t.Fatalf("NewIndexer: %v", err)
-	}
-
-	injectedErr := errors.New("late second-event append failure")
-	var res1, res3 *scanner.IndexFileResult
-	rawBadPath := []byte{'F', 'a', 'i', 'l', 'e', 'd', 0xff, '/', 'B', 'a', 'd', ' ', 'v', '0', '1', '.', 'c', 'b', 'z'}
-
-	err = transactor.WithTx(ctx, func(tx storage.Tx) error {
-		var err error
-		res1, err = idx.IndexFileInTx(ctx, tx, scanner.IndexFileInput{
-			LibraryID:     lib.ID,
-			LibraryRootID: root.ID,
-			Inspected: scanner.InspectedFile{
-				RelPath:    mustRelIdentity(t, []byte("Outer One v01.cbz")),
-				Size:       1000,
-				Format:     domain.MediaFormatCBZ,
-				DigestKind: domain.DigestKindXXH364Partial,
-				Digest:     "4040404040404041",
-				PageCount:  20,
-				ComicInfo:  &comicinfo.Metadata{Series: "Outer One", Number: "1", Writer: []string{"Writer One"}},
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("file 1: %w", err)
-		}
-
-		// File 2 writes series, volume, membership, asset, digest, credits, entities, AND
-		// asset.added, then fails when appending asset.invalid_utf8_path.
-		faultTx := &faultInjectingTx{Tx: tx, failStage: "event_invalid_utf8", err: injectedErr}
-		_, failErr := idx.IndexFileInTx(ctx, faultTx, scanner.IndexFileInput{
-			LibraryID:     lib.ID,
-			LibraryRootID: root.ID,
-			Inspected: scanner.InspectedFile{
-				RelPath:    mustRelIdentity(t, rawBadPath),
-				Size:       2000,
-				Format:     domain.MediaFormatCBZ,
-				DigestKind: domain.DigestKindXXH364Partial,
-				Digest:     "4040404040404042",
-				PageCount:  30,
-				ComicInfo:  &comicinfo.Metadata{Series: "Failed Mid-Tx Series", Number: "1", Writer: []string{"Rolled Back Writer"}, Characters: []string{"Rolled Back Hero"}},
-			},
-		})
-		if !errors.Is(failErr, injectedErr) {
-			return fmt.Errorf("expected injected error on file 2, got %v", failErr)
-		}
-
-		res3, err = idx.IndexFileInTx(ctx, tx, scanner.IndexFileInput{
-			LibraryID:     lib.ID,
-			LibraryRootID: root.ID,
-			Inspected: scanner.InspectedFile{
-				RelPath:    mustRelIdentity(t, []byte("Outer Three v01.cbz")),
-				Size:       3000,
-				Format:     domain.MediaFormatCBZ,
-				DigestKind: domain.DigestKindXXH364Partial,
-				Digest:     "4040404040404043",
-				PageCount:  40,
-				ComicInfo:  &comicinfo.Metadata{Series: "Outer Three", Number: "1", Writer: []string{"Writer Three"}},
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("file 3: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("outer WithTx failed: %v", err)
-	}
-
-	for _, check := range []struct {
-		table string
-		want  int
-	}{
-		{"series", 2},
-		{"volumes", 2},
-		{"series_memberships", 2},
-		{"media_assets", 2},
-		{"asset_digests", 2},
-		{"people", 2},
-		{"credits", 2},
-		{"entities", 0},
-		{"volume_entities", 0},
-		{"domain_events", 2},
-	} {
-		var got int
-		if err := db.QueryRow(ctx, "SELECT COUNT(*) FROM "+check.table).Scan(&got); err != nil {
-			t.Fatalf("count %s: %v", check.table, err)
-		}
-		if got != check.want {
-			t.Fatalf("%s count = %d, want %d (only file 1 and file 3 should commit)", check.table, got, check.want)
-		}
-	}
-
-	// Verify the 2 committed events belong strictly to file 1 and file 3.
-	published, err := postgres.NewEventRepository(db.Pool).PublishUnsequencedEvents(ctx, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("PublishUnsequencedEvents: %v", err)
-	}
-	if len(published) != 2 ||
-		published[0].AggregateID != res1.Asset.ID || published[0].Kind != domain.EventAssetAdded ||
-		published[1].AggregateID != res3.Asset.ID || published[1].Kind != domain.EventAssetAdded {
-		t.Fatalf("unexpected committed events: %+v", published)
-	}
-}
-
 func makeIncompressibleTitle(seed uint64, length int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	var b strings.Builder
@@ -2092,7 +1963,7 @@ func TestIndexer_LongPoorlyCompressibleSeriesKeyAndHashCollisionIsolation(t *tes
 		}
 
 		// Force Series Alpha's resolver_key_hash to equal Beta's SHA-256 token,
-		// simulating an exact collision on the bounded index representation.
+		// simulating an exact collision on the bounded unique digest index.
 		betaKey := "title:run=none:collision beta"
 		betaSum := sha256.Sum256([]byte(betaKey))
 		if _, err := db.Exec(ctx,
@@ -2102,7 +1973,9 @@ func TestIndexer_LongPoorlyCompressibleSeriesKeyAndHashCollisionIsolation(t *tes
 			t.Fatalf("inject hash collision: %v", err)
 		}
 
-		betaRes, err := idx.IndexFile(ctx, scanner.IndexFileInput{
+		// Both IndexFile and GetSeriesByResolverKey must surface an explicit
+		// ErrResolverKeyHashCollision rather than silently attaching Beta to Alpha.
+		_, err = idx.IndexFile(ctx, scanner.IndexFileInput{
 			LibraryID:     lib.ID,
 			LibraryRootID: root.ID,
 			Inspected: scanner.InspectedFile{
@@ -2114,38 +1987,218 @@ func TestIndexer_LongPoorlyCompressibleSeriesKeyAndHashCollisionIsolation(t *tes
 				ComicInfo:  &comicinfo.Metadata{Series: "Collision Beta", Number: "1"},
 			},
 		})
-		if err != nil {
-			t.Fatalf("IndexFile beta #1 under hash collision: %v", err)
-		}
-		if !betaRes.SeriesCreated || betaRes.Series.ID == alphaRes.Series.ID {
-			t.Fatalf("lookup attached to wrong exact key despite colliding hash: alpha=%s beta=%+v", alphaRes.Series.ID, betaRes.Series)
+		if !errors.Is(err, storage.ErrResolverKeyHashCollision) {
+			t.Fatalf("IndexFile beta under hash collision = %v, want storage.ErrResolverKeyHashCollision", err)
 		}
 
-		betaReuse, err := idx.IndexFile(ctx, scanner.IndexFileInput{
+		_, err = postgres.NewCatalogueWriteRepository(db.Pool).GetSeriesByResolverKey(ctx, lib.ID, betaKey)
+		if !errors.Is(err, storage.ErrResolverKeyHashCollision) {
+			t.Fatalf("GetSeriesByResolverKey(beta) = %v, want storage.ErrResolverKeyHashCollision", err)
+		}
+
+		// Verify Beta's asset never attached to Alpha and Alpha still owns only its original volume.
+		var alphaVolumes int
+		if err := db.QueryRow(ctx,
+			`SELECT count(*) FROM series_memberships WHERE series_id = $1`,
+			alphaRes.Series.ID,
+		).Scan(&alphaVolumes); err != nil {
+			t.Fatalf("count alpha memberships: %v", err)
+		}
+		if alphaVolumes != 1 {
+			t.Fatalf("alpha membership count = %d, want 1 (Beta must never attach to Alpha)", alphaVolumes)
+		}
+	})
+}
+
+func TestIndexer_ConcurrentNewNumberInExistingSeriesAttachesToOneVolume(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Variant Race Lib", nil, []byte("/srv/variant-race"))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	idx, err := scanner.NewIndexer(transactor, scanner.IndexerOptions{})
+	if err != nil {
+		t.Fatalf("NewIndexer: %v", err)
+	}
+
+	// Seed the existing series with Volume 1 so the series already exists before
+	// concurrent workers index a previously unseen number (#2).
+	seedRes, err := idx.IndexFile(ctx, scanner.IndexFileInput{
+		LibraryID:     lib.ID,
+		LibraryRootID: root.ID,
+		Inspected: scanner.InspectedFile{
+			RelPath:    mustRelIdentity(t, []byte("Variant Race v01.cbz")),
+			Size:       1000,
+			Format:     domain.MediaFormatCBZ,
+			DigestKind: domain.DigestKindXXH364Partial,
+			Digest:     "7070707070707071",
+			PageCount:  100,
+			ComicInfo:  &comicinfo.Metadata{Series: "Variant Race", Number: "1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed volume 1: %v", err)
+	}
+
+	// Deterministic serialization witness: hold AcquireSeriesVariantLock(series, VOLUME, 99),
+	// start a concurrent IndexFile for #99, verify it blocks on the advisory lock, create #99
+	// before releasing, and confirm the waiting indexer attaches to the newly committed volume
+	// rather than creating a second volume.
+	holdEntered := make(chan struct{})
+	releaseHold := make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- transactor.WithTx(ctx, func(tx storage.Tx) error {
+			cw := tx.CatalogueWrites()
+			if err := cw.AcquireSeriesVariantLock(ctx, seedRes.Series.ID, domain.VolumeKindVolume, 99); err != nil {
+				return err
+			}
+			close(holdEntered)
+			<-releaseHold
+
+			num := 99.0
+			vol := domain.Volume{LibraryID: lib.ID, Kind: domain.VolumeKindVolume, Number: &num}
+			if err := cw.CreateVolume(ctx, &vol); err != nil {
+				return err
+			}
+			return tx.SeriesMemberships().SetVolumeMemberships(ctx, vol.ID, []domain.SeriesMembership{
+				{VolumeID: vol.ID, SeriesID: seedRes.Series.ID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &num, Source: domain.MembershipSourceResolver},
+			})
+		})
+	}()
+	<-holdEntered
+
+	waiterResCh := make(chan *scanner.IndexFileResult, 1)
+	waiterErrCh := make(chan error, 1)
+	go func() {
+		r, err := idx.IndexFile(ctx, scanner.IndexFileInput{
 			LibraryID:     lib.ID,
 			LibraryRootID: root.ID,
 			Inspected: scanner.InspectedFile{
-				RelPath:    mustRelIdentity(t, []byte("beta-2.cbz")),
-				Size:       100,
+				RelPath:    mustRelIdentity(t, []byte("Variant Race v99-waiter.cbz")),
+				Size:       1500,
 				Format:     domain.MediaFormatCBZ,
 				DigestKind: domain.DigestKindXXH364Partial,
-				Digest:     "6060606060606063",
-				ComicInfo:  &comicinfo.Metadata{Series: "Collision Beta", Number: "2"},
+				Digest:     "7070707070707099",
+				PageCount:  120,
+				ComicInfo:  &comicinfo.Metadata{Series: "Variant Race", Number: "99"},
 			},
 		})
-		if err != nil {
-			t.Fatalf("IndexFile beta #2: %v", err)
-		}
-		if betaReuse.SeriesCreated || betaReuse.Series.ID != betaRes.Series.ID {
-			t.Fatalf("expected beta #2 to reuse beta series %s, got created=%v id=%s", betaRes.Series.ID, betaReuse.SeriesCreated, betaReuse.Series.ID)
-		}
+		waiterResCh <- r
+		waiterErrCh <- err
+	}()
 
-		gotBeta, err := postgres.NewCatalogueWriteRepository(db.Pool).GetSeriesByResolverKey(ctx, lib.ID, betaKey)
-		if err != nil {
-			t.Fatalf("GetSeriesByResolverKey(beta): %v", err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int
+		if err := db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+		).Scan(&waiting); err == nil && waiting > 0 {
+			break
 		}
-		if gotBeta.ID != betaRes.Series.ID {
-			t.Fatalf("GetSeriesByResolverKey(beta) = %s, want %s", gotBeta.ID, betaRes.Series.ID)
+		if time.Now().After(deadline) {
+			close(releaseHold)
+			t.Fatal("timed out waiting for IndexFile to block on AcquireSeriesVariantLock")
 		}
-	})
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(releaseHold)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("holder tx: %v", err)
+	}
+	waiterRes := <-waiterResCh
+	if err := <-waiterErrCh; err != nil {
+		t.Fatalf("waiter IndexFile: %v", err)
+	}
+	if waiterRes.VolumeCreated {
+		t.Fatalf("expected waiter to attach to holder's committed #99 volume, got VolumeCreated=true (%s)", waiterRes.Volume.ID)
+	}
+
+	// Concurrent race: two goroutines simultaneously index a previously unseen number (#2)
+	// in the seeded series; both must serialize and attach to a single volume #2.
+	const workers = 2
+	start := make(chan struct{})
+	type workerOutcome struct {
+		res *scanner.IndexFileResult
+		err error
+	}
+	outcomes := make([]workerOutcome, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := range workers {
+		go func(idxNum int) {
+			defer wg.Done()
+			<-start
+			r, err := idx.IndexFile(ctx, scanner.IndexFileInput{
+				LibraryID:     lib.ID,
+				LibraryRootID: root.ID,
+				Inspected: scanner.InspectedFile{
+					RelPath:    mustRelIdentity(t, []byte(fmt.Sprintf("Variant Race v02-%d.cbz", idxNum))),
+					Size:       int64(2000 + idxNum),
+					Format:     domain.MediaFormatCBZ,
+					DigestKind: domain.DigestKindXXH364Partial,
+					Digest:     fmt.Sprintf("707070707070702%d", idxNum),
+					PageCount:  150,
+					ComicInfo:  &comicinfo.Metadata{Series: "Variant Race", Number: "2"},
+				},
+			})
+			outcomes[idxNum] = workerOutcome{res: r, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var vol2ID string
+	createdVol2 := 0
+	for i, o := range outcomes {
+		if o.err != nil {
+			t.Fatalf("concurrent worker %d failed: %v", i, o.err)
+		}
+		if vol2ID == "" {
+			vol2ID = o.res.Volume.ID
+		} else if o.res.Volume.ID != vol2ID {
+			t.Fatalf("concurrent workers created separate #2 volumes: %s vs %s", vol2ID, o.res.Volume.ID)
+		}
+		if o.res.VolumeCreated {
+			createdVol2++
+		}
+	}
+	if createdVol2 != 1 {
+		t.Fatalf("createdVol2 = %d, want 1", createdVol2)
+	}
+
+	var vol2Count int
+	if err := db.QueryRow(ctx,
+		`SELECT count(*) FROM volumes WHERE library_id = $1 AND kind = 'VOLUME' AND number = 2`,
+		lib.ID,
+	).Scan(&vol2Count); err != nil {
+		t.Fatalf("count volume #2: %v", err)
+	}
+	if vol2Count != 1 {
+		t.Fatalf("volume #2 row count = %d, want 1", vol2Count)
+	}
+
+	var assetCount int
+	if err := db.QueryRow(ctx,
+		`SELECT count(*) FROM media_assets WHERE volume_id = $1`,
+		vol2ID,
+	).Scan(&assetCount); err != nil {
+		t.Fatalf("count volume #2 assets: %v", err)
+	}
+	if assetCount != workers {
+		t.Fatalf("volume #2 asset count = %d, want %d", assetCount, workers)
+	}
 }

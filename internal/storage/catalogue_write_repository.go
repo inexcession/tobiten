@@ -18,6 +18,7 @@ type CatalogueWriteRepository interface {
 	GetSeriesByIDForUpdate(ctx context.Context, id string) (*domain.Series, error)
 	GetSeriesByResolverKey(ctx context.Context, libraryID, resolverKey string) (*domain.Series, error)
 	FindOrCreateSeriesByResolverKey(ctx context.Context, series *domain.Series) (created bool, err error)
+	AcquireSeriesVariantLock(ctx context.Context, seriesID string, kind domain.VolumeKind, number float64) error
 	UpdateSeries(ctx context.Context, series *domain.Series) error
 
 	// Volumes

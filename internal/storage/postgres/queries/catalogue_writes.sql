@@ -25,11 +25,12 @@ INSERT INTO series (
     release_year,
     created_at,
     updated_at,
-    resolver_key
+    resolver_key,
+    resolver_key_hash
 )
 VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
 )
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,
@@ -37,13 +38,51 @@ RETURNING id, library_id, title, title_sort, language, original_title, romaji_ti
           locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
           resolver_key, resolver_key_hash;
 
--- name: AcquireSeriesResolverKeyLock :exec
+-- name: FindOrInsertSeriesByResolverKey :one
+INSERT INTO series (
+    id,
+    library_id,
+    title,
+    title_sort,
+    language,
+    original_title,
+    romaji_title,
+    franchise,
+    edition_name,
+    publisher,
+    imprint,
+    status,
+    summary,
+    age_rating,
+    genres,
+    tags,
+    cover_policy,
+    cover_volume_id,
+    cover_image_digest,
+    locked_fields,
+    external_ids,
+    total_volumes,
+    release_year,
+    created_at,
+    updated_at,
+    resolver_key,
+    resolver_key_hash
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+    $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+)
+ON CONFLICT (library_id, resolver_key_hash) WHERE resolver_key_hash IS NOT NULL DO NOTHING
+RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
+          franchise, edition_name, publisher, imprint, status, summary, age_rating,
+          genres, tags, cover_policy, cover_volume_id, cover_image_digest,
+          locked_fields, external_ids, total_volumes, release_year, created_at, updated_at,
+          resolver_key, resolver_key_hash;
+
+-- name: AcquireSeriesVariantLock :exec
 SELECT pg_advisory_xact_lock(
-    1414746699,
-    hashtext(
-        sqlc.arg(library_id)::text || ':' ||
-        encode(sha256(convert_to(sqlc.arg(resolver_key)::text, 'UTF8')), 'hex')
-    )
+    1414747724,
+    hashtext(sqlc.arg(variant_key)::text)
 );
 
 -- name: GetSeriesByIDForWrite :one
@@ -73,8 +112,7 @@ SELECT id, library_id, title, title_sort, language, original_title, romaji_title
        resolver_key, resolver_key_hash
 FROM series
 WHERE library_id = $1
-  AND resolver_key_hash = sha256(convert_to(sqlc.arg(resolver_key)::text, 'UTF8'))
-  AND resolver_key = sqlc.arg(resolver_key)::text;
+  AND resolver_key_hash = $2;
 
 -- name: UpdateSeries :one
 UPDATE series
@@ -101,7 +139,8 @@ SET library_id = $2,
     total_volumes = $22,
     release_year = $23,
     updated_at = $24,
-    resolver_key = $25
+    resolver_key = $25,
+    resolver_key_hash = $26
 WHERE id = $1
 RETURNING id, library_id, title, title_sort, language, original_title, romaji_title,
           franchise, edition_name, publisher, imprint, status, summary, age_rating,

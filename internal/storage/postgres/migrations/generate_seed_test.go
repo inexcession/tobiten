@@ -291,3 +291,101 @@ func TestGenerateSeed0007(t *testing.T) {
 	}
 	t.Logf("Successfully generated seed fixture: %s (%d bytes)", target, len(out))
 }
+
+const sampleCatalogue0009DataSQL = `
+-- 16. 0009-seeded keyed series and its references (volumes, memberships, assets, credits, item_labels)
+INSERT INTO series (id, library_id, title, title_sort, status, created_at, updated_at, resolver_key) VALUES
+    ('019318a0-0000-7000-8000-000000000094', '019318a0-0000-7000-8000-000000000080', 'Dorohedoro', 'Dorohedoro', 'COMPLETED', '2026-11-11 10:00:00+00', '2026-11-11 10:00:00+00', 'title:run=2018:dorohedoro');
+
+INSERT INTO volumes (id, library_id, kind, number, title, page_count, created_at, updated_at) VALUES
+    ('019318a0-0000-7000-8000-000000000095', '019318a0-0000-7000-8000-000000000080', 'VOLUME', 1, 'Dorohedoro v01', 192, '2026-11-11 10:00:00+00', '2026-11-11 10:00:00+00');
+
+INSERT INTO series_memberships (volume_id, series_id, is_primary, kind, position, source, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000095', '019318a0-0000-7000-8000-000000000094', true, 'SERIES', 1, 'RESOLVER', '{}'::jsonb);
+
+INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format, page_count, created_at, updated_at) VALUES
+    ('019318a0-0000-7000-8000-000000000099', '019318a0-0000-7000-8000-000000000095', '019318a0-0000-7000-8000-000000000085', '\x446f726f6865646f726f207630312e63627a', 'Dorohedoro v01.cbz', 'Dorohedoro v01.cbz', 2097152, 'CBZ', 192, '2026-11-11 10:00:00+00', '2026-11-11 10:00:00+00');
+
+INSERT INTO asset_digests (asset_id, kind, value, is_current, reason, recorded_at) VALUES
+    ('019318a0-0000-7000-8000-000000000099', 'XXH3_64_PARTIAL', 'fedcba9876543210', true, 'SCAN', '2026-11-11 10:00:00+00');
+
+INSERT INTO credits (id, person_id, series_id, volume_id, role, position, locked_fields) VALUES
+    ('019318a0-0000-7000-8000-000000000205', '019318a0-0000-7000-8000-000000000101', '019318a0-0000-7000-8000-000000000094', NULL, 'ARTIST', 0, '{}'::jsonb);
+
+INSERT INTO item_labels (label_id, item_type, item_id) VALUES
+    ('019318a0-0000-7000-8000-000000000033', 'SERIES', '019318a0-0000-7000-8000-000000000094');
+`
+
+// TestGenerateSeed0009 is a maintenance generator invoked with:
+//
+//	go test -v -tags=generator -run TestGenerateSeed0009 ./internal/storage/postgres/migrations/...
+//
+// It boots a temporary PostgreSQL instance, applies 0001_init.sql + M1A seed data,
+// upgrades through 0009, inserts populated 0007 + 0009 catalogue rows (including a
+// keyed series and its referencing rows), dumps via pg_dump, and writes
+// testdata/seeds/0009.sql.
+func TestGenerateSeed0009(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+
+	coreMigrations, err := migrations.Collect(migrations.CoreFS)
+	if err != nil {
+		t.Fatalf("collecting core migrations: %v", err)
+	}
+	var mig0001 []migrations.Migration
+	var migsUpTo9 []migrations.Migration
+	for _, m := range coreMigrations {
+		if m.Version == 1 {
+			mig0001 = append(mig0001, m)
+		}
+		if m.Version <= 9 {
+			migsUpTo9 = append(migsUpTo9, m)
+		}
+	}
+	if len(mig0001) != 1 || len(migsUpTo9) != 9 {
+		t.Fatalf("expected 1 migration at v1 and 9 up to v9, got %d and %d", len(mig0001), len(migsUpTo9))
+	}
+	if err := migrations.Run(ctx, db, mig0001); err != nil {
+		t.Fatalf("applying 0001_init.sql: %v", err)
+	}
+	if _, err := db.Exec(ctx, sampleSeedDataSQL); err != nil {
+		t.Fatalf("inserting sample M1A seed rows: %v", err)
+	}
+	if err := migrations.Run(ctx, db, migsUpTo9); err != nil {
+		t.Fatalf("applying migrations 0002..0009: %v", err)
+	}
+	if _, err := db.Exec(ctx, sampleCatalogue0007DataSQL); err != nil {
+		t.Fatalf("inserting sample catalogue 0007 seed rows: %v", err)
+	}
+	if _, err := db.Exec(ctx, sampleCatalogue0009DataSQL); err != nil {
+		t.Fatalf("inserting sample catalogue 0009 seed rows: %v", err)
+	}
+
+	pgDumpPath, err := findPgDump()
+	if err != nil {
+		t.Fatalf("pg_dump not found: %v", err)
+	}
+
+	cmd := exec.Command(pgDumpPath,
+		"--no-owner",
+		"--no-privileges",
+		"--inserts",
+		db.URL,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_dump failed: %v\nOutput: %s", err, string(out))
+	}
+
+	seedsDir := filepath.Join("testdata", "seeds")
+	if err := os.MkdirAll(seedsDir, 0755); err != nil {
+		t.Fatalf("creating seeds dir: %v", err)
+	}
+
+	out = append(bytes.TrimRight(out, "\r\n"), '\n')
+	target := filepath.Join(seedsDir, "0009.sql")
+	if err := os.WriteFile(target, out, 0644); err != nil {
+		t.Fatalf("writing seed file %s: %v", target, err)
+	}
+	t.Logf("Successfully generated seed fixture: %s (%d bytes)", target, len(out))
+}

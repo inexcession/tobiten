@@ -2053,3 +2053,143 @@ func TestCatalogueWriteRepository_FindVolumesByPrimarySeriesKindNumber(t *testin
 		t.Fatalf("transaction failed: %v", err)
 	}
 }
+
+func TestCatalogueWriteRepository_RepeatableReadResolverKeyUniqueness(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var libID string
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, _ := seedTestLibraryAndRoot(ctx, t, tx, "RR Isolation Lib", []byte("/srv/rr"))
+		libID = lib.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("seed library: %v", err)
+	}
+
+	rrOpts := pgx.TxOptions{IsoLevel: pgx.RepeatableRead}
+
+	t.Run("CreateSeries_concurrent_repeatable_read_enforces_unique_digest", func(t *testing.T) {
+		key := "title:run=2024:rr-create"
+
+		tx1, err := db.Pool.BeginTx(ctx, rrOpts)
+		if err != nil {
+			t.Fatalf("begin tx1: %v", err)
+		}
+		defer func() { _ = tx1.Rollback(ctx) }()
+
+		tx2, err := db.Pool.BeginTx(ctx, rrOpts)
+		if err != nil {
+			t.Fatalf("begin tx2: %v", err)
+		}
+		defer func() { _ = tx2.Rollback(ctx) }()
+
+		// Establish both REPEATABLE READ snapshots before either writes.
+		var c1, c2 int
+		if err := tx1.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1`, libID).Scan(&c1); err != nil {
+			t.Fatalf("snapshot tx1: %v", err)
+		}
+		if err := tx2.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1`, libID).Scan(&c2); err != nil {
+			t.Fatalf("snapshot tx2: %v", err)
+		}
+
+		s1 := domain.Series{
+			LibraryID:   libID,
+			ResolverKey: &key,
+			Title:       "RR Create One",
+			TitleSort:   "rr create one",
+			Status:      domain.SeriesStatusOngoing,
+		}
+		if err := postgres.NewCatalogueWriteRepository(tx1).CreateSeries(ctx, &s1); err != nil {
+			t.Fatalf("tx1 CreateSeries: %v", err)
+		}
+		if err := tx1.Commit(ctx); err != nil {
+			t.Fatalf("tx1 Commit: %v", err)
+		}
+
+		s2 := domain.Series{
+			LibraryID:   libID,
+			ResolverKey: &key,
+			Title:       "RR Create Two",
+			TitleSort:   "rr create two",
+			Status:      domain.SeriesStatusOngoing,
+		}
+		err = postgres.NewCatalogueWriteRepository(tx2).CreateSeries(ctx, &s2)
+		if !errors.Is(err, storage.ErrAlreadyExists) {
+			t.Fatalf("tx2 CreateSeries err = %v, want storage.ErrAlreadyExists", err)
+		}
+
+		var count int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1 AND resolver_key = $2`, libID, key).Scan(&count); err != nil {
+			t.Fatalf("count committed rows: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("committed series count = %d, want 1", count)
+		}
+	})
+
+	t.Run("FindOrCreateSeriesByResolverKey_concurrent_repeatable_read_rejects_stale_snapshot", func(t *testing.T) {
+		key := "title:run=2024:rr-find-or-create"
+
+		tx1, err := db.Pool.BeginTx(ctx, rrOpts)
+		if err != nil {
+			t.Fatalf("begin tx1: %v", err)
+		}
+		defer func() { _ = tx1.Rollback(ctx) }()
+
+		tx2, err := db.Pool.BeginTx(ctx, rrOpts)
+		if err != nil {
+			t.Fatalf("begin tx2: %v", err)
+		}
+		defer func() { _ = tx2.Rollback(ctx) }()
+
+		// Establish both REPEATABLE READ snapshots before either transaction writes.
+		var c1, c2 int
+		if err := tx1.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1`, libID).Scan(&c1); err != nil {
+			t.Fatalf("snapshot tx1: %v", err)
+		}
+		if err := tx2.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1`, libID).Scan(&c2); err != nil {
+			t.Fatalf("snapshot tx2: %v", err)
+		}
+
+		s1 := domain.Series{
+			LibraryID:   libID,
+			ResolverKey: &key,
+			Title:       "RR FindOrCreate One",
+			TitleSort:   "rr find or create one",
+			Status:      domain.SeriesStatusOngoing,
+		}
+		created1, err := postgres.NewCatalogueWriteRepository(tx1).FindOrCreateSeriesByResolverKey(ctx, &s1)
+		if err != nil || !created1 {
+			t.Fatalf("tx1 FindOrCreateSeriesByResolverKey = (created=%v, err=%v), want (true, nil)", created1, err)
+		}
+		if err := tx1.Commit(ctx); err != nil {
+			t.Fatalf("tx1 Commit: %v", err)
+		}
+
+		s2 := domain.Series{
+			LibraryID:   libID,
+			ResolverKey: &key,
+			Title:       "RR FindOrCreate Two",
+			TitleSort:   "rr find or create two",
+			Status:      domain.SeriesStatusOngoing,
+		}
+		created2, err := postgres.NewCatalogueWriteRepository(tx2).FindOrCreateSeriesByResolverKey(ctx, &s2)
+		var pgErr *pgconn.PgError
+		isSerializationErr := errors.As(err, &pgErr) && pgErr.Code == "40001"
+		if !errors.Is(err, storage.ErrTransactionIsolation) && !isSerializationErr {
+			t.Fatalf("tx2 FindOrCreateSeriesByResolverKey = (created=%v, err=%v), want ErrTransactionIsolation or SQLSTATE 40001", created2, err)
+		}
+
+		var count int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM series WHERE library_id = $1 AND resolver_key = $2`, libID, key).Scan(&count); err != nil {
+			t.Fatalf("count committed rows: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("committed series count = %d, want 1", count)
+		}
+	})
+}

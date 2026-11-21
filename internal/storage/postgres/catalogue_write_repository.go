@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,11 +120,14 @@ func (r *CatalogueWriteRepository) GetSeriesByResolverKey(ctx context.Context, l
 		return nil, err
 	}
 	row, err := r.q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
-		LibraryID:   libraryID,
-		ResolverKey: resolverKey,
+		LibraryID:       libraryID,
+		ResolverKeyHash: hashStringSHA256(resolverKey),
 	})
 	if err != nil {
 		return nil, mapPgError(err)
+	}
+	if row.ResolverKey == nil || *row.ResolverKey != resolverKey {
+		return nil, storage.ErrResolverKeyHashCollision
 	}
 	out, err := seriesModelToDomain(row)
 	if err != nil {
@@ -145,9 +149,41 @@ func validateSeriesResolverKeyArgs(r *CatalogueWriteRepository, libraryID, resol
 	return nil
 }
 
+// AcquireSeriesVariantLock acquires a transaction-scoped advisory lock on
+// (seriesID, kind, normalized number) so concurrent indexers serialize zero-match
+// volume lookup through volume and membership creation without taking a series row
+// lock before volume row locks.
+func (r *CatalogueWriteRepository) AcquireSeriesVariantLock(
+	ctx context.Context,
+	seriesID string,
+	kind domain.VolumeKind,
+	number float64,
+) error {
+	if r == nil {
+		return errors.New("catalogue write repository is required")
+	}
+	if r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(seriesID) == "" {
+		return domain.ErrEmptySeriesID
+	}
+	if !kind.IsValid() {
+		return domain.ErrInvalidVolumeKind
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) {
+		return errors.New("volume number must be finite")
+	}
+	if number == 0 {
+		number = 0
+	}
+	variantKey := fmt.Sprintf("%s:%s:%016x", seriesID, kind, math.Float64bits(number))
+	return mapPgError(r.q.AcquireSeriesVariantLock(ctx, variantKey))
+}
+
 // FindOrCreateSeriesByResolverKey resolves or atomically creates a series scoped
 // by (series.LibraryID, *series.ResolverKey), returning created=true when newly
-// inserted or created=false with the existing locked row when already present.
+// inserted or created=false with the existing row when already present.
 func (r *CatalogueWriteRepository) FindOrCreateSeriesByResolverKey(ctx context.Context, series *domain.Series) (bool, error) {
 	if r == nil {
 		return false, errors.New("catalogue write repository is required")
@@ -184,51 +220,49 @@ func findOrCreateSeriesByResolverKeyInTx(
 	series *domain.Series,
 ) (domain.Series, bool, error) {
 	resolverKey := *series.ResolverKey
-	row, err := q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
-		LibraryID:   series.LibraryID,
-		ResolverKey: resolverKey,
-	})
-	if err == nil {
-		out, convErr := seriesModelToDomain(row)
-		return out, false, convErr
+	keyHash := hashStringSHA256(resolverKey)
+
+	lookupExact := func() (domain.Series, error) {
+		row, err := q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
+			LibraryID:       series.LibraryID,
+			ResolverKeyHash: keyHash,
+		})
+		if err != nil {
+			return domain.Series{}, err
+		}
+		if row.ResolverKey == nil || *row.ResolverKey != resolverKey {
+			return domain.Series{}, storage.ErrResolverKeyHashCollision
+		}
+		return seriesModelToDomain(row)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+
+	if existing, err := lookupExact(); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.Series{}, false, mapPgError(err)
 	}
 
-	if lockErr := q.AcquireSeriesResolverKeyLock(ctx, AcquireSeriesResolverKeyLockParams{
-		LibraryID:   series.LibraryID,
-		ResolverKey: resolverKey,
-	}); lockErr != nil {
-		return domain.Series{}, false, mapPgError(lockErr)
-	}
-
 	for range maxFindOrCreateAttempts {
-		existing, selErr := q.GetSeriesByResolverKey(ctx, GetSeriesByResolverKeyParams{
-			LibraryID:   series.LibraryID,
-			ResolverKey: resolverKey,
-		})
-		if selErr == nil {
-			out, convErr := seriesModelToDomain(existing)
-			return out, false, convErr
-		}
-		if !errors.Is(selErr, pgx.ErrNoRows) {
-			return domain.Series{}, false, mapPgError(selErr)
-		}
-
 		attempt := *series
 		params, prepErr := buildCreateSeriesParams(&attempt)
 		if prepErr != nil {
 			return domain.Series{}, false, prepErr
 		}
-		inserted, insErr := q.CreateSeries(ctx, params)
+		inserted, insErr := q.FindOrInsertSeriesByResolverKey(ctx, FindOrInsertSeriesByResolverKeyParams(params))
 		if insErr == nil {
 			out, convErr := seriesModelToDomain(inserted)
 			return out, true, convErr
 		}
-		mappedErr := mapCatalogueWriteError(insErr)
-		if !errors.Is(mappedErr, storage.ErrAlreadyExists) {
-			return domain.Series{}, false, mappedErr
+		if !errors.Is(insErr, pgx.ErrNoRows) {
+			return domain.Series{}, false, mapCatalogueWriteError(insErr)
+		}
+
+		existing, selErr := lookupExact()
+		if selErr == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(selErr, pgx.ErrNoRows) {
+			return domain.Series{}, false, mapPgError(selErr)
 		}
 
 		if isoErr := ensureReadCommittedIsolation(ctx, q); isoErr != nil {
@@ -236,6 +270,18 @@ func findOrCreateSeriesByResolverKeyInTx(
 		}
 	}
 	return domain.Series{}, false, storage.ErrNotFound
+}
+
+func hashStringSHA256(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+func seriesResolverKeyHash(key *string) []byte {
+	if key == nil {
+		return nil
+	}
+	return hashStringSHA256(*key)
 }
 
 func ensureReadCommittedIsolation(ctx context.Context, q *Queries) error {
@@ -258,6 +304,7 @@ func buildCreateSeriesParams(series *domain.Series) (CreateSeriesParams, error) 
 		ID:               candidate.ID,
 		LibraryID:        candidate.LibraryID,
 		ResolverKey:      cloneStringPtr(candidate.ResolverKey),
+		ResolverKeyHash:  seriesResolverKeyHash(candidate.ResolverKey),
 		Title:            candidate.Title,
 		TitleSort:        candidate.TitleSort,
 		Language:         cloneStringPtr(candidate.Language),
@@ -298,6 +345,7 @@ func (r *CatalogueWriteRepository) UpdateSeries(ctx context.Context, series *dom
 		ID:               candidate.ID,
 		LibraryID:        candidate.LibraryID,
 		ResolverKey:      cloneStringPtr(candidate.ResolverKey),
+		ResolverKeyHash:  seriesResolverKeyHash(candidate.ResolverKey),
 		Title:            candidate.Title,
 		TitleSort:        candidate.TitleSort,
 		Language:         cloneStringPtr(candidate.Language),

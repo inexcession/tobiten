@@ -105,36 +105,6 @@ func (idx *Indexer) IndexFile(ctx context.Context, in IndexFileInput) (*IndexFil
 	return result, nil
 }
 
-// IndexFileInTx resolves and indexes one inspected file inside an active
-// caller-supplied transaction tx using a savepoint so a failure rolls back
-// only this file's catalogue writes and outbox events without tainting tx.
-func (idx *Indexer) IndexFileInTx(ctx context.Context, tx storage.Tx, in IndexFileInput) (*IndexFileResult, error) {
-	if idx == nil {
-		return nil, errors.New("scanner: indexer is not initialized")
-	}
-	if tx == nil {
-		return nil, storage.ErrTransactionRequired
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	relPath, err := validateIndexFileInput(in)
-	if err != nil {
-		return nil, err
-	}
-
-	var result *IndexFileResult
-	err = tx.WithTx(ctx, func(innerTx storage.Tx) error {
-		var txErr error
-		result, txErr = idx.indexFileWithValidatedPath(ctx, innerTx, in, relPath)
-		return txErr
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
 func validateIndexFileInput(in IndexFileInput) (domain.PathIdentity, error) {
 	if strings.TrimSpace(in.LibraryID) == "" {
 		return domain.PathIdentity{}, domain.ErrEmptyLibraryID
@@ -208,6 +178,14 @@ func (idx *Indexer) indexFileWithValidatedPath(
 	var seriesID string
 	if series != nil {
 		seriesID = series.ID
+	}
+	// Serialize concurrent indexers on the same (series, kind, number) variant from
+	// zero-match volume lookup through membership creation so two workers do not create
+	// duplicate volumes for a newly seen number.
+	if strings.TrimSpace(in.TargetVolumeID) == "" && !res.Standalone && seriesID != "" && res.Number != nil {
+		if err := cw.AcquireSeriesVariantLock(ctx, seriesID, res.VolumeKind, *res.Number); err != nil {
+			return nil, err
+		}
 	}
 	vol, volCreated, err := resolveOrCreateVolume(ctx, cw, lib.ID, seriesID, res, in.Inspected, in.TargetVolumeID, now)
 	if err != nil {

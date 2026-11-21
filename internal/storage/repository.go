@@ -56,6 +56,11 @@ var (
 	// receives non-empty locked_fields on proposed memberships; field locks belong
 	// strictly to stored curator edits.
 	ErrAutomaticSyncLockedFields = errors.New("automatic resolver sync cannot supply locked_fields")
+
+	// ErrResolverKeyHashCollision is returned when a series lookup or upsert matches
+	// another series's library-scoped resolver_key_hash digest with a different full
+	// resolver_key string.
+	ErrResolverKeyHashCollision = errors.New("series resolver_key_hash collided with a different resolver_key")
 )
 
 // UserRepository defines the persistence interface for users, credentials, and roles.
