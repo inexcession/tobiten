@@ -62,6 +62,8 @@ const (
 	SkipReasonBrokenSymlink SkipReason = "broken_symlink"
 	// SkipReasonSymlinkCycle indicates a directory symlink pointing to an ancestor in the active walk path.
 	SkipReasonSymlinkCycle SkipReason = "symlink_cycle"
+	// SkipReasonIndexFailed indicates a file whose inspection succeeded but whose catalogue indexing failed.
+	SkipReasonIndexFailed SkipReason = "index_failed"
 )
 
 // EntryKind classifies one result emitted by WalkRoot.

@@ -1356,37 +1356,44 @@ func TestIndexer_FailureInAnyStepRollsBackRowsAndEvents(t *testing.T) {
 }
 
 type faultInjectingTransactor struct {
-	inner     storage.Transactor
-	failStage string
-	err       error
+	inner         storage.Transactor
+	failStage     string
+	failAssetPath string
+	err           error
 }
 
 func (f *faultInjectingTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	return f.inner.WithTx(ctx, func(tx storage.Tx) error {
-		return fn(&faultInjectingTx{Tx: tx, failStage: f.failStage, err: f.err})
+		return fn(&faultInjectingTx{Tx: tx, failStage: f.failStage, failAssetPath: f.failAssetPath, err: f.err})
 	})
 }
 
 func (f *faultInjectingTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	return f.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-		return fn(&faultInjectingTx{Tx: tx, failStage: f.failStage, err: f.err})
+		return fn(&faultInjectingTx{Tx: tx, failStage: f.failStage, failAssetPath: f.failAssetPath, err: f.err})
 	})
 }
 
 type faultInjectingTx struct {
 	storage.Tx
-	failStage string
-	err       error
+	failStage     string
+	failAssetPath string
+	err           error
 }
 
 func (f *faultInjectingTx) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
 	return f.Tx.WithTx(ctx, func(inner storage.Tx) error {
-		return fn(&faultInjectingTx{Tx: inner, failStage: f.failStage, err: f.err})
+		return fn(&faultInjectingTx{Tx: inner, failStage: f.failStage, failAssetPath: f.failAssetPath, err: f.err})
 	})
 }
 
 func (f *faultInjectingTx) CatalogueWrites() storage.CatalogueWriteRepository {
-	return &faultCatalogueWrites{CatalogueWriteRepository: f.Tx.CatalogueWrites(), failStage: f.failStage, err: f.err}
+	return &faultCatalogueWrites{
+		CatalogueWriteRepository: f.Tx.CatalogueWrites(),
+		failStage:                f.failStage,
+		failAssetPath:            f.failAssetPath,
+		err:                      f.err,
+	}
 }
 
 func (f *faultInjectingTx) SeriesMemberships() storage.SeriesMembershipRepository {
@@ -1403,12 +1410,13 @@ func (f *faultInjectingTx) Events() storage.EventRepository {
 
 type faultCatalogueWrites struct {
 	storage.CatalogueWriteRepository
-	failStage string
-	err       error
+	failStage     string
+	failAssetPath string
+	err           error
 }
 
 func (f *faultCatalogueWrites) CreateAsset(ctx context.Context, asset *domain.MediaAsset) error {
-	if f.failStage == "asset_create" {
+	if f.failStage == "asset_create" && (f.failAssetPath == "" || string(asset.RelPathBytes) == f.failAssetPath) {
 		return f.err
 	}
 	return f.CatalogueWriteRepository.CreateAsset(ctx, asset)
