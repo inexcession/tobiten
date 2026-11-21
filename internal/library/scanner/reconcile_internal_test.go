@@ -225,3 +225,113 @@ func BenchmarkMatchMovesFixedPoint_4000(b *testing.B) {
 		}
 	}
 }
+
+func TestPlanReconciliation_SamePathHistoricalPrecedence(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	makeHistoryAsset := func(id, relPath, curDigest, histDigest string, ts time.Time) domain.MediaAsset {
+		return makeTestAssetForPlanner(id, relPath, ts, false,
+			domain.AssetDigest{AssetID: id, Kind: domain.DigestKindXXH364Partial, Value: curDigest, IsCurrent: true, Reason: domain.DigestReasonExternalModify, RecordedAt: ts.Add(time.Minute)},
+			domain.AssetDigest{AssetID: id, Kind: domain.DigestKindXXH364Partial, Value: histDigest, IsCurrent: false, Reason: domain.DigestReasonScan, RecordedAt: ts},
+		)
+	}
+
+	runPlan := func(assets []domain.MediaAsset, changed []ChangedFile, newFiles []observedFile) reconciliationPlan {
+		obs := newLibraryWalkObservations()
+		obs.newFiles = newFiles
+		roots := []RootScanResult{{
+			LibraryRootID: testPlannerRootID,
+			Complete:      true,
+			Changed:       changed,
+		}}
+		return planReconciliation(roots, assets, obs)
+	}
+
+	t.Run("same-path historical overwrite plus copy yields modify at original and add for copy", func(t *testing.T) {
+		t.Parallel()
+		orig := makeHistoryAsset("asset-a", "a.cbz", "digest-v2", "digest-v1", t0)
+		candA := makeTestCandidateForPlanner("a.cbz", "digest-v1")
+		candB := makeTestCandidateForPlanner("b.cbz", "digest-v1")
+
+		plan := runPlan(
+			[]domain.MediaAsset{orig},
+			[]ChangedFile{{Existing: orig, Inspected: candA.inspected}},
+			[]observedFile{{rootID: testPlannerRootID, inspected: candB.inspected}},
+		)
+		if len(plan.MoveComponents) != 0 {
+			t.Fatalf("expected 0 moves, got %+v", plan.MoveComponents)
+		}
+		if len(plan.Modifies) != 1 || plan.Modifies[0].Existing.ID != orig.ID || plan.Modifies[0].Inspected.RelPath.Display != "a.cbz" {
+			t.Fatalf("expected 1 modify for orig at a.cbz, got %+v", plan.Modifies)
+		}
+		if len(plan.ToIndex) != 1 || plan.ToIndex[0].inspected.RelPath.Display != "b.cbz" {
+			t.Fatalf("expected 1 new index at b.cbz, got %+v", plan.ToIndex)
+		}
+	})
+
+	t.Run("current-digest move explaining departure takes precedence over same-path historical", func(t *testing.T) {
+		t.Parallel()
+		orig := makeHistoryAsset("asset-a", "a.cbz", "digest-v2", "digest-v1", t0)
+		candA := makeTestCandidateForPlanner("a.cbz", "digest-v1")
+		candB := makeTestCandidateForPlanner("b.cbz", "digest-v2")
+
+		plan := runPlan(
+			[]domain.MediaAsset{orig},
+			[]ChangedFile{{Existing: orig, Inspected: candA.inspected}},
+			[]observedFile{{rootID: testPlannerRootID, inspected: candB.inspected}},
+		)
+		if len(plan.MoveComponents) != 1 || len(plan.MoveComponents[0]) != 1 ||
+			plan.MoveComponents[0][0].Asset.ID != orig.ID || plan.MoveComponents[0][0].Inspected.RelPath.Display != "b.cbz" {
+			t.Fatalf("expected current move orig -> b.cbz, got %+v", plan.MoveComponents)
+		}
+		if len(plan.Modifies) != 0 {
+			t.Fatalf("expected 0 modifies, got %+v", plan.Modifies)
+		}
+		if len(plan.ToIndex) != 1 || plan.ToIndex[0].inspected.RelPath.Display != "a.cbz" {
+			t.Fatalf("expected vacated a.cbz indexed as new, got %+v", plan.ToIndex)
+		}
+	})
+
+	t.Run("exact-current exchange is preserved even with cross historical digests", func(t *testing.T) {
+		t.Parallel()
+		assetA := makeHistoryAsset("asset-a", "a.cbz", "digest-v2", "digest-v1", t0)
+		assetB := makeHistoryAsset("asset-b", "b.cbz", "digest-v1", "digest-v2", t0.Add(time.Second))
+		candA := makeTestCandidateForPlanner("a.cbz", "digest-v1")
+		candB := makeTestCandidateForPlanner("b.cbz", "digest-v2")
+
+		plan := runPlan(
+			[]domain.MediaAsset{assetA, assetB},
+			[]ChangedFile{
+				{Existing: assetA, Inspected: candA.inspected},
+				{Existing: assetB, Inspected: candB.inspected},
+			},
+			nil,
+		)
+		if len(plan.MoveComponents) != 1 || len(plan.MoveComponents[0]) != 2 {
+			t.Fatalf("expected 1 exchange component of 2 moves, got %+v", plan.MoveComponents)
+		}
+		if len(plan.Modifies) != 0 || len(plan.ToIndex) != 0 {
+			t.Fatalf("expected 0 modifies and 0 indexes, got modifies=%+v toIndex=%+v", plan.Modifies, plan.ToIndex)
+		}
+	})
+
+	t.Run("historical move where source is gone is preserved", func(t *testing.T) {
+		t.Parallel()
+		orig := makeHistoryAsset("asset-a", "a.cbz", "digest-v2", "digest-v1", t0)
+		candB := makeTestCandidateForPlanner("b.cbz", "digest-v1")
+
+		plan := runPlan(
+			[]domain.MediaAsset{orig},
+			nil,
+			[]observedFile{{rootID: testPlannerRootID, inspected: candB.inspected}},
+		)
+		if len(plan.MoveComponents) != 1 || len(plan.MoveComponents[0]) != 1 ||
+			plan.MoveComponents[0][0].Asset.ID != orig.ID || plan.MoveComponents[0][0].Inspected.RelPath.Display != "b.cbz" {
+			t.Fatalf("expected historical move orig -> b.cbz, got %+v", plan.MoveComponents)
+		}
+		if len(plan.Modifies) != 0 || len(plan.ToIndex) != 0 {
+			t.Fatalf("expected 0 modifies and 0 indexes, got modifies=%+v toIndex=%+v", plan.Modifies, plan.ToIndex)
+		}
+	})
+}

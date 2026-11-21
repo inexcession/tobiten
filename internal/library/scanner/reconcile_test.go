@@ -18,8 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/library/paths"
+	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
@@ -1736,6 +1738,270 @@ func TestReconcile_RootSnapshotInvalidatedBeforeWrite(t *testing.T) {
 			t.Fatalf("expected Complete=false ApplyRemovals=false, got %+v", res2)
 		}
 	})
+
+	t.Run("reconciliation write blocks concurrent ConfigService.AddRoot until commit then subsequent write rejects ErrStalePreCheck", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		canonBase, err := paths.CanonicalPath(base)
+		if err != nil {
+			t.Fatalf("CanonicalPath: %v", err)
+		}
+		root1Dir := filepath.Join(canonBase, "root-1")
+		root2Dir := filepath.Join(canonBase, "root-2")
+		cbzMove := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sync-addroot-move"), method: zip.Store})
+		cbzNew := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sync-addroot-new"), method: zip.Store})
+		cbzRoot2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sync-addroot-root2"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(root1Dir, "a.cbz"), cbzMove)
+		writeDiskFile(t, filepath.Join(root2Dir, "r2.cbz"), cbzRoot2)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var seeded []domain.LibraryRoot
+			lib, seeded = seedLibraryAndRoots(ctx, t, tx, "Sync AddRoot Blocks Lib", nil, []byte(root1Dir))
+			root = seeded[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(root1Dir, "a.cbz"), filepath.Join(root1Dir, "b.cbz"))
+		writeDiskFile(t, filepath.Join(root1Dir, "c.cbz"), cbzNew)
+
+		moveInTx := make(chan struct{})
+		releaseMove := make(chan struct{})
+		var releaseMoveOnce sync.Once
+		closeMove := func() { releaseMoveOnce.Do(func() { close(releaseMove) }) }
+
+		scanDone := make(chan struct{})
+		addDone := make(chan struct{})
+		addStarted := false
+		defer func() {
+			cancel()
+			closeMove()
+			<-scanDone
+			if addStarted {
+				<-addDone
+			}
+		}()
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			onAfterUpdateAsset: func() error {
+				close(moveInTx)
+				select {
+				case <-releaseMove:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		var (
+			scanRes scanner.ScanResult
+			scanErr error
+		)
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		select {
+		case <-moveInTx:
+		case <-scanDone:
+			t.Fatalf("scan exited before holding root guard: res=%+v err=%v", scanRes, scanErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for move write tx: %v", ctx.Err())
+		}
+
+		cfgSvc, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{})
+		if err != nil {
+			t.Fatalf("NewConfigService: %v", err)
+		}
+		admin := adminPrincipalForReconcileTest()
+
+		addStarted = true
+		var (
+			addedRoot *domain.LibraryRoot
+			addErr    error
+		)
+		go func() {
+			defer close(addDone)
+			addedRoot, addErr = cfgSvc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+				LibraryID: lib.ID,
+				Path:      []byte(root2Dir),
+			})
+		}()
+
+		if err := waitForScannerLockWaiter(ctx, db, addDone); err != nil {
+			t.Fatalf("expected ConfigService.AddRoot to block until move tx commits: %v (addErr=%v)", err, addErr)
+		}
+
+		closeMove()
+		<-addDone
+		if addErr != nil || addedRoot == nil {
+			t.Fatalf("AddRoot failed after move commit: root=%+v err=%v", addedRoot, addErr)
+		}
+		<-scanDone
+		if !errors.Is(scanErr, scanner.ErrStalePreCheck) {
+			t.Fatalf("expected ErrStalePreCheck on subsequent write after AddRoot commit, got err=%v res=%+v", scanErr, scanRes)
+		}
+		if scanRes.Complete || scanRes.ApplyRemovals {
+			t.Fatalf("expected Complete=false ApplyRemovals=false after root insertion, got %+v", scanRes)
+		}
+		gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID)
+		if len(gotAssets) != 1 || gotAssets[0].ID != orig.ID || gotAssets[0].RelPathDisplay != "b.cbz" {
+			t.Fatalf("expected move #1 committed and c.cbz deferred/unindexed after AddRoot, got %+v", gotAssets)
+		}
+	})
+
+	t.Run("concurrent ConfigService.AddRoot blocks reconciliation write until commit then rejects ErrStalePreCheck", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		canonBase, err := paths.CanonicalPath(base)
+		if err != nil {
+			t.Fatalf("CanonicalPath: %v", err)
+		}
+		root1Dir := filepath.Join(canonBase, "root-1")
+		root2Dir := filepath.Join(canonBase, "root-2")
+		cbzMove := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sync-addroot-first"), method: zip.Store})
+		cbzRoot2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sync-addroot-second"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(root1Dir, "a.cbz"), cbzMove)
+		writeDiskFile(t, filepath.Join(root2Dir, "r2.cbz"), cbzRoot2)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var seeded []domain.LibraryRoot
+			lib, seeded = seedLibraryAndRoots(ctx, t, tx, "Sync AddRoot Before Write Lib", nil, []byte(root1Dir))
+			root = seeded[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(root1Dir, "a.cbz"), filepath.Join(root1Dir, "b.cbz"))
+
+		addPreCommit := make(chan struct{})
+		releaseAdd := make(chan struct{})
+		var releaseAddOnce sync.Once
+		closeAdd := func() { releaseAddOnce.Do(func() { close(releaseAdd) }) }
+
+		addDone := make(chan struct{})
+		addStarted := false
+		scanDone := make(chan struct{})
+		defer func() {
+			cancel()
+			closeAdd()
+			<-scanDone
+			if addStarted {
+				<-addDone
+			}
+		}()
+
+		holdAddTx := &commitHoldTransactor{
+			inner:     transactor,
+			preCommit: addPreCommit,
+			release:   releaseAdd,
+		}
+		cfgSvc, err := roots.NewConfigService(holdAddTx, roots.ConfigServiceOptions{})
+		if err != nil {
+			t.Fatalf("NewConfigService(hold): %v", err)
+		}
+		admin := adminPrincipalForReconcileTest()
+		var addErr error
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			beforeSecondReadCommitted: func() error {
+				addStarted = true
+				go func() {
+					defer close(addDone)
+					_, addErr = cfgSvc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+						LibraryID: lib.ID,
+						Path:      []byte(root2Dir),
+					})
+				}()
+				select {
+				case <-addPreCommit:
+					return nil
+				case <-addDone:
+					return fmt.Errorf("AddRoot exited before pre-commit hold: %w", addErr)
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		var (
+			scanRes scanner.ScanResult
+			scanErr error
+		)
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		if err := waitForScannerLockWaiter(ctx, db, scanDone); err != nil {
+			t.Fatalf("expected reconciliation write to block on AddRoot lock: %v (scanErr=%v)", err, scanErr)
+		}
+
+		closeAdd()
+		<-addDone
+		if addErr != nil {
+			t.Fatalf("AddRoot failed: %v", addErr)
+		}
+		<-scanDone
+		if !errors.Is(scanErr, scanner.ErrStalePreCheck) {
+			t.Fatalf("expected ErrStalePreCheck after AddRoot committed, got err=%v res=%+v", scanErr, scanRes)
+		}
+		if scanRes.Complete || scanRes.ApplyRemovals || scanRes.MovedCount != 0 {
+			t.Fatalf("expected Complete=false ApplyRemovals=false MovedCount=0, got %+v", scanRes)
+		}
+		got, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+		if err != nil || got.RelPathDisplay != "a.cbz" {
+			t.Fatalf("expected move rolled back leaving a.cbz intact, got (%+v, %v)", got, err)
+		}
+	})
 }
 
 func waitForScannerLockWaiter(ctx context.Context, db *testdb.TestDB, earlyExit <-chan struct{}) error {
@@ -2068,4 +2334,437 @@ func mustRootPathIdentity(t *testing.T, raw []byte) domain.PathIdentity {
 		t.Fatalf("NewRootPathIdentity(%q): %v", raw, err)
 	}
 	return p
+}
+
+func adminPrincipalForReconcileTest() *domain.Principal {
+	var adminRole domain.Role
+	for _, r := range domain.BuiltInRoles() {
+		if r.ID == domain.RoleAdminID {
+			adminRole = r
+			break
+		}
+	}
+	return domain.NewPrincipal(
+		domain.User{ID: "user-admin-reconcile", Username: "admin"},
+		[]domain.Role{adminRole},
+		domain.CredentialKindPassword,
+		"cred-admin-reconcile",
+		nil,
+	)
+}
+
+func TestReconcile_RestoredHistoricalVersionCopiedPreservesOriginalAsset(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "root")
+	cbzV1 := buildDeterministicZip(t, "", zipEntry{name: "001.jxl", data: []byte("restored-v1-jxl"), method: zip.Store})
+	cbzV2 := buildDeterministicZip(t, "",
+		zipEntry{name: "001.avif", data: []byte("modified-v2-page-1"), method: zip.Store},
+		zipEntry{name: "002.png", data: []byte("modified-v2-page-2"), method: zip.Store},
+	)
+
+	pathA := filepath.Join(rootDir, "a.cbz")
+	pathB := filepath.Join(rootDir, "b.cbz")
+	writeDiskFile(t, pathA, cbzV1)
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Restored Historical Copy Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+		t.Fatalf("scan 1 = (%+v, %v)", res, err)
+	}
+	orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+	v1Digest, ok := orig.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok {
+		t.Fatalf("missing initial V1 digest on %+v", orig)
+	}
+	userID := seedUserAndReadingProgress(ctx, t, db, transactor, "restore-copy-reader", orig, 3)
+
+	// Scan 2: overwrite a.cbz with V2 so V1 becomes historical.
+	writeDiskFile(t, pathA, cbzV2)
+	t2 := time.Now().Add(2 * time.Second).UTC()
+	if err := os.Chtimes(pathA, t2, t2); err != nil {
+		t.Fatalf("chtimes V2: %v", err)
+	}
+	if res2, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res2.Complete || res2.ModifiedCount != 1 {
+		t.Fatalf("scan 2 = (%+v, %v)", res2, err)
+	}
+	afterV2, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID(afterV2): %v", err)
+	}
+	v2Digest, ok := afterV2.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok || v2Digest.Value == v1Digest.Value {
+		t.Fatalf("expected rotated V2 digest, got (%+v, %v)", v2Digest, ok)
+	}
+
+	// Overwrite a.cbz in place with V1 AND copy V1 to b.cbz.
+	writeDiskFile(t, pathA, cbzV1)
+	t3 := t2.Add(2 * time.Second)
+	if err := os.Chtimes(pathA, t3, t3); err != nil {
+		t.Fatalf("chtimes V1: %v", err)
+	}
+	writeDiskFile(t, pathB, cbzV1)
+
+	res3, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("scan 3: %v", err)
+	}
+	if !res3.Complete || !res3.ApplyRemovals || res3.ModifiedCount != 1 || res3.IndexedCount != 1 || res3.MovedCount != 0 {
+		t.Fatalf("expected 1 modify + 1 index + 0 moves, got %+v", res3)
+	}
+
+	assets := listAssetsForRoot(ctx, t, transactor, root.ID)
+	if len(assets) != 2 {
+		t.Fatalf("expected 2 assets, got %d", len(assets))
+	}
+	var gotA, gotB domain.MediaAsset
+	for _, a := range assets {
+		switch a.RelPathDisplay {
+		case "a.cbz":
+			gotA = a
+		case "b.cbz":
+			gotB = a
+		default:
+			t.Fatalf("unexpected asset path %q", a.RelPathDisplay)
+		}
+	}
+	if gotA.ID != orig.ID || gotA.VolumeID != orig.VolumeID {
+		t.Fatalf("expected a.cbz to preserve orig ID/volume (%s, %s), got (%s, %s)", orig.ID, orig.VolumeID, gotA.ID, gotA.VolumeID)
+	}
+	if gotB.ID == orig.ID {
+		t.Fatalf("expected b.cbz to receive a new asset ID, got orig ID %s", orig.ID)
+	}
+
+	fullA, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID(orig): %v", err)
+	}
+	if fullA.PageCount != 1 || !slices.Equal(fullA.Diagnostics.ImageCodecs, []string{"jxl"}) || fullA.FileSize != int64(len(cbzV1)) {
+		t.Fatalf("expected restored 1-page JXL facts on a.cbz, got page_count=%d codecs=%v size=%d",
+			fullA.PageCount, fullA.Diagnostics.ImageCodecs, fullA.FileSize)
+	}
+	curA, ok := fullA.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok || curA.Value != v1Digest.Value || curA.Reason != domain.DigestReasonExternalModify {
+		t.Fatalf("expected V1 EXTERNAL_MODIFY current digest on a.cbz, got (%+v, %v)", curA, ok)
+	}
+	if len(fullA.Digests) != 2 {
+		t.Fatalf("expected 2 digests retained on a.cbz, got %+v", fullA.Digests)
+	}
+
+	assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 3)
+
+	events := loadOutboxEventsDetailed(ctx, t, db)
+	var sawModifiedA, sawAddedB, sawMoved bool
+	for _, ev := range events {
+		switch ev.Kind {
+		case domain.EventAssetModified:
+			if ev.AggregateID == orig.ID {
+				var p domain.AssetEventPayloadV1
+				if err := json.Unmarshal(ev.Payload, &p); err != nil {
+					t.Fatalf("unmarshal asset.modified: %v", err)
+				}
+				if p.PathDisplay == "a.cbz" {
+					sawModifiedA = true
+				}
+			}
+		case domain.EventAssetAdded:
+			if ev.AggregateID == gotB.ID {
+				var p domain.AssetEventPayloadV1
+				if err := json.Unmarshal(ev.Payload, &p); err != nil {
+					t.Fatalf("unmarshal asset.added: %v", err)
+				}
+				if p.PathDisplay == "b.cbz" {
+					sawAddedB = true
+				}
+			}
+		case domain.EventAssetMoved:
+			sawMoved = true
+		}
+	}
+	if !sawModifiedA || !sawAddedB || sawMoved {
+		t.Fatalf("unexpected events: sawModifiedA=%v sawAddedB=%v sawMoved=%v events=%+v", sawModifiedA, sawAddedB, sawMoved, events)
+	}
+
+	assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 2)
+}
+
+func TestReconcile_ConcurrentTargetedIndexFileAndMoveNoDeadlock(t *testing.T) {
+	t.Parallel()
+
+	t.Run("targeted IndexFile holds volume before commit while move waits on library lock", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBase := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("target-idx-move-1"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "a.cbz"), cbzBase)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var seeded []domain.LibraryRoot
+			lib, seeded = seedLibraryAndRoots(ctx, t, tx, "Target Index Then Move Lib", nil, []byte(rootDir))
+			root = seeded[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(rootDir, "a.cbz"), filepath.Join(rootDir, "b.cbz"))
+
+		idxPreCommit := make(chan struct{})
+		releaseIdx := make(chan struct{})
+		var releaseIdxOnce sync.Once
+		closeIdx := func() { releaseIdxOnce.Do(func() { close(releaseIdx) }) }
+
+		idxDone := make(chan struct{})
+		scanDone := make(chan struct{})
+		var (
+			idxRes  *scanner.IndexFileResult
+			idxErr  error
+			scanRes scanner.ScanResult
+			scanErr error
+		)
+		defer func() {
+			cancel()
+			closeIdx()
+			<-idxDone
+			<-scanDone
+		}()
+
+		holdIdxTx := &commitHoldTransactor{
+			inner:     transactor,
+			preCommit: idxPreCommit,
+			release:   releaseIdx,
+		}
+		idx, err := scanner.NewIndexer(holdIdxTx, scanner.IndexerOptions{})
+		if err != nil {
+			t.Fatalf("NewIndexer: %v", err)
+		}
+		go func() {
+			defer close(idxDone)
+			idxRes, idxErr = idx.IndexFile(ctx, scanner.IndexFileInput{
+				LibraryID:      lib.ID,
+				LibraryRootID:  root.ID,
+				TargetVolumeID: orig.VolumeID,
+				Inspected: scanner.InspectedFile{
+					RelPath:    mustRelIdentity(t, []byte("variant.cbz")),
+					Size:       512,
+					Format:     domain.MediaFormatCBZ,
+					DigestKind: domain.DigestKindXXH364Partial,
+					Digest:     "fedcba9876543210",
+					PageCount:  12,
+				},
+			})
+		}()
+
+		select {
+		case <-idxPreCommit:
+		case <-idxDone:
+			close(scanDone)
+			t.Fatalf("targeted IndexFile exited before pre-commit barrier: res=%+v err=%v", idxRes, idxErr)
+		case <-ctx.Done():
+			close(scanDone)
+			t.Fatalf("timed out waiting for IndexFile pre-commit barrier: %v", ctx.Err())
+		}
+
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		if err := waitForScannerLockWaiter(ctx, db, scanDone); err != nil {
+			t.Fatalf("expected move scan to wait cleanly on library lock: %v (scanErr=%v)", err, scanErr)
+		}
+
+		closeIdx()
+		<-idxDone
+		if idxErr != nil || idxRes == nil || idxRes.Volume.ID != orig.VolumeID {
+			t.Fatalf("targeted IndexFile failed: res=%+v err=%v", idxRes, idxErr)
+		}
+		<-scanDone
+		if scanErr != nil || !scanRes.Complete || !scanRes.ApplyRemovals || scanRes.MovedCount != 1 {
+			t.Fatalf("move scan failed: res=%+v err=%v", scanRes, scanErr)
+		}
+
+		gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID)
+		if len(gotAssets) != 2 {
+			t.Fatalf("expected 2 assets on root after concurrent targeted index + move, got %d", len(gotAssets))
+		}
+		for _, a := range gotAssets {
+			if a.VolumeID != orig.VolumeID {
+				t.Fatalf("expected asset %s on volume %s, got %s", a.RelPathDisplay, orig.VolumeID, a.VolumeID)
+			}
+			if a.ID == orig.ID && a.RelPathDisplay != "b.cbz" {
+				t.Fatalf("expected orig asset moved to b.cbz, got %s", a.RelPathDisplay)
+			}
+		}
+	})
+
+	t.Run("ScanLibrary move holds library and volume while targeted IndexFile waits on library lock", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBase := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("target-idx-move-2"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "a.cbz"), cbzBase)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var seeded []domain.LibraryRoot
+			lib, seeded = seedLibraryAndRoots(ctx, t, tx, "Move Then Target Index Lib", nil, []byte(rootDir))
+			root = seeded[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(rootDir, "a.cbz"), filepath.Join(rootDir, "b.cbz"))
+
+		moveUpdated := make(chan struct{})
+		releaseMove := make(chan struct{})
+		var releaseMoveOnce sync.Once
+		closeMove := func() { releaseMoveOnce.Do(func() { close(releaseMove) }) }
+
+		scanDone := make(chan struct{})
+		idxDone := make(chan struct{})
+		idxStarted := false
+		var (
+			scanRes scanner.ScanResult
+			scanErr error
+			idxRes  *scanner.IndexFileResult
+			idxErr  error
+		)
+		defer func() {
+			cancel()
+			closeMove()
+			<-scanDone
+			if idxStarted {
+				<-idxDone
+			}
+		}()
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			onAfterUpdateAsset: func() error {
+				close(moveUpdated)
+				select {
+				case <-releaseMove:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		select {
+		case <-moveUpdated:
+		case <-scanDone:
+			t.Fatalf("scan exited before holding locks: res=%+v err=%v", scanRes, scanErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for move UpdateAsset: %v", ctx.Err())
+		}
+
+		idx, err := scanner.NewIndexer(transactor, scanner.IndexerOptions{})
+		if err != nil {
+			t.Fatalf("NewIndexer: %v", err)
+		}
+		idxStarted = true
+		go func() {
+			defer close(idxDone)
+			idxRes, idxErr = idx.IndexFile(ctx, scanner.IndexFileInput{
+				LibraryID:      lib.ID,
+				LibraryRootID:  root.ID,
+				TargetVolumeID: orig.VolumeID,
+				Inspected: scanner.InspectedFile{
+					RelPath:    mustRelIdentity(t, []byte("variant.cbz")),
+					Size:       512,
+					Format:     domain.MediaFormatCBZ,
+					DigestKind: domain.DigestKindXXH364Partial,
+					Digest:     "0123456789abcdef",
+					PageCount:  12,
+				},
+			})
+		}()
+
+		if err := waitForScannerLockWaiter(ctx, db, idxDone); err != nil {
+			t.Fatalf("expected targeted IndexFile to wait cleanly on library lock: %v (idxErr=%v)", err, idxErr)
+		}
+
+		closeMove()
+		<-scanDone
+		if scanErr != nil || !scanRes.Complete || !scanRes.ApplyRemovals || scanRes.MovedCount != 1 {
+			t.Fatalf("move scan failed: res=%+v err=%v", scanRes, scanErr)
+		}
+		<-idxDone
+		if idxErr != nil || idxRes == nil || idxRes.Volume.ID != orig.VolumeID {
+			t.Fatalf("targeted IndexFile failed after move commit: res=%+v err=%v", idxRes, idxErr)
+		}
+
+		gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID)
+		if len(gotAssets) != 2 {
+			t.Fatalf("expected 2 assets on root after concurrent move + targeted index, got %d", len(gotAssets))
+		}
+		for _, a := range gotAssets {
+			if a.VolumeID != orig.VolumeID {
+				t.Fatalf("expected asset %s on volume %s, got %s", a.RelPathDisplay, orig.VolumeID, a.VolumeID)
+			}
+			if a.ID == orig.ID && a.RelPathDisplay != "b.cbz" {
+				t.Fatalf("expected orig asset moved to b.cbz, got %s", a.RelPathDisplay)
+			}
+		}
+	})
 }

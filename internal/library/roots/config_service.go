@@ -213,7 +213,7 @@ func (s *ConfigService) AddRoot(
 			return err
 		}
 
-		if _, err := repo.GetLibraryByID(ctx, req.LibraryID); err != nil {
+		if err := repo.LockLibrary(ctx, req.LibraryID); err != nil {
 			return mapLibraryStorageError(err)
 		}
 

@@ -111,13 +111,20 @@ func (idx *Indexer) indexFile(
 	}
 
 	var result *IndexFileResult
-	runTx := idx.tx.WithTx
-	if verifySnapshot {
-		runTx = idx.tx.WithReadCommittedTx
-	}
-	err = runTx(ctx, func(tx storage.Tx) error {
+	err = idx.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		// Align both indexer entry points with the reconciliation lock order:
+		// libraries (FOR UPDATE in reconciliation, FOR KEY SHARE here) before
+		// library_roots, volumes, media_assets, and series.
 		if verifySnapshot {
 			if err := lockAndVerifyRootSnapshot(ctx, tx, in.LibraryID, checkedRoots); err != nil {
+				return err
+			}
+		} else {
+			libRepo := tx.Libraries()
+			if libRepo == nil {
+				return errors.New("scanner: library repository is required")
+			}
+			if err := libRepo.LockLibraryForKeyShare(ctx, in.LibraryID); err != nil {
 				return err
 			}
 		}

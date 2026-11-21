@@ -89,7 +89,7 @@ func lockAndVerifyRootSnapshot(
 	if libRepo == nil {
 		return errors.New("scanner: library repository is required")
 	}
-	if err := libRepo.LockLibraryForKeyShare(ctx, libraryID); errors.Is(err, storage.ErrNotFound) {
+	if err := libRepo.LockLibrary(ctx, libraryID); errors.Is(err, storage.ErrNotFound) {
 		return ErrStalePreCheck
 	} else if err != nil {
 		return err
@@ -265,21 +265,38 @@ func collectUnconfirmedAssets(
 }
 
 type moveDigestIndex struct {
-	unconfirmedLocs   []assetLocation
-	currentBuckets    map[digestKey][]int
-	historicalBuckets map[digestKey][]int
+	unconfirmedLocs    []assetLocation
+	samePathHistorical []bool
+	currentBuckets     map[digestKey][]int
+	historicalBuckets  map[digestKey][]int
 }
 
-func buildMoveDigestIndex(unconfirmed []domain.MediaAsset) moveDigestIndex {
+func buildMoveDigestIndex(unconfirmed []domain.MediaAsset, candidates []candidateObservation) moveDigestIndex {
+	candByLoc := make(map[assetLocation]int, len(candidates))
+	for obsIdx, cand := range candidates {
+		candByLoc[cand.loc] = obsIdx
+	}
+
 	idx := moveDigestIndex{
-		unconfirmedLocs:   make([]assetLocation, len(unconfirmed)),
-		currentBuckets:    make(map[digestKey][]int, len(unconfirmed)),
-		historicalBuckets: make(map[digestKey][]int),
+		unconfirmedLocs:    make([]assetLocation, len(unconfirmed)),
+		samePathHistorical: make([]bool, len(unconfirmed)),
+		currentBuckets:     make(map[digestKey][]int, len(unconfirmed)),
+		historicalBuckets:  make(map[digestKey][]int),
 	}
 	for i, asset := range unconfirmed {
-		idx.unconfirmedLocs[i] = assetLocation{
+		loc := assetLocation{
 			rootID:       asset.LibraryRootID,
 			relPathBytes: string(asset.RelPathBytes),
+		}
+		idx.unconfirmedLocs[i] = loc
+		if obsIdx, ok := candByLoc[loc]; ok {
+			cand := candidates[obsIdx]
+			for _, d := range asset.Digests {
+				if !d.IsCurrent && d.Kind == cand.inspected.DigestKind && d.Value == cand.inspected.Digest {
+					idx.samePathHistorical[i] = true
+					break
+				}
+			}
 		}
 		for _, d := range asset.Digests {
 			key := digestKey{kind: d.Kind, value: d.Value}
@@ -304,7 +321,7 @@ func matchMovesFixedPoint(
 	candidates []candidateObservation,
 	existingByLoc map[assetLocation]domain.MediaAsset,
 ) (map[string]plannedMove, []bool) {
-	index := buildMoveDigestIndex(unconfirmed)
+	index := buildMoveDigestIndex(unconfirmed, candidates)
 	blockedDest := make(map[assetLocation]struct{})
 	for {
 		proposedMoves, matchedObs := matchCandidateMoves(unconfirmed, candidates, index, blockedDest)
@@ -364,6 +381,14 @@ func matchCandidateMoves(
 	}
 
 	matchPass(index.currentBuckets)
+	// When no current-digest move explains an unconfirmed asset's departure,
+	// keep a same-path historical observation in place as an external modify
+	// rather than letting a copy of that historical digest steal the asset ID.
+	for assetIdx, hasHist := range index.samePathHistorical {
+		if hasHist && !claimed[assetIdx] {
+			claimed[assetIdx] = true
+		}
+	}
 	matchPass(index.historicalBuckets)
 	return proposed, matchedObs
 }
@@ -555,7 +580,7 @@ func (s *Scanner) applyMoveComponent(
 ) error {
 	return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		// Global lock order:
-		// libraries (FOR KEY SHARE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
+		// libraries (FOR UPDATE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
 		// volumes (id ASC, FOR UPDATE) -> media_assets (id ASC, FOR UPDATE).
 		if err := lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots); err != nil {
 			return err
@@ -740,7 +765,6 @@ func promoteHistoricalMoveDigest(
 	if err := cw.RecordAssetDigest(ctx, &promoted); err != nil {
 		return err
 	}
-	fresh.Digests = applyPromotedDigestInMemory(fresh.Digests, promoted)
 	fresh.Format = inspected.Format
 	fresh.PageCount = inspected.PageCount
 	fresh.CoverPageIndex = inspected.CoverPageIndex
@@ -757,28 +781,6 @@ func promoteHistoricalMoveDigest(
 		lockedVolumes[fresh.VolumeID] = vol
 	}
 	return nil
-}
-
-func applyPromotedDigestInMemory(digests []domain.AssetDigest, promoted domain.AssetDigest) []domain.AssetDigest {
-	out := make([]domain.AssetDigest, 0, len(digests)+1)
-	replaced := false
-	for _, d := range digests {
-		if d.Kind != promoted.Kind {
-			out = append(out, d)
-			continue
-		}
-		if d.Value == promoted.Value {
-			out = append(out, promoted)
-			replaced = true
-			continue
-		}
-		d.IsCurrent = false
-		out = append(out, d)
-	}
-	if !replaced {
-		out = append(out, promoted)
-	}
-	return out
 }
 
 func shouldSyncMovedVolumePageCount(vol domain.Volume, assetID string, pageCount int) bool {
@@ -891,7 +893,7 @@ func (s *Scanner) applyExternalModify(
 	var applied bool
 	err = s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		// Global lock order:
-		// libraries (FOR KEY SHARE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
+		// libraries (FOR UPDATE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
 		// volumes (FOR UPDATE) -> media_assets (FOR UPDATE) -> series_memberships ->
 		// series -> people/credits/entities -> domain_events.
 		if err := lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots); err != nil {
