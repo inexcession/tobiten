@@ -55,6 +55,12 @@ FROM libraries
 WHERE id = $1
 FOR UPDATE;
 
+-- name: LockLibraryForKeyShare :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR KEY SHARE;
+
 -- name: LibraryHasCatalogueRows :one
 SELECT (
     EXISTS (SELECT 1 FROM series s WHERE s.library_id = $1)
@@ -89,6 +95,13 @@ SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked
 FROM library_roots
 WHERE library_id = $1
 ORDER BY path_match ASC, id ASC;
+
+-- name: ListLibraryRootsByLibraryForNoKeyUpdate :many
+SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
+FROM library_roots
+WHERE library_id = $1
+ORDER BY id ASC
+FOR NO KEY UPDATE;
 
 -- name: ListAllLibraryRoots :many
 SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error

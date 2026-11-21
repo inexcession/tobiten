@@ -369,6 +369,43 @@ func (q *Queries) ListLibraryRootsByLibrary(ctx context.Context, libraryID strin
 	return items, nil
 }
 
+const listLibraryRootsByLibraryForNoKeyUpdate = `-- name: ListLibraryRootsByLibraryForNoKeyUpdate :many
+SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
+FROM library_roots
+WHERE library_id = $1
+ORDER BY id ASC
+FOR NO KEY UPDATE
+`
+
+func (q *Queries) ListLibraryRootsByLibraryForNoKeyUpdate(ctx context.Context, libraryID string) ([]LibraryRoot, error) {
+	rows, err := q.db.Query(ctx, listLibraryRootsByLibraryForNoKeyUpdate, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LibraryRoot
+	for rows.Next() {
+		var i LibraryRoot
+		if err := rows.Scan(
+			&i.ID,
+			&i.LibraryID,
+			&i.PathBytes,
+			&i.PathDisplay,
+			&i.PathMatch,
+			&i.State,
+			&i.LastCheckedAt,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockLibrary = `-- name: LockLibrary :one
 SELECT id
 FROM libraries
@@ -378,6 +415,20 @@ FOR UPDATE
 
 func (q *Queries) LockLibrary(ctx context.Context, id string) (string, error) {
 	row := q.db.QueryRow(ctx, lockLibrary, id)
+	var id_2 string
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const lockLibraryForKeyShare = `-- name: LockLibraryForKeyShare :one
+SELECT id
+FROM libraries
+WHERE id = $1
+FOR KEY SHARE
+`
+
+func (q *Queries) LockLibraryForKeyShare(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRow(ctx, lockLibraryForKeyShare, id)
 	var id_2 string
 	err := row.Scan(&id_2)
 	return id_2, err

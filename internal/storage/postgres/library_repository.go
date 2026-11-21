@@ -226,6 +226,22 @@ func (r *LibraryRepository) ListLibraryRoots(ctx context.Context, libraryID stri
 	return toDomainLibraryRoots(rows), nil
 }
 
+// ListLibraryRootsForNoKeyUpdate returns all roots belonging to libraryID ordered by ID
+// with row-level FOR NO KEY UPDATE locks inside an active transaction.
+func (r *LibraryRepository) ListLibraryRootsForNoKeyUpdate(ctx context.Context, libraryID string) ([]domain.LibraryRoot, error) {
+	if r == nil || r.scope == nil {
+		return nil, storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(libraryID) == "" {
+		return nil, domain.ErrEmptyLibraryID
+	}
+	rows, err := r.q.ListLibraryRootsByLibraryForNoKeyUpdate(ctx, libraryID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return toDomainLibraryRoots(rows), nil
+}
+
 // ListAllLibraryRoots returns all roots across all libraries ordered by library ID, match key, and ID.
 func (r *LibraryRepository) ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error) {
 	rows, err := r.q.ListAllLibraryRoots(ctx)
@@ -343,6 +359,21 @@ func (r *LibraryRepository) LockLibrary(ctx context.Context, id string) error {
 		return domain.ErrEmptyLibraryID
 	}
 	if _, err := r.q.LockLibrary(ctx, id); err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
+// LockLibraryForKeyShare acquires a row-level FOR KEY SHARE lock on library id inside an active
+// transaction, blocking concurrent FOR UPDATE availability writes while allowing concurrent scans.
+func (r *LibraryRepository) LockLibraryForKeyShare(ctx context.Context, id string) error {
+	if r == nil || r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(id) == "" {
+		return domain.ErrEmptyLibraryID
+	}
+	if _, err := r.q.LockLibraryForKeyShare(ctx, id); err != nil {
 		return mapPgError(err)
 	}
 	return nil

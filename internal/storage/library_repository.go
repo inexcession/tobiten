@@ -21,6 +21,7 @@ type LibraryRepository interface {
 	CreateLibraryRoot(ctx context.Context, root *domain.LibraryRoot) error
 	GetLibraryRootByID(ctx context.Context, id string) (*domain.LibraryRoot, error)
 	ListLibraryRoots(ctx context.Context, libraryID string) ([]domain.LibraryRoot, error)
+	ListLibraryRootsForNoKeyUpdate(ctx context.Context, libraryID string) ([]domain.LibraryRoot, error)
 	ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error)
 	UpdateLibraryRoot(ctx context.Context, root *domain.LibraryRoot) error
 	// UpdateLibraryRootStatus returns ErrNotFound if the root's identity changed since it was checked.
@@ -30,4 +31,5 @@ type LibraryRepository interface {
 	// Configuration serialization
 	LockConfiguration(ctx context.Context) error
 	LockLibrary(ctx context.Context, id string) error
+	LockLibraryForKeyShare(ctx context.Context, id string) error
 }

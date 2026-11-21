@@ -82,6 +82,23 @@ func NewIndexer(tx storage.Transactor, opts IndexerOptions) (*Indexer, error) {
 
 // IndexFile resolves and indexes one inspected file in a single transaction.
 func (idx *Indexer) IndexFile(ctx context.Context, in IndexFileInput) (*IndexFileResult, error) {
+	return idx.indexFile(ctx, in, nil, false)
+}
+
+func (idx *Indexer) indexFileWithRootSnapshot(
+	ctx context.Context,
+	in IndexFileInput,
+	checkedRoots []RootCheckResult,
+) (*IndexFileResult, error) {
+	return idx.indexFile(ctx, in, checkedRoots, true)
+}
+
+func (idx *Indexer) indexFile(
+	ctx context.Context,
+	in IndexFileInput,
+	checkedRoots []RootCheckResult,
+	verifySnapshot bool,
+) (*IndexFileResult, error) {
 	if idx == nil || idx.tx == nil {
 		return nil, errors.New("scanner: indexer is not initialized")
 	}
@@ -94,7 +111,16 @@ func (idx *Indexer) IndexFile(ctx context.Context, in IndexFileInput) (*IndexFil
 	}
 
 	var result *IndexFileResult
-	err = idx.tx.WithTx(ctx, func(tx storage.Tx) error {
+	runTx := idx.tx.WithTx
+	if verifySnapshot {
+		runTx = idx.tx.WithReadCommittedTx
+	}
+	err = runTx(ctx, func(tx storage.Tx) error {
+		if verifySnapshot {
+			if err := lockAndVerifyRootSnapshot(ctx, tx, in.LibraryID, checkedRoots); err != nil {
+				return err
+			}
+		}
 		var txErr error
 		result, txErr = idx.indexFileWithValidatedPath(ctx, tx, in, relPath)
 		return txErr

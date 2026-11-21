@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -347,8 +349,11 @@ func TestReconcile_MoveViaHistoricalDigest(t *testing.T) {
 	defer cancel()
 
 	rootDir := filepath.Join(t.TempDir(), "root")
-	cbzV1 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("version-1"), method: zip.Store})
-	cbzV2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("version-2-modified"), method: zip.Store})
+	cbzV1 := buildDeterministicZip(t, "", zipEntry{name: "001.jxl", data: []byte("version-1-jxl"), method: zip.Store})
+	cbzV2 := buildDeterministicZip(t, "",
+		zipEntry{name: "001.avif", data: []byte("version-2-modified-page-1"), method: zip.Store},
+		zipEntry{name: "002.png", data: []byte("version-2-modified-page-2"), method: zip.Store},
+	)
 
 	oldFile := filepath.Join(rootDir, "v01.cbz")
 	writeDiskFile(t, oldFile, cbzV1)
@@ -375,9 +380,16 @@ func TestReconcile_MoveViaHistoricalDigest(t *testing.T) {
 	}
 
 	orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+	v1Digest, ok := orig.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok {
+		t.Fatalf("missing initial partial digest on orig asset %+v", orig)
+	}
+	if orig.PageCount != 1 || !slices.Equal(orig.Diagnostics.ImageCodecs, []string{"jxl"}) {
+		t.Fatalf("unexpected initial layout/codecs: page_count=%d codecs=%v", orig.PageCount, orig.Diagnostics.ImageCodecs)
+	}
 	userID := seedUserAndReadingProgress(ctx, t, db, transactor, "hist-reader", orig, 4)
 
-	// External modify v01.cbz -> cbzV2 so cbzV1 digest becomes historical (is_current=false).
+	// External modify v01.cbz -> 2-page cbzV2 so cbzV1 digest becomes historical (is_current=false).
 	writeDiskFile(t, oldFile, cbzV2)
 	future := time.Now().Add(2 * time.Second).UTC()
 	if err := os.Chtimes(oldFile, future, future); err != nil {
@@ -387,27 +399,74 @@ func TestReconcile_MoveViaHistoricalDigest(t *testing.T) {
 		t.Fatalf("scan 2 (modify) = (%+v, %v)", res, err)
 	}
 
-	// Remove v01.cbz and place original cbzV1 bytes at a new path -> must match historical digest and move!
+	cwRepo := postgres.NewCatalogueWriteRepository(db.Pool)
+	afterMod, err := cwRepo.GetAssetByID(ctx, orig.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID(afterMod): %v", err)
+	}
+	v2Digest, ok := afterMod.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok || v2Digest.Value == v1Digest.Value {
+		t.Fatalf("expected rotated V2 current digest, got (%+v, %v)", v2Digest, ok)
+	}
+	if afterMod.PageCount != 2 || !slices.Equal(afterMod.Diagnostics.ImageCodecs, []string{"avif"}) {
+		t.Fatalf("unexpected V2 layout/codecs: page_count=%d codecs=%v", afterMod.PageCount, afterMod.Diagnostics.ImageCodecs)
+	}
+
+	// Remove v01.cbz and place original 1-page cbzV1 bytes at a new path -> must match historical
+	// digest, move, promote V1 back to current digest while keeping V2 in history, and update layout.
 	if err := os.Remove(oldFile); err != nil {
 		t.Fatalf("remove oldFile: %v", err)
 	}
-	writeDiskFile(t, filepath.Join(rootDir, "Archive/v01_original.cbz"), cbzV1)
+	movedFile := filepath.Join(rootDir, "Archive/v01_original.cbz")
+	writeDiskFile(t, movedFile, cbzV1)
 
 	res3, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
 	if err != nil {
 		t.Fatalf("scan 3 (historical move): %v", err)
 	}
-	if !res3.Complete || res3.MovedCount != 1 || res3.IndexedCount != 0 || res3.ModifiedCount != 0 {
+	if !res3.Complete || !res3.ApplyRemovals || res3.MovedCount != 1 || res3.IndexedCount != 0 || res3.ModifiedCount != 0 {
 		t.Fatalf("unexpected scan 3 result: %+v", res3)
 	}
 
-	moved, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+	moved, err := cwRepo.GetAssetByID(ctx, orig.ID)
 	if err != nil {
-		t.Fatalf("GetAssetByID: %v", err)
+		t.Fatalf("GetAssetByID(moved): %v", err)
 	}
-	if moved.RelPathDisplay != "Archive/v01_original.cbz" || len(moved.Digests) != 2 {
-		t.Fatalf("expected moved path with both digests retained, got %+v", moved)
+	if moved.RelPathDisplay != "Archive/v01_original.cbz" || moved.VolumeID != orig.VolumeID {
+		t.Fatalf("expected moved path keeping volume %s, got %+v", orig.VolumeID, moved)
 	}
+	if moved.PageCount != 1 || !slices.Equal(moved.Diagnostics.ImageCodecs, []string{"jxl"}) || moved.FileSize != int64(len(cbzV1)) {
+		t.Fatalf("expected 1-page JXL file facts after historical move, got page_count=%d codecs=%v size=%d",
+			moved.PageCount, moved.Diagnostics.ImageCodecs, moved.FileSize)
+	}
+	curAfterMove, ok := moved.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok || curAfterMove.Value != v1Digest.Value || !curAfterMove.IsCurrent || curAfterMove.Reason != domain.DigestReasonScan {
+		t.Fatalf("expected current digest promoted back to V1 (%s), got (%+v, %v)", v1Digest.Value, curAfterMove, ok)
+	}
+	if len(moved.Digests) != 2 {
+		t.Fatalf("expected 2 retained digests, got %+v", moved.Digests)
+	}
+	foundHistoricalV2 := false
+	for _, d := range moved.Digests {
+		if d.Kind == v2Digest.Kind && d.Value == v2Digest.Value {
+			if d.IsCurrent || d.Reason != domain.DigestReasonExternalModify {
+				t.Fatalf("expected historical V2 digest demoted with EXTERNAL_MODIFY reason, got %+v", d)
+			}
+			foundHistoricalV2 = true
+		}
+	}
+	if !foundHistoricalV2 {
+		t.Fatalf("expected V2 digest %s retained in asset_digests history, got %+v", v2Digest.Value, moved.Digests)
+	}
+
+	var volPageCount int
+	if err := db.QueryRow(ctx, `SELECT page_count FROM volumes WHERE id = $1`, orig.VolumeID).Scan(&volPageCount); err != nil {
+		t.Fatalf("query volume page_count: %v", err)
+	}
+	if volPageCount != 1 {
+		t.Fatalf("expected volume page_count synced back to 1, got %d", volPageCount)
+	}
+
 	assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 4)
 	assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 1)
 }
@@ -1354,4 +1413,659 @@ func TestReconcile_MovePlusVacatedNewFileAndOverwriteOntoUnmovedPath(t *testing.
 			t.Fatalf("expected asset.modified event for A (%s), got %+v", origA.ID, events)
 		}
 	})
+}
+
+func TestReconcile_IncompleteWalkDefersNewDigestAdditionsAcrossRoots(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	root1 := filepath.Join(base, "r1")
+	root2 := filepath.Join(base, "r2")
+
+	cbzNewInRoot1 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("genuinely-new-digest-root1"), method: zip.Store})
+	cbzVisibleInRoot2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("visible-root2"), method: zip.Store})
+	cbzLockedInRoot2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("locked-root2"), method: zip.Store})
+
+	writeDiskFile(t, filepath.Join(root1, "brand_new.cbz"), cbzNewInRoot1)
+	writeDiskFile(t, filepath.Join(root2, "visible.cbz"), cbzVisibleInRoot2)
+	writeDiskFile(t, filepath.Join(root2, "locked_dir/hidden.cbz"), cbzLockedInRoot2)
+
+	var (
+		lib   domain.Library
+		roots []domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Defer New Across Roots Lib", nil, []byte(root1), []byte(root2))
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+
+	res1, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			if filepath.Base(string(rawDir)) == "locked_dir" {
+				return nil, os.ErrPermission
+			}
+			return os.ReadDir(string(rawDir))
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScanLibrary incomplete walk: %v", err)
+	}
+	if res1.Complete || res1.ApplyRemovals || res1.IndexedCount != 0 || res1.SkippedCount != 1 {
+		t.Fatalf("expected Complete=false ApplyRemovals=false IndexedCount=0 SkippedCount=1, got %+v", res1)
+	}
+	if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 ||
+		len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {
+		t.Fatal("expected zero media_assets committed before all roots walk cleanly")
+	}
+	if events := loadOutboxEventsDetailed(ctx, t, db); len(events) != 0 {
+		t.Fatalf("expected zero outbox events during incomplete walk, got %+v", events)
+	}
+
+	// Once root2 becomes readable, rescan completes the walk and indexes all 3 files.
+	res2, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary complete rescan: %v", err)
+	}
+	if !res2.Complete || !res2.ApplyRemovals || res2.IndexedCount != 3 || res2.SkippedCount != 0 {
+		t.Fatalf("expected Complete=true ApplyRemovals=true IndexedCount=3, got %+v", res2)
+	}
+	assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 3)
+}
+
+type reconcileHookTransactor struct {
+	inner             storage.Transactor
+	readCommittedCall atomic.Int32
+	// beforeSecondReadCommitted fires right before the first post-walk
+	// WithReadCommittedTx call (after PreCheckLibrary's call #1).
+	beforeSecondReadCommitted func() error
+	// onLockVolume calls hook right before GetVolumeByIDForUpdate on the
+	// reconciliation transaction.
+	onLockVolume func() error
+	// wrapUpdateAsset runs hook right after cw.UpdateAsset completes.
+	onAfterUpdateAsset func() error
+}
+
+func (r *reconcileHookTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return r.inner.WithTx(ctx, fn)
+}
+
+func (r *reconcileHookTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	callNum := r.readCommittedCall.Add(1)
+	if callNum == 2 && r.beforeSecondReadCommitted != nil {
+		if err := r.beforeSecondReadCommitted(); err != nil {
+			return err
+		}
+	}
+	return r.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		if callNum == 2 && (r.onLockVolume != nil || r.onAfterUpdateAsset != nil) {
+			return fn(&reconcileHookTx{Tx: tx, parent: r})
+		}
+		return fn(tx)
+	})
+}
+
+type reconcileHookTx struct {
+	storage.Tx
+	parent *reconcileHookTransactor
+}
+
+func (r *reconcileHookTx) CatalogueWrites() storage.CatalogueWriteRepository {
+	return &reconcileHookCatalogueRepo{
+		CatalogueWriteRepository: r.Tx.CatalogueWrites(),
+		parent:                   r.parent,
+	}
+}
+
+type reconcileHookCatalogueRepo struct {
+	storage.CatalogueWriteRepository
+	parent *reconcileHookTransactor
+}
+
+func (r *reconcileHookCatalogueRepo) GetVolumeByIDForUpdate(ctx context.Context, id string) (*domain.Volume, error) {
+	if r.parent.onLockVolume != nil {
+		if err := r.parent.onLockVolume(); err != nil {
+			return nil, err
+		}
+	}
+	return r.CatalogueWriteRepository.GetVolumeByIDForUpdate(ctx, id)
+}
+
+func (r *reconcileHookCatalogueRepo) UpdateAsset(ctx context.Context, asset *domain.MediaAsset) error {
+	if err := r.CatalogueWriteRepository.UpdateAsset(ctx, asset); err != nil {
+		return err
+	}
+	if r.parent.onAfterUpdateAsset != nil {
+		return r.parent.onAfterUpdateAsset()
+	}
+	return nil
+}
+
+func TestReconcile_RootSnapshotInvalidatedBeforeWrite(t *testing.T) {
+	t.Parallel()
+
+	t.Run("root relocated before move write returns ErrStalePreCheck and blocks stale commit", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		oldRootDir := filepath.Join(base, "old-root")
+		relocatedDir := filepath.Join(base, "new-root")
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("relocate-test"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(oldRootDir, "book.cbz"), cbzBytes)
+		writeDiskFile(t, filepath.Join(relocatedDir, "other.cbz"), cbzBytes)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Root Relocate Reconcile Lib", nil, []byte(oldRootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(oldRootDir, "book.cbz"), filepath.Join(oldRootDir, "book_renamed.cbz"))
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			beforeSecondReadCommitted: func() error {
+				return transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+					updated := root
+					updated.Path = mustRootPathIdentity(t, []byte(relocatedDir))
+					return tx.Libraries().UpdateLibraryRoot(ctx, &updated)
+				})
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		res2, err := scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if !errors.Is(err, scanner.ErrStalePreCheck) {
+			t.Fatalf("expected ErrStalePreCheck on root relocation before move write, got err=%v res=%+v", err, res2)
+		}
+		if res2.Complete || res2.ApplyRemovals || res2.MovedCount != 0 {
+			t.Fatalf("expected Complete=false ApplyRemovals=false MovedCount=0, got %+v", res2)
+		}
+		got, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+		if err != nil || got.RelPathDisplay != "book.cbz" {
+			t.Fatalf("expected stale move rolled back leaving book.cbz intact, got (%+v, %v)", got, err)
+		}
+		events := loadOutboxEventsDetailed(ctx, t, db)
+		if len(events) != 1 || events[0].Kind != domain.EventAssetAdded {
+			t.Fatalf("expected only initial asset.added event, got %+v", events)
+		}
+	})
+
+	t.Run("newer OFFLINE verdict before move write returns ErrStalePreCheck and clears ApplyRemovals", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("offline-verdict-test"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "book.cbz"), cbzBytes)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Offline Verdict Reconcile Lib", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(rootDir, "book.cbz"), filepath.Join(rootDir, "book_renamed.cbz"))
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			beforeSecondReadCommitted: func() error {
+				return transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+					msg := "unmounted concurrently"
+					return tx.Libraries().UpdateLibraryRootStatus(ctx, root, domain.LibraryRootStateOffline, time.Now().UTC(), &msg)
+				})
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		res2, err := scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if !errors.Is(err, scanner.ErrStalePreCheck) {
+			t.Fatalf("expected ErrStalePreCheck on newer OFFLINE verdict, got err=%v res=%+v", err, res2)
+		}
+		if res2.Complete || res2.ApplyRemovals || res2.MovedCount != 0 {
+			t.Fatalf("expected Complete=false ApplyRemovals=false MovedCount=0, got %+v", res2)
+		}
+		got, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+		if err != nil || got.RelPathDisplay != "book.cbz" {
+			t.Fatalf("expected stale move rolled back leaving book.cbz intact, got (%+v, %v)", got, err)
+		}
+	})
+
+	t.Run("newer OFFLINE verdict on unchanged scan clears ApplyRemovals", func(t *testing.T) {
+		t.Parallel()
+		_, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("empty-diff-offline"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "book.cbz"), cbzBytes)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Empty Diff Offline Lib", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			beforeSecondReadCommitted: func() error {
+				return transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+					msg := "unmounted during unchanged walk"
+					return tx.Libraries().UpdateLibraryRootStatus(ctx, root, domain.LibraryRootStateOffline, time.Now().UTC(), &msg)
+				})
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		res2, err := scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if !errors.Is(err, scanner.ErrStalePreCheck) {
+			t.Fatalf("expected ErrStalePreCheck on unchanged scan with newer OFFLINE verdict, got err=%v res=%+v", err, res2)
+		}
+		if res2.Complete || res2.ApplyRemovals {
+			t.Fatalf("expected Complete=false ApplyRemovals=false, got %+v", res2)
+		}
+	})
+}
+
+func waitForScannerLockWaiter(ctx context.Context, db *testdb.TestDB, earlyExit <-chan struct{}) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-earlyExit:
+			return errors.New("raced transaction exited before blocking on lock")
+		case <-waitCtx.Done():
+			return fmt.Errorf("waiting for lock contention: %w", waitCtx.Err())
+		default:
+		}
+
+		var waiting bool
+		if err := db.QueryRow(waitCtx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+			)`).Scan(&waiting); err != nil {
+			return fmt.Errorf("polling lock waiter: %w", err)
+		}
+		if waiting {
+			return nil
+		}
+
+		select {
+		case <-earlyExit:
+			return errors.New("raced transaction exited before blocking on lock")
+		case <-waitCtx.Done():
+			return fmt.Errorf("waiting for lock contention: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestReconcile_OverlappingMoveAndModifySerializesWithoutDeadlockAndSurfacesStaleState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("modify holds volume then locks asset while move waits on volume and surfaces ErrStaleAssetState", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("overlap-base"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "a.cbz"), cbzBytes)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Overlap Move/Mod 1", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(rootDir, "a.cbz"), filepath.Join(rootDir, "b.cbz"))
+
+		modReady := make(chan struct{})
+		releaseMod := make(chan struct{})
+		var releaseModOnce sync.Once
+		closeMod := func() {
+			releaseModOnce.Do(func() { close(releaseMod) })
+		}
+
+		var modErr error
+		modDone := make(chan struct{})
+		modStarted := false
+
+		scanDone := make(chan struct{})
+		defer func() {
+			cancel()
+			closeMod()
+			<-scanDone
+			if modStarted {
+				<-modDone
+			}
+		}()
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			onLockVolume: func() error {
+				modStarted = true
+				go func() {
+					defer close(modDone)
+					modErr = transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+						cw := tx.CatalogueWrites()
+						if _, err := cw.GetVolumeByIDForUpdate(ctx, orig.VolumeID); err != nil {
+							return err
+						}
+						close(modReady)
+						select {
+						case <-releaseMod:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						// Lock asset AFTER scan's GetVolumeByIDForUpdate is already waiting on volume!
+						// This used to deadlock (40P01) when move locked media_assets before volumes.
+						asset, err := cw.GetAssetByIDForUpdate(ctx, orig.ID)
+						if err != nil {
+							return err
+						}
+						now := time.Now().UTC().Truncate(time.Microsecond)
+						d := domain.AssetDigest{
+							AssetID:    asset.ID,
+							Kind:       domain.DigestKindXXH364Partial,
+							Value:      "concurrent-external-modify-digest",
+							IsCurrent:  true,
+							Reason:     domain.DigestReasonExternalModify,
+							RecordedAt: now,
+						}
+						if err := cw.RecordAssetDigest(ctx, &d); err != nil {
+							return err
+						}
+						updated := *asset
+						updated.FileSize = asset.FileSize + 10
+						updated.UpdatedAt = now
+						return cw.UpdateAssetContent(ctx, &updated)
+					})
+				}()
+				select {
+				case <-modReady:
+					return nil
+				case <-modDone:
+					return fmt.Errorf("concurrent modifier exited early: %w", modErr)
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		var (
+			scanRes scanner.ScanResult
+			scanErr error
+		)
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		select {
+		case <-modReady:
+		case <-scanDone:
+			t.Fatalf("scan exited before concurrent modifier acquired volume lock: res=%+v err=%v", scanRes, scanErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for modifier lock: %v", ctx.Err())
+		}
+
+		if err := waitForScannerLockWaiter(ctx, db, scanDone); err != nil {
+			t.Fatalf("expected move transaction to wait on volume lock: %v", err)
+		}
+
+		closeMod()
+		<-modDone
+		if modErr != nil {
+			t.Fatalf("concurrent modifier failed: %v", modErr)
+		}
+
+		<-scanDone
+		if !errors.Is(scanErr, scanner.ErrStaleAssetState) {
+			t.Fatalf("expected ErrStaleAssetState from stale move write, got err=%v res=%+v", scanErr, scanRes)
+		}
+		if scanRes.Complete || scanRes.ApplyRemovals || scanRes.MovedCount != 0 {
+			t.Fatalf("expected Complete=false ApplyRemovals=false MovedCount=0, got %+v", scanRes)
+		}
+
+		got, err := postgres.NewCatalogueWriteRepository(db.Pool).GetAssetByID(ctx, orig.ID)
+		if err != nil {
+			t.Fatalf("GetAssetByID: %v", err)
+		}
+		cur, ok := got.CurrentDigest(domain.DigestKindXXH364Partial)
+		if !ok || cur.Value != "concurrent-external-modify-digest" || got.RelPathDisplay != "a.cbz" {
+			t.Fatalf("expected concurrent modify preserved at a.cbz, got asset=%+v cur=(%+v, %v)", got, cur, ok)
+		}
+	})
+
+	t.Run("move holds volume then asset while concurrent modifier waits on volume and commits cleanly", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("overlap-order-2"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(rootDir, "a.cbz"), cbzBytes)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Overlap Move/Mod 2", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+		mustRenameDiskFile(t, filepath.Join(rootDir, "a.cbz"), filepath.Join(rootDir, "b.cbz"))
+
+		moveUpdated := make(chan struct{})
+		releaseMove := make(chan struct{})
+		var releaseMoveOnce sync.Once
+		closeMove := func() {
+			releaseMoveOnce.Do(func() { close(releaseMove) })
+		}
+
+		modDone := make(chan struct{})
+		scanDone := make(chan struct{})
+		var (
+			modErr  error
+			scanRes scanner.ScanResult
+			scanErr error
+		)
+		defer func() {
+			cancel()
+			closeMove()
+			<-scanDone
+			<-modDone
+		}()
+
+		hookTx := &reconcileHookTransactor{
+			inner: transactor,
+			onAfterUpdateAsset: func() error {
+				close(moveUpdated)
+				select {
+				case <-releaseMove:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		scHook, err := scanner.NewScanner(hookTx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner(hook): %v", err)
+		}
+
+		go func() {
+			defer close(scanDone)
+			scanRes, scanErr = scHook.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		}()
+
+		select {
+		case <-moveUpdated:
+		case <-scanDone:
+			close(modDone)
+			t.Fatalf("scan exited before holding locks: res=%+v err=%v", scanRes, scanErr)
+		case <-ctx.Done():
+			close(modDone)
+			t.Fatalf("timed out waiting for move UpdateAsset: %v", ctx.Err())
+		}
+
+		go func() {
+			defer close(modDone)
+			modErr = transactor.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+				cw := tx.CatalogueWrites()
+				vol, err := cw.GetVolumeByIDForUpdate(ctx, orig.VolumeID)
+				if err != nil {
+					return err
+				}
+				asset, err := cw.GetAssetByIDForUpdate(ctx, orig.ID)
+				if err != nil {
+					return err
+				}
+				if asset.VolumeID != vol.ID || asset.RelPathDisplay != "b.cbz" {
+					return fmt.Errorf("unexpected post-move asset state: %+v", asset)
+				}
+				return nil
+			})
+		}()
+
+		if err := waitForScannerLockWaiter(ctx, db, modDone); err != nil {
+			t.Fatalf("expected modifier to wait cleanly on volume lock: %v", err)
+		}
+
+		closeMove()
+		<-scanDone
+		if scanErr != nil || !scanRes.Complete || !scanRes.ApplyRemovals || scanRes.MovedCount != 1 {
+			t.Fatalf("move scan failed: res=%+v err=%v", scanRes, scanErr)
+		}
+		<-modDone
+		if modErr != nil {
+			t.Fatalf("concurrent modifier failed after move commit: %v", modErr)
+		}
+	})
+}
+
+func mustRootPathIdentity(t *testing.T, raw []byte) domain.PathIdentity {
+	t.Helper()
+	p, err := domain.NewRootPathIdentity(raw)
+	if err != nil {
+		t.Fatalf("NewRootPathIdentity(%q): %v", raw, err)
+	}
+	return p
 }

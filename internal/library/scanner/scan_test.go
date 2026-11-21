@@ -41,6 +41,14 @@ func (w *singleWriterWitnessTransactor) WithTx(ctx context.Context, fn func(tx s
 }
 
 func (w *singleWriterWitnessTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	cur := w.active.Add(1)
+	defer w.active.Add(-1)
+	for {
+		prev := w.maxActive.Load()
+		if cur <= prev || w.maxActive.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
 	return w.inner.WithReadCommittedTx(ctx, fn)
 }
 
@@ -58,7 +66,9 @@ func (c *cancelOnThirdAssetTransactor) WithTx(ctx context.Context, fn func(tx st
 }
 
 func (c *cancelOnThirdAssetTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
-	return c.inner.WithReadCommittedTx(ctx, fn)
+	return c.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return fn(&cancelOnThirdAssetTx{Tx: tx, parent: c})
+	})
 }
 
 type cancelOnThirdAssetTx struct {
@@ -825,7 +835,7 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		}
 	})
 
-	t.Run("unreadable subtree in one root marks overall pass incomplete while siblings and other roots index", func(t *testing.T) {
+	t.Run("unreadable subtree in one root marks overall pass incomplete and defers all additions", func(t *testing.T) {
 		t.Parallel()
 		_, transactor := setupIndexerTestDB(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -838,9 +848,12 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		writeDiskFile(t, filepath.Join(root1, "locked_dir/hidden.cbz"), goodB)
 		writeDiskFile(t, filepath.Join(root2, "beta.cbz"), goodC)
 
-		var lib domain.Library
+		var (
+			lib   domain.Library
+			roots []domain.LibraryRoot
+		)
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
-			lib, _ = seedLibraryAndRoots(ctx, t, tx, "Incomplete Subtree Lib", nil, []byte(root1), []byte(root2))
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Incomplete Subtree Lib", nil, []byte(root1), []byte(root2))
 			return nil
 		}); err != nil {
 			t.Fatalf("seed failed: %v", err)
@@ -861,14 +874,18 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ScanLibrary: %v", err)
 		}
-		if res.Complete {
-			t.Fatal("expected res.Complete=false when root1 had an unreadable subtree")
+		if res.Complete || res.ApplyRemovals {
+			t.Fatalf("expected Complete=false and ApplyRemovals=false when root1 had an unreadable subtree, got %+v", res)
 		}
 		if res.Roots[0].Complete || !res.Roots[1].Complete {
 			t.Fatalf("expected root0 Complete=false and root1 Complete=true, got %v / %v", res.Roots[0].Complete, res.Roots[1].Complete)
 		}
-		if res.IndexedCount != 2 || res.SkippedCount != 1 {
-			t.Fatalf("expected 2 indexed and 1 skipped dir, got %+v", res)
+		if res.IndexedCount != 0 || res.SkippedCount != 1 {
+			t.Fatalf("expected 0 indexed and 1 skipped dir when walk is incomplete, got %+v", res)
+		}
+		if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 ||
+			len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {
+			t.Fatal("expected zero committed assets across all roots when walk is incomplete")
 		}
 	})
 
@@ -930,9 +947,12 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		writeDiskFile(t, filepath.Join(flakyRoot, "precheck.cbz"), goodA)
 		writeDiskFile(t, filepath.Join(healthyRoot, "ok.cbz"), goodB)
 
-		var lib domain.Library
+		var (
+			lib   domain.Library
+			roots []domain.LibraryRoot
+		)
 		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
-			lib, _ = seedLibraryAndRoots(ctx, t, tx, "Walk Error Root Lib", nil, []byte(flakyRoot), []byte(healthyRoot))
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Walk Error Root Lib", nil, []byte(flakyRoot), []byte(healthyRoot))
 			return nil
 		}); err != nil {
 			t.Fatalf("seed failed: %v", err)
@@ -965,8 +985,11 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		if res.Roots[0].Complete || res.Roots[0].Err == nil {
 			t.Fatalf("expected root walk error and Complete=false, got %+v", res.Roots[0])
 		}
-		if !res.Roots[1].Complete || res.Roots[1].IndexedCount != 1 {
-			t.Fatalf("expected healthy root to complete and index 1 file, got %+v", res.Roots[1])
+		if !res.Roots[1].Complete || res.Roots[1].IndexedCount != 0 || res.IndexedCount != 0 {
+			t.Fatalf("expected healthy root walk to complete while deferring indexing, got root=%+v res=%+v", res.Roots[1], res)
+		}
+		if len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {
+			t.Fatal("expected healthy root assets not to commit until all roots walk completely")
 		}
 	})
 }

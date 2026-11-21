@@ -1312,3 +1312,186 @@ func TestLibraryRepository_LockLibrary(t *testing.T) {
 		t.Fatalf("tx2 failed after tx1 released: %v", tx2Err)
 	}
 }
+
+func TestLibraryRepository_LockLibraryForKeyShareAndRootsForNoKeyUpdate(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupLibraryTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	poolRepo := postgres.NewLibraryRepository(db.Pool)
+	if err := poolRepo.LockLibraryForKeyShare(ctx, "lib-1"); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("LockLibraryForKeyShare(pool) = %v, want ErrTransactionRequired", err)
+	}
+	if _, err := poolRepo.ListLibraryRootsForNoKeyUpdate(ctx, "lib-1"); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("ListLibraryRootsForNoKeyUpdate(pool) = %v, want ErrTransactionRequired", err)
+	}
+
+	var (
+		libID string
+		rootB domain.LibraryRoot
+		rootA domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.Libraries().LockLibraryForKeyShare(ctx, "   "); !errors.Is(err, domain.ErrEmptyLibraryID) {
+			t.Fatalf("LockLibraryForKeyShare(empty) = %v, want ErrEmptyLibraryID", err)
+		}
+		if err := tx.Libraries().LockLibraryForKeyShare(ctx, domain.MustNewID()); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("LockLibraryForKeyShare(missing) = %v, want ErrNotFound", err)
+		}
+		if _, err := tx.Libraries().ListLibraryRootsForNoKeyUpdate(ctx, "  "); !errors.Is(err, domain.ErrEmptyLibraryID) {
+			t.Fatalf("ListLibraryRootsForNoKeyUpdate(empty) = %v, want ErrEmptyLibraryID", err)
+		}
+
+		lib := domain.Library{
+			Name:          "KeyShare Target",
+			Mode:          domain.LibraryModeVirtual,
+			ResolverChain: domain.DefaultResolverChain(),
+		}
+		if err := tx.Libraries().CreateLibrary(ctx, &lib); err != nil {
+			return err
+		}
+		libID = lib.ID
+
+		// Insert zzz before aaa with explicit ascending IDs so ListLibraryRootsForNoKeyUpdate
+		// proves it orders by ID ASC (not path_match ASC).
+		rootB = domain.LibraryRoot{
+			ID:        domain.MustNewID(),
+			LibraryID: lib.ID,
+			Path:      mustRootPath(t, []byte("/mnt/zzz")),
+		}
+		if err := tx.Libraries().CreateLibraryRoot(ctx, &rootB); err != nil {
+			return err
+		}
+		rootA = domain.LibraryRoot{
+			ID:        domain.MustNewID(),
+			LibraryID: lib.ID,
+			Path:      mustRootPath(t, []byte("/mnt/aaa")),
+		}
+		return tx.Libraries().CreateLibraryRoot(ctx, &rootA)
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer subCancel()
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+
+	var tx1Err error
+	tx1Done := make(chan struct{})
+	go func() {
+		defer close(tx1Done)
+		tx1Err = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+			if err := tx.Libraries().LockLibraryForKeyShare(subCtx, libID); err != nil {
+				return err
+			}
+			roots, err := tx.Libraries().ListLibraryRootsForNoKeyUpdate(subCtx, libID)
+			if err != nil {
+				return err
+			}
+			if len(roots) != 2 || roots[0].ID != rootB.ID || roots[1].ID != rootA.ID {
+				return fmt.Errorf("unexpected root order: got %v, want [%s, %s]", roots, rootB.ID, rootA.ID)
+			}
+			close(locked)
+			select {
+			case <-release:
+				return subCtx.Err()
+			case <-subCtx.Done():
+				return subCtx.Err()
+			}
+		})
+	}()
+
+	var (
+		sharedErr   error
+		forUpdErr   error
+		rootUpdErr  error
+		sharedDone  = make(chan struct{})
+		forUpdDone  = make(chan struct{})
+		rootUpdDone = make(chan struct{})
+		started     bool
+	)
+	defer func() {
+		subCancel()
+		closeRelease()
+		<-tx1Done
+		if started {
+			<-sharedDone
+			<-forUpdDone
+			<-rootUpdDone
+		}
+	}()
+
+	select {
+	case <-locked:
+	case <-tx1Done:
+		t.Fatalf("tx1 exited before acquiring locks: %v", tx1Err)
+	case <-subCtx.Done():
+		t.Fatalf("timed out waiting for tx1 lock: %v", subCtx.Err())
+	}
+
+	// Compatible concurrent FOR KEY SHARE must succeed immediately without blocking.
+	go func() {
+		defer close(sharedDone)
+		sharedErr = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+			return tx.Libraries().LockLibraryForKeyShare(subCtx, libID)
+		})
+	}()
+	select {
+	case <-sharedDone:
+		if sharedErr != nil {
+			t.Fatalf("concurrent LockLibraryForKeyShare failed: %v", sharedErr)
+		}
+	case <-subCtx.Done():
+		t.Fatalf("concurrent LockLibraryForKeyShare blocked: %v", subCtx.Err())
+	}
+
+	// Concurrent FOR UPDATE on library and UpdateLibraryRoot on root must block until tx1 commits.
+	started = true
+	go func() {
+		defer close(forUpdDone)
+		forUpdErr = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+			return tx.Libraries().LockLibrary(subCtx, libID)
+		})
+	}()
+	go func() {
+		defer close(rootUpdDone)
+		rootUpdErr = transactor.WithReadCommittedTx(subCtx, func(tx storage.Tx) error {
+			updated := rootA
+			updated.Path = mustRootPath(t, []byte("/mnt/aaa-relocated"))
+			return tx.Libraries().UpdateLibraryRoot(subCtx, &updated)
+		})
+	}()
+
+	if err := waitForLockWaiter(subCtx, db, `
+		SELECT COUNT(*) = 2
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND state = 'active'
+		  AND wait_event_type = 'Lock'
+		  AND wait_event IN ('tuple', 'transactionid')`, forUpdDone); err != nil {
+		t.Fatalf("expected FOR UPDATE and UpdateLibraryRoot to block on tx1 locks: %v", err)
+	}
+
+	closeRelease()
+	<-tx1Done
+	if tx1Err != nil {
+		t.Fatalf("tx1 failed: %v", tx1Err)
+	}
+	<-forUpdDone
+	if forUpdErr != nil {
+		t.Fatalf("forUpd failed after release: %v", forUpdErr)
+	}
+	<-rootUpdDone
+	if rootUpdErr != nil {
+		t.Fatalf("rootUpd failed after release: %v", rootUpdErr)
+	}
+}
