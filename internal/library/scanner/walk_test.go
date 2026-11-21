@@ -490,18 +490,11 @@ func TestWalkRoot_SkipsHiddenTempNonCBZCorruptAndUnreadableEntries(t *testing.T)
 	writeDiskFile(t, filepath.Join(root, "corrupt.cbz"), []byte("not-a-zip"))
 	writeDiskFile(t, filepath.Join(root, "empty_zero.cbz"), nil)
 
-	// Unreadable CBZ & unreadable subdirectory simulated deterministically via hooks
+	// Unreadable CBZ simulated deterministically via hooks
 	// (avoids root-UID chmod 0000 bypasses in container CI).
 	writeDiskFile(t, filepath.Join(root, "unreadable.cbz"), goodCBZ)
-	writeDiskFile(t, filepath.Join(root, "locked_dir/secret.cbz"), goodCBZ)
 
 	res, err := scanner.WalkRoot(context.Background(), []byte(root), scanner.WalkOptions{
-		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-			if filepath.Base(string(rawDir)) == "locked_dir" {
-				return nil, os.ErrPermission
-			}
-			return os.ReadDir(string(rawDir))
-		},
 		Open: func(ctx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
 			if filepath.Base(string(rawPath)) == "unreadable.cbz" {
 				return nil, os.ErrPermission
@@ -547,7 +540,6 @@ func TestWalkRoot_SkipsHiddenTempNonCBZCorruptAndUnreadableEntries(t *testing.T)
 		"corrupt.cbz":                scanner.SkipReasonCorruptArchive,
 		"empty_zero.cbz":             scanner.SkipReasonCorruptArchive,
 		"unreadable.cbz":             scanner.SkipReasonUnreadable,
-		"locked_dir":                 scanner.SkipReasonUnreadable,
 	}
 	for path, wantReason := range wantReasons {
 		got, ok := skipped[path]
@@ -740,10 +732,14 @@ func TestWalkRoot_NFCNFDAndInvalidUTF8Names(t *testing.T) {
 				}
 			},
 			Stat: func(rawPath []byte) (os.FileInfo, error) {
-				if string(rawPath) == "/synthetic/root" {
+				switch string(rawPath) {
+				case "/synthetic/root":
 					return syntheticFileInfo{name: "root", mode: fs.ModeDir | 0o755, mtime: now, id: 1}, nil
+				case string(append([]byte("/synthetic/root/"), []byte(badDirName)...)):
+					return syntheticFileInfo{name: badDirName, mode: fs.ModeDir | 0o755, mtime: now, id: 2}, nil
+				default:
+					return syntheticFileInfo{name: badFileName, mode: 0o644, size: int64(len(cbzBytes)), mtime: now, id: 3}, nil
 				}
-				return syntheticFileInfo{name: badFileName, mode: 0o644, size: int64(len(cbzBytes)), mtime: now, id: 2}, nil
 			},
 			Open: func(_ context.Context, _ []byte) (scanner.ReadAtCloser, error) {
 				return &bytesReadAtCloser{Reader: bytes.NewReader(cbzBytes)}, nil
@@ -892,6 +888,297 @@ func TestWalkRoot_ValidationAndOnEntryStreaming(t *testing.T) {
 	if len(res.Files) != 0 || len(res.Skipped) != 0 {
 		t.Errorf("expected result slices empty when OnEntry is set, got files=%d skipped=%d", len(res.Files), len(res.Skipped))
 	}
+}
+
+func TestWalkRoot_UnreadableSubtreeMarksIncompleteAndContinuesSiblings(t *testing.T) {
+	goodCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("good"), method: zip.Store})
+
+	cases := []struct {
+		name     string
+		setup    func(t *testing.T, root string) scanner.WalkOptions
+		wantSkip string
+		wantDir  bool
+	}{
+		{
+			name: "descendant ReadDir permission error",
+			setup: func(t *testing.T, root string) scanner.WalkOptions {
+				writeDiskFile(t, filepath.Join(root, "alpha.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "locked_dir/hidden_inside.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "zeta/sibling.cbz"), goodCBZ)
+				return scanner.WalkOptions{
+					ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+						if filepath.Base(string(rawDir)) == "locked_dir" {
+							return nil, os.ErrPermission
+						}
+						return os.ReadDir(string(rawDir))
+					},
+				}
+			},
+			wantSkip: "locked_dir",
+			wantDir:  true,
+		},
+		{
+			name: "descendant directory stat error",
+			setup: func(t *testing.T, root string) scanner.WalkOptions {
+				writeDiskFile(t, filepath.Join(root, "alpha.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "unstat_dir/inside.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "zeta/sibling.cbz"), goodCBZ)
+				return scanner.WalkOptions{
+					Stat: func(rawPath []byte) (os.FileInfo, error) {
+						if filepath.Base(string(rawPath)) == "unstat_dir" {
+							return nil, syscall.EIO
+						}
+						return os.Stat(string(rawPath))
+					},
+				}
+			},
+			wantSkip: "unstat_dir",
+			wantDir:  true,
+		},
+		{
+			name: "symlink target unreadable via traversal error",
+			setup: func(t *testing.T, root string) scanner.WalkOptions {
+				writeDiskFile(t, filepath.Join(root, "alpha.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "zeta/sibling.cbz"), goodCBZ)
+				mustSymlink(t, filepath.Join(root, "zeta"), filepath.Join(root, "blocked_link"))
+				return scanner.WalkOptions{
+					Stat: func(rawPath []byte) (os.FileInfo, error) {
+						if filepath.Base(string(rawPath)) == "blocked_link" {
+							return nil, os.ErrPermission
+						}
+						return os.Stat(string(rawPath))
+					},
+				}
+			},
+			wantSkip: "blocked_link",
+		},
+		{
+			name: "unknown entry type stat traversal error",
+			setup: func(t *testing.T, root string) scanner.WalkOptions {
+				writeDiskFile(t, filepath.Join(root, "alpha.cbz"), goodCBZ)
+				writeDiskFile(t, filepath.Join(root, "zeta/sibling.cbz"), goodCBZ)
+				return scanner.WalkOptions{
+					ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+						entries, err := os.ReadDir(string(rawDir))
+						if err != nil {
+							return nil, err
+						}
+						if string(rawDir) == root {
+							entries = append(entries, syntheticDirEntry{name: "unknown_node", mode: 0})
+						}
+						return entries, nil
+					},
+					Stat: func(rawPath []byte) (os.FileInfo, error) {
+						if filepath.Base(string(rawPath)) == "unknown_node" {
+							return nil, syscall.EIO
+						}
+						return os.Stat(string(rawPath))
+					},
+				}
+			},
+			wantSkip: "unknown_node",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			baseOpts := tc.setup(t, root)
+
+			// 1. Collected results mode
+			res, err := scanner.WalkRoot(context.Background(), []byte(root), baseOpts)
+			if err != nil {
+				t.Fatalf("WalkRoot error = %v, want nil", err)
+			}
+			if res.Complete {
+				t.Fatal("WalkRoot reported Complete=true despite unreadable subtree")
+			}
+			inspected := inspectedMap(res)
+			if _, ok := inspected["alpha.cbz"]; !ok {
+				t.Errorf("missing sibling alpha.cbz in inspected: %v", inspected)
+			}
+			if _, ok := inspected["zeta/sibling.cbz"]; !ok {
+				t.Errorf("missing sibling zeta/sibling.cbz in inspected: %v", inspected)
+			}
+			skipped := skippedMap(res)
+			gotSkip, ok := skipped[tc.wantSkip]
+			if !ok {
+				t.Fatalf("missing skipped entry %q in %v", tc.wantSkip, skipped)
+			}
+			if gotSkip.Reason != scanner.SkipReasonUnreadable || gotSkip.IsDir != tc.wantDir || gotSkip.Err == nil {
+				t.Fatalf("unexpected skip diagnostic: %+v", gotSkip)
+			}
+
+			// 2. Callback mode
+			var streamedInspected []string
+			var streamedSkipped []scanner.SkippedEntry
+			cbOpts := baseOpts
+			cbOpts.OnEntry = func(e scanner.WalkEntry) error {
+				switch e.Kind {
+				case scanner.EntryInspected:
+					streamedInspected = append(streamedInspected, string(e.Inspected.RelPath.Bytes))
+				case scanner.EntrySkipped:
+					streamedSkipped = append(streamedSkipped, *e.Skipped)
+				}
+				return nil
+			}
+			cbRes, err := scanner.WalkRoot(context.Background(), []byte(root), cbOpts)
+			if err != nil {
+				t.Fatalf("callback WalkRoot error = %v, want nil", err)
+			}
+			if cbRes.Complete {
+				t.Fatal("callback WalkRoot reported Complete=true despite unreadable subtree")
+			}
+			sort.Strings(streamedInspected)
+			if !slices.Equal(streamedInspected, []string{"alpha.cbz", "zeta/sibling.cbz"}) {
+				t.Fatalf("callback inspected = %v, want [alpha.cbz zeta/sibling.cbz]", streamedInspected)
+			}
+			if len(streamedSkipped) != 1 || string(streamedSkipped[0].RelPath.Bytes) != tc.wantSkip ||
+				streamedSkipped[0].Reason != scanner.SkipReasonUnreadable {
+				t.Fatalf("callback skipped = %+v, want %q unreadable", streamedSkipped, tc.wantSkip)
+			}
+		})
+	}
+}
+
+func TestWalkRoot_FIFOSwapAndFileReplacementBetweenStatAndOpen(t *testing.T) {
+	t.Run("link swapped to FIFO after stat never blocks production Open", func(t *testing.T) {
+		root := t.TempDir()
+		ext := t.TempDir()
+
+		targetCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("target"), method: zip.Store})
+		siblingCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("sibling"), method: zip.Store})
+		targetPath := filepath.Join(ext, "target.cbz")
+		fifoPath := filepath.Join(ext, "pipe.fifo")
+		linkPath := filepath.Join(root, "link.cbz")
+		directFifoPath := filepath.Join(root, "direct.cbz")
+
+		writeDiskFile(t, targetPath, targetCBZ)
+		writeDiskFile(t, filepath.Join(root, "sibling.cbz"), siblingCBZ)
+		mustSymlink(t, targetPath, linkPath)
+		if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+			t.Fatalf("Mkfifo(ext): %v", err)
+		}
+		if err := syscall.Mkfifo(directFifoPath, 0o600); err != nil {
+			t.Fatalf("Mkfifo(direct): %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		var swapped atomic.Bool
+		res, err := scanner.WalkRoot(ctx, []byte(root), scanner.WalkOptions{
+			Workers: 1,
+			Stat: func(rawPath []byte) (os.FileInfo, error) {
+				info, statErr := os.Stat(string(rawPath))
+				if statErr == nil && string(rawPath) == linkPath && swapped.CompareAndSwap(false, true) {
+					if rmErr := os.Remove(linkPath); rmErr != nil {
+						return nil, rmErr
+					}
+					if symErr := os.Symlink(fifoPath, linkPath); symErr != nil {
+						return nil, symErr
+					}
+				}
+				return info, statErr
+			},
+		})
+		if err != nil {
+			t.Fatalf("WalkRoot error = %v", err)
+		}
+		if !res.Complete {
+			t.Fatal("WalkRoot reported Complete=false")
+		}
+		inspected := inspectedMap(res)
+		if _, ok := inspected["sibling.cbz"]; !ok {
+			t.Fatalf("missing sibling.cbz in inspected: %v", inspected)
+		}
+		skipped := skippedMap(res)
+		for _, p := range []string{"link.cbz", "direct.cbz"} {
+			got, ok := skipped[p]
+			if !ok {
+				t.Fatalf("missing skipped FIFO %q in %v", p, skipped)
+			}
+			if got.Reason != scanner.SkipReasonNonRegular {
+				t.Fatalf("skipped[%q].Reason = %q, want %q", p, got.Reason, scanner.SkipReasonNonRegular)
+			}
+		}
+	})
+
+	t.Run("regular file replaced between stat and open uses opened handle metadata", func(t *testing.T) {
+		root := t.TempDir()
+		oldCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("old-small"), method: zip.Store})
+		newCBZ := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Replaced</Series></ComicInfo>`), method: zip.Store},
+			zipEntry{name: "001.jpg", data: []byte("new-much-larger-page-one"), method: zip.Store},
+			zipEntry{name: "002.jpg", data: []byte("new-much-larger-page-two"), method: zip.Store},
+		)
+
+		swappedPath := filepath.Join(root, "swapped.cbz")
+		unchangedPath := filepath.Join(root, "unchanged.cbz")
+		writeDiskFile(t, swappedPath, oldCBZ)
+		writeDiskFile(t, unchangedPath, oldCBZ)
+
+		oldTime := time.Unix(1700000100, 0).UTC()
+		newTime := time.Unix(1700000500, 0).UTC()
+		if err := os.Chtimes(swappedPath, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(unchangedPath, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+
+		wantNewDigest, err := scanner.PartialFingerprint(bytes.NewReader(newCBZ), int64(len(newCBZ)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var replaced atomic.Bool
+		res, err := scanner.WalkRoot(context.Background(), []byte(root), scanner.WalkOptions{
+			Workers: 1,
+			Known: map[string]scanner.KnownFile{
+				"unchanged.cbz": {Size: int64(len(oldCBZ)), Mtime: &oldTime},
+			},
+			Stat: func(rawPath []byte) (os.FileInfo, error) {
+				info, statErr := os.Stat(string(rawPath))
+				if statErr == nil && string(rawPath) == swappedPath && replaced.CompareAndSwap(false, true) {
+					if writeErr := os.WriteFile(swappedPath, newCBZ, 0o600); writeErr != nil {
+						return nil, writeErr
+					}
+					if chErr := os.Chtimes(swappedPath, newTime, newTime); chErr != nil {
+						return nil, chErr
+					}
+				}
+				return info, statErr
+			},
+		})
+		if err != nil {
+			t.Fatalf("WalkRoot error = %v", err)
+		}
+		if !res.Complete {
+			t.Fatal("WalkRoot reported Complete=false")
+		}
+		unchanged := unchangedMap(res)
+		if _, ok := unchanged["unchanged.cbz"]; !ok {
+			t.Fatalf("missing unchanged.cbz in %v", unchanged)
+		}
+		inspected := inspectedMap(res)
+		got, ok := inspected["swapped.cbz"]
+		if !ok {
+			t.Fatalf("missing swapped.cbz in inspected: %v (skipped=%v)", inspected, res.Skipped)
+		}
+		if got.Size != int64(len(newCBZ)) {
+			t.Errorf("swapped.cbz Size = %d, want %d from opened handle", got.Size, len(newCBZ))
+		}
+		if !got.Mtime.Equal(newTime) {
+			t.Errorf("swapped.cbz Mtime = %v, want %v from opened handle", got.Mtime, newTime)
+		}
+		if got.Digest != wantNewDigest {
+			t.Errorf("swapped.cbz Digest = %s, want %s", got.Digest, wantNewDigest)
+		}
+		if got.PageCount != 2 || got.ComicInfo == nil || got.ComicInfo.Series != "Replaced" {
+			t.Errorf("swapped.cbz pages/ComicInfo mismatch: pages=%d meta=%+v", got.PageCount, got.ComicInfo)
+		}
+	})
 }
 
 func mustSymlink(t *testing.T, target, linkPath string) {

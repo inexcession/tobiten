@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -117,9 +119,9 @@ type WalkEntry struct {
 	Skipped   *SkippedEntry
 }
 
-// WalkResult summarizes a WalkRoot invocation. Complete is true only if the full
-// directory tree was walked and all scheduled inspections completed without
-// cancellation or callback errors.
+// WalkResult summarizes a WalkRoot invocation. Complete is true only if every
+// reachable directory in the root was read and all scheduled inspections
+// completed without lost subtree coverage, cancellation, or callback errors.
 type WalkResult struct {
 	Complete       bool
 	Files          []InspectedFile
@@ -173,14 +175,23 @@ type inspectTask struct {
 	mtime   time.Time
 }
 
+type statReadAtCloser interface {
+	Stat() (os.FileInfo, error)
+}
+
 type walkRuntime struct {
-	opts    WalkOptions
-	root    []byte
-	workers int
-	formats *container.FormatRegistry
-	readDir func([]byte) ([]os.DirEntry, error)
-	stat    func([]byte) (os.FileInfo, error)
-	open    func(context.Context, []byte) (ReadAtCloser, error)
+	opts              WalkOptions
+	root              []byte
+	workers           int
+	formats           *container.FormatRegistry
+	readDir           func([]byte) ([]os.DirEntry, error)
+	stat              func([]byte) (os.FileInfo, error)
+	open              func(context.Context, []byte) (ReadAtCloser, error)
+	subtreeIncomplete atomic.Bool
+}
+
+func (rt *walkRuntime) markSubtreeIncomplete() {
+	rt.subtreeIncomplete.Store(true)
 }
 
 // WalkRoot sequentially walks rootBytes (reading one directory at a time in
@@ -254,7 +265,7 @@ func newWalkRuntime(rootBytes []byte, opts WalkOptions) (*walkRuntime, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			return paths.OpenRaw(rawPath)
+			return openRawReadOnlyNonBlock(rawPath)
 		}
 	}
 
@@ -267,6 +278,13 @@ func newWalkRuntime(rootBytes []byte, opts WalkOptions) (*walkRuntime, error) {
 		stat:    statFn,
 		open:    openFn,
 	}, nil
+}
+
+func openRawReadOnlyNonBlock(rawPath []byte) (*os.File, error) {
+	if len(rawPath) == 0 || bytes.IndexByte(rawPath, 0) >= 0 {
+		return nil, paths.ErrInvalidRawPath
+	}
+	return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
 }
 
 func trimTrailingSlashes(raw []byte) []byte {
@@ -293,49 +311,32 @@ func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkR
 		}()
 	}
 
-	var walkErrMu sync.Mutex
 	var walkErr error
-	walkerDone := make(chan struct{})
 	go func() {
-		defer close(walkerDone)
+		defer close(resultsCh)
+		defer workersWG.Wait()
 		defer close(tasksCh)
-		err := rt.walkDir(walkCtx, nil, rt.root, []os.FileInfo{rootInfo}, true, tasksCh, resultsCh)
-		if err != nil {
-			walkErrMu.Lock()
+		if err := rt.walkDir(walkCtx, nil, rt.root, []os.FileInfo{rootInfo}, true, tasksCh, resultsCh); err != nil {
 			walkErr = err
-			walkErrMu.Unlock()
 			cancel()
 		}
 	}()
 
-	go func() {
-		<-walkerDone
-		workersWG.Wait()
-		close(resultsCh)
-	}()
-
 	res, cbErr := rt.collectResults(resultsCh, cancel)
-	<-walkerDone
-	workersWG.Wait()
-
-	walkErrMu.Lock()
-	wErr := walkErr
-	walkErrMu.Unlock()
-
 	if cbErr != nil {
 		res.Complete = false
 		return res, cbErr
 	}
-	if wErr != nil {
+	if walkErr != nil {
 		res.Complete = false
-		return res, wErr
+		return res, walkErr
 	}
 	if err := ctx.Err(); err != nil {
 		res.Complete = false
 		return res, err
 	}
 
-	res.Complete = true
+	res.Complete = !rt.subtreeIncomplete.Load()
 	return res, nil
 }
 
@@ -394,6 +395,7 @@ func (rt *walkRuntime) walkDir(
 		if isRoot {
 			return fmt.Errorf("scanner: read root directory: %w", err)
 		}
+		rt.markSubtreeIncomplete()
 		relID, idErr := domain.NewRelativePathIdentity(relDir)
 		if idErr != nil {
 			return idErr
@@ -432,8 +434,7 @@ func (rt *walkRuntime) visitEntry(
 	resultsCh chan<- WalkEntry,
 ) error {
 	nameBytes := []byte(de.Name())
-	relBytes := joinRelativeBytes(relDir, nameBytes)
-	relID, err := domain.NewRelativePathIdentity(relBytes)
+	relID, err := domain.NewRelativePathIdentity(joinRelativeBytes(relDir, nameBytes))
 	if err != nil {
 		return err
 	}
@@ -457,91 +458,50 @@ func (rt *walkRuntime) visitEntry(
 		})
 	}
 
-	if entryType&os.ModeSymlink != 0 {
-		return rt.visitSymlink(ctx, relID, absBytes, ancestry, nameBytes, tasksCh, resultsCh)
-	}
-
-	if entryType == 0 {
-		info, statErr := rt.stat(absBytes)
-		if statErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
+	needsFollow := entryType&os.ModeSymlink != 0 || entryType == 0
+	if !needsFollow && !isDirHint {
+		if !entryType.IsRegular() {
 			return emitSkipped(ctx, resultsCh, SkippedEntry{
 				RelPath: relID,
-				Reason:  classifyStatError(statErr),
-				Err:     statErr,
+				Reason:  SkipReasonNonRegular,
 			})
 		}
-		return rt.dispatchResolved(ctx, relID, absBytes, ancestry, nameBytes, info, tasksCh, resultsCh)
-	}
-
-	if entryType.IsDir() {
-		info, infoErr := rt.statOrInfo(absBytes, de)
-		if infoErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
+		if !isCBZName(nameBytes) {
 			return emitSkipped(ctx, resultsCh, SkippedEntry{
 				RelPath: relID,
-				IsDir:   true,
-				Reason:  SkipReasonUnreadable,
-				Err:     infoErr,
+				Reason:  SkipReasonNonCBZ,
 			})
 		}
-		nextAncestry := append(slices.Clone(ancestry), info)
-		return rt.walkDir(ctx, relID.Bytes, absBytes, nextAncestry, false, tasksCh, resultsCh)
 	}
 
-	if !entryType.IsRegular() {
-		return emitSkipped(ctx, resultsCh, SkippedEntry{
-			RelPath: relID,
-			Reason:  SkipReasonNonRegular,
-		})
-	}
-
-	if !isCBZName(nameBytes) {
-		return emitSkipped(ctx, resultsCh, SkippedEntry{
-			RelPath: relID,
-			Reason:  SkipReasonNonCBZ,
-		})
-	}
-
-	info, infoErr := rt.statOrInfo(absBytes, de)
-	if infoErr != nil {
+	info, resolveErr := rt.resolveEntryInfo(absBytes, de, needsFollow)
+	if resolveErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
+		reason := SkipReasonUnreadable
+		if needsFollow {
+			reason = classifyStatError(resolveErr)
+		}
+		if (isDirHint || needsFollow) && reason == SkipReasonUnreadable {
+			rt.markSubtreeIncomplete()
+		}
 		return emitSkipped(ctx, resultsCh, SkippedEntry{
 			RelPath: relID,
-			Reason:  SkipReasonUnreadable,
-			Err:     infoErr,
+			IsDir:   isDirHint,
+			Reason:  reason,
+			Err:     resolveErr,
 		})
 	}
-	return rt.handleCBZFile(ctx, relID, absBytes, info, tasksCh, resultsCh)
+
+	return rt.dispatchResolved(ctx, relID, absBytes, ancestry, nameBytes, info, tasksCh, resultsCh)
 }
 
-func (rt *walkRuntime) visitSymlink(
-	ctx context.Context,
-	relID domain.PathIdentity,
-	absBytes []byte,
-	ancestry []os.FileInfo,
-	nameBytes []byte,
-	tasksCh chan<- inspectTask,
-	resultsCh chan<- WalkEntry,
-) error {
-	targetInfo, err := rt.stat(absBytes)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return emitSkipped(ctx, resultsCh, SkippedEntry{
-			RelPath: relID,
-			Reason:  classifyStatError(err),
-			Err:     err,
-		})
+func (rt *walkRuntime) resolveEntryInfo(absBytes []byte, de os.DirEntry, follow bool) (os.FileInfo, error) {
+	if follow || rt.opts.Stat != nil {
+		return rt.stat(absBytes)
 	}
-	return rt.dispatchResolved(ctx, relID, absBytes, ancestry, nameBytes, targetInfo, tasksCh, resultsCh)
+	return de.Info()
 }
 
 func (rt *walkRuntime) dispatchResolved(
@@ -615,13 +575,6 @@ func (rt *walkRuntime) handleCBZFile(
 	}
 }
 
-func (rt *walkRuntime) statOrInfo(absBytes []byte, de os.DirEntry) (os.FileInfo, error) {
-	if rt.opts.Stat != nil {
-		return rt.opts.Stat(absBytes)
-	}
-	return de.Info()
-}
-
 func (rt *walkRuntime) runWorker(ctx context.Context, tasksCh <-chan inspectTask, resultsCh chan<- WalkEntry) {
 	for {
 		select {
@@ -657,7 +610,30 @@ func (rt *walkRuntime) inspectOne(ctx context.Context, task inspectTask) (WalkEn
 		_ = f.Close()
 	}()
 
-	digest, err := PartialFingerprint(f, task.size)
+	size, mtime := task.size, task.mtime
+	if statable, ok := f.(statReadAtCloser); ok {
+		openedInfo, statErr := statable.Stat()
+		if statErr != nil {
+			return skippedEntry(task.relPath, SkipReasonUnreadable, statErr), false
+		}
+		if !openedInfo.Mode().IsRegular() {
+			if openedInfo.IsDir() {
+				rt.markSubtreeIncomplete()
+			}
+			return WalkEntry{
+				Kind: EntrySkipped,
+				Skipped: &SkippedEntry{
+					RelPath: task.relPath,
+					IsDir:   openedInfo.IsDir(),
+					Reason:  SkipReasonNonRegular,
+				},
+			}, false
+		}
+		size = openedInfo.Size()
+		mtime = normalizeMtime(openedInfo.ModTime())
+	}
+
+	digest, err := PartialFingerprint(f, size)
 	if err != nil {
 		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			return WalkEntry{}, true
@@ -665,7 +641,7 @@ func (rt *walkRuntime) inspectOne(ctx context.Context, task inspectTask) (WalkEn
 		return skippedEntry(task.relPath, SkipReasonUnreadable, err), false
 	}
 
-	cr, err := rt.formats.Open(f, task.size)
+	cr, err := rt.formats.Open(f, size)
 	if err != nil {
 		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			return WalkEntry{}, true
@@ -702,8 +678,8 @@ func (rt *walkRuntime) inspectOne(ctx context.Context, task inspectTask) (WalkEn
 		Kind: EntryInspected,
 		Inspected: &InspectedFile{
 			RelPath:              task.relPath,
-			Size:                 task.size,
-			Mtime:                task.mtime,
+			Size:                 size,
+			Mtime:                mtime,
 			Format:               domain.MediaFormatCBZ,
 			DigestKind:           domain.DigestKindXXH364Partial,
 			Digest:               digest,
@@ -944,10 +920,10 @@ func classifyStatError(err error) SkipReason {
 	if errors.Is(err, syscall.ELOOP) {
 		return SkipReasonSymlinkCycle
 	}
-	if os.IsPermission(err) {
-		return SkipReasonUnreadable
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
+		return SkipReasonBrokenSymlink
 	}
-	return SkipReasonBrokenSymlink
+	return SkipReasonUnreadable
 }
 
 func classifyOpenArchiveError(err error) SkipReason {
