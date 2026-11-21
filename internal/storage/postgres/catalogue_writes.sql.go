@@ -995,6 +995,72 @@ func (q *Queries) InsertAssetDigest(ctx context.Context, arg InsertAssetDigestPa
 	return i, err
 }
 
+const listMediaAssetsWithAllDigestsByLibrary = `-- name: ListMediaAssetsWithAllDigestsByLibrary :many
+SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
+       d.kind AS digest_kind,
+       d.value AS digest_value,
+       d.is_current AS digest_is_current,
+       d.reason AS digest_reason,
+       d.recorded_at AS digest_recorded_at
+FROM media_assets a
+JOIN library_roots r ON r.id = a.library_root_id
+LEFT JOIN asset_digests d ON d.asset_id = a.id
+WHERE r.library_id = $1
+ORDER BY a.created_at ASC, a.id ASC, d.kind ASC, d.is_current DESC, d.recorded_at DESC, d.value ASC
+`
+
+type ListMediaAssetsWithAllDigestsByLibraryRow struct {
+	MediaAsset       MediaAsset
+	DigestKind       *string
+	DigestValue      *string
+	DigestIsCurrent  pgtype.Bool
+	DigestReason     *string
+	DigestRecordedAt *time.Time
+}
+
+func (q *Queries) ListMediaAssetsWithAllDigestsByLibrary(ctx context.Context, libraryID string) ([]ListMediaAssetsWithAllDigestsByLibraryRow, error) {
+	rows, err := q.db.Query(ctx, listMediaAssetsWithAllDigestsByLibrary, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMediaAssetsWithAllDigestsByLibraryRow
+	for rows.Next() {
+		var i ListMediaAssetsWithAllDigestsByLibraryRow
+		if err := rows.Scan(
+			&i.MediaAsset.ID,
+			&i.MediaAsset.VolumeID,
+			&i.MediaAsset.LibraryRootID,
+			&i.MediaAsset.RelPathBytes,
+			&i.MediaAsset.RelPathDisplay,
+			&i.MediaAsset.RelPathMatch,
+			&i.MediaAsset.FileSize,
+			&i.MediaAsset.FileMtime,
+			&i.MediaAsset.Format,
+			&i.MediaAsset.PageCount,
+			&i.MediaAsset.CoverPageIndex,
+			&i.MediaAsset.SuppressedPages,
+			&i.MediaAsset.Diagnostics,
+			&i.MediaAsset.MissingSince,
+			&i.MediaAsset.RetiredAt,
+			&i.MediaAsset.CreatedAt,
+			&i.MediaAsset.UpdatedAt,
+			&i.DigestKind,
+			&i.DigestValue,
+			&i.DigestIsCurrent,
+			&i.DigestReason,
+			&i.DigestRecordedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMediaAssetsWithCurrentDigestsByRoot = `-- name: ListMediaAssetsWithCurrentDigestsByRoot :many
 SELECT a.id, a.volume_id, a.library_root_id, a.rel_path_bytes, a.rel_path_display, a.rel_path_match, a.file_size, a.file_mtime, a.format, a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics, a.missing_since, a.retired_at, a.created_at, a.updated_at,
        d.kind AS digest_kind,
@@ -1133,6 +1199,69 @@ func (q *Queries) UpdateMediaAsset(ctx context.Context, arg UpdateMediaAssetPara
 		arg.Diagnostics,
 		arg.MissingSince,
 		arg.RetiredAt,
+		arg.UpdatedAt,
+	)
+	var i MediaAsset
+	err := row.Scan(
+		&i.ID,
+		&i.VolumeID,
+		&i.LibraryRootID,
+		&i.RelPathBytes,
+		&i.RelPathDisplay,
+		&i.RelPathMatch,
+		&i.FileSize,
+		&i.FileMtime,
+		&i.Format,
+		&i.PageCount,
+		&i.CoverPageIndex,
+		&i.SuppressedPages,
+		&i.Diagnostics,
+		&i.MissingSince,
+		&i.RetiredAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateMediaAssetContent = `-- name: UpdateMediaAssetContent :one
+UPDATE media_assets
+SET file_size = $2,
+    file_mtime = $3,
+    format = $4,
+    page_count = $5,
+    cover_page_index = $6,
+    suppressed_pages = $7,
+    diagnostics = $8,
+    updated_at = $9
+WHERE id = $1
+RETURNING id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match,
+          file_size, file_mtime, format, page_count, cover_page_index, suppressed_pages,
+          diagnostics, missing_since, retired_at, created_at, updated_at
+`
+
+type UpdateMediaAssetContentParams struct {
+	ID              string
+	FileSize        int64
+	FileMtime       *time.Time
+	Format          string
+	PageCount       int32
+	CoverPageIndex  int32
+	SuppressedPages []int32
+	Diagnostics     []byte
+	UpdatedAt       time.Time
+}
+
+func (q *Queries) UpdateMediaAssetContent(ctx context.Context, arg UpdateMediaAssetContentParams) (MediaAsset, error) {
+	row := q.db.QueryRow(ctx, updateMediaAssetContent,
+		arg.ID,
+		arg.FileSize,
+		arg.FileMtime,
+		arg.Format,
+		arg.PageCount,
+		arg.CoverPageIndex,
+		arg.SuppressedPages,
+		arg.Diagnostics,
 		arg.UpdatedAt,
 	)
 	var i MediaAsset

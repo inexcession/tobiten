@@ -58,6 +58,8 @@ type RootScanResult struct {
 	Complete       bool
 	Err            error
 	IndexedCount   int
+	MovedCount     int
+	ModifiedCount  int
 	UnchangedCount int
 	Changed        []ChangedFile
 	Skipped        []SkippedEntry
@@ -73,6 +75,8 @@ type ScanResult struct {
 	Complete       bool
 	Roots          []RootScanResult
 	IndexedCount   int
+	MovedCount     int
+	ModifiedCount  int
 	UnchangedCount int
 	ChangedCount   int
 	SkippedCount   int
@@ -156,13 +160,16 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return res, nil
 	}
 
-	_, currentRoots, err := s.loadLibraryAndRoots(ctx, libraryID)
+	currentRoots, preWalkAssets, err := s.loadLibraryRootsAndAssets(ctx, libraryID)
 	if err != nil {
 		return ScanResult{}, err
 	}
 	if !rootSnapshotPathsMatch(preCheck.Roots, currentRoots) || !allRootsOnline(currentRoots) {
 		return ScanResult{}, ErrStalePreCheck
 	}
+
+	assetsByRoot, existingDigestSet := indexPreWalkAssets(preWalkAssets, len(preCheck.Roots))
+	obs := newLibraryWalkObservations()
 
 	res.Complete = true
 	res.Roots = make([]RootScanResult, 0, len(preCheck.Roots))
@@ -179,12 +186,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 			Path:      checkedRoot.RootPath,
 			State:     checkedRoot.State,
 		}
-		rootRes, loadErr := s.scanOneRoot(ctx, preCheck.LibraryID, root, opts)
-		if loadErr != nil {
-			res.Complete = false
-			res.ApplyRemovals = false
-			return res, loadErr
-		}
+		rootRes := s.scanOneRoot(ctx, preCheck.LibraryID, root, assetsByRoot[root.ID], existingDigestSet, obs, opts)
 		res.recordRoot(rootRes)
 		if rootRes.Err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -193,6 +195,13 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 				return res, ctxErr
 			}
 			rootErrs = append(rootErrs, rootRes.Err)
+		}
+	}
+	if res.Complete && len(rootErrs) == 0 && ctx.Err() == nil {
+		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, &res); err != nil {
+			res.Complete = false
+			res.ApplyRemovals = false
+			return res, err
 		}
 	}
 	res.ApplyRemovals = res.Complete && preCheck.ApplyRemovals
@@ -205,11 +214,51 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 func (r *ScanResult) recordRoot(rootRes RootScanResult) {
 	r.Roots = append(r.Roots, rootRes)
 	r.IndexedCount += rootRes.IndexedCount
+	r.MovedCount += rootRes.MovedCount
+	r.ModifiedCount += rootRes.ModifiedCount
 	r.UnchangedCount += rootRes.UnchangedCount
 	r.ChangedCount += len(rootRes.Changed)
 	r.SkippedCount += rootRes.SkippedCount
 	if !rootRes.Complete {
 		r.Complete = false
+	}
+}
+
+func (r *ScanResult) findRootIndex(rootID string) int {
+	for i := range r.Roots {
+		if r.Roots[i].LibraryRootID == rootID {
+			return i
+		}
+	}
+	return -1
+}
+
+func (r *ScanResult) recordReconcileMoved(rootID string) {
+	r.MovedCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].MovedCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileModified(rootID string) {
+	r.ModifiedCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].ModifiedCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileIndexed(rootID string) {
+	r.IndexedCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].IndexedCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileSkipped(rootID string, skip SkippedEntry) {
+	r.SkippedCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].Skipped = append(r.Roots[i].Skipped, skip)
+		r.Roots[i].SkippedCount++
 	}
 }
 
@@ -254,41 +303,70 @@ func (s *Scanner) loadLibraryAndRoots(ctx context.Context, libraryID string) (*d
 	return lib, roots, nil
 }
 
-func (s *Scanner) loadRootAssets(ctx context.Context, rootID string) ([]domain.MediaAsset, error) {
-	var assets []domain.MediaAsset
+func (s *Scanner) loadLibraryRootsAndAssets(ctx context.Context, libraryID string) ([]domain.LibraryRoot, []domain.MediaAsset, error) {
+	var (
+		roots  []domain.LibraryRoot
+		assets []domain.MediaAsset
+	)
 	err := s.tx.WithTx(ctx, func(tx storage.Tx) error {
+		repo := tx.Libraries()
+		if repo == nil {
+			return errors.New("scanner: library repository is required")
+		}
 		cw := tx.CatalogueWrites()
 		if cw == nil {
 			return errors.New("scanner: catalogue write repository is required")
 		}
-		var err error
-		assets, err = cw.ListAssetsByRoot(ctx, rootID)
+		lib, err := repo.GetLibraryByID(ctx, libraryID)
+		if err != nil {
+			return err
+		}
+		roots, err = repo.ListLibraryRoots(ctx, lib.ID)
+		if err != nil {
+			return err
+		}
+		assets, err = cw.ListAssetsByLibrary(ctx, lib.ID)
 		return err
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return assets, nil
+	return roots, assets, nil
+}
+
+func indexPreWalkAssets(assets []domain.MediaAsset, rootCap int) (map[string][]domain.MediaAsset, map[digestKey]struct{}) {
+	byRoot := make(map[string][]domain.MediaAsset, rootCap)
+	digestSet := make(map[digestKey]struct{})
+	for _, asset := range assets {
+		byRoot[asset.LibraryRootID] = append(byRoot[asset.LibraryRootID], asset)
+		if asset.MissingSince != nil {
+			continue
+		}
+		for _, d := range asset.Digests {
+			digestSet[digestKey{kind: d.Kind, value: d.Value}] = struct{}{}
+		}
+	}
+	return byRoot, digestSet
 }
 
 func (s *Scanner) scanOneRoot(
 	ctx context.Context,
 	libraryID string,
 	root domain.LibraryRoot,
+	assets []domain.MediaAsset,
+	existingDigestSet map[digestKey]struct{},
+	obs *libraryWalkObservations,
 	opts ScanOptions,
-) (RootScanResult, error) {
-	assets, err := s.loadRootAssets(ctx, root.ID)
-	if err != nil {
-		return RootScanResult{}, err
-	}
-
+) RootScanResult {
 	knownByPath, knownForWalk := buildKnownMaps(assets)
 	state := &rootScanState{
-		ctx:         ctx,
-		libraryID:   libraryID,
-		rootID:      root.ID,
-		indexer:     s.indexer,
-		knownByPath: knownByPath,
+		ctx:               ctx,
+		libraryID:         libraryID,
+		rootID:            root.ID,
+		indexer:           s.indexer,
+		knownByPath:       knownByPath,
+		existingDigestSet: existingDigestSet,
+		obs:               obs,
 		result: RootScanResult{
 			LibraryRootID: root.ID,
 			RootPath:      root.Path,
@@ -307,7 +385,7 @@ func (s *Scanner) scanOneRoot(
 	walkRes, walkErr := WalkRoot(ctx, root.Path.Bytes, walkOpts)
 	state.result.Err = walkErr
 	state.result.Complete = walkErr == nil && walkRes.Complete && ctx.Err() == nil
-	return state.result, nil
+	return state.result
 }
 
 func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, map[string]KnownFile) {
@@ -327,12 +405,14 @@ func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, m
 }
 
 type rootScanState struct {
-	ctx         context.Context
-	libraryID   string
-	rootID      string
-	indexer     *Indexer
-	knownByPath map[string]domain.MediaAsset
-	result      RootScanResult
+	ctx               context.Context
+	libraryID         string
+	rootID            string
+	indexer           *Indexer
+	knownByPath       map[string]domain.MediaAsset
+	existingDigestSet map[digestKey]struct{}
+	obs               *libraryWalkObservations
+	result            RootScanResult
 }
 
 func (st *rootScanState) handleEntry(entry WalkEntry) error {
@@ -343,12 +423,24 @@ func (st *rootScanState) handleEntry(entry WalkEntry) error {
 	case EntryUnchanged:
 		if entry.Unchanged != nil {
 			st.result.UnchangedCount++
+			loc := assetLocation{
+				rootID:       st.rootID,
+				relPathBytes: string(entry.Unchanged.RelPath.Bytes),
+			}
+			st.obs.seenUnchanged[loc] = struct{}{}
 		}
 		return nil
 	case EntrySkipped:
 		if entry.Skipped != nil {
 			st.result.Skipped = append(st.result.Skipped, *entry.Skipped)
 			st.result.SkippedCount++
+			if !entry.Skipped.IsDir {
+				loc := assetLocation{
+					rootID:       st.rootID,
+					relPathBytes: string(entry.Skipped.RelPath.Bytes),
+				}
+				st.obs.seenSkipped[loc] = struct{}{}
+			}
 		}
 		return nil
 	case EntryInspected:
@@ -366,6 +458,18 @@ func (st *rootScanState) handleInspected(inspected InspectedFile) error {
 		st.result.Changed = append(st.result.Changed, ChangedFile{
 			Existing:  existing,
 			Inspected: inspected,
+		})
+		st.obs.changed = append(st.obs.changed, observedChanged{
+			rootID:    st.rootID,
+			existing:  existing,
+			inspected: inspected,
+		})
+		return nil
+	}
+	if _, matchesExisting := st.existingDigestSet[digestKey{kind: inspected.DigestKind, value: inspected.Digest}]; matchesExisting {
+		st.obs.deferredNew = append(st.obs.deferredNew, observedFile{
+			rootID:    st.rootID,
+			inspected: inspected,
 		})
 		return nil
 	}

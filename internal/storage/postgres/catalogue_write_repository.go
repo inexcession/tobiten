@@ -681,6 +681,28 @@ func (r *CatalogueWriteRepository) GetAssetByID(ctx context.Context, id string) 
 	if strings.TrimSpace(id) == "" {
 		return nil, domain.ErrEmptyAssetID
 	}
+	return r.fetchAssetWithDigestsByID(ctx, id)
+}
+
+// GetAssetByIDForUpdate locks the media asset row FOR UPDATE within an active
+// transaction and retrieves it along with its current and historical digests.
+func (r *CatalogueWriteRepository) GetAssetByIDForUpdate(ctx context.Context, id string) (*domain.MediaAsset, error) {
+	if r == nil {
+		return nil, errors.New("catalogue write repository is required")
+	}
+	if r.scope == nil {
+		return nil, storage.ErrTransactionRequired
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptyAssetID
+	}
+	if _, err := r.q.LockMediaAssetForUpdate(ctx, id); err != nil {
+		return nil, mapPgError(err)
+	}
+	return r.fetchAssetWithDigestsByID(ctx, id)
+}
+
+func (r *CatalogueWriteRepository) fetchAssetWithDigestsByID(ctx context.Context, id string) (*domain.MediaAsset, error) {
 	rows, err := r.q.GetMediaAssetWithDigestsByIDForWrite(ctx, id)
 	if err != nil {
 		return nil, mapPgError(err)
@@ -744,6 +766,40 @@ func (r *CatalogueWriteRepository) UpdateAsset(ctx context.Context, asset *domai
 	return nil
 }
 
+// UpdateAssetContent persists content, metadata-derived layout, and diagnostics
+// changes to an existing media asset without altering its volume or location.
+func (r *CatalogueWriteRepository) UpdateAssetContent(ctx context.Context, asset *domain.MediaAsset) error {
+	if r == nil {
+		return errors.New("catalogue write repository is required")
+	}
+	prepared, err := prepareAssetWrite(asset, false)
+	if err != nil {
+		return err
+	}
+
+	row, err := r.q.UpdateMediaAssetContent(ctx, UpdateMediaAssetContentParams{
+		ID:              prepared.candidate.ID,
+		FileSize:        prepared.candidate.FileSize,
+		FileMtime:       normalizeOptionalTimeUTC(prepared.candidate.FileMtime),
+		Format:          string(prepared.candidate.Format),
+		PageCount:       prepared.pageCount,
+		CoverPageIndex:  prepared.coverPageIndex,
+		SuppressedPages: prepared.suppressedPages,
+		Diagnostics:     prepared.diagnosticsBytes,
+		UpdatedAt:       prepared.candidate.UpdatedAt,
+	})
+	if err != nil {
+		return mapCatalogueWriteError(err)
+	}
+	out, err := mediaAssetModelToDomain(row)
+	if err != nil {
+		return err
+	}
+	out.Digests = slices.Clone(asset.Digests)
+	*asset = out
+	return nil
+}
+
 // UpdateAssetLocation updates an asset's library root and relative path while preserving its ID,
 // volume assignment, digests, and reading progress.
 func (r *CatalogueWriteRepository) UpdateAssetLocation(
@@ -785,26 +841,89 @@ func (r *CatalogueWriteRepository) UpdateAssetLocation(
 
 // ListAssetsByRoot returns all media assets belonging to libraryRootID along with their current digests.
 func (r *CatalogueWriteRepository) ListAssetsByRoot(ctx context.Context, libraryRootID string) ([]domain.MediaAsset, error) {
+	return listAssetsWithDigests(r, libraryRootID, domain.ErrEmptyLibraryRootID,
+		func(id string) ([]ListMediaAssetsWithCurrentDigestsByRootRow, error) {
+			return r.q.ListMediaAssetsWithCurrentDigestsByRoot(ctx, id)
+		},
+		func(row ListMediaAssetsWithCurrentDigestsByRootRow) joinedAssetDigestRow {
+			return joinedAssetDigestRow{
+				asset:            row.MediaAsset,
+				digestKind:       row.DigestKind,
+				digestValue:      row.DigestValue,
+				digestIsCurrent:  row.DigestIsCurrent,
+				digestReason:     row.DigestReason,
+				digestRecordedAt: row.DigestRecordedAt,
+			}
+		},
+	)
+}
+
+// ListAssetsByLibrary returns all media assets across all roots of libraryID along
+// with both their current and historical digests.
+func (r *CatalogueWriteRepository) ListAssetsByLibrary(ctx context.Context, libraryID string) ([]domain.MediaAsset, error) {
+	return listAssetsWithDigests(r, libraryID, domain.ErrEmptyLibraryID,
+		func(id string) ([]ListMediaAssetsWithAllDigestsByLibraryRow, error) {
+			return r.q.ListMediaAssetsWithAllDigestsByLibrary(ctx, id)
+		},
+		func(row ListMediaAssetsWithAllDigestsByLibraryRow) joinedAssetDigestRow {
+			return joinedAssetDigestRow{
+				asset:            row.MediaAsset,
+				digestKind:       row.DigestKind,
+				digestValue:      row.DigestValue,
+				digestIsCurrent:  row.DigestIsCurrent,
+				digestReason:     row.DigestReason,
+				digestRecordedAt: row.DigestRecordedAt,
+			}
+		},
+	)
+}
+
+func listAssetsWithDigests[R any](
+	r *CatalogueWriteRepository,
+	id string,
+	emptyErr error,
+	fetch func(string) ([]R, error),
+	convert func(R) joinedAssetDigestRow,
+) ([]domain.MediaAsset, error) {
 	if r == nil {
 		return nil, errors.New("catalogue write repository is required")
 	}
-	if strings.TrimSpace(libraryRootID) == "" {
-		return nil, domain.ErrEmptyLibraryRootID
+	if strings.TrimSpace(id) == "" {
+		return nil, emptyErr
 	}
-	rows, err := r.q.ListMediaAssetsWithCurrentDigestsByRoot(ctx, libraryRootID)
+	rows, err := fetch(id)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	return mapJoinedAssetRows(rows, func(row ListMediaAssetsWithCurrentDigestsByRootRow) joinedAssetDigestRow {
-		return joinedAssetDigestRow{
-			asset:            row.MediaAsset,
-			digestKind:       row.DigestKind,
-			digestValue:      row.DigestValue,
-			digestIsCurrent:  row.DigestIsCurrent,
-			digestReason:     row.DigestReason,
-			digestRecordedAt: row.DigestRecordedAt,
-		}
-	})
+	return mapJoinedAssetRows(rows, convert)
+}
+
+// DeferAssetPathUniqueness defers the (library_root_id, rel_path_bytes) unique
+// constraint check until CheckAssetPathUniqueness or commit within the active
+// transaction.
+func (r *CatalogueWriteRepository) DeferAssetPathUniqueness(ctx context.Context) error {
+	if r == nil {
+		return errors.New("catalogue write repository is required")
+	}
+	if r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	_, err := r.scope.tx.Exec(ctx, "SET CONSTRAINTS media_assets_library_root_id_rel_path_bytes_key DEFERRED")
+	return mapPgError(err)
+}
+
+// CheckAssetPathUniqueness immediately checks and restores immediate enforcement
+// of the (library_root_id, rel_path_bytes) unique constraint within the active
+// transaction.
+func (r *CatalogueWriteRepository) CheckAssetPathUniqueness(ctx context.Context) error {
+	if r == nil {
+		return errors.New("catalogue write repository is required")
+	}
+	if r.scope == nil {
+		return storage.ErrTransactionRequired
+	}
+	_, err := r.scope.tx.Exec(ctx, "SET CONSTRAINTS media_assets_library_root_id_rel_path_bytes_key IMMEDIATE")
+	return mapCatalogueWriteError(err)
 }
 
 // RecordAssetDigest records a new current digest for (digest.AssetID, digest.Kind),

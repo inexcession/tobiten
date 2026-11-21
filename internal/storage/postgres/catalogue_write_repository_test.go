@@ -2193,3 +2193,302 @@ func TestCatalogueWriteRepository_RepeatableReadResolverKeyUniqueness(t *testing
 		}
 	})
 }
+
+func TestCatalogueWriteRepository_ListAssetsByLibraryAndUpdateContentAndDeferredSwap(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupCatalogueWriteTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+
+	var (
+		libA, libB           domain.Library
+		rootA1, rootA2       domain.LibraryRoot
+		volA1, volA2, volB1  domain.Volume
+		assetA1, assetA2, b1 domain.MediaAsset
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		libA, rootA1 = seedTestLibraryAndRoot(ctx, t, tx, "Lib A Multi", []byte("/srv/a1"))
+		rootA2 = domain.LibraryRoot{
+			LibraryID: libA.ID,
+			Path:      mustRootPathBytes(t, []byte("/srv/a2")),
+			State:     domain.LibraryRootStateOnline,
+		}
+		if err := tx.Libraries().CreateLibraryRoot(ctx, &rootA2); err != nil {
+			return err
+		}
+		var rootB domain.LibraryRoot
+		libB, rootB = seedTestLibraryAndRoot(ctx, t, tx, "Lib B Isolated", []byte("/srv/b1"))
+
+		cw := tx.CatalogueWrites()
+		volA1 = domain.Volume{LibraryID: libA.ID, Kind: domain.VolumeKindVolume}
+		volA2 = domain.Volume{LibraryID: libA.ID, Kind: domain.VolumeKindVolume}
+		volB1 = domain.Volume{LibraryID: libB.ID, Kind: domain.VolumeKindVolume}
+		for _, v := range []*domain.Volume{&volA1, &volA2, &volB1} {
+			if err := cw.CreateVolume(ctx, v); err != nil {
+				return err
+			}
+		}
+
+		assetA1 = domain.MediaAsset{
+			VolumeID:      volA1.ID,
+			LibraryRootID: rootA1.ID,
+			RelPathBytes:  []byte("alpha.cbz"),
+			FileSize:      100,
+			FileMtime:     &t0,
+			Format:        domain.MediaFormatCBZ,
+			PageCount:     10,
+			Digests: []domain.AssetDigest{{
+				Kind:       domain.DigestKindXXH364Partial,
+				Value:      "hist-a1",
+				IsCurrent:  true,
+				Reason:     domain.DigestReasonScan,
+				RecordedAt: t0,
+			}},
+			CreatedAt: t0,
+			UpdatedAt: t0,
+		}
+		if err := cw.CreateAsset(ctx, &assetA1); err != nil {
+			return err
+		}
+		if err := cw.RecordAssetDigest(ctx, &domain.AssetDigest{
+			AssetID:    assetA1.ID,
+			Kind:       domain.DigestKindXXH364Partial,
+			Value:      "curr-a1",
+			Reason:     domain.DigestReasonExternalModify,
+			RecordedAt: t1,
+		}); err != nil {
+			return err
+		}
+
+		assetA2 = domain.MediaAsset{
+			VolumeID:      volA2.ID,
+			LibraryRootID: rootA2.ID,
+			RelPathBytes:  []byte("beta.cbz"),
+			FileSize:      200,
+			FileMtime:     &t0,
+			Format:        domain.MediaFormatCBZ,
+			PageCount:     20,
+			Digests: []domain.AssetDigest{{
+				Kind:       domain.DigestKindXXH364Partial,
+				Value:      "curr-a2",
+				IsCurrent:  true,
+				Reason:     domain.DigestReasonScan,
+				RecordedAt: t0,
+			}},
+			CreatedAt: t1,
+			UpdatedAt: t1,
+		}
+		if err := cw.CreateAsset(ctx, &assetA2); err != nil {
+			return err
+		}
+
+		b1 = domain.MediaAsset{
+			VolumeID:      volB1.ID,
+			LibraryRootID: rootB.ID,
+			RelPathBytes:  []byte("other.cbz"),
+			FileSize:      300,
+			Format:        domain.MediaFormatCBZ,
+			Digests: []domain.AssetDigest{{
+				Kind:       domain.DigestKindXXH364Partial,
+				Value:      "curr-b1",
+				IsCurrent:  true,
+				Reason:     domain.DigestReasonScan,
+				RecordedAt: t0,
+			}},
+			CreatedAt: t0,
+			UpdatedAt: t0,
+		}
+		return cw.CreateAsset(ctx, &b1)
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	nonTxCW := postgres.NewCatalogueWriteRepository(db.Pool)
+
+	// 1. GetAssetByIDForUpdate requires an active transaction.
+	if _, err := nonTxCW.GetAssetByIDForUpdate(ctx, assetA1.ID); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("GetAssetByIDForUpdate without tx = %v, want ErrTransactionRequired", err)
+	}
+
+	// 2. ListAssetsByLibrary returns all roots for libA with current and historical digests, excluding libB.
+	libAAssets, err := nonTxCW.ListAssetsByLibrary(ctx, libA.ID)
+	if err != nil {
+		t.Fatalf("ListAssetsByLibrary: %v", err)
+	}
+	if len(libAAssets) != 2 {
+		t.Fatalf("len(libAAssets) = %d, want 2", len(libAAssets))
+	}
+	if libAAssets[0].ID != assetA1.ID || libAAssets[1].ID != assetA2.ID {
+		t.Fatalf("unexpected asset order/IDs: %+v", libAAssets)
+	}
+	if len(libAAssets[0].Digests) != 2 {
+		t.Fatalf("expected 2 digests (current + historical) on assetA1, got %+v", libAAssets[0].Digests)
+	}
+	if cur, ok := libAAssets[0].CurrentDigest(domain.DigestKindXXH364Partial); !ok || cur.Value != "curr-a1" {
+		t.Fatalf("expected current digest curr-a1, got (%+v, %v)", cur, ok)
+	}
+
+	// 3. GetAssetByIDForUpdate + UpdateAssetContent update content/diagnostics without altering location/volume.
+	t2 := t1.Add(time.Minute)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		cw := tx.CatalogueWrites()
+		locked, err := cw.GetAssetByIDForUpdate(ctx, assetA1.ID)
+		if err != nil {
+			return err
+		}
+		if len(locked.Digests) != 2 {
+			t.Fatalf("GetAssetByIDForUpdate digests = %d, want 2", len(locked.Digests))
+		}
+		locked.FileSize = 999
+		locked.FileMtime = &t2
+		locked.PageCount = 42
+		locked.CoverPageIndex = 2
+		locked.SuppressedPages = []int{0, 41}
+		locked.Diagnostics.ImageCodecs = []string{"webp", "jpeg"}
+		locked.UpdatedAt = t2
+		return cw.UpdateAssetContent(ctx, locked)
+	}); err != nil {
+		t.Fatalf("UpdateAssetContent tx: %v", err)
+	}
+	reloadedA1, err := nonTxCW.GetAssetByID(ctx, assetA1.ID)
+	if err != nil {
+		t.Fatalf("GetAssetByID after UpdateAssetContent: %v", err)
+	}
+	if reloadedA1.FileSize != 999 || reloadedA1.PageCount != 42 || reloadedA1.CoverPageIndex != 2 ||
+		!bytes.Equal(reloadedA1.RelPathBytes, []byte("alpha.cbz")) ||
+		reloadedA1.LibraryRootID != rootA1.ID || reloadedA1.VolumeID != volA1.ID ||
+		len(reloadedA1.SuppressedPages) != 2 || len(reloadedA1.Diagnostics.ImageCodecs) != 2 {
+		t.Fatalf("unexpected asset after UpdateAssetContent: %+v", reloadedA1)
+	}
+
+	// 4. DeferAssetPathUniqueness / CheckAssetPathUniqueness require a transaction and enable atomic path swap.
+	if err := nonTxCW.DeferAssetPathUniqueness(ctx); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("DeferAssetPathUniqueness without tx = %v, want ErrTransactionRequired", err)
+	}
+	if err := nonTxCW.CheckAssetPathUniqueness(ctx); !errors.Is(err, storage.ErrTransactionRequired) {
+		t.Fatalf("CheckAssetPathUniqueness without tx = %v, want ErrTransactionRequired", err)
+	}
+
+	// Swap assetA1 (rootA1/alpha.cbz) <-> assetA2 (rootA2/beta.cbz) across roots,
+	// and then swap two assets within the SAME root (rootA1) to exercise deferred uniqueness.
+	var assetA3ID string
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		cw := tx.CatalogueWrites()
+		volA3 := domain.Volume{LibraryID: libA.ID, Kind: domain.VolumeKindVolume}
+		if err := cw.CreateVolume(ctx, &volA3); err != nil {
+			return err
+		}
+		a3 := domain.MediaAsset{
+			VolumeID:      volA3.ID,
+			LibraryRootID: rootA1.ID,
+			RelPathBytes:  []byte("gamma.cbz"),
+			FileSize:      250,
+			Format:        domain.MediaFormatCBZ,
+			CreatedAt:     t1,
+			UpdatedAt:     t1,
+		}
+		if err := cw.CreateAsset(ctx, &a3); err != nil {
+			return err
+		}
+		assetA3ID = a3.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("seed assetA3: %v", err)
+	}
+
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		cw := tx.CatalogueWrites()
+		if err := cw.DeferAssetPathUniqueness(ctx); err != nil {
+			return err
+		}
+		a1, err := cw.GetAssetByIDForUpdate(ctx, assetA1.ID)
+		if err != nil {
+			return err
+		}
+		a2, err := cw.GetAssetByIDForUpdate(ctx, assetA2.ID)
+		if err != nil {
+			return err
+		}
+		a1.LibraryRootID = rootA2.ID
+		a1.RelPathBytes = []byte("beta.cbz")
+		a1.RelPathDisplay = "beta.cbz"
+		a1.RelPathMatch = "beta.cbz"
+		a1.UpdatedAt = t2
+		if err := cw.UpdateAsset(ctx, a1); err != nil {
+			return err
+		}
+		a2.LibraryRootID = rootA1.ID
+		a2.RelPathBytes = []byte("alpha.cbz")
+		a2.RelPathDisplay = "alpha.cbz"
+		a2.RelPathMatch = "alpha.cbz"
+		a2.UpdatedAt = t2
+		if err := cw.UpdateAsset(ctx, a2); err != nil {
+			return err
+		}
+		return cw.CheckAssetPathUniqueness(ctx)
+	}); err != nil {
+		t.Fatalf("atomic cross-root swap failed: %v", err)
+	}
+
+	// Same-root swap: assetA2 (rootA1/alpha.cbz) <-> assetA3 (rootA1/gamma.cbz).
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		cw := tx.CatalogueWrites()
+		if err := cw.DeferAssetPathUniqueness(ctx); err != nil {
+			return err
+		}
+		a2, err := cw.GetAssetByIDForUpdate(ctx, assetA2.ID)
+		if err != nil {
+			return err
+		}
+		a3, err := cw.GetAssetByIDForUpdate(ctx, assetA3ID)
+		if err != nil {
+			return err
+		}
+		a2.RelPathBytes = []byte("gamma.cbz")
+		a2.RelPathDisplay = "gamma.cbz"
+		a2.RelPathMatch = "gamma.cbz"
+		a2.UpdatedAt = t2
+		if err := cw.UpdateAsset(ctx, a2); err != nil {
+			return err
+		}
+		a3.RelPathBytes = []byte("alpha.cbz")
+		a3.RelPathDisplay = "alpha.cbz"
+		a3.RelPathMatch = "alpha.cbz"
+		a3.UpdatedAt = t2
+		if err := cw.UpdateAsset(ctx, a3); err != nil {
+			return err
+		}
+		return cw.CheckAssetPathUniqueness(ctx)
+	}); err != nil {
+		t.Fatalf("atomic same-root deferred swap failed: %v", err)
+	}
+
+	// Verify deferred duplicate still fails with storage.ErrAlreadyExists on CheckAssetPathUniqueness.
+	dupErr := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		cw := tx.CatalogueWrites()
+		if err := cw.DeferAssetPathUniqueness(ctx); err != nil {
+			return err
+		}
+		a1, err := cw.GetAssetByIDForUpdate(ctx, assetA1.ID)
+		if err != nil {
+			return err
+		}
+		// assetA3 is now at rootA1/alpha.cbz; collide assetA1 onto it.
+		a1.LibraryRootID = rootA1.ID
+		a1.RelPathBytes = []byte("alpha.cbz")
+		a1.RelPathDisplay = "alpha.cbz"
+		a1.RelPathMatch = "alpha.cbz"
+		a1.UpdatedAt = t2
+		if err := cw.UpdateAsset(ctx, a1); err != nil {
+			return err
+		}
+		return cw.CheckAssetPathUniqueness(ctx)
+	})
+	if !errors.Is(dupErr, storage.ErrAlreadyExists) {
+		t.Fatalf("CheckAssetPathUniqueness duplicate err = %v, want storage.ErrAlreadyExists", dupErr)
+	}
+}

@@ -352,6 +352,21 @@ RETURNING id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_
           file_size, file_mtime, format, page_count, cover_page_index, suppressed_pages,
           diagnostics, missing_since, retired_at, created_at, updated_at;
 
+-- name: UpdateMediaAssetContent :one
+UPDATE media_assets
+SET file_size = $2,
+    file_mtime = $3,
+    format = $4,
+    page_count = $5,
+    cover_page_index = $6,
+    suppressed_pages = $7,
+    diagnostics = $8,
+    updated_at = $9
+WHERE id = $1
+RETURNING id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match,
+          file_size, file_mtime, format, page_count, cover_page_index, suppressed_pages,
+          diagnostics, missing_since, retired_at, created_at, updated_at;
+
 -- name: ListMediaAssetsWithCurrentDigestsByRoot :many
 SELECT sqlc.embed(a),
        d.kind AS digest_kind,
@@ -363,6 +378,19 @@ FROM media_assets a
 LEFT JOIN asset_digests d ON d.asset_id = a.id AND d.is_current = TRUE
 WHERE a.library_root_id = $1
 ORDER BY a.rel_path_bytes ASC, a.id ASC, d.kind ASC;
+
+-- name: ListMediaAssetsWithAllDigestsByLibrary :many
+SELECT sqlc.embed(a),
+       d.kind AS digest_kind,
+       d.value AS digest_value,
+       d.is_current AS digest_is_current,
+       d.reason AS digest_reason,
+       d.recorded_at AS digest_recorded_at
+FROM media_assets a
+JOIN library_roots r ON r.id = a.library_root_id
+LEFT JOIN asset_digests d ON d.asset_id = a.id
+WHERE r.library_id = $1
+ORDER BY a.created_at ASC, a.id ASC, d.kind ASC, d.is_current DESC, d.recorded_at DESC, d.value ASC;
 
 -- name: InsertAssetDigest :one
 INSERT INTO asset_digests (

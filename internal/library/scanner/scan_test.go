@@ -273,7 +273,7 @@ func TestScanner_MultiRootIndexingUnchangedRescanAndChangedFile(t *testing.T) {
 		t.Fatalf("media_assets.updated_at changed on unchanged rescan: %v -> %v", maxUpdatedBefore, maxUpdatedAfter)
 	}
 
-	// Modify one existing file on disk: size/mtime change triggers inspection into Changed without re-indexing.
+	// Modify one existing file on disk: size/mtime change triggers EXTERNAL_MODIFY reconciliation.
 	modifiedBytes := buildDeterministicZip(t, "",
 		zipEntry{name: "001.jpg", data: []byte("new-page-1-longer"), method: zip.Store},
 		zipEntry{name: "002.jpg", data: []byte("new-page-2"), method: zip.Store},
@@ -300,21 +300,82 @@ func TestScanner_MultiRootIndexingUnchangedRescanAndChangedFile(t *testing.T) {
 	if !res3.Complete || openCalls.Load() != 1 {
 		t.Fatalf("expected Complete=true and 1 open for modified file, got Complete=%v opens=%d", res3.Complete, openCalls.Load())
 	}
-	if res3.UnchangedCount != 3 || res3.IndexedCount != 0 || res3.ChangedCount != 1 || res3.SkippedCount != 2 {
+	if res3.UnchangedCount != 3 || res3.IndexedCount != 0 || res3.ChangedCount != 1 || res3.ModifiedCount != 1 || res3.MovedCount != 0 || res3.SkippedCount != 2 {
 		t.Fatalf("unexpected counts after modify: %+v", res3)
 	}
-	if len(res3.Roots[0].Changed) != 1 {
-		t.Fatalf("expected 1 changed file in rootA, got %+v", res3.Roots[0].Changed)
+	if len(res3.Roots[0].Changed) != 1 || res3.Roots[0].ModifiedCount != 1 {
+		t.Fatalf("expected 1 changed & modified file in rootA, got %+v", res3.Roots[0])
 	}
 	ch := res3.Roots[0].Changed[0]
 	if string(ch.Existing.RelPathBytes) != "Standalone.cbz" || ch.Inspected.PageCount != 2 || ch.Inspected.Size != int64(len(modifiedBytes)) {
 		t.Fatalf("unexpected ChangedFile payload: %+v", ch)
 	}
+
 	afterModifyCounts := tableCounts(ctx, t, db, trackedTables...)
 	for _, table := range trackedTables {
-		if afterModifyCounts[table] != beforeRescanCounts[table] {
-			t.Fatalf("M1-T10.9 must leave DB reconciliation to M1-T10.6; table %s changed %d -> %d", table, beforeRescanCounts[table], afterModifyCounts[table])
+		want := beforeRescanCounts[table]
+		if table == "asset_digests" || table == "domain_events" {
+			want++
 		}
+		if afterModifyCounts[table] != want {
+			t.Fatalf("after modify table %s count = %d, want %d", table, afterModifyCounts[table], want)
+		}
+	}
+
+	var gotAssetPages, gotVolPages int
+	if err := db.QueryRow(ctx, `
+		SELECT a.page_count, v.page_count
+		FROM media_assets a
+		JOIN volumes v ON v.id = a.volume_id
+		WHERE a.id = $1`, ch.Existing.ID,
+	).Scan(&gotAssetPages, &gotVolPages); err != nil {
+		t.Fatalf("query modified page counts: %v", err)
+	}
+	if gotAssetPages != 2 || gotVolPages != 2 {
+		t.Fatalf("modified page counts = (asset=%d, volume=%d), want (2, 2)", gotAssetPages, gotVolPages)
+	}
+
+	var digestTotal, digestCurrent, extModCurrent int
+	if err := db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE is_current),
+		       COUNT(*) FILTER (WHERE is_current AND reason = 'EXTERNAL_MODIFY')
+		FROM asset_digests
+		WHERE asset_id = $1`, ch.Existing.ID,
+	).Scan(&digestTotal, &digestCurrent, &extModCurrent); err != nil {
+		t.Fatalf("query asset_digests: %v", err)
+	}
+	if digestTotal != 2 || digestCurrent != 1 || extModCurrent != 1 {
+		t.Fatalf("unexpected digest rotation counts total=%d current=%d extModCurrent=%d", digestTotal, digestCurrent, extModCurrent)
+	}
+
+	var evKind string
+	if err := db.QueryRow(ctx, `
+		SELECT kind
+		FROM domain_events
+		WHERE aggregate_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1`, ch.Existing.ID,
+	).Scan(&evKind); err != nil {
+		t.Fatalf("query latest event for modified asset: %v", err)
+	}
+	if evKind != string(domain.EventAssetModified) {
+		t.Fatalf("latest event kind = %q, want %q", evKind, domain.EventAssetModified)
+	}
+
+	// Fourth scan on unchanged tree after modification: opens zero archives and writes zero rows.
+	openCalls.Store(0)
+	res4, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+		Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+			openCalls.Add(1)
+			return os.Open(string(rawPath))
+		},
+	})
+	if err != nil {
+		t.Fatalf("4th scan: %v", err)
+	}
+	if !res4.Complete || res4.UnchangedCount != 4 || res4.ModifiedCount != 0 || res4.MovedCount != 0 || openCalls.Load() != 0 {
+		t.Fatalf("unexpected 4th scan result: res=%+v opens=%d", res4, openCalls.Load())
 	}
 }
 

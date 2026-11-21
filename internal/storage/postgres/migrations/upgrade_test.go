@@ -212,6 +212,24 @@ func TestUpgradeSeeds_MigrateToHead(t *testing.T) {
 					t.Errorf("role %s jobs:cancel_all = %v, want %v after upgrade", roleID, hasCancelAll, wantCancelAll)
 				}
 			}
+
+			// Verify 0011_deferrable_media_asset_path_unique.sql made the path unique
+			// constraint DEFERRABLE INITIALLY IMMEDIATE.
+			var conDeferrable, conDeferred bool
+			if err := db.QueryRow(ctx, `
+				SELECT c.condeferrable, c.condeferred
+				FROM pg_constraint c
+				JOIN pg_class t ON t.oid = c.conrelid
+				JOIN pg_namespace n ON n.oid = t.relnamespace
+				WHERE n.nspname = 'public'
+				  AND t.relname = 'media_assets'
+				  AND c.conname = 'media_assets_library_root_id_rel_path_bytes_key'`,
+			).Scan(&conDeferrable, &conDeferred); err != nil {
+				t.Fatalf("verify media_assets path unique constraint after upgrade: %v", err)
+			}
+			if !conDeferrable || conDeferred {
+				t.Fatalf("media_assets_library_root_id_rel_path_bytes_key = (deferrable=%v, deferred=%v), want (true, false)", conDeferrable, conDeferred)
+			}
 		})
 	}
 }

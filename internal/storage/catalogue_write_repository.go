@@ -32,9 +32,14 @@ type CatalogueWriteRepository interface {
 	// Media assets
 	CreateAsset(ctx context.Context, asset *domain.MediaAsset) error
 	GetAssetByID(ctx context.Context, id string) (*domain.MediaAsset, error)
+	GetAssetByIDForUpdate(ctx context.Context, id string) (*domain.MediaAsset, error)
 	UpdateAsset(ctx context.Context, asset *domain.MediaAsset) error
+	UpdateAssetContent(ctx context.Context, asset *domain.MediaAsset) error
 	UpdateAssetLocation(ctx context.Context, assetID, libraryRootID string, relPath domain.PathIdentity, updatedAt time.Time) error
 	ListAssetsByRoot(ctx context.Context, libraryRootID string) ([]domain.MediaAsset, error)
+	ListAssetsByLibrary(ctx context.Context, libraryID string) ([]domain.MediaAsset, error)
+	DeferAssetPathUniqueness(ctx context.Context) error
+	CheckAssetPathUniqueness(ctx context.Context) error
 
 	// Asset digests
 	RecordAssetDigest(ctx context.Context, digest *domain.AssetDigest) error
