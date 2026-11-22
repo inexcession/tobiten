@@ -40,6 +40,11 @@ var (
 	// a transaction running at a stricter isolation level such as REPEATABLE READ.
 	ErrTransactionIsolation = errors.New("operation requires READ COMMITTED transaction isolation")
 
+	// ErrRepeatableReadRequired is returned when an operation requiring a
+	// REPEATABLE READ (or SERIALIZABLE) READ ONLY snapshot transaction is invoked
+	// inside an incompatible caller transaction (for example READ COMMITTED or read-write).
+	ErrRepeatableReadRequired = errors.New("operation requires REPEATABLE READ READ ONLY transaction isolation")
+
 	// ErrRootRepositoryRequired is returned when an operation that must own its own
 	// transaction (such as outbox publication sequencing) is called on a transaction-bound handle.
 	ErrRootRepositoryRequired = errors.New("non-transactional root repository required")

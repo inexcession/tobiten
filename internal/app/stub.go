@@ -66,14 +66,15 @@ func NewStubLibraryService() *StubLibraryService {
 		},
 		Volumes: []Volume{
 			{
-				ID:         "vol-stub-1",
-				LibraryID:  "lib-stub-1",
-				Kind:       string(domain.VolumeKindVolume),
-				Title:      "Volume 1",
-				NumberSort: 1.0,
-				AssetCount: 1,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:                "vol-stub-1",
+				LibraryID:         "lib-stub-1",
+				SeriesMemberships: []SeriesMembership{},
+				Kind:              string(domain.VolumeKindVolume),
+				Title:             "Volume 1",
+				NumberSort:        1.0,
+				AssetCount:        1,
+				CreatedAt:         now,
+				UpdatedAt:         now,
 			},
 		},
 	}

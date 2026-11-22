@@ -67,26 +67,36 @@ type Series struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+// SeriesMembership represents an authorized association between a volume and a series (ADR-0008 §5).
+type SeriesMembership struct {
+	SeriesID  string   `json:"series_id"`
+	IsPrimary bool     `json:"is_primary"`
+	Kind      string   `json:"kind"`
+	Position  *float64 `json:"position"`
+}
+
 // Volume represents a bibliographic unit with zero or more manifestations (ADR-0018 S5, ADR-0020 §4).
-// SeriesID is explicitly serialized as null for standalone volumes (zero series_memberships).
+// SeriesID is derived from the volume's visible primary membership (null when standalone or hidden);
+// SeriesMemberships exposes every authorized membership including secondary series (ADR-0008 §5).
 type Volume struct {
-	ID               string     `json:"id"`
-	LibraryID        string     `json:"library_id"`
-	SeriesID         *string    `json:"series_id"`
-	Kind             string     `json:"kind"`
-	Number           *float64   `json:"number"`
-	ChapterStart     *float64   `json:"chapter_start"`
-	ChapterEnd       *float64   `json:"chapter_end"`
-	Title            string     `json:"title"`
-	Summary          *string    `json:"summary"`
-	ReleaseDate      *time.Time `json:"release_date"`
-	NumberSort       float64    `json:"number_sort"`
-	PageCount        int        `json:"page_count"`
-	AssetCount       int        `json:"asset_count"`
-	PreferredAssetID *string    `json:"preferred_asset_id"`
-	IsMissing        bool       `json:"is_missing"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ID                string             `json:"id"`
+	LibraryID         string             `json:"library_id"`
+	SeriesID          *string            `json:"series_id"`
+	SeriesMemberships []SeriesMembership `json:"series_memberships"`
+	Kind              string             `json:"kind"`
+	Number            *float64           `json:"number"`
+	ChapterStart      *float64           `json:"chapter_start"`
+	ChapterEnd        *float64           `json:"chapter_end"`
+	Title             string             `json:"title"`
+	Summary           *string            `json:"summary"`
+	ReleaseDate       *time.Time         `json:"release_date"`
+	NumberSort        float64            `json:"number_sort"`
+	PageCount         int                `json:"page_count"`
+	AssetCount        int                `json:"asset_count"`
+	PreferredAssetID  *string            `json:"preferred_asset_id"`
+	IsMissing         bool               `json:"is_missing"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
 // FolderEntry represents one immediate child folder or available file in a library folder listing (ADR-0019 §4).

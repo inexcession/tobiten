@@ -184,6 +184,24 @@ func TestLibraryReadRoutes_AuthAndServiceUnavailable(t *testing.T) {
 			t.Fatalf("nil service GET %s = %d, want 503", path, recUnavail.Code)
 		}
 	}
+
+	for _, invalidPath := range []string{
+		"/api/v1/libraries?offset=bad",
+		"/api/v1/libraries/%20",
+		"/api/v1/libraries/lib-1/folders?path_hex=zzzz",
+		"/api/v1/series?library_id=%20",
+		"/api/v1/series/%20",
+		"/api/v1/volumes?limit=-1",
+		"/api/v1/volumes/%20",
+	} {
+		reqNoPerm := httptest.NewRequest(http.MethodGet, invalidPath, nil)
+		reqNoPerm = reqNoPerm.WithContext(domain.ContextWithPrincipal(reqNoPerm.Context(), libraryTestPrincipal(domain.PermissionJobsReadAll)))
+		recNoPerm := httptest.NewRecorder()
+		modAuthOnly.router.ServeHTTP(recNoPerm, reqNoPerm)
+		if recNoPerm.Code != http.StatusForbidden {
+			t.Fatalf("no library:read invalid query GET %s = %d, want 403", invalidPath, recNoPerm.Code)
+		}
+	}
 }
 
 func TestLibraryReadRoutes_QueryValidationJSONContractAndHEAD(t *testing.T) {

@@ -37,6 +37,8 @@ type Transactor interface {
 
 // ReadTransactor executes multi-query reads inside a single REPEATABLE READ READ ONLY
 // transaction snapshot so paged results, total counts, and associations stay consistent.
+// Caller-owned transactions that are not REPEATABLE READ (or SERIALIZABLE) and READ ONLY
+// must fail closed with ErrRepeatableReadRequired without executing fn.
 type ReadTransactor interface {
 	WithRepeatableReadTx(ctx context.Context, fn func(tx ReadTx) error) error
 }

@@ -29,18 +29,20 @@ func TestDomainToAppMappings(t *testing.T) {
 	}
 
 	missingAt := now.Add(-time.Hour)
+	subPos := 2.0
 	vol := domain.Volume{
 		ID:        "vol-1",
 		LibraryID: "lib-1",
 		Kind:      domain.VolumeKindVolume,
 		Title:     &volTitle,
+		PageCount: 144, // Stale volume-level count (e.g. from an inaccessible asset) must not override chosen asset.
 		Memberships: []domain.SeriesMembership{
-			{VolumeID: "vol-1", SeriesID: "ser-sub", IsPrimary: false, Kind: domain.MembershipKindSubSeries, Position: &pos, Source: domain.MembershipSourceMetadata},
+			{VolumeID: "vol-1", SeriesID: "ser-sub", IsPrimary: false, Kind: domain.MembershipKindSubSeries, Position: &subPos, Source: domain.MembershipSourceMetadata},
 			{VolumeID: "vol-1", SeriesID: "ser-1", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver},
 		},
 		Assets: []domain.MediaAsset{
-			{ID: "asset-live", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("d8.cbz"), Format: domain.MediaFormatCBZ},
-			{ID: "asset-missing", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("d8m.cbz"), Format: domain.MediaFormatCBZ, MissingSince: &missingAt},
+			{ID: "asset-live", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("d8.cbz"), Format: domain.MediaFormatCBZ, PageCount: 24, CreatedAt: now.Add(-time.Minute)},
+			{ID: "asset-missing", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("d8m.cbz"), Format: domain.MediaFormatCBZ, PageCount: 144, MissingSince: &missingAt, CreatedAt: now},
 		},
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -49,27 +51,53 @@ func TestDomainToAppMappings(t *testing.T) {
 	if volDTO.SeriesID == nil || *volDTO.SeriesID != "ser-1" {
 		t.Fatalf("expected projected primary SeriesID ser-1, got %v", volDTO.SeriesID)
 	}
-	if volDTO.NumberSort != 8.0 || volDTO.AssetCount != 1 || volDTO.Title != "Volume 8" {
+	if volDTO.NumberSort != 8.0 || volDTO.AssetCount != 1 || volDTO.PageCount != 24 || volDTO.Title != "Volume 8" {
 		t.Fatalf("VolumeFromDomain mismatch: %+v", volDTO)
+	}
+	if len(volDTO.SeriesMemberships) != 2 ||
+		volDTO.SeriesMemberships[0].SeriesID != "ser-1" || !volDTO.SeriesMemberships[0].IsPrimary ||
+		volDTO.SeriesMemberships[1].SeriesID != "ser-sub" || volDTO.SeriesMemberships[1].IsPrimary ||
+		volDTO.SeriesMemberships[1].Position == nil || *volDTO.SeriesMemberships[1].Position != 2.0 {
+		t.Fatalf("expected sorted visible memberships, got %+v", volDTO.SeriesMemberships)
+	}
+
+	// Hidden primary membership with visible secondary membership: series_id is null, secondary membership preserved.
+	hiddenPrimary := domain.Volume{
+		ID:        "vol-sec-only",
+		LibraryID: "lib-1",
+		Kind:      domain.VolumeKindVolume,
+		PageCount: 99,
+		Memberships: []domain.SeriesMembership{
+			{VolumeID: "vol-sec-only", SeriesID: "ser-sub", IsPrimary: false, Kind: domain.MembershipKindSubSeries, Position: &subPos, Source: domain.MembershipSourceMetadata},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	hiddenPrimaryDTO := VolumeFromDomain(hiddenPrimary)
+	if hiddenPrimaryDTO.SeriesID != nil || hiddenPrimaryDTO.PageCount != 0 ||
+		len(hiddenPrimaryDTO.SeriesMemberships) != 1 ||
+		hiddenPrimaryDTO.SeriesMemberships[0].SeriesID != "ser-sub" || hiddenPrimaryDTO.SeriesMemberships[0].IsPrimary {
+		t.Fatalf("unexpected hidden-primary VolumeFromDomain projection: %+v", hiddenPrimaryDTO)
 	}
 
 	standalone := domain.Volume{
 		ID:        "vol-standalone",
 		LibraryID: "lib-1",
 		Kind:      domain.VolumeKindVolume,
+		PageCount: 144,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
 	standaloneDTO := VolumeFromDomain(standalone)
-	if standaloneDTO.SeriesID != nil || standaloneDTO.AssetCount != 0 || !standaloneDTO.IsMissing {
-		t.Fatalf("expected standalone nil SeriesID, 0 AssetCount, IsMissing=true, got %+v", standaloneDTO)
+	if standaloneDTO.SeriesID != nil || standaloneDTO.AssetCount != 0 || standaloneDTO.PageCount != 0 || !standaloneDTO.IsMissing {
+		t.Fatalf("expected standalone nil SeriesID, 0 AssetCount, 0 PageCount, IsMissing=true, got %+v", standaloneDTO)
 	}
 	rawStandalone, err := json.Marshal(standaloneDTO)
 	if err != nil {
 		t.Fatalf("Marshal standaloneDTO: %v", err)
 	}
-	if !strings.Contains(string(rawStandalone), `"series_id":null`) {
-		t.Fatalf("expected explicit null series_id in JSON, got %s", rawStandalone)
+	if !strings.Contains(string(rawStandalone), `"series_id":null`) || !strings.Contains(string(rawStandalone), `"series_memberships":[]`) {
+		t.Fatalf("expected explicit null series_id and [] series_memberships in JSON, got %s", rawStandalone)
 	}
 
 	// Library mapping: ONLINE/OFFLINE aggregate state + admin vs reader path/error redaction.

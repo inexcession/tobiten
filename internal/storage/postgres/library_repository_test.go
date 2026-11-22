@@ -61,7 +61,7 @@ func assertPathIdentityEqual(t *testing.T, label string, got, want domain.PathId
 
 func TestLibraryRepository_CRUDAndMultiRootViaTx(t *testing.T) {
 	t.Parallel()
-	_, transactor := setupLibraryTestDB(t)
+	db, transactor := setupLibraryTestDB(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -228,6 +228,62 @@ func TestLibraryRepository_CRUDAndMultiRootViaTx(t *testing.T) {
 			return nil
 		}); err != nil {
 			t.Fatalf("WithRepeatableReadTx: %v", err)
+		}
+
+		// Incompatible caller transactions (READ COMMITTED or read-write REPEATABLE READ) must fail closed
+		// without invoking the callback; compatible REPEATABLE READ READ ONLY parent succeeds via savepoint.
+		for _, tc := range []struct {
+			name    string
+			opts    pgx.TxOptions
+			wantErr bool
+		}{
+			{
+				name:    "READ COMMITTED read-only parent rejected",
+				opts:    pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly},
+				wantErr: true,
+			},
+			{
+				name:    "READ COMMITTED read-write parent rejected",
+				opts:    pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadWrite},
+				wantErr: true,
+			},
+			{
+				name:    "REPEATABLE READ read-write parent rejected",
+				opts:    pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadWrite},
+				wantErr: true,
+			},
+			{
+				name:    "REPEATABLE READ READ ONLY parent allowed",
+				opts:    pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly},
+				wantErr: false,
+			},
+			{
+				name:    "SERIALIZABLE READ ONLY parent allowed",
+				opts:    pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly},
+				wantErr: false,
+			},
+		} {
+			parentTx, err := db.Pool.BeginTx(ctx, tc.opts)
+			if err != nil {
+				t.Fatalf("%s BeginTx: %v", tc.name, err)
+			}
+			called := false
+			txErr := postgres.NewTransactor(parentTx).WithRepeatableReadTx(ctx, func(rtx storage.ReadTx) error {
+				called = true
+				_, listErr := rtx.Libraries().ListLibrariesPaged(ctx, 1, 0)
+				return listErr
+			})
+			_ = parentTx.Rollback(ctx)
+			if tc.wantErr {
+				if !errors.Is(txErr, storage.ErrRepeatableReadRequired) {
+					t.Fatalf("%s: WithRepeatableReadTx = %v, want ErrRepeatableReadRequired", tc.name, txErr)
+				}
+				if called {
+					t.Fatalf("%s: expected callback not to run for incompatible parent", tc.name)
+				}
+			} else if txErr != nil || !called {
+				t.Fatalf("%s: WithRepeatableReadTx = (%v, called=%v), want nil error and called=true", tc.name, txErr, called)
+			}
 		}
 
 		rootsLib1, err := repo.ListLibraryRoots(ctx, lib1ID)

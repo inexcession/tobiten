@@ -130,14 +130,18 @@ func TestDaemonLibraryAndCatalogueReadAPI(t *testing.T) {
 		}
 	})
 
-	t.Run("missing library:read returns 403 Forbidden across all routes", func(t *testing.T) {
+	t.Run("missing library:read returns 403 Forbidden across all routes even on invalid query params", func(t *testing.T) {
 		for _, p := range []string{
 			"/api/v1/libraries",
+			"/api/v1/libraries?offset=bad",
 			"/api/v1/libraries/lib-main",
 			"/api/v1/libraries/lib-main/folders",
+			"/api/v1/libraries/lib-main/folders?path_hex=zzzz",
 			"/api/v1/series",
+			"/api/v1/series?library_id=%20",
 			"/api/v1/series/ser-clean",
 			"/api/v1/volumes",
+			"/api/v1/volumes?limit=-1",
 			"/api/v1/volumes/vol-stand",
 		} {
 			code, _ := doBasicGet(t, client, ts.URL+p, "jobsonly", "jobs-pass-123")
@@ -242,17 +246,89 @@ func TestDaemonLibraryAndCatalogueReadAPI(t *testing.T) {
 			t.Fatalf("expected fail-closed empty series for blankkid, got %+v", blankPage)
 		}
 
-		// Standalone volume lists with explicit `"series_id":null` and get by ID also emits `"series_id":null`.
+		// Standalone volume lists with explicit `"series_id":null` and `"series_memberships":[]` on both list and detail routes.
 		vCode, vBody := doBasicGet(t, client, ts.URL+"/api/v1/volumes?search=Standalone", "libreader", "reader-pass-123")
-		if vCode != http.StatusOK || !strings.Contains(vBody, `"series_id":null`) {
-			t.Fatalf("expected explicit null series_id in GET /volumes: %d %s", vCode, vBody)
+		if vCode != http.StatusOK || !strings.Contains(vBody, `"series_id":null`) || !strings.Contains(vBody, `"series_memberships":[]`) {
+			t.Fatalf("expected explicit null series_id and [] series_memberships in GET /volumes: %d %s", vCode, vBody)
 		}
 		vIDCode, vIDBody := doBasicGet(t, client, ts.URL+"/api/v1/volumes/vol-stand", "libreader", "reader-pass-123")
-		if vIDCode != http.StatusOK || !strings.Contains(vIDBody, `"series_id":null`) {
-			t.Fatalf("expected explicit null series_id in GET /volumes/vol-stand: %d %s", vIDCode, vIDBody)
+		if vIDCode != http.StatusOK || !strings.Contains(vIDBody, `"series_id":null`) || !strings.Contains(vIDBody, `"series_memberships":[]`) {
+			t.Fatalf("expected explicit null series_id and [] series_memberships in GET /volumes/vol-stand: %d %s", vIDCode, vIDBody)
 		}
 		if c, _ := doBasicGet(t, client, ts.URL+"/api/v1/volumes/vol-nsfw", "libreader", "reader-pass-123"); c != http.StatusNotFound {
 			t.Fatalf("reader GET /volumes/vol-nsfw = %d, want 404", c)
+		}
+
+		// Page count is derived from the permitted available file (not volumes.page_count or restricted preferred asset)
+		// and returns 0 when no readable file exists on both GET /volumes and GET /volumes/{id}.
+		listAllCode, listAllBody := doBasicGet(t, client, ts.URL+"/api/v1/volumes?library_id=lib-main", "libreader", "reader-pass-123")
+		if listAllCode != http.StatusOK {
+			t.Fatalf("reader GET /volumes = %d (%s)", listAllCode, listAllBody)
+		}
+		var readerVolPage app.VolumePage
+		mustUnmarshal(t, listAllBody, &readerVolPage)
+		volByID := make(map[string]app.Volume, len(readerVolPage.Items))
+		for _, v := range readerVolPage.Items {
+			volByID[v.ID] = v
+		}
+		if vc := volByID["vol-clean"]; vc.PageCount != 24 || vc.PreferredAssetID != nil {
+			t.Fatalf("reader list vol-clean = %+v, want PageCount=24 and redacted PreferredAssetID", vc)
+		}
+		if vnf := volByID["vol-nofile"]; vnf.PageCount != 0 || vnf.AssetCount != 0 || !vnf.IsMissing {
+			t.Fatalf("reader list vol-nofile = %+v, want PageCount=0, AssetCount=0, IsMissing=true", vnf)
+		}
+		for _, check := range []struct {
+			id       string
+			wantPage int
+		}{
+			{"vol-clean", 24},
+			{"vol-nofile", 0},
+		} {
+			dc, db := doBasicGet(t, client, ts.URL+"/api/v1/volumes/"+check.id, "libreader", "reader-pass-123")
+			if dc != http.StatusOK {
+				t.Fatalf("reader GET /volumes/%s = %d", check.id, dc)
+			}
+			var dv app.Volume
+			mustUnmarshal(t, db, &dv)
+			if dv.PageCount != check.wantPage {
+				t.Fatalf("reader detail GET /volumes/%s PageCount = %d, want %d", check.id, dv.PageCount, check.wantPage)
+			}
+		}
+
+		// Admin who can access the restricted preferred asset sees its preferred page_count (144).
+		admVC, admVB := doBasicGet(t, client, ts.URL+"/api/v1/volumes/vol-clean", "libadmin", "admin-pass-123")
+		if admVC != http.StatusOK {
+			t.Fatalf("admin GET /volumes/vol-clean = %d", admVC)
+		}
+		var admVol app.Volume
+		mustUnmarshal(t, admVB, &admVol)
+		if admVol.PageCount != 144 {
+			t.Fatalf("admin detail GET /volumes/vol-clean PageCount = %d, want 144", admVol.PageCount)
+		}
+
+		// Two visible memberships (primary + secondary) for reader; hidden primary + allowed secondary for kidreader.
+		vm := volByID["vol-multi"]
+		if vm.SeriesID == nil || *vm.SeriesID != "ser-clean" || len(vm.SeriesMemberships) != 2 ||
+			vm.SeriesMemberships[0].SeriesID != "ser-clean" || !vm.SeriesMemberships[0].IsPrimary ||
+			vm.SeriesMemberships[0].Position == nil || *vm.SeriesMemberships[0].Position != 1.0 ||
+			vm.SeriesMemberships[1].SeriesID != "ser-kids" || vm.SeriesMemberships[1].IsPrimary ||
+			vm.SeriesMemberships[1].Position == nil || *vm.SeriesMemberships[1].Position != 7.0 {
+			t.Fatalf("reader vol-multi memberships mismatch: %+v", vm)
+		}
+
+		kidVolC, kidVolB := doBasicGet(t, client, ts.URL+"/api/v1/volumes/vol-multi", "kidreader", "kid-pass-123")
+		if kidVolC != http.StatusOK {
+			t.Fatalf("kidreader GET /volumes/vol-multi = %d (%s)", kidVolC, kidVolB)
+		}
+		if !strings.Contains(kidVolB, `"series_id":null`) {
+			t.Fatalf("expected explicit null series_id when primary is hidden: %s", kidVolB)
+		}
+		var kidVol app.Volume
+		mustUnmarshal(t, kidVolB, &kidVol)
+		if kidVol.SeriesID != nil || len(kidVol.SeriesMemberships) != 1 ||
+			kidVol.SeriesMemberships[0].SeriesID != "ser-kids" || kidVol.SeriesMemberships[0].IsPrimary ||
+			kidVol.SeriesMemberships[0].Position == nil || *kidVol.SeriesMemberships[0].Position != 7.0 {
+			t.Fatalf("kidreader vol-multi memberships mismatch: %+v", kidVol)
 		}
 	})
 
@@ -340,10 +416,14 @@ func seedDaemonCatalogueFixture(ctx context.Context, t *testing.T, db postgres.D
 
 		standTitle := "Standalone Anthology"
 		nsfwTitle := "NSFW Vol 1"
+		multiTitle := "Crossover Vol 1"
+		noFileTitle := "No Readable File Vol"
 		for _, v := range []domain.Volume{
-			{ID: "vol-clean", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-clean", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, PageCount: 144, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-stand", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, Title: &standTitle, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-nsfw", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, Title: &nsfwTitle, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-multi", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, Title: &multiTitle, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-nofile", LibraryID: "lib-main", Kind: domain.VolumeKindVolume, Title: &noFileTitle, PageCount: 144, CreatedAt: now, UpdatedAt: now},
 		} {
 			vol := v
 			if err := cw.CreateVolume(ctx, &vol); err != nil {
@@ -353,25 +433,39 @@ func seedDaemonCatalogueFixture(ctx context.Context, t *testing.T, db postgres.D
 
 		sm := tx.SeriesMemberships()
 		pos := 1.0
-		for _, m := range []domain.SeriesMembership{
-			{VolumeID: "vol-clean", SeriesID: "ser-clean", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver},
-			{VolumeID: "vol-nsfw", SeriesID: "ser-nsfw", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver},
+		secPos := 7.0
+		for _, entry := range []struct {
+			volID string
+			list  []domain.SeriesMembership
+		}{
+			{"vol-clean", []domain.SeriesMembership{{VolumeID: "vol-clean", SeriesID: "ser-clean", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver}}},
+			{"vol-nsfw", []domain.SeriesMembership{{VolumeID: "vol-nsfw", SeriesID: "ser-nsfw", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver}}},
+			{"vol-multi", []domain.SeriesMembership{
+				{VolumeID: "vol-multi", SeriesID: "ser-clean", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver},
+				{VolumeID: "vol-multi", SeriesID: "ser-kids", IsPrimary: false, Kind: domain.MembershipKindSubSeries, Position: &secPos, Source: domain.MembershipSourceMetadata},
+			}},
+			{"vol-nofile", []domain.SeriesMembership{{VolumeID: "vol-nofile", SeriesID: "ser-clean", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &pos, Source: domain.MembershipSourceResolver}}},
 		} {
-			if err := sm.SetVolumeMemberships(ctx, m.VolumeID, []domain.SeriesMembership{m}); err != nil {
+			if err := sm.SetVolumeMemberships(ctx, entry.volID, entry.list); err != nil {
 				return err
 			}
 		}
 
 		for _, a := range []struct {
-			id   string
-			vol  string
-			root string
-			rel  []byte
+			id        string
+			vol       string
+			root      string
+			rel       []byte
+			pages     int
+			createdAt time.Time
 		}{
-			{"a-clean", "vol-clean", "r-main-1", []byte("Clean/v1.cbz")},
-			{"a-raw", "vol-clean", "r-main-2", rawFile},
-			{"a-stand", "vol-stand", "r-main-1", []byte("Standalone.cbz")},
-			{"a-nsfw", "vol-nsfw", "r-main-1", []byte("RestrictedDir/nsfw.cbz")},
+			{"a-clean", "vol-clean", "r-main-1", []byte("Clean/v1.cbz"), 24, now},
+			{"a-raw", "vol-clean", "r-main-2", rawFile, 32, now.Add(time.Second)},
+			{"a-clean-nsfw", "vol-clean", "r-main-1", []byte("RestrictedDir/v1-uncensored.cbz"), 144, now.Add(2 * time.Second)},
+			{"a-stand", "vol-stand", "r-main-1", []byte("Standalone.cbz"), 10, now},
+			{"a-nsfw", "vol-nsfw", "r-main-1", []byte("RestrictedDir/nsfw.cbz"), 50, now},
+			{"a-multi", "vol-multi", "r-main-1", []byte("Clean/multi.cbz"), 18, now},
+			{"a-nofile-nsfw", "vol-nofile", "r-main-1", []byte("RestrictedDir/nofile.cbz"), 144, now},
 		} {
 			ident := domain.NewPathIdentity(a.rel)
 			asset := domain.MediaAsset{
@@ -383,11 +477,25 @@ func seedDaemonCatalogueFixture(ctx context.Context, t *testing.T, db postgres.D
 				RelPathMatch:   ident.Match,
 				FileSize:       100,
 				Format:         domain.MediaFormatCBZ,
-				PageCount:      10,
+				PageCount:      a.pages,
+				CreatedAt:      a.createdAt,
+				UpdatedAt:      a.createdAt,
 			}
 			if err := cw.CreateAsset(ctx, &asset); err != nil {
 				return err
 			}
+		}
+		prefID := "a-clean-nsfw"
+		if err := cw.UpdateVolume(ctx, &domain.Volume{
+			ID:               "vol-clean",
+			LibraryID:        "lib-main",
+			Kind:             domain.VolumeKindVolume,
+			PageCount:        144,
+			PreferredAssetID: &prefID,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			return err
 		}
 
 		labels := tx.Labels()
@@ -412,6 +520,8 @@ func seedDaemonCatalogueFixture(ctx context.Context, t *testing.T, db postgres.D
 		for _, il := range []domain.ItemLabel{
 			{LabelID: "lbl-kids", ItemType: domain.ItemTypeSeries, ItemID: "ser-kids"},
 			{LabelID: "lbl-nsfw", ItemType: domain.ItemTypeSeries, ItemID: "ser-nsfw"},
+			{LabelID: "lbl-nsfw", ItemType: domain.ItemTypeAsset, ItemID: "a-clean-nsfw"},
+			{LabelID: "lbl-nsfw", ItemType: domain.ItemTypeAsset, ItemID: "a-nofile-nsfw"},
 			{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeSeries, ItemID: "ser-trashed"},
 		} {
 			itemLabel := il

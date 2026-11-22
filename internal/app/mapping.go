@@ -1,6 +1,7 @@
 package app
 
 import (
+	"cmp"
 	"encoding/json"
 	"slices"
 	"time"
@@ -122,24 +123,51 @@ func VolumeFromDomain(v domain.Volume) Volume {
 		numberSort = *v.Number
 	}
 
+	pageCount := 0
+	if chosen, ok := v.SelectPreferredAsset("", func(a domain.MediaAsset) bool {
+		return a.IsAvailable()
+	}); ok && chosen != nil {
+		pageCount = chosen.PageCount
+	}
+
+	memberships := make([]SeriesMembership, 0, len(v.Memberships))
+	for _, m := range v.Memberships {
+		memberships = append(memberships, SeriesMembership{
+			SeriesID:  m.SeriesID,
+			IsPrimary: m.IsPrimary,
+			Kind:      string(m.Kind),
+			Position:  cloneFloat64Ptr(m.Position),
+		})
+	}
+	slices.SortFunc(memberships, func(a, b SeriesMembership) int {
+		if a.IsPrimary != b.IsPrimary {
+			if a.IsPrimary {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a.SeriesID, b.SeriesID)
+	})
+
 	return Volume{
-		ID:               v.ID,
-		LibraryID:        v.LibraryID,
-		SeriesID:         seriesID,
-		Kind:             string(v.Kind),
-		Number:           cloneFloat64Ptr(v.Number),
-		ChapterStart:     cloneFloat64Ptr(v.ChapterStart),
-		ChapterEnd:       cloneFloat64Ptr(v.ChapterEnd),
-		Title:            title,
-		Summary:          cloneStringPtr(v.Summary),
-		ReleaseDate:      cloneTimePtr(v.ReleaseDate),
-		NumberSort:       numberSort,
-		PageCount:        v.PageCount,
-		AssetCount:       len(v.AvailableAssets()),
-		PreferredAssetID: cloneStringPtr(v.PreferredAssetID),
-		IsMissing:        v.IsMissing(),
-		CreatedAt:        v.CreatedAt,
-		UpdatedAt:        v.UpdatedAt,
+		ID:                v.ID,
+		LibraryID:         v.LibraryID,
+		SeriesID:          seriesID,
+		SeriesMemberships: memberships,
+		Kind:              string(v.Kind),
+		Number:            cloneFloat64Ptr(v.Number),
+		ChapterStart:      cloneFloat64Ptr(v.ChapterStart),
+		ChapterEnd:        cloneFloat64Ptr(v.ChapterEnd),
+		Title:             title,
+		Summary:           cloneStringPtr(v.Summary),
+		ReleaseDate:       cloneTimePtr(v.ReleaseDate),
+		NumberSort:        numberSort,
+		PageCount:         pageCount,
+		AssetCount:        len(v.AvailableAssets()),
+		PreferredAssetID:  cloneStringPtr(v.PreferredAssetID),
+		IsMissing:         v.IsMissing(),
+		CreatedAt:         v.CreatedAt,
+		UpdatedAt:         v.UpdatedAt,
 	}
 }
 

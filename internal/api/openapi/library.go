@@ -229,6 +229,10 @@ func (m *Module) prepareLibraryRequest(w http.ResponseWriter, r *http.Request) (
 		middleware.WriteUnauthorized(w, r)
 		return nil, nil, false
 	}
+	if !p.HasPermission(domain.PermissionLibraryRead) {
+		middleware.WriteAppError(w, r, app.ErrForbidden)
+		return nil, nil, false
+	}
 	svc := m.libraryService()
 	if svc == nil {
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")

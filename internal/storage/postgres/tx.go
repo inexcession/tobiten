@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,7 +52,9 @@ func (t *Transactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage
 }
 
 // WithRepeatableReadTx executes fn inside a REPEATABLE READ READ ONLY PostgreSQL transaction
-// when backed by a pool, or a nested savepoint when backed by an existing pgx.Tx.
+// when backed by a pool, or a nested savepoint when backed by a caller-owned pgx.Tx that
+// is already running at REPEATABLE READ (or SERIALIZABLE) and READ ONLY; incompatible caller
+// transactions fail closed with storage.ErrRepeatableReadRequired before invoking fn.
 func (t *Transactor) WithRepeatableReadTx(ctx context.Context, fn func(tx storage.ReadTx) error) error {
 	if t == nil {
 		return errors.New("transactor database handle is required")
@@ -61,11 +64,28 @@ func (t *Transactor) WithRepeatableReadTx(ctx context.Context, fn func(tx storag
 	}
 	var parentScope *txScope
 	if extTx, ok := t.db.(pgx.Tx); ok {
+		if err := verifyRepeatableReadReadOnlyParent(ctx, extTx); err != nil {
+			return err
+		}
 		parentScope = newCallerTxScope(extTx)
 	}
 	return runTxWithOptions(ctx, t.db, parentScope, "read", txModeRepeatableReadReadOnly, func(child *txScope) error {
 		return fn(&pgReadTx{scope: child, q: New(child.tx)})
 	})
+}
+
+func verifyRepeatableReadReadOnlyParent(ctx context.Context, tx pgx.Tx) error {
+	var iso, readOnly string
+	err := tx.QueryRow(ctx, `SELECT current_setting('transaction_isolation')::text, current_setting('transaction_read_only')::text`).Scan(&iso, &readOnly)
+	if err != nil {
+		return fmt.Errorf("inspecting caller transaction isolation: %w", err)
+	}
+	isoNorm := strings.ToLower(strings.TrimSpace(iso))
+	roNorm := strings.ToLower(strings.TrimSpace(readOnly))
+	if (isoNorm != "repeatable read" && isoNorm != "serializable") || roNorm != "on" {
+		return fmt.Errorf("%w: got isolation=%q read_only=%q", storage.ErrRepeatableReadRequired, iso, readOnly)
+	}
+	return nil
 }
 
 func (t *Transactor) withTx(ctx context.Context, mode txIsolationMode, fn func(tx storage.Tx) error) error {
