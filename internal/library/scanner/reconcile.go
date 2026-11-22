@@ -65,18 +65,35 @@ type plannedModify struct {
 	Inspected InspectedFile
 }
 
+type plannedRestore struct {
+	Existing  domain.MediaAsset
+	RootID    string
+	Inspected InspectedFile
+}
+
+type plannedAssetTransition struct {
+	Existing domain.MediaAsset
+	RootID   string
+}
+
 type reconciliationPlan struct {
 	MoveComponents [][]plannedMove
 	Modifies       []plannedModify
+	Restores       []plannedRestore
 	MtimeRefreshes []plannedModify
 	ToIndex        []observedFile
+	MarkMissing    []plannedAssetTransition
+	RetireMissing  []plannedAssetTransition
 }
 
 func (p reconciliationPlan) hasWrites() bool {
 	return len(p.MoveComponents) > 0 ||
 		len(p.Modifies) > 0 ||
+		len(p.Restores) > 0 ||
 		len(p.MtimeRefreshes) > 0 ||
-		len(p.ToIndex) > 0
+		len(p.ToIndex) > 0 ||
+		len(p.MarkMissing) > 0 ||
+		len(p.RetireMissing) > 0
 }
 
 func lockAndVerifyRootSnapshot(
@@ -110,13 +127,15 @@ func (s *Scanner) reconcileLibraryPass(
 	checkedRoots []RootCheckResult,
 	preWalkAssets []domain.MediaAsset,
 	obs *libraryWalkObservations,
+	gracePeriod time.Duration,
 	res *ScanResult,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	plan := planReconciliation(res.Roots, preWalkAssets, obs)
+	reconcileNow := s.now().UTC().Truncate(time.Microsecond)
+	plan := planReconciliation(res.Roots, preWalkAssets, obs, reconcileNow, gracePeriod)
 	if !plan.hasWrites() {
 		return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 			return lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots)
@@ -124,26 +143,36 @@ func (s *Scanner) reconcileLibraryPass(
 	}
 
 	var writeErrs []error
-	if err := s.executeMoves(ctx, libraryID, checkedRoots, plan.MoveComponents, res); err != nil {
+	for _, step := range []func() error{
+		func() error { return s.executeMoves(ctx, libraryID, checkedRoots, plan.MoveComponents, res) },
+		func() error { return s.executeModifies(ctx, libraryID, checkedRoots, plan.Modifies, res) },
+		func() error { return s.executeRestores(ctx, libraryID, checkedRoots, plan.Restores, res) },
+		func() error {
+			return s.executeMtimeRefreshes(ctx, libraryID, checkedRoots, plan.MtimeRefreshes, res)
+		},
+	} {
+		if err := step(); err != nil {
+			if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
+				return errors.Join(append(writeErrs, err)...)
+			}
+			writeErrs = append(writeErrs, err)
+		}
+	}
+	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, res); err != nil {
+		return errors.Join(append(writeErrs, err)...)
+	}
+	if len(writeErrs) > 0 {
+		return errors.Join(writeErrs...)
+	}
+
+	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, res); err != nil {
 		if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
 			return err
 		}
 		writeErrs = append(writeErrs, err)
 	}
-	if err := s.executeModifies(ctx, libraryID, checkedRoots, plan.Modifies, res); err != nil {
-		if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
-			return errors.Join(append(writeErrs, err)...)
-		}
+	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, plan.RetireMissing, gracePeriod, reconcileNow, res); err != nil {
 		writeErrs = append(writeErrs, err)
-	}
-	if err := s.executeMtimeRefreshes(ctx, libraryID, checkedRoots, plan.MtimeRefreshes, res); err != nil {
-		if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
-			return errors.Join(append(writeErrs, err)...)
-		}
-		writeErrs = append(writeErrs, err)
-	}
-	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, res); err != nil {
-		return errors.Join(append(writeErrs, err)...)
 	}
 	return errors.Join(writeErrs...)
 }
@@ -152,9 +181,12 @@ func planReconciliation(
 	roots []RootScanResult,
 	preWalkAssets []domain.MediaAsset,
 	obs *libraryWalkObservations,
+	now time.Time,
+	grace time.Duration,
 ) reconciliationPlan {
 	existingByLoc := make(map[assetLocation]domain.MediaAsset, len(preWalkAssets))
 	activeAssets := make([]domain.MediaAsset, 0, len(preWalkAssets))
+	missingAssets := make([]domain.MediaAsset, 0)
 	for _, asset := range preWalkAssets {
 		loc := assetLocation{
 			rootID:       asset.LibraryRootID,
@@ -163,15 +195,35 @@ func planReconciliation(
 		existingByLoc[loc] = asset
 		if asset.MissingSince == nil {
 			activeAssets = append(activeAssets, asset)
+		} else {
+			missingAssets = append(missingAssets, asset)
 		}
 	}
 
-	confirmedInPlace, mtimeRefreshes, candidates := collectReconciliationObservations(roots, obs)
-	unconfirmed := collectUnconfirmedAssets(activeAssets, obs, confirmedInPlace)
+	confirmedInPlace, mtimeRefreshes, samePathRestores, candidates := collectReconciliationObservations(roots, obs)
+	unconfirmedActive := collectUnconfirmedAssets(activeAssets, obs, confirmedInPlace)
+	unconfirmedMissing := collectUnconfirmedMissingAssets(missingAssets, confirmedInPlace)
+	unconfirmed := make([]domain.MediaAsset, 0, len(unconfirmedActive)+len(unconfirmedMissing))
+	unconfirmed = append(unconfirmed, unconfirmedActive...)
+	unconfirmed = append(unconfirmed, unconfirmedMissing...)
 	slices.SortFunc(candidates, compareCandidateObservation)
 
 	proposedMoves, matchedObs := matchMovesFixedPoint(unconfirmed, candidates, existingByLoc)
-	modifies, toIndex := classifyUnmatchedCandidates(candidates, matchedObs, existingByLoc, proposedMoves)
+	modifies, histRestores, toIndex := classifyUnmatchedCandidates(candidates, matchedObs, existingByLoc, proposedMoves)
+	samePathRestores = append(samePathRestores, histRestores...)
+	slices.SortFunc(samePathRestores, func(a, b plannedRestore) int {
+		return cmp.Compare(a.Existing.ID, b.Existing.ID)
+	})
+
+	markMissing, retireMissing := collectMissingAndRetiredTransitions(
+		unconfirmedActive,
+		unconfirmedMissing,
+		proposedMoves,
+		modifies,
+		samePathRestores,
+		now,
+		grace,
+	)
 
 	moves := make([]plannedMove, 0, len(proposedMoves))
 	for _, mv := range proposedMoves {
@@ -184,29 +236,49 @@ func planReconciliation(
 	return reconciliationPlan{
 		MoveComponents: partitionMoveComponents(moves),
 		Modifies:       modifies,
+		Restores:       samePathRestores,
 		MtimeRefreshes: mtimeRefreshes,
 		ToIndex:        toIndex,
+		MarkMissing:    markMissing,
+		RetireMissing:  retireMissing,
 	}
 }
 
 func collectReconciliationObservations(
 	roots []RootScanResult,
 	obs *libraryWalkObservations,
-) (map[string]struct{}, []plannedModify, []candidateObservation) {
+) (map[string]struct{}, []plannedModify, []plannedRestore, []candidateObservation) {
 	confirmedInPlace := make(map[string]struct{})
 	var mtimeRefreshes []plannedModify
+	var samePathRestores []plannedRestore
 	var candidates []candidateObservation
 
 	for _, rootRes := range roots {
 		for _, ch := range rootRes.Changed {
-			if ch.Existing.MissingSince != nil {
-				continue
-			}
 			loc := assetLocation{
 				rootID:       rootRes.LibraryRootID,
 				relPathBytes: string(ch.Inspected.RelPath.Bytes),
 			}
-			if cur, ok := ch.Existing.CurrentDigest(ch.Inspected.DigestKind); ok && cur.Value == ch.Inspected.Digest {
+			cur, hasCur := ch.Existing.CurrentDigest(ch.Inspected.DigestKind)
+			curMatches := hasCur && cur.Value == ch.Inspected.Digest
+			if ch.Existing.MissingSince != nil {
+				if curMatches {
+					confirmedInPlace[ch.Existing.ID] = struct{}{}
+					samePathRestores = append(samePathRestores, plannedRestore{
+						Existing:  ch.Existing,
+						RootID:    rootRes.LibraryRootID,
+						Inspected: ch.Inspected,
+					})
+					continue
+				}
+				candidates = append(candidates, candidateObservation{
+					loc:       loc,
+					rootID:    rootRes.LibraryRootID,
+					inspected: ch.Inspected,
+				})
+				continue
+			}
+			if curMatches {
 				confirmedInPlace[ch.Existing.ID] = struct{}{}
 				if ch.Existing.FileSize != ch.Inspected.Size || !equalOptionalNormalizedMtime(ch.Existing.FileMtime, ch.Inspected.Mtime) {
 					mtimeRefreshes = append(mtimeRefreshes, plannedModify{
@@ -235,7 +307,74 @@ func collectReconciliationObservations(
 			inspected: f.inspected,
 		})
 	}
-	return confirmedInPlace, mtimeRefreshes, candidates
+	return confirmedInPlace, mtimeRefreshes, samePathRestores, candidates
+}
+
+func collectUnconfirmedMissingAssets(
+	missingAssets []domain.MediaAsset,
+	confirmedInPlace map[string]struct{},
+) []domain.MediaAsset {
+	unconfirmed := make([]domain.MediaAsset, 0, len(missingAssets))
+	for _, asset := range missingAssets {
+		if _, ok := confirmedInPlace[asset.ID]; ok {
+			continue
+		}
+		unconfirmed = append(unconfirmed, asset)
+	}
+	slices.SortFunc(unconfirmed, compareAssetOrderForReconcile)
+	return unconfirmed
+}
+
+func collectMissingAndRetiredTransitions(
+	unconfirmedActive []domain.MediaAsset,
+	unconfirmedMissing []domain.MediaAsset,
+	proposedMoves map[string]plannedMove,
+	modifies []plannedModify,
+	restores []plannedRestore,
+	now time.Time,
+	grace time.Duration,
+) ([]plannedAssetTransition, []plannedAssetTransition) {
+	resolvedIDs := make(map[string]struct{}, len(modifies)+len(restores))
+	for _, m := range modifies {
+		resolvedIDs[m.Existing.ID] = struct{}{}
+	}
+	for _, r := range restores {
+		resolvedIDs[r.Existing.ID] = struct{}{}
+	}
+
+	var markMissing []plannedAssetTransition
+	for _, asset := range unconfirmedActive {
+		if _, moved := proposedMoves[asset.ID]; moved {
+			continue
+		}
+		if _, resolved := resolvedIDs[asset.ID]; resolved {
+			continue
+		}
+		markMissing = append(markMissing, plannedAssetTransition{
+			Existing: asset,
+			RootID:   asset.LibraryRootID,
+		})
+	}
+
+	var retireMissing []plannedAssetTransition
+	for _, asset := range unconfirmedMissing {
+		if _, moved := proposedMoves[asset.ID]; moved {
+			continue
+		}
+		if _, resolved := resolvedIDs[asset.ID]; resolved {
+			continue
+		}
+		if asset.RetiredAt != nil || asset.MissingSince == nil {
+			continue
+		}
+		if !now.Before(asset.MissingSince.UTC().Add(grace)) {
+			retireMissing = append(retireMissing, plannedAssetTransition{
+				Existing: asset,
+				RootID:   asset.LibraryRootID,
+			})
+		}
+	}
+	return markMissing, retireMissing
 }
 
 func collectUnconfirmedAssets(
@@ -265,10 +404,12 @@ func collectUnconfirmedAssets(
 }
 
 type moveDigestIndex struct {
-	unconfirmedLocs    []assetLocation
-	samePathHistorical []bool
-	currentBuckets     map[digestKey][]int
-	historicalBuckets  map[digestKey][]int
+	unconfirmedLocs          []assetLocation
+	samePathHistorical       []bool
+	activeCurrentBuckets     map[digestKey][]int
+	missingCurrentBuckets    map[digestKey][]int
+	activeHistoricalBuckets  map[digestKey][]int
+	missingHistoricalBuckets map[digestKey][]int
 }
 
 func buildMoveDigestIndex(unconfirmed []domain.MediaAsset, candidates []candidateObservation) moveDigestIndex {
@@ -278,10 +419,12 @@ func buildMoveDigestIndex(unconfirmed []domain.MediaAsset, candidates []candidat
 	}
 
 	idx := moveDigestIndex{
-		unconfirmedLocs:    make([]assetLocation, len(unconfirmed)),
-		samePathHistorical: make([]bool, len(unconfirmed)),
-		currentBuckets:     make(map[digestKey][]int, len(unconfirmed)),
-		historicalBuckets:  make(map[digestKey][]int),
+		unconfirmedLocs:          make([]assetLocation, len(unconfirmed)),
+		samePathHistorical:       make([]bool, len(unconfirmed)),
+		activeCurrentBuckets:     make(map[digestKey][]int, len(unconfirmed)),
+		missingCurrentBuckets:    make(map[digestKey][]int),
+		activeHistoricalBuckets:  make(map[digestKey][]int),
+		missingHistoricalBuckets: make(map[digestKey][]int),
 	}
 	for i, asset := range unconfirmed {
 		loc := assetLocation{
@@ -291,29 +434,43 @@ func buildMoveDigestIndex(unconfirmed []domain.MediaAsset, candidates []candidat
 		idx.unconfirmedLocs[i] = loc
 		if obsIdx, ok := candByLoc[loc]; ok {
 			cand := candidates[obsIdx]
-			for _, d := range asset.Digests {
-				if !d.IsCurrent && d.Kind == cand.inspected.DigestKind && d.Value == cand.inspected.Digest {
-					idx.samePathHistorical[i] = true
-					break
-				}
+			if hasMatchingHistoricalDigest(asset, cand.inspected.DigestKind, cand.inspected.Digest) {
+				idx.samePathHistorical[i] = true
 			}
 		}
+		isMissing := asset.MissingSince != nil
 		for _, d := range asset.Digests {
 			key := digestKey{kind: d.Kind, value: d.Value}
-			if d.IsCurrent {
-				bucket := idx.currentBuckets[key]
-				if len(bucket) == 0 || bucket[len(bucket)-1] != i {
-					idx.currentBuckets[key] = append(bucket, i)
-				}
-				continue
-			}
-			bucket := idx.historicalBuckets[key]
+			target := selectDigestBucket(idx, isMissing, d.IsCurrent)
+			bucket := target[key]
 			if len(bucket) == 0 || bucket[len(bucket)-1] != i {
-				idx.historicalBuckets[key] = append(bucket, i)
+				target[key] = append(bucket, i)
 			}
 		}
 	}
 	return idx
+}
+
+func selectDigestBucket(idx moveDigestIndex, isMissing, isCurrent bool) map[digestKey][]int {
+	if isMissing {
+		if isCurrent {
+			return idx.missingCurrentBuckets
+		}
+		return idx.missingHistoricalBuckets
+	}
+	if isCurrent {
+		return idx.activeCurrentBuckets
+	}
+	return idx.activeHistoricalBuckets
+}
+
+func hasMatchingHistoricalDigest(asset domain.MediaAsset, kind domain.DigestKind, value string) bool {
+	for _, d := range asset.Digests {
+		if !d.IsCurrent && d.Kind == kind && d.Value == value {
+			return true
+		}
+	}
+	return false
 }
 
 func matchMovesFixedPoint(
@@ -380,16 +537,18 @@ func matchCandidateMoves(
 		}
 	}
 
-	matchPass(index.currentBuckets)
+	matchPass(index.activeCurrentBuckets)
+	matchPass(index.missingCurrentBuckets)
 	// When no current-digest move explains an unconfirmed asset's departure,
-	// keep a same-path historical observation in place as an external modify
-	// rather than letting a copy of that historical digest steal the asset ID.
+	// keep a same-path historical observation in place as an external modify or
+	// same-path historical restore rather than letting a copy steal the asset ID.
 	for assetIdx, hasHist := range index.samePathHistorical {
 		if hasHist && !claimed[assetIdx] {
 			claimed[assetIdx] = true
 		}
 	}
-	matchPass(index.historicalBuckets)
+	matchPass(index.activeHistoricalBuckets)
+	matchPass(index.missingHistoricalBuckets)
 	return proposed, matchedObs
 }
 
@@ -408,13 +567,6 @@ func findNewlyBlockedDestinations(
 		if !occupied {
 			continue
 		}
-		if occupant.MissingSince != nil {
-			if _, already := blockedDest[dst]; !already {
-				blockedDest[dst] = struct{}{}
-				newlyBlocked = true
-			}
-			continue
-		}
 		if _, vacated := proposedMoves[occupant.ID]; !vacated {
 			if _, already := blockedDest[dst]; !already {
 				blockedDest[dst] = struct{}{}
@@ -430,8 +582,9 @@ func classifyUnmatchedCandidates(
 	matchedObs []bool,
 	existingByLoc map[assetLocation]domain.MediaAsset,
 	proposedMoves map[string]plannedMove,
-) ([]plannedModify, []observedFile) {
+) ([]plannedModify, []plannedRestore, []observedFile) {
 	var modifies []plannedModify
+	var restores []plannedRestore
 	var toIndex []observedFile
 
 	for obsIdx, cand := range candidates {
@@ -446,14 +599,18 @@ func classifyUnmatchedCandidates(
 			})
 			continue
 		}
-		if occupant.MissingSince != nil {
-			// Leave missing/retired asset paths to M1-T22.2 reconciliation.
-			continue
-		}
 		if _, vacated := proposedMoves[occupant.ID]; vacated {
 			toIndex = append(toIndex, observedFile{
 				rootID:    cand.rootID,
 				inspected: cand.inspected,
+			})
+			continue
+		}
+		if occupant.MissingSince != nil && hasMatchingHistoricalDigest(occupant, cand.inspected.DigestKind, cand.inspected.Digest) {
+			restores = append(restores, plannedRestore{
+				Existing:  occupant,
+				RootID:    cand.rootID,
+				Inspected: cand.inspected,
 			})
 			continue
 		}
@@ -463,7 +620,7 @@ func classifyUnmatchedCandidates(
 			Inspected: cand.inspected,
 		})
 	}
-	return modifies, toIndex
+	return modifies, restores, toIndex
 }
 
 func findDSURoot(parent []int, x int) int {
@@ -561,6 +718,9 @@ func (s *Scanner) executeMoves(
 		}
 		for _, mv := range comp {
 			res.recordReconcileMoved(mv.TargetRootID)
+			if mv.Asset.MissingSince != nil {
+				res.recordReconcileRestored(mv.TargetRootID)
+			}
 		}
 	}
 	return errors.Join(writeErrs...)
@@ -570,6 +730,7 @@ type pendingMoveEvent struct {
 	asset               domain.MediaAsset
 	prevDisplay         string
 	emitInvalidUTF8Path bool
+	emitRestored        bool
 }
 
 func (s *Scanner) applyMoveComponent(
@@ -606,7 +767,7 @@ func (s *Scanner) applyMoveComponent(
 			return err
 		}
 
-		now := s.now().UTC()
+		now := s.now().UTC().Truncate(time.Microsecond)
 		eventsToEmit, err := applyComponentAssetUpdates(ctx, cw, comp, lockedVolumes, lockedAssets, now)
 		if err != nil {
 			return err
@@ -619,7 +780,7 @@ func (s *Scanner) applyMoveComponent(
 		}
 
 		for _, ev := range eventsToEmit {
-			if err := s.appendMoveEvents(ctx, appender, libraryID, ev.asset, ev.prevDisplay, ev.emitInvalidUTF8Path); err != nil {
+			if err := s.appendMoveEvents(ctx, appender, libraryID, ev); err != nil {
 				return err
 			}
 		}
@@ -674,7 +835,8 @@ func lockComponentAssets(
 }
 
 func verifyLockedAssetSnapshot(fresh, expected domain.MediaAsset, action string) error {
-	if fresh.MissingSince != nil ||
+	if !equalOptionalTimePtr(fresh.MissingSince, expected.MissingSince) ||
+		!equalOptionalTimePtr(fresh.RetiredAt, expected.RetiredAt) ||
 		fresh.VolumeID != expected.VolumeID ||
 		fresh.LibraryRootID != expected.LibraryRootID ||
 		!bytes.Equal(fresh.RelPathBytes, expected.RelPathBytes) ||
@@ -719,6 +881,7 @@ func applyMoveToAsset(
 	}
 	prevDisplay := fresh.RelPathDisplay
 	wasInvalidUTF8 := fresh.Diagnostics.InvalidUTF8Path
+	wasMissing := fresh.MissingSince != nil
 
 	fresh.LibraryRootID = mv.TargetRootID
 	fresh.RelPathBytes = slices.Clone(relPath.Bytes)
@@ -727,6 +890,8 @@ func applyMoveToAsset(
 	fresh.FileSize = mv.Inspected.Size
 	fresh.FileMtime = optionalNormalizedMtimePtr(mv.Inspected.Mtime)
 	fresh.Diagnostics.InvalidUTF8Path = relPath.InvalidUTF8
+	fresh.MissingSince = nil
+	fresh.RetiredAt = nil
 	fresh.UpdatedAt = now
 
 	cur, hasCur := fresh.CurrentDigest(mv.Inspected.DigestKind)
@@ -743,6 +908,7 @@ func applyMoveToAsset(
 		asset:               fresh,
 		prevDisplay:         prevDisplay,
 		emitInvalidUTF8Path: !wasInvalidUTF8 && fresh.Diagnostics.InvalidUTF8Path,
+		emitRestored:        wasMissing,
 	}, nil
 }
 
@@ -793,22 +959,47 @@ func shouldSyncMovedVolumePageCount(vol domain.Volume, assetID string, pageCount
 	return vol.PageCount != pageCount
 }
 
+func (s *Scanner) appendAssetEvent(
+	ctx context.Context,
+	appender storage.EventRepository,
+	kind domain.EventKind,
+	libraryID string,
+	asset domain.MediaAsset,
+) error {
+	payload := domain.AssetEventPayloadV1{
+		AssetID:       asset.ID,
+		VolumeID:      asset.VolumeID,
+		LibraryID:     libraryID,
+		LibraryRootID: asset.LibraryRootID,
+		Format:        asset.Format,
+		PathDisplay:   asset.RelPathDisplay,
+	}
+	_, err := s.outbox.AppendPayload(
+		ctx,
+		appender,
+		kind,
+		domain.EventVersion1,
+		domain.AggregateTypeAsset,
+		asset.ID,
+		payload,
+	)
+	return err
+}
+
 func (s *Scanner) appendMoveEvents(
 	ctx context.Context,
 	appender storage.EventRepository,
 	libraryID string,
-	asset domain.MediaAsset,
-	prevDisplay string,
-	emitInvalidUTF8 bool,
+	ev pendingMoveEvent,
 ) error {
 	movedPayload := domain.AssetEventPayloadV1{
-		AssetID:             asset.ID,
-		VolumeID:            asset.VolumeID,
+		AssetID:             ev.asset.ID,
+		VolumeID:            ev.asset.VolumeID,
 		LibraryID:           libraryID,
-		LibraryRootID:       asset.LibraryRootID,
-		Format:              asset.Format,
-		PathDisplay:         asset.RelPathDisplay,
-		PreviousPathDisplay: prevDisplay,
+		LibraryRootID:       ev.asset.LibraryRootID,
+		Format:              ev.asset.Format,
+		PathDisplay:         ev.asset.RelPathDisplay,
+		PreviousPathDisplay: ev.prevDisplay,
 	}
 	if _, err := s.outbox.AppendPayload(
 		ctx,
@@ -816,29 +1007,18 @@ func (s *Scanner) appendMoveEvents(
 		domain.EventAssetMoved,
 		domain.EventVersion1,
 		domain.AggregateTypeAsset,
-		asset.ID,
+		ev.asset.ID,
 		movedPayload,
 	); err != nil {
 		return err
 	}
-	if emitInvalidUTF8 {
-		invalidPayload := domain.AssetEventPayloadV1{
-			AssetID:       asset.ID,
-			VolumeID:      asset.VolumeID,
-			LibraryID:     libraryID,
-			LibraryRootID: asset.LibraryRootID,
-			Format:        asset.Format,
-			PathDisplay:   asset.RelPathDisplay,
+	if ev.emitRestored {
+		if err := s.appendAssetEvent(ctx, appender, domain.EventAssetRestored, libraryID, ev.asset); err != nil {
+			return err
 		}
-		if _, err := s.outbox.AppendPayload(
-			ctx,
-			appender,
-			domain.EventAssetInvalidUTF8Path,
-			domain.EventVersion1,
-			domain.AggregateTypeAsset,
-			asset.ID,
-			invalidPayload,
-		); err != nil {
+	}
+	if ev.emitInvalidUTF8Path {
+		if err := s.appendAssetEvent(ctx, appender, domain.EventAssetInvalidUTF8Path, libraryID, ev.asset); err != nil {
 			return err
 		}
 	}
@@ -852,32 +1032,30 @@ func (s *Scanner) executeModifies(
 	modifies []plannedModify,
 	res *ScanResult,
 ) error {
-	var writeErrs []error
-	for _, mod := range modifies {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		applied, err := s.applyExternalModify(ctx, libraryID, checkedRoots, mod)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return errors.Join(append(writeErrs, ctxErr)...)
+	return runReconcileStep(
+		ctx,
+		modifies,
+		func(mod plannedModify) error {
+			applied, wasMissing, err := s.applyExternalModify(ctx, libraryID, checkedRoots, mod)
+			if err != nil {
+				return err
 			}
-			if errors.Is(err, ErrStalePreCheck) {
-				return errors.Join(append(writeErrs, err)...)
+			if applied {
+				res.recordReconcileModified(mod.RootID)
+				if wasMissing {
+					res.recordReconcileRestored(mod.RootID)
+				}
 			}
+			return nil
+		},
+		func(mod plannedModify, err error) {
 			res.recordReconcileSkipped(mod.RootID, SkippedEntry{
 				RelPath: mod.Inspected.RelPath,
 				Reason:  SkipReasonIndexFailed,
 				Err:     err,
 			})
-			writeErrs = append(writeErrs, err)
-			continue
-		}
-		if applied {
-			res.recordReconcileModified(mod.RootID)
-		}
-	}
-	return errors.Join(writeErrs...)
+		},
+	)
 }
 
 func (s *Scanner) applyExternalModify(
@@ -885,81 +1063,66 @@ func (s *Scanner) applyExternalModify(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	mod plannedModify,
-) (bool, error) {
+) (bool, bool, error) {
 	relPath, err := normalizeInspectedRelPath(mod.Inspected.RelPath)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	var applied bool
-	err = s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-		// Global lock order:
-		// libraries (FOR UPDATE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
-		// volumes (FOR UPDATE) -> media_assets (FOR UPDATE) -> series_memberships ->
-		// series -> people/credits/entities -> domain_events.
-		if err := lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots); err != nil {
-			return err
-		}
+	var (
+		applied    bool
+		wasMissing bool
+	)
+	err = s.withLockedAssetSnapshot(ctx, libraryID, checkedRoots, mod.Existing, "modify",
+		func(tx storage.Tx, cw storage.CatalogueWriteRepository, vol *domain.Volume, asset *domain.MediaAsset) error {
+			libRepo := tx.Libraries()
+			appender := tx.Events()
+			if libRepo == nil || appender == nil {
+				return errors.New("scanner: library and event repositories are required")
+			}
+			lib, err := libRepo.GetLibraryByID(ctx, libraryID)
+			if err != nil {
+				return err
+			}
+			if asset.VolumeID != vol.ID || asset.LibraryRootID != mod.RootID || !bytes.Equal(asset.RelPathBytes, relPath.Bytes) {
+				return fmt.Errorf("%w: asset %q changed concurrently before modify", ErrStaleAssetState, mod.Existing.ID)
+			}
+			if cur, ok := asset.CurrentDigest(mod.Inspected.DigestKind); ok && cur.Value == mod.Inspected.Digest {
+				return nil
+			}
 
-		libRepo := tx.Libraries()
-		cw := tx.CatalogueWrites()
-		appender := tx.Events()
-		if libRepo == nil || cw == nil || appender == nil {
-			return errors.New("scanner: library, catalogue write, and event repositories are required")
-		}
-
-		lib, err := libRepo.GetLibraryByID(ctx, libraryID)
-		if err != nil {
-			return err
-		}
-		vol, err := cw.GetVolumeByIDForUpdate(ctx, mod.Existing.VolumeID)
-		if err != nil {
-			return err
-		}
-		asset, err := cw.GetAssetByIDForUpdate(ctx, mod.Existing.ID)
-		if err != nil {
-			return err
-		}
-		if err := verifyLockedAssetSnapshot(*asset, mod.Existing, "modify"); err != nil {
-			return err
-		}
-		if asset.VolumeID != vol.ID || asset.LibraryRootID != mod.RootID || !bytes.Equal(asset.RelPathBytes, relPath.Bytes) {
-			return fmt.Errorf("%w: asset %q changed concurrently before modify", ErrStaleAssetState, mod.Existing.ID)
-		}
-		if cur, ok := asset.CurrentDigest(mod.Inspected.DigestKind); ok && cur.Value == mod.Inspected.Digest {
-			applied = false
+			now := s.now().UTC().Truncate(time.Microsecond)
+			wasMissing = asset.MissingSince != nil
+			updatedAsset, err := s.persistExternalModifyAsset(ctx, cw, *asset, relPath, mod.Inspected, now)
+			if err != nil {
+				return err
+			}
+			if err := refreshModifiedCatalogue(ctx, tx, cw, lib, *vol, relPath, mod.Inspected, now); err != nil {
+				return err
+			}
+			if err := s.appendExternalModifyEvents(ctx, appender, lib.ID, updatedAsset, wasMissing); err != nil {
+				return err
+			}
+			applied = true
 			return nil
-		}
+		},
+	)
+	return applied, wasMissing, err
+}
 
-		now := s.now().UTC()
-		updatedAsset, err := s.persistExternalModifyAsset(ctx, cw, *asset, relPath, mod.Inspected, now)
-		if err != nil {
-			return err
-		}
-		if err := refreshModifiedCatalogue(ctx, tx, cw, lib, *vol, relPath, mod.Inspected, now); err != nil {
-			return err
-		}
-		if _, err := s.outbox.AppendPayload(
-			ctx,
-			appender,
-			domain.EventAssetModified,
-			domain.EventVersion1,
-			domain.AggregateTypeAsset,
-			updatedAsset.ID,
-			domain.AssetEventPayloadV1{
-				AssetID:       updatedAsset.ID,
-				VolumeID:      updatedAsset.VolumeID,
-				LibraryID:     lib.ID,
-				LibraryRootID: updatedAsset.LibraryRootID,
-				Format:        updatedAsset.Format,
-				PathDisplay:   updatedAsset.RelPathDisplay,
-			},
-		); err != nil {
-			return err
-		}
-		applied = true
-		return nil
-	})
-	return applied, err
+func (s *Scanner) appendExternalModifyEvents(
+	ctx context.Context,
+	appender storage.EventRepository,
+	libraryID string,
+	asset domain.MediaAsset,
+	wasMissing bool,
+) error {
+	if err := s.appendAssetEvent(ctx, appender, domain.EventAssetModified, libraryID, asset); err != nil {
+		return err
+	}
+	if wasMissing {
+		return s.appendAssetEvent(ctx, appender, domain.EventAssetRestored, libraryID, asset)
+	}
+	return nil
 }
 
 func (s *Scanner) persistExternalModifyAsset(
@@ -982,6 +1145,7 @@ func (s *Scanner) persistExternalModifyAsset(
 		return domain.MediaAsset{}, err
 	}
 
+	wasMissing := asset.MissingSince != nil
 	updated := asset
 	updated.FileSize = inspected.Size
 	updated.FileMtime = optionalNormalizedMtimePtr(inspected.Mtime)
@@ -991,7 +1155,15 @@ func (s *Scanner) persistExternalModifyAsset(
 	updated.SuppressedPages = slices.Clone(inspected.SuppressedPages)
 	updated.Diagnostics.ImageCodecs = slices.Clone(inspected.ImageCodecs)
 	updated.Diagnostics.InvalidUTF8Path = relPath.InvalidUTF8
+	updated.MissingSince = nil
+	updated.RetiredAt = nil
 	updated.UpdatedAt = now
+	if wasMissing {
+		if err := cw.UpdateAsset(ctx, &updated); err != nil {
+			return domain.MediaAsset{}, err
+		}
+		return updated, nil
+	}
 	if err := cw.UpdateAssetContent(ctx, &updated); err != nil {
 		return domain.MediaAsset{}, err
 	}
@@ -1124,6 +1296,137 @@ func isImmutableModifyPrimary(m domain.SeriesMembership) bool {
 		m.LockedFields.IsLocked("series_id")
 }
 
+func runReconcileStep[T any](
+	ctx context.Context,
+	items []T,
+	apply func(T) error,
+	onSkip func(T, error),
+) error {
+	var writeErrs []error
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(writeErrs, err)...)
+		}
+		if err := apply(item); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errors.Join(append(writeErrs, ctxErr)...)
+			}
+			if errors.Is(err, ErrStalePreCheck) {
+				return errors.Join(append(writeErrs, err)...)
+			}
+			if onSkip != nil {
+				onSkip(item, err)
+			}
+			writeErrs = append(writeErrs, err)
+		}
+	}
+	return errors.Join(writeErrs...)
+}
+
+func (s *Scanner) withLockedAssetSnapshot(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	expected domain.MediaAsset,
+	action string,
+	fn func(tx storage.Tx, cw storage.CatalogueWriteRepository, vol *domain.Volume, asset *domain.MediaAsset) error,
+) error {
+	return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		// Global lock order:
+		// libraries (FOR UPDATE) -> library_roots (id ASC, FOR NO KEY UPDATE) ->
+		// volumes (FOR UPDATE) -> media_assets (FOR UPDATE).
+		if err := lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots); err != nil {
+			return err
+		}
+		cw := tx.CatalogueWrites()
+		if cw == nil {
+			return errors.New("scanner: catalogue write repository is required")
+		}
+		vol, err := cw.GetVolumeByIDForUpdate(ctx, expected.VolumeID)
+		if err != nil {
+			return err
+		}
+		asset, err := cw.GetAssetByIDForUpdate(ctx, expected.ID)
+		if err != nil {
+			return err
+		}
+		if err := verifyLockedAssetSnapshot(*asset, expected, action); err != nil {
+			return err
+		}
+		return fn(tx, cw, vol, asset)
+	})
+}
+
+func (s *Scanner) executeRestores(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	restores []plannedRestore,
+	res *ScanResult,
+) error {
+	return runReconcileStep(
+		ctx,
+		restores,
+		func(r plannedRestore) error {
+			if err := s.applySamePathRestore(ctx, libraryID, checkedRoots, r); err != nil {
+				return err
+			}
+			res.recordReconcileRestored(r.RootID)
+			return nil
+		},
+		func(r plannedRestore, err error) {
+			res.recordReconcileSkipped(r.RootID, SkippedEntry{
+				RelPath: r.Inspected.RelPath,
+				Reason:  SkipReasonIndexFailed,
+				Err:     err,
+			})
+		},
+	)
+}
+
+func (s *Scanner) applySamePathRestore(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	r plannedRestore,
+) error {
+	relPath, err := normalizeInspectedRelPath(r.Inspected.RelPath)
+	if err != nil {
+		return err
+	}
+	return s.withLockedAssetSnapshot(ctx, libraryID, checkedRoots, r.Existing, "restore",
+		func(tx storage.Tx, cw storage.CatalogueWriteRepository, vol *domain.Volume, asset *domain.MediaAsset) error {
+			appender := tx.Events()
+			if appender == nil {
+				return errors.New("scanner: event repository is required")
+			}
+			if asset.MissingSince == nil || asset.LibraryRootID != r.RootID || !bytes.Equal(asset.RelPathBytes, relPath.Bytes) {
+				return fmt.Errorf("%w: asset %q changed concurrently before restore", ErrStaleAssetState, r.Existing.ID)
+			}
+			now := s.now().UTC().Truncate(time.Microsecond)
+			cur, hasCur := asset.CurrentDigest(r.Inspected.DigestKind)
+			if !hasCur || cur.Value != r.Inspected.Digest {
+				if !hasMatchingHistoricalDigest(*asset, r.Inspected.DigestKind, r.Inspected.Digest) {
+					return fmt.Errorf("%w: asset %q digest changed concurrently before restore", ErrStaleAssetState, r.Existing.ID)
+				}
+				vols := map[string]domain.Volume{vol.ID: *vol}
+				if err := promoteHistoricalMoveDigest(ctx, cw, asset, vols, r.Inspected, now); err != nil {
+					return err
+				}
+			}
+			asset.FileSize = r.Inspected.Size
+			asset.FileMtime = optionalNormalizedMtimePtr(r.Inspected.Mtime)
+			asset.MissingSince = nil
+			asset.RetiredAt = nil
+			asset.UpdatedAt = now
+			if err := cw.UpdateAsset(ctx, asset); err != nil {
+				return err
+			}
+			return s.appendAssetEvent(ctx, appender, domain.EventAssetRestored, libraryID, *asset)
+		},
+	)
+}
+
 func (s *Scanner) executeMtimeRefreshes(
 	ctx context.Context,
 	libraryID string,
@@ -1131,28 +1434,20 @@ func (s *Scanner) executeMtimeRefreshes(
 	refreshes []plannedModify,
 	res *ScanResult,
 ) error {
-	var writeErrs []error
-	for _, ref := range refreshes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.applyMtimeRefresh(ctx, libraryID, checkedRoots, ref); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return errors.Join(append(writeErrs, ctxErr)...)
-			}
-			if errors.Is(err, ErrStalePreCheck) {
-				return errors.Join(append(writeErrs, err)...)
-			}
+	return runReconcileStep(
+		ctx,
+		refreshes,
+		func(ref plannedModify) error {
+			return s.applyMtimeRefresh(ctx, libraryID, checkedRoots, ref)
+		},
+		func(ref plannedModify, err error) {
 			res.recordReconcileSkipped(ref.RootID, SkippedEntry{
 				RelPath: ref.Inspected.RelPath,
 				Reason:  SkipReasonIndexFailed,
 				Err:     err,
 			})
-			writeErrs = append(writeErrs, err)
-			continue
-		}
-	}
-	return errors.Join(writeErrs...)
+		},
+	)
 }
 
 func (s *Scanner) applyMtimeRefresh(
@@ -1161,39 +1456,120 @@ func (s *Scanner) applyMtimeRefresh(
 	checkedRoots []RootCheckResult,
 	ref plannedModify,
 ) error {
-	return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-		if err := lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots); err != nil {
-			return err
-		}
-		cw := tx.CatalogueWrites()
-		if cw == nil {
-			return errors.New("scanner: catalogue write repository is required")
-		}
-		// Maintain volumes -> media_assets lock order with moves and modifies.
-		if _, err := cw.GetVolumeByIDForUpdate(ctx, ref.Existing.VolumeID); err != nil {
-			return err
-		}
-		asset, err := cw.GetAssetByIDForUpdate(ctx, ref.Existing.ID)
-		if err != nil {
-			return err
-		}
-		if err := verifyLockedAssetSnapshot(*asset, ref.Existing, "mtime refresh"); err != nil {
-			return err
-		}
-		if asset.LibraryRootID != ref.RootID || !bytes.Equal(asset.RelPathBytes, ref.Inspected.RelPath.Bytes) {
-			return fmt.Errorf("%w: asset %q changed concurrently before mtime refresh", ErrStaleAssetState, ref.Existing.ID)
-		}
-		cur, ok := asset.CurrentDigest(ref.Inspected.DigestKind)
-		if !ok || cur.Value != ref.Inspected.Digest {
-			return fmt.Errorf("%w: asset %q digest changed concurrently before mtime refresh", ErrStaleAssetState, ref.Existing.ID)
-		}
+	return s.withLockedAssetSnapshot(ctx, libraryID, checkedRoots, ref.Existing, "mtime refresh",
+		func(_ storage.Tx, cw storage.CatalogueWriteRepository, _ *domain.Volume, asset *domain.MediaAsset) error {
+			if asset.LibraryRootID != ref.RootID || !bytes.Equal(asset.RelPathBytes, ref.Inspected.RelPath.Bytes) {
+				return fmt.Errorf("%w: asset %q changed concurrently before mtime refresh", ErrStaleAssetState, ref.Existing.ID)
+			}
+			cur, ok := asset.CurrentDigest(ref.Inspected.DigestKind)
+			if !ok || cur.Value != ref.Inspected.Digest {
+				return fmt.Errorf("%w: asset %q digest changed concurrently before mtime refresh", ErrStaleAssetState, ref.Existing.ID)
+			}
 
-		updated := *asset
-		updated.FileSize = ref.Inspected.Size
-		updated.FileMtime = optionalNormalizedMtimePtr(ref.Inspected.Mtime)
-		updated.UpdatedAt = s.now().UTC()
-		return cw.UpdateAssetContent(ctx, &updated)
-	})
+			updated := *asset
+			updated.FileSize = ref.Inspected.Size
+			updated.FileMtime = optionalNormalizedMtimePtr(ref.Inspected.Mtime)
+			updated.UpdatedAt = s.now().UTC().Truncate(time.Microsecond)
+			return cw.UpdateAssetContent(ctx, &updated)
+		},
+	)
+}
+
+func (s *Scanner) executeMarkMissing(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	items []plannedAssetTransition,
+	missingAt time.Time,
+	res *ScanResult,
+) error {
+	return runReconcileStep(
+		ctx,
+		items,
+		func(item plannedAssetTransition) error {
+			if err := s.applyMarkMissing(ctx, libraryID, checkedRoots, item, missingAt); err != nil {
+				return err
+			}
+			res.recordReconcileMissing(item.RootID)
+			return nil
+		},
+		nil,
+	)
+}
+
+func (s *Scanner) applyMarkMissing(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	item plannedAssetTransition,
+	missingAt time.Time,
+) error {
+	return s.withLockedAssetSnapshot(ctx, libraryID, checkedRoots, item.Existing, "mark missing",
+		func(tx storage.Tx, cw storage.CatalogueWriteRepository, _ *domain.Volume, asset *domain.MediaAsset) error {
+			appender := tx.Events()
+			if appender == nil {
+				return errors.New("scanner: event repository is required")
+			}
+			if asset.MissingSince != nil || asset.RetiredAt != nil {
+				return fmt.Errorf("%w: asset %q already missing before mark missing", ErrStaleAssetState, item.Existing.ID)
+			}
+			ts := missingAt.UTC().Truncate(time.Microsecond)
+			asset.MissingSince = &ts
+			asset.UpdatedAt = ts
+			if err := cw.UpdateAsset(ctx, asset); err != nil {
+				return err
+			}
+			return s.appendAssetEvent(ctx, appender, domain.EventAssetMissing, libraryID, *asset)
+		},
+	)
+}
+
+func (s *Scanner) executeRetireMissing(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	items []plannedAssetTransition,
+	grace time.Duration,
+	retiredAt time.Time,
+	res *ScanResult,
+) error {
+	return runReconcileStep(
+		ctx,
+		items,
+		func(item plannedAssetTransition) error {
+			if err := s.applyRetireMissing(ctx, libraryID, checkedRoots, item, grace, retiredAt); err != nil {
+				return err
+			}
+			res.recordReconcileRetired(item.RootID)
+			return nil
+		},
+		nil,
+	)
+}
+
+func (s *Scanner) applyRetireMissing(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	item plannedAssetTransition,
+	grace time.Duration,
+	retiredAt time.Time,
+) error {
+	return s.withLockedAssetSnapshot(ctx, libraryID, checkedRoots, item.Existing, "retire",
+		func(_ storage.Tx, cw storage.CatalogueWriteRepository, _ *domain.Volume, asset *domain.MediaAsset) error {
+			if asset.MissingSince == nil || asset.RetiredAt != nil {
+				return fmt.Errorf("%w: asset %q not eligible for retirement", ErrStaleAssetState, item.Existing.ID)
+			}
+			ts := retiredAt.UTC().Truncate(time.Microsecond)
+			if ts.Before(asset.MissingSince.UTC().Add(grace)) {
+				return fmt.Errorf("%w: asset %q grace period no longer elapsed before retire", ErrStaleAssetState, item.Existing.ID)
+			}
+			asset.RetiredAt = &ts
+			asset.UpdatedAt = ts
+			// Retirement within the missing state does not produce another missing event (ADR-0018 S3, M1B-D3).
+			return cw.UpdateAsset(ctx, asset)
+		},
+	)
 }
 
 func (s *Scanner) executeDeferredIndexes(

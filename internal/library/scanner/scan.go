@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,10 +17,30 @@ import (
 	"github.com/inexcession/tobiten/internal/storage"
 )
 
+const (
+	// MissingGraceDaysSettingKey is the PostgreSQL system_settings key configuring
+	// how many days a missing asset remains in soft-delete grace before retirement
+	// sets retired_at (ADR-0019 §6).
+	MissingGraceDaysSettingKey = "scanner.missing_grace_days"
+
+	// DefaultMissingGraceDays is the default missing-file grace period in days (ADR-0019 §6).
+	DefaultMissingGraceDays = 7
+
+	// DefaultMissingGracePeriod is the default missing-file grace duration (7 days).
+	DefaultMissingGracePeriod = DefaultMissingGraceDays * 24 * time.Hour
+)
+
+// ErrInvalidMissingGracePeriod is returned when the configured missing grace period is
+// negative or cannot be parsed as a non-negative integer number of days.
+var ErrInvalidMissingGracePeriod = errors.New("scanner: invalid missing grace period")
+
 // Options configures a Scanner instance.
 type Options struct {
 	Outbox *events.Outbox
 	Now    func() time.Time
+	// MissingGracePeriod optionally overrides the MissingGraceDaysSettingKey
+	// system_settings value when non-nil (ADR-0019 §6).
+	MissingGracePeriod *time.Duration
 }
 
 // ScanOptions configures a single library scan pass.
@@ -60,6 +83,9 @@ type RootScanResult struct {
 	IndexedCount   int
 	MovedCount     int
 	ModifiedCount  int
+	RestoredCount  int
+	MissingCount   int
+	RetiredCount   int
 	UnchangedCount int
 	Changed        []ChangedFile
 	Skipped        []SkippedEntry
@@ -77,6 +103,9 @@ type ScanResult struct {
 	IndexedCount   int
 	MovedCount     int
 	ModifiedCount  int
+	RestoredCount  int
+	MissingCount   int
+	RetiredCount   int
 	UnchangedCount int
 	ChangedCount   int
 	SkippedCount   int
@@ -86,14 +115,18 @@ type ScanResult struct {
 // opening them, collects inspection data for changed existing paths, and indexes
 // newly discovered CBZ files sequentially in one transaction per file.
 type Scanner struct {
-	tx      storage.Transactor
-	indexer *Indexer
-	outbox  *events.Outbox
-	now     func() time.Time
+	tx                 storage.Transactor
+	indexer            *Indexer
+	outbox             *events.Outbox
+	now                func() time.Time
+	missingGracePeriod *time.Duration
 }
 
 // NewScanner constructs a Scanner backed by tx.
 func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
+	if opts.MissingGracePeriod != nil && *opts.MissingGracePeriod < 0 {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidMissingGracePeriod, *opts.MissingGracePeriod)
+	}
 	nowFn := opts.Now
 	if nowFn == nil {
 		nowFn = time.Now
@@ -109,11 +142,17 @@ func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
 	if err != nil {
 		return nil, err
 	}
+	var graceOverride *time.Duration
+	if opts.MissingGracePeriod != nil {
+		d := *opts.MissingGracePeriod
+		graceOverride = &d
+	}
 	return &Scanner{
-		tx:      tx,
-		indexer: idx,
-		outbox:  outbox,
-		now:     nowFn,
+		tx:                 tx,
+		indexer:            idx,
+		outbox:             outbox,
+		now:                nowFn,
+		missingGracePeriod: graceOverride,
 	}, nil
 }
 
@@ -158,7 +197,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return res, nil
 	}
 
-	currentRoots, preWalkAssets, err := s.loadLibraryRootsAndAssets(ctx, libraryID)
+	currentRoots, preWalkAssets, gracePeriod, err := s.loadLibraryScanSnapshot(ctx, libraryID)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -196,7 +235,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		}
 	}
 	if res.Complete && len(rootErrs) == 0 && ctx.Err() == nil {
-		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, &res); err != nil {
+		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, &res); err != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
 			return res, err
@@ -214,6 +253,9 @@ func (r *ScanResult) recordRoot(rootRes RootScanResult) {
 	r.IndexedCount += rootRes.IndexedCount
 	r.MovedCount += rootRes.MovedCount
 	r.ModifiedCount += rootRes.ModifiedCount
+	r.RestoredCount += rootRes.RestoredCount
+	r.MissingCount += rootRes.MissingCount
+	r.RetiredCount += rootRes.RetiredCount
 	r.UnchangedCount += rootRes.UnchangedCount
 	r.ChangedCount += len(rootRes.Changed)
 	r.SkippedCount += rootRes.SkippedCount
@@ -242,6 +284,27 @@ func (r *ScanResult) recordReconcileModified(rootID string) {
 	r.ModifiedCount++
 	if i := r.findRootIndex(rootID); i >= 0 {
 		r.Roots[i].ModifiedCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileRestored(rootID string) {
+	r.RestoredCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].RestoredCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileMissing(rootID string) {
+	r.MissingCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].MissingCount++
+	}
+}
+
+func (r *ScanResult) recordReconcileRetired(rootID string) {
+	r.RetiredCount++
+	if i := r.findRootIndex(rootID); i >= 0 {
+		r.Roots[i].RetiredCount++
 	}
 }
 
@@ -301,10 +364,11 @@ func (s *Scanner) loadLibraryAndRoots(ctx context.Context, libraryID string) (*d
 	return lib, roots, nil
 }
 
-func (s *Scanner) loadLibraryRootsAndAssets(ctx context.Context, libraryID string) ([]domain.LibraryRoot, []domain.MediaAsset, error) {
+func (s *Scanner) loadLibraryScanSnapshot(ctx context.Context, libraryID string) ([]domain.LibraryRoot, []domain.MediaAsset, time.Duration, error) {
 	var (
-		roots  []domain.LibraryRoot
-		assets []domain.MediaAsset
+		roots       []domain.LibraryRoot
+		assets      []domain.MediaAsset
+		gracePeriod time.Duration
 	)
 	err := s.tx.WithTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
@@ -324,12 +388,45 @@ func (s *Scanner) loadLibraryRootsAndAssets(ctx context.Context, libraryID strin
 			return err
 		}
 		assets, err = cw.ListAssetsByLibrary(ctx, lib.ID)
+		if err != nil {
+			return err
+		}
+		gracePeriod, err = s.resolveMissingGracePeriod(ctx, tx)
 		return err
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	return roots, assets, nil
+	return roots, assets, gracePeriod, nil
+}
+
+func (s *Scanner) resolveMissingGracePeriod(ctx context.Context, tx storage.Tx) (time.Duration, error) {
+	if s.missingGracePeriod != nil {
+		return *s.missingGracePeriod, nil
+	}
+	settings := tx.Settings()
+	if settings == nil {
+		return 0, errors.New("scanner: settings repository is required")
+	}
+	setting, err := settings.GetSetting(ctx, MissingGraceDaysSettingKey)
+	if errors.Is(err, storage.ErrNotFound) {
+		return DefaultMissingGracePeriod, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if setting == nil {
+		return DefaultMissingGracePeriod, nil
+	}
+	raw := strings.TrimSpace(setting.ValueString())
+	if raw == "" {
+		return DefaultMissingGracePeriod, nil
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days < 0 || days > math.MaxInt64/int(24*time.Hour) {
+		return 0, fmt.Errorf("%w: %s=%q", ErrInvalidMissingGracePeriod, MissingGraceDaysSettingKey, raw)
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
 }
 
 func indexPreWalkAssetsByRoot(assets []domain.MediaAsset, rootCap int) map[string][]domain.MediaAsset {

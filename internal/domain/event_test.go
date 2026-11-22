@@ -11,8 +11,8 @@ import (
 
 func TestValidEventKindsAndAggregateTypes(t *testing.T) {
 	kinds := ValidEventKinds()
-	if len(kinds) != 18 {
-		t.Fatalf("len(ValidEventKinds()) = %d, want 18", len(kinds))
+	if len(kinds) != 20 {
+		t.Fatalf("len(ValidEventKinds()) = %d, want 20", len(kinds))
 	}
 	seen := make(map[EventKind]bool, len(kinds))
 	for _, k := range kinds {
@@ -138,6 +138,24 @@ func TestNewDomainEventAndDecodeVersionedPayloads(t *testing.T) {
 		gotInvalidUTF8, err := DecodeEventPayload[AssetEventPayloadV1](invalidUTF8Ev)
 		if err != nil || gotInvalidUTF8.PathDisplay != `Series\xff/v01.cbz` {
 			t.Fatalf("decoded invalid_utf8_path = %+v, err = %v", gotInvalidUTF8, err)
+		}
+
+		for _, kind := range []EventKind{EventAssetMissing, EventAssetRestored} {
+			ev, err := NewDomainEvent(kind, EventVersion1, AggregateTypeAsset, "asset-3", AssetEventPayloadV1{
+				AssetID:       "asset-3",
+				VolumeID:      "vol-3",
+				LibraryID:     "lib-1",
+				LibraryRootID: "root-1",
+				Format:        MediaFormatCBZ,
+				PathDisplay:   "Series/v03.cbz",
+			}, now)
+			if err != nil {
+				t.Fatalf("NewDomainEvent %s: %v", kind, err)
+			}
+			got, err := DecodeEventPayload[AssetEventPayloadV1](ev)
+			if err != nil || got.AssetID != "asset-3" || got.PathDisplay != "Series/v03.cbz" {
+				t.Fatalf("decoded %s = %+v, err = %v", kind, got, err)
+			}
 		}
 
 		libOfflineEv, err := NewDomainEvent(EventLibraryOffline, EventVersion1, AggregateTypeLibrary, "lib-1", LibraryEventPayloadV1{

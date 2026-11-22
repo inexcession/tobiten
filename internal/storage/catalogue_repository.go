@@ -65,8 +65,12 @@ type AuthorizedAssetFile struct {
 // volumes, media assets, authorized file projections, and per-user reading progress (ADR-0006 §5).
 // Every method must apply the repository LabelPredicate and fail closed on missing principals
 // or predicate errors:
-//   - GetVolumeByID and ListVolumes populate each volume's authorized Memberships and Assets
-//     and clear PreferredAssetID when the referenced asset is not authorized for scope.
+//   - GetVolumeByID and ListVolumes populate each volume's authorized Memberships and available
+//     Assets (excluding missing/retired manifestations) and clear PreferredAssetID when the
+//     referenced asset is not authorized or not available for scope.
+//   - GetAssetByID, ListAssetsByVolume, CountAssetsByVolume, GetAuthorizedAssetFile, and
+//     SelectPreferredAssetFileForVolume operate on available manifestations only
+//     (missing_since IS NULL AND retired_at IS NULL).
 //   - SelectPreferredAssetFileForVolume always excludes trashed items (marked_for_deletion),
 //     even when scope.IncludeTrashed is true for an admin.
 //   - Reading progress methods bind ownership strictly to the exact scope.Principal.User.ID

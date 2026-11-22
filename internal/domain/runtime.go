@@ -281,6 +281,8 @@ const (
 	EventAssetAdded            EventKind = "asset.added"
 	EventAssetModified         EventKind = "asset.modified"
 	EventAssetMoved            EventKind = "asset.moved"
+	EventAssetMissing          EventKind = "asset.missing"
+	EventAssetRestored         EventKind = "asset.restored"
 	EventAssetRemoved          EventKind = "asset.removed"
 	EventAssetInvalidUTF8Path  EventKind = "asset.invalid_utf8_path"
 	EventLibraryOffline        EventKind = "library.offline"

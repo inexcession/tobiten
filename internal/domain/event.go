@@ -32,6 +32,8 @@ var eventKindAggregateTypes = map[EventKind]string{
 	EventAssetAdded:            AggregateTypeAsset,
 	EventAssetModified:         AggregateTypeAsset,
 	EventAssetMoved:            AggregateTypeAsset,
+	EventAssetMissing:          AggregateTypeAsset,
+	EventAssetRestored:         AggregateTypeAsset,
 	EventAssetRemoved:          AggregateTypeAsset,
 	EventAssetInvalidUTF8Path:  AggregateTypeAsset,
 	EventVolumeRemoved:         AggregateTypeVolume,
@@ -55,6 +57,8 @@ func ValidEventKinds() []EventKind {
 		EventAssetAdded,
 		EventAssetModified,
 		EventAssetMoved,
+		EventAssetMissing,
+		EventAssetRestored,
 		EventAssetRemoved,
 		EventAssetInvalidUTF8Path,
 		EventVolumeRemoved,
@@ -101,7 +105,8 @@ type JobEventPayloadV1 struct {
 }
 
 // AssetEventPayloadV1 is the version 1 payload for asset.added, asset.modified,
-// asset.moved, asset.removed, and asset.invalid_utf8_path domain events (ADR-0003 §7, ADR-0018 S3).
+// asset.moved, asset.missing, asset.restored, asset.removed, and asset.invalid_utf8_path
+// domain events (ADR-0003 §7, ADR-0018 S3).
 type AssetEventPayloadV1 struct {
 	AssetID             string      `json:"asset_id"`
 	VolumeID            string      `json:"volume_id"`

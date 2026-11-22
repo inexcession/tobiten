@@ -921,3 +921,92 @@ func enforceCountReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {
 	completedFalse := false
 	assertCount("admin IncludeTrashed=true Completed=false", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, storage.ReadingProgressReadFilter{Completed: &completedFalse}, 1)
 }
+
+func TestCatalogueRepository_MissingAndRetiredAssetsExcludedFromAvailableReads(t *testing.T) {
+	ctx := context.Background()
+	cat := setupSeededCatalogue(t)
+	repo := postgres.NewCatalogueRepository(cat.tdb.Pool)
+	admin := domain.NewPrincipal(*cat.adminUser, []domain.Role{cat.adminRole}, domain.CredentialKindPassword, "c-admin", nil)
+	reader := domain.NewPrincipal(*cat.readerUser, []domain.Role{cat.readerRole}, domain.CredentialKindPassword, "c-reader", nil)
+	adminScope := storage.CatalogueReadScope{Principal: admin, IncludeTrashed: true}
+	readerScope := storage.CatalogueReadScope{Principal: reader}
+
+	if _, err := cat.tdb.Exec(ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, cat.aStandaloneClean, cat.vStandaloneKids); err != nil {
+		t.Fatalf("set preferred_asset_id: %v", err)
+	}
+
+	missingAt := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	retiredAt := missingAt.Add(8 * 24 * time.Hour)
+
+	for _, phase := range []struct {
+		name      string
+		retiredAt *time.Time
+	}{
+		{name: "missing within grace", retiredAt: nil},
+		{name: "retired after grace", retiredAt: &retiredAt},
+	} {
+		t.Run(phase.name, func(t *testing.T) {
+			if _, err := cat.tdb.Exec(ctx,
+				`UPDATE media_assets SET missing_since = $1, retired_at = $2 WHERE id = $3`,
+				missingAt, phase.retiredAt, cat.aStandaloneClean,
+			); err != nil {
+				t.Fatalf("update aStandaloneClean missing/retired: %v", err)
+			}
+			// Also mark aStandaloneNSFW missing so vStandaloneKids has zero available assets.
+			if _, err := cat.tdb.Exec(ctx,
+				`UPDATE media_assets SET missing_since = $1, retired_at = $2 WHERE id = $3`,
+				missingAt, phase.retiredAt, cat.aStandaloneNSFW,
+			); err != nil {
+				t.Fatalf("update aStandaloneNSFW missing/retired: %v", err)
+			}
+
+			for _, sc := range []storage.CatalogueReadScope{adminScope, readerScope} {
+				if _, err := repo.GetAssetByID(ctx, sc, cat.aStandaloneClean); !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("GetAssetByID(missing/retired) = %v, want ErrNotFound", err)
+				}
+				if _, err := repo.GetAuthorizedAssetFile(ctx, sc, cat.aStandaloneClean); !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("GetAuthorizedAssetFile(missing/retired) = %v, want ErrNotFound", err)
+				}
+				if _, err := repo.SelectPreferredAssetFileForVolume(ctx, sc, cat.vStandaloneKids); !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("SelectPreferredAssetFileForVolume(all missing/retired) = %v, want ErrNotFound", err)
+				}
+				assets, err := repo.ListAssetsByVolume(ctx, sc, cat.vStandaloneKids)
+				if err != nil || len(assets) != 0 {
+					t.Fatalf("ListAssetsByVolume = (%+v, %v), want empty", assets, err)
+				}
+				cnt, err := repo.CountAssetsByVolume(ctx, sc, cat.vStandaloneKids)
+				if err != nil || cnt != 0 {
+					t.Fatalf("CountAssetsByVolume = (%d, %v), want 0", cnt, err)
+				}
+				vol, err := repo.GetVolumeByID(ctx, sc, cat.vStandaloneKids)
+				if err != nil {
+					t.Fatalf("GetVolumeByID(missing assets): %v", err)
+				}
+				if !vol.IsMissing() || len(vol.Assets) != 0 || vol.PreferredAssetID != nil {
+					t.Fatalf("expected retained missing volume with 0 assets and redacted preferred_asset_id, got %+v", vol)
+				}
+				vols, err := repo.ListVolumes(ctx, sc, storage.VolumeReadFilter{LibraryID: cat.libraryID})
+				if err != nil {
+					t.Fatalf("ListVolumes: %v", err)
+				}
+				var found bool
+				for _, v := range vols {
+					if v.ID == cat.vStandaloneKids {
+						found = true
+						if !v.IsMissing() || len(v.Assets) != 0 || v.PreferredAssetID != nil {
+							t.Fatalf("ListVolumes volume unexpected state: %+v", v)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("retained volume %s missing from ListVolumes", cat.vStandaloneKids)
+				}
+			}
+
+			// Reading progress on the retained volume remains intact.
+			if rp, err := repo.GetReadingProgress(ctx, readerScope, cat.vStandaloneKids); err != nil || rp.VolumeID != cat.vStandaloneKids {
+				t.Fatalf("GetReadingProgress after asset missing/retired = (%+v, %v)", rp, err)
+			}
+		})
+	}
+}

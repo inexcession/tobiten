@@ -422,7 +422,7 @@ func (r *CatalogueRepository) listAuthorizedAssetsByVolumeIDs(
 ) (map[string][]domain.MediaAsset, error) {
 	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
 		selectFrom: selectAssetColumns,
-		whereParts: []string{"a.volume_id = ANY($1::text[])"},
+		whereParts: []string{"a.volume_id = ANY($1::text[])", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{volumeIDs},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 		orderBy:    " ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC",
@@ -456,17 +456,17 @@ func (r *CatalogueRepository) CountVolumes(ctx context.Context, scope storage.Ca
 	return queryCount(ctx, &r.guard, pred, spec)
 }
 
-// GetAssetByID retrieves a single media asset if visible under the principal's label predicate.
+// GetAssetByID retrieves a single available media asset if visible under the principal's label predicate.
 func (r *CatalogueRepository) GetAssetByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.MediaAsset, error) {
 	return queryScopedOne(ctx, r, scope, guardedQuerySpec{
 		selectFrom: selectAssetColumns,
-		whereParts: []string{"a.id = $1"},
+		whereParts: []string{"a.id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{id},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 	}, scanAssetRow)
 }
 
-// ListAssetsByVolume returns all visible media asset manifestations for volumeID.
+// ListAssetsByVolume returns all visible, available media asset manifestations for volumeID.
 func (r *CatalogueRepository) ListAssetsByVolume(ctx context.Context, scope storage.CatalogueReadScope, volumeID string) ([]domain.MediaAsset, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -474,14 +474,14 @@ func (r *CatalogueRepository) ListAssetsByVolume(ctx context.Context, scope stor
 	}
 	return queryList(ctx, &r.guard, pred, guardedQuerySpec{
 		selectFrom: selectAssetColumns,
-		whereParts: []string{"a.volume_id = $1"},
+		whereParts: []string{"a.volume_id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{volumeID},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 		orderBy:    " ORDER BY a.created_at ASC, a.id ASC",
 	}, scanAssetRow)
 }
 
-// CountAssetsByVolume returns the count of visible media asset manifestations for volumeID.
+// CountAssetsByVolume returns the count of visible, available media asset manifestations for volumeID.
 func (r *CatalogueRepository) CountAssetsByVolume(ctx context.Context, scope storage.CatalogueReadScope, volumeID string) (int64, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -489,18 +489,18 @@ func (r *CatalogueRepository) CountAssetsByVolume(ctx context.Context, scope sto
 	}
 	return queryCount(ctx, &r.guard, pred, guardedQuerySpec{
 		selectFrom: "SELECT COUNT(*) FROM media_assets a",
-		whereParts: []string{"a.volume_id = $1"},
+		whereParts: []string{"a.volume_id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{volumeID},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 	})
 }
 
-// GetAuthorizedAssetFile retrieves the root and asset path projection for assetID
+// GetAuthorizedAssetFile retrieves the root and asset path projection for available assetID
 // only when the asset, its parent volume, and its series satisfy the label predicate.
 func (r *CatalogueRepository) GetAuthorizedAssetFile(ctx context.Context, scope storage.CatalogueReadScope, assetID string) (*storage.AuthorizedAssetFile, error) {
 	return queryScopedOne(ctx, r, scope, guardedQuerySpec{
 		selectFrom: selectAuthorizedAssetFileColumns,
-		whereParts: []string{"a.id = $1"},
+		whereParts: []string{"a.id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{assetID},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 	}, scanAuthorizedAssetFileRow)
@@ -559,7 +559,7 @@ func (r *CatalogueRepository) listAuthorizedAssetCandidatesWithPredicate(
 ) ([]domain.MediaAsset, map[string]storage.AuthorizedAssetFile, error) {
 	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
 		selectFrom: selectAuthorizedAssetCandidatesColumns,
-		whereParts: []string{"a.volume_id = $1"},
+		whereParts: []string{"a.volume_id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{volumeID},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
 		orderBy:    " ORDER BY a.created_at ASC, a.id ASC",
