@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"strings"
 
@@ -70,6 +71,53 @@ const (
 		       sm.source, sm.locked_fields
 		FROM series_memberships sm
 		JOIN series s_m ON s_m.id = sm.series_id`
+
+	selectFolderBrowseCount = `
+		SELECT
+			COUNT(DISTINCT CASE WHEN entry.is_folder THEN entry.child_name_bytes END)
+			+ COUNT(CASE WHEN NOT entry.is_folder THEN 1 END)
+		FROM media_assets a
+		JOIN library_roots r ON r.id = a.library_root_id
+		CROSS JOIN LATERAL (
+			SELECT
+				(p.slash_pos > 0) AS is_folder,
+				CASE
+					WHEN p.slash_pos > 0 THEN substring(a.rel_path_bytes FROM $2::int FOR p.slash_pos - 1)
+					ELSE NULL::bytea
+				END AS child_name_bytes
+			FROM (SELECT position('/'::bytea IN substring(a.rel_path_bytes FROM $2::int)) AS slash_pos) p
+		) entry`
+
+	selectFolderBrowseEntries = `
+		SELECT
+			entry.is_folder,
+			entry.child_name_bytes,
+			entry.entry_rel_path_bytes,
+			entry.asset_id,
+			MAX(CASE WHEN NOT entry.is_folder THEN a.volume_id END) AS volume_id,
+			MAX(CASE WHEN NOT entry.is_folder THEN a.library_root_id END) AS library_root_id,
+			MAX(CASE WHEN NOT entry.is_folder THEN a.file_size END) AS file_size,
+			MAX(CASE WHEN NOT entry.is_folder THEN a.format END) AS format,
+			MAX(CASE WHEN NOT entry.is_folder THEN a.page_count END) AS page_count
+		FROM media_assets a
+		JOIN library_roots r ON r.id = a.library_root_id
+		CROSS JOIN LATERAL (
+			SELECT
+				(p.slash_pos > 0) AS is_folder,
+				CASE
+					WHEN p.slash_pos > 0 THEN substring(a.rel_path_bytes FROM $2::int FOR p.slash_pos - 1)
+					ELSE substring(a.rel_path_bytes FROM $2::int)
+				END AS child_name_bytes,
+				CASE
+					WHEN p.slash_pos > 0 THEN substring(a.rel_path_bytes FROM 1 FOR $3::int + p.slash_pos - 1)
+					ELSE a.rel_path_bytes
+				END AS entry_rel_path_bytes,
+				CASE
+					WHEN p.slash_pos = 0 THEN a.id
+					ELSE NULL::text
+				END AS asset_id
+			FROM (SELECT position('/'::bytea IN substring(a.rel_path_bytes FROM $2::int)) AS slash_pos) p
+		) entry`
 )
 
 // predicateClause binds a table alias in the query to a LabelPredicate SQL fragment generator.
@@ -84,6 +132,7 @@ type guardedQuerySpec struct {
 	whereParts []string
 	args       []any
 	predicates []predicateClause
+	groupBy    string
 	orderBy    string
 	limit      int
 	offset     int
@@ -141,7 +190,7 @@ func (g *guardedCatalogueDB) prepare(pred *LabelPredicate, spec guardedQuerySpec
 		args = append(args, frag.Args...)
 	}
 
-	query := spec.selectFrom + " WHERE " + strings.Join(whereParts, " AND ") + spec.orderBy
+	query := spec.selectFrom + " WHERE " + strings.Join(whereParts, " AND ") + spec.groupBy + spec.orderBy
 	if spec.limit > 0 {
 		args = append(args, spec.limit)
 		query += fmt.Sprintf(" LIMIT $%d", len(args))
@@ -629,6 +678,116 @@ func (r *CatalogueRepository) CountReadingProgress(ctx context.Context, scope st
 	}
 	spec := buildProgressQuerySpec("SELECT COUNT(*) FROM reading_progress rp", principalUserID(scope), filter, "", false)
 	return queryCount(ctx, &r.guard, pred, spec)
+}
+
+// BrowseFolder returns a server-paginated slice of immediate child folders and available
+// file manifestations under filter.FolderPathBytes across all roots of filter.LibraryID,
+// enforcing LabelPredicate visibility and capping page size at storage.MaxFolderBrowseLimit.
+func (r *CatalogueRepository) BrowseFolder(ctx context.Context, scope storage.CatalogueReadScope, filter storage.FolderBrowseFilter) (*storage.FolderBrowseResult, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	folderPath, limit, err := normalizeFolderBrowseFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+
+	whereParts, args := buildFolderBrowseWhereAndArgs(filter.LibraryID, folderPath.Bytes)
+	total, err := queryCount(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectFolderBrowseCount,
+		whereParts: whereParts,
+		args:       args,
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	entries := []storage.FolderEntry{}
+	if total > 0 && int64(filter.Offset) < total {
+		entries, err = queryList(ctx, &r.guard, pred, guardedQuerySpec{
+			selectFrom: selectFolderBrowseEntries,
+			whereParts: whereParts,
+			args:       args,
+			predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+			groupBy:    " GROUP BY entry.is_folder, entry.child_name_bytes, entry.entry_rel_path_bytes, entry.asset_id",
+			orderBy:    " ORDER BY entry.is_folder DESC, entry.child_name_bytes ASC, entry.asset_id ASC NULLS FIRST",
+			limit:      limit,
+			offset:     filter.Offset,
+		}, scanFolderEntryRow)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &storage.FolderBrowseResult{
+		LibraryID:  filter.LibraryID,
+		FolderPath: folderPath,
+		Entries:    entries,
+		TotalCount: total,
+		Limit:      limit,
+		Offset:     filter.Offset,
+	}, nil
+}
+
+func normalizeFolderBrowseFilter(filter storage.FolderBrowseFilter) (domain.PathIdentity, int, error) {
+	if strings.TrimSpace(filter.LibraryID) == "" {
+		return domain.PathIdentity{}, 0, domain.ErrEmptyLibraryID
+	}
+	var folderPath domain.PathIdentity
+	if len(filter.FolderPathBytes) > 0 {
+		var err error
+		folderPath, err = domain.NewRelativePathIdentity(filter.FolderPathBytes)
+		if err != nil {
+			return domain.PathIdentity{}, 0, err
+		}
+	}
+	if filter.Limit < 0 || filter.Offset < 0 || filter.Offset > math.MaxInt32 {
+		return domain.PathIdentity{}, 0, fmt.Errorf("invalid pagination limit=%d offset=%d", filter.Limit, filter.Offset)
+	}
+	limit := filter.Limit
+	if limit == 0 {
+		limit = storage.DefaultFolderBrowseLimit
+	} else if limit > storage.MaxFolderBrowseLimit {
+		limit = storage.MaxFolderBrowseLimit
+	}
+	return folderPath, limit, nil
+}
+
+func buildFolderBrowseWhereAndArgs(libraryID string, prefix []byte) ([]string, []any) {
+	remStart := int32(1)
+	needleLen := int32(0)
+	args := []any{libraryID, remStart, needleLen}
+	whereParts := []string{
+		"r.library_id = $1",
+		"a.missing_since IS NULL",
+		"a.retired_at IS NULL",
+		"octet_length(a.rel_path_bytes) > $3::int",
+		"position('/'::bytea IN substring(a.rel_path_bytes FROM $2::int)) <> 1",
+	}
+
+	if len(prefix) > 0 {
+		needle := make([]byte, len(prefix)+1)
+		copy(needle, prefix)
+		needle[len(prefix)] = '/'
+
+		upper := make([]byte, len(prefix)+1)
+		copy(upper, prefix)
+		upper[len(prefix)] = '0'
+
+		needleLen = int32(len(needle))
+		remStart = needleLen + 1
+		args[1] = remStart
+		args[2] = needleLen
+		args = append(args, needle, upper)
+		whereParts = append(whereParts,
+			"a.rel_path_bytes >= $4",
+			"a.rel_path_bytes < $5",
+		)
+	}
+
+	return whereParts, args
 }
 
 func scanCountRow(row pgx.Row) (int64, error) {
@@ -1129,4 +1288,52 @@ func int32SliceToInt(in []int32) []int {
 		out[i] = int(v)
 	}
 	return out
+}
+
+func scanFolderEntryRow(row pgx.Row) (*storage.FolderEntry, error) {
+	var (
+		isFolder       bool
+		childNameBytes []byte
+		relPathBytes   []byte
+		assetID        *string
+		volumeID       *string
+		libraryRootID  *string
+		fileSize       *int64
+		format         *string
+		pageCount      *int32
+	)
+	err := row.Scan(
+		&isFolder,
+		&childNameBytes,
+		&relPathBytes,
+		&assetID,
+		&volumeID,
+		&libraryRootID,
+		&fileSize,
+		&format,
+		&pageCount,
+	)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+
+	entry := &storage.FolderEntry{
+		Name:    domain.NewPathIdentity(childNameBytes),
+		RelPath: domain.NewPathIdentity(relPathBytes),
+	}
+	if isFolder {
+		entry.Kind = storage.FolderEntryKindFolder
+		return entry, nil
+	}
+	if assetID == nil || volumeID == nil || libraryRootID == nil || fileSize == nil || format == nil || pageCount == nil {
+		return nil, errors.New("folder file entry missing required asset metadata")
+	}
+	entry.Kind = storage.FolderEntryKindFile
+	entry.AssetID = *assetID
+	entry.VolumeID = *volumeID
+	entry.LibraryRootID = *libraryRootID
+	entry.FileSize = *fileSize
+	entry.Format = domain.MediaFormat(*format)
+	entry.PageCount = int(*pageCount)
+	return entry, nil
 }

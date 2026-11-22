@@ -134,6 +134,13 @@ var catalogueReadEnforcementSpecs = map[string]catalogueReadEnforcementSpec{
 			return err
 		},
 	},
+	"BrowseFolder": {
+		runEnforcement: enforceBrowseFolder,
+		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
+			_, err := repo.BrowseFolder(ctx, scope, storage.FolderBrowseFilter{LibraryID: "lib-any"})
+			return err
+		},
+	},
 }
 
 func TestCatalogueRepository_EveryReadMethodHasEnforcementTest(t *testing.T) {
@@ -920,6 +927,308 @@ func enforceCountReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {
 
 	completedFalse := false
 	assertCount("admin IncludeTrashed=true Completed=false", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, storage.ReadingProgressReadFilter{Completed: &completedFalse}, 1)
+}
+
+func enforceBrowseFolder(t *testing.T, ec *catalogueEnforcementCtx) {
+	assertAssetIDs := func(name string, scope storage.CatalogueReadScope, filter storage.FolderBrowseFilter, want []string) {
+		t.Helper()
+		res, err := ec.repo.BrowseFolder(ec.ctx, scope, filter)
+		if err != nil {
+			t.Fatalf("%s: BrowseFolder err: %v", name, err)
+		}
+		got := make([]string, 0, len(res.Entries))
+		for _, e := range res.Entries {
+			if e.Kind != storage.FolderEntryKindFile {
+				t.Fatalf("%s: expected only FILE entries, got %+v", name, e)
+			}
+			got = append(got, e.AssetID)
+		}
+		slices.Sort(got)
+		wantSorted := slices.Clone(want)
+		slices.Sort(wantSorted)
+		if !slices.Equal(got, wantSorted) {
+			t.Fatalf("%s: BrowseFolder files = %v, want %v", name, got, wantSorted)
+		}
+		if res.TotalCount != int64(len(wantSorted)) {
+			t.Fatalf("%s: BrowseFolder TotalCount = %d, want %d", name, res.TotalCount, len(wantSorted))
+		}
+	}
+
+	cat := ec.cat
+	rootFilter := storage.FolderBrowseFilter{LibraryID: cat.libraryID}
+	assertAssetIDs("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, rootFilter, nil)
+	assertAssetIDs("empty user principal", storage.CatalogueReadScope{Principal: &domain.Principal{}}, rootFilter, nil)
+	assertAssetIDs("multiRole fail closed", storage.CatalogueReadScope{Principal: ec.multiRole, IncludeTrashed: true}, rootFilter, nil)
+	assertAssetIDs("timmy ALLOW kids + RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.timmy}, rootFilter, []string{
+		cat.aKidsClean, cat.aStandaloneClean, cat.aInKidsAndClean,
+	})
+	assertAssetIDs("timmy + group ALLOW all-ages", storage.CatalogueReadScope{
+		Principal:     ec.timmy,
+		GroupPolicies: []domain.GroupLabelPolicy{{GroupClaim: "family", LabelID: cat.lblAllAges, Effect: domain.PolicyEffectAllow}},
+	}, rootFilter, []string{
+		cat.aKidsClean, cat.aStandaloneClean, cat.aInKidsAndClean, cat.aInAllAges,
+	})
+	assertAssetIDs("timmy + group RESTRICT kids", storage.CatalogueReadScope{
+		Principal:     ec.timmy,
+		GroupPolicies: []domain.GroupLabelPolicy{{GroupClaim: "strict", LabelID: cat.lblKids, Effect: domain.PolicyEffectRestrict}},
+	}, rootFilter, nil)
+	assertAssetIDs("reader RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.reader}, rootFilter, []string{
+		cat.aKidsClean,
+		cat.aAllowedInHiddenVol,
+		cat.aAllowedInUnallowedStandal,
+		cat.aStandaloneUnlabeledDefault,
+		cat.aStandaloneClean,
+		cat.aInClean,
+		cat.aInKidsAndClean,
+		cat.aInAllAges,
+	})
+	assertAssetIDs("admin normal excludes trashed", storage.CatalogueReadScope{Principal: ec.admin}, rootFilter, []string{
+		cat.aKidsClean,
+		cat.aKidsNSFW,
+		cat.aAllowedInHiddenVol,
+		cat.aCleanInRestrictedVol,
+		cat.aKidsInRestrictedVol,
+		cat.aInAltRestricted,
+		cat.aAltPrimaryRestricted,
+		cat.aAllowedInUnallowedStandal,
+		cat.aStandaloneUnlabeledDefault,
+		cat.aStandaloneClean,
+		cat.aStandaloneNSFW,
+		cat.aInClean,
+		cat.aInKidsAndClean,
+		cat.aInAllAges,
+	})
+	assertAssetIDs("adminPAT IncludeTrashed=true excludes trashed", storage.CatalogueReadScope{Principal: ec.adminPAT, IncludeTrashed: true}, rootFilter, []string{
+		cat.aKidsClean,
+		cat.aKidsNSFW,
+		cat.aAllowedInHiddenVol,
+		cat.aCleanInRestrictedVol,
+		cat.aKidsInRestrictedVol,
+		cat.aInAltRestricted,
+		cat.aAltPrimaryRestricted,
+		cat.aAllowedInUnallowedStandal,
+		cat.aStandaloneUnlabeledDefault,
+		cat.aStandaloneClean,
+		cat.aStandaloneNSFW,
+		cat.aInClean,
+		cat.aInKidsAndClean,
+		cat.aInAllAges,
+	})
+	assertAssetIDs("admin IncludeTrashed=true sees all assets", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, rootFilter, cat.allAssetIDs)
+
+	// Folder-level omission check in a dedicated second library, cleaned up before sibling subtests run.
+	lib2 := domain.MustNewID()
+	root2 := domain.MustNewID()
+	if _, err := cat.tdb.Exec(ec.ctx, `INSERT INTO libraries (id, name) VALUES ($1, $2)`, lib2, "Folder Enforcement Lib"); err != nil {
+		t.Fatalf("insert lib2: %v", err)
+	}
+	if _, err := cat.tdb.Exec(ec.ctx, `INSERT INTO library_roots (id, library_id, path_bytes, path_display, path_match) VALUES ($1, $2, $3, $4, $4)`,
+		root2, lib2, []byte("/folder-enf"), "/folder-enf"); err != nil {
+		t.Fatalf("insert root2: %v", err)
+	}
+
+	var lib2ItemIDs []string
+	var lib2LabelIDs []string
+	t.Cleanup(func() {
+		cleanCtx := context.Background()
+		if len(lib2ItemIDs) > 0 {
+			_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM item_labels WHERE item_id = ANY($1::text[])`, lib2ItemIDs)
+		}
+		if len(lib2LabelIDs) > 0 {
+			_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM labels WHERE id = ANY($1::text[])`, lib2LabelIDs)
+		}
+		_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM media_assets WHERE library_root_id = $1`, root2)
+		_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM library_roots WHERE id = $1`, root2)
+		_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM volumes WHERE library_id = $1`, lib2)
+		_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM series WHERE library_id = $1`, lib2)
+		_, _ = cat.tdb.Exec(cleanCtx, `DELETE FROM libraries WHERE id = $1`, lib2)
+	})
+
+	makeSeries := func(title string, labels ...string) string {
+		id := domain.MustNewID()
+		if _, err := cat.tdb.Exec(ec.ctx, `INSERT INTO series (id, library_id, title, title_sort) VALUES ($1, $2, $3, $3)`, id, lib2, title); err != nil {
+			t.Fatalf("insert series %s: %v", title, err)
+		}
+		lib2ItemIDs = append(lib2ItemIDs, id)
+		for _, l := range labels {
+			if err := cat.labelRepo.AssignItemLabel(ec.ctx, &domain.ItemLabel{LabelID: l, ItemType: domain.ItemTypeSeries, ItemID: id}); err != nil {
+				t.Fatalf("assign series label: %v", err)
+			}
+		}
+		return id
+	}
+	makeVol := func(title string, seriesIDs []string, labels ...string) string {
+		id := domain.MustNewID()
+		if _, err := cat.tdb.Exec(ec.ctx, `INSERT INTO volumes (id, library_id, title) VALUES ($1, $2, $3)`, id, lib2, title); err != nil {
+			t.Fatalf("insert volume %s: %v", title, err)
+		}
+		lib2ItemIDs = append(lib2ItemIDs, id)
+		for i, sid := range seriesIDs {
+			if _, err := cat.tdb.Exec(ec.ctx, `INSERT INTO series_memberships (volume_id, series_id, is_primary, position) VALUES ($1, $2, $3, $4)`,
+				id, sid, i == 0, float64(i+1)); err != nil {
+				t.Fatalf("insert membership: %v", err)
+			}
+		}
+		for _, l := range labels {
+			if err := cat.labelRepo.AssignItemLabel(ec.ctx, &domain.ItemLabel{LabelID: l, ItemType: domain.ItemTypeVolume, ItemID: id}); err != nil {
+				t.Fatalf("assign volume label: %v", err)
+			}
+		}
+		return id
+	}
+	makeAsset := func(volID, relPath string, labels ...string) string {
+		id := domain.MustNewID()
+		if _, err := cat.tdb.Exec(ec.ctx, `
+			INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format, page_count)
+			VALUES ($1, $2, $3, $4, $5, $5, 512, 'CBZ', 10)`,
+			id, volID, root2, []byte(relPath), relPath,
+		); err != nil {
+			t.Fatalf("insert asset %s: %v", relPath, err)
+		}
+		lib2ItemIDs = append(lib2ItemIDs, id)
+		for _, l := range labels {
+			if err := cat.labelRepo.AssignItemLabel(ec.ctx, &domain.ItemLabel{LabelID: l, ItemType: domain.ItemTypeAsset, ItemID: id}); err != nil {
+				t.Fatalf("assign asset label: %v", err)
+			}
+		}
+		return id
+	}
+
+	s2Kids := makeSeries("Lib2 Kids", cat.lblKids)
+	s2Clean := makeSeries("Lib2 Clean")
+	s2NSFW := makeSeries("Lib2 NSFW", cat.lblNSFW)
+	s2Trashed := makeSeries("Lib2 Trashed", cat.lblKids, cat.lblTrash)
+
+	v2Kids := makeVol("Lib2 V Kids", []string{s2Kids})
+	v2NSFWVol := makeVol("Lib2 V NSFW", []string{s2Kids}, cat.lblNSFW)
+	v2NSFWSeries := makeVol("Lib2 V in NSFW Series", []string{s2NSFW})
+	v2SecNSFW := makeVol("Lib2 V Kids+NSFW", []string{s2Kids, s2NSFW})
+	v2TrashedVol := makeVol("Lib2 V Trashed", []string{s2Kids}, cat.lblTrash)
+	v2TrashedSeries := makeVol("Lib2 V in Trashed Series", []string{s2Trashed})
+	v2KidsVolInCleanSeries := makeVol("Lib2 Kids Vol in Clean Series", []string{s2Clean}, cat.lblKids)
+	v2Clean := makeVol("Lib2 V Clean", []string{s2Clean})
+
+	userNSFWLbl := domain.MustNewID()
+	if err := cat.labelRepo.CreateLabel(ec.ctx, &domain.Label{
+		ID: userNSFWLbl, Scope: domain.LabelScopeUser, OwnerID: &cat.readerUser.ID, Name: "folder-nsfw-user",
+	}); err != nil {
+		t.Fatalf("create reader user label: %v", err)
+	}
+	lib2LabelIDs = append(lib2LabelIDs, userNSFWLbl)
+	userKidsLbl := domain.MustNewID()
+	if err := cat.labelRepo.CreateLabel(ec.ctx, &domain.Label{
+		ID: userKidsLbl, Scope: domain.LabelScopeUser, OwnerID: &cat.restrictedUser.ID, Name: "folder-kids-user",
+	}); err != nil {
+		t.Fatalf("create timmy user label: %v", err)
+	}
+	lib2LabelIDs = append(lib2LabelIDs, userKidsLbl)
+
+	aMixClean := makeAsset(v2Kids, "visible-mixed/clean.cbz")
+	aMixNSFW := makeAsset(v2Kids, "visible-mixed/nsfw.cbz", cat.lblNSFW)
+	aMixTrash := makeAsset(v2Kids, "visible-mixed/trashed.cbz", cat.lblTrash)
+	_ = makeAsset(v2Kids, "only-asset-restricted/secret.cbz", cat.lblNSFW)
+	_ = makeAsset(v2NSFWVol, "only-vol-restricted/book.cbz")
+	_ = makeAsset(v2NSFWSeries, "only-series-restricted/book.cbz")
+	_ = makeAsset(v2SecNSFW, "only-secondary-series-restricted/book.cbz")
+	_ = makeAsset(v2Kids, "only-trashed-asset/gone.cbz", cat.lblTrash)
+	_ = makeAsset(v2TrashedVol, "only-trashed-vol/gone.cbz")
+	_ = makeAsset(v2TrashedSeries, "only-trashed-series/gone.cbz")
+	_ = makeAsset(v2KidsVolInCleanSeries, "only-unallowed-vol-in-clean/book.cbz")
+	_ = makeAsset(v2Clean, "user-labeled-folder/book.cbz", userNSFWLbl, userKidsLbl)
+
+	assertFolderNames := func(name string, scope storage.CatalogueReadScope, prefix []byte, wantFolders []string, wantFileIDs []string) {
+		t.Helper()
+		res, err := ec.repo.BrowseFolder(ec.ctx, scope, storage.FolderBrowseFilter{LibraryID: lib2, FolderPathBytes: prefix})
+		if err != nil {
+			t.Fatalf("%s: BrowseFolder err: %v", name, err)
+		}
+		var gotFolders, gotFiles []string
+		for _, e := range res.Entries {
+			switch e.Kind {
+			case storage.FolderEntryKindFolder:
+				gotFolders = append(gotFolders, e.Name.Display)
+			case storage.FolderEntryKindFile:
+				gotFiles = append(gotFiles, e.AssetID)
+			default:
+				t.Fatalf("%s: unexpected entry kind %q", name, e.Kind)
+			}
+		}
+		slices.Sort(gotFolders)
+		slices.Sort(gotFiles)
+		wf := slices.Clone(wantFolders)
+		slices.Sort(wf)
+		wfIDs := slices.Clone(wantFileIDs)
+		slices.Sort(wfIDs)
+		if !slices.Equal(gotFolders, wf) {
+			t.Fatalf("%s: folders = %v, want %v", name, gotFolders, wf)
+		}
+		if !slices.Equal(gotFiles, wfIDs) {
+			t.Fatalf("%s: fileIDs = %v, want %v", name, gotFiles, wfIDs)
+		}
+		if res.TotalCount != int64(len(wf)+len(wfIDs)) {
+			t.Fatalf("%s: TotalCount = %d, want %d", name, res.TotalCount, len(wf)+len(wfIDs))
+		}
+	}
+
+	assertFolderNames("timmy root omits restricted, trashed, unallowed-series, user-labeled folders",
+		storage.CatalogueReadScope{Principal: ec.timmy}, nil,
+		[]string{"visible-mixed"}, nil)
+	assertFolderNames("timmy inside visible-mixed sees only clean file",
+		storage.CatalogueReadScope{Principal: ec.timmy}, []byte("visible-mixed"),
+		nil, []string{aMixClean})
+	assertFolderNames("timmy direct browse into only-asset-restricted is empty",
+		storage.CatalogueReadScope{Principal: ec.timmy}, []byte("only-asset-restricted"),
+		nil, nil)
+	assertFolderNames("timmy direct browse into only-trashed-asset is empty",
+		storage.CatalogueReadScope{Principal: ec.timmy}, []byte("only-trashed-asset"),
+		nil, nil)
+
+	assertFolderNames("reader root omits all restricted and trashed folders",
+		storage.CatalogueReadScope{Principal: ec.reader}, nil,
+		[]string{"only-unallowed-vol-in-clean", "user-labeled-folder", "visible-mixed"}, nil)
+	assertFolderNames("reader inside visible-mixed sees only clean file",
+		storage.CatalogueReadScope{Principal: ec.reader}, []byte("visible-mixed"),
+		nil, []string{aMixClean})
+
+	assertFolderNames("admin normal root omits all trashed folders",
+		storage.CatalogueReadScope{Principal: ec.admin}, nil,
+		[]string{
+			"only-asset-restricted",
+			"only-secondary-series-restricted",
+			"only-series-restricted",
+			"only-unallowed-vol-in-clean",
+			"only-vol-restricted",
+			"user-labeled-folder",
+			"visible-mixed",
+		}, nil)
+	assertFolderNames("adminPAT IncludeTrashed=true still omits all trashed folders",
+		storage.CatalogueReadScope{Principal: ec.adminPAT, IncludeTrashed: true}, nil,
+		[]string{
+			"only-asset-restricted",
+			"only-secondary-series-restricted",
+			"only-series-restricted",
+			"only-unallowed-vol-in-clean",
+			"only-vol-restricted",
+			"user-labeled-folder",
+			"visible-mixed",
+		}, nil)
+	assertFolderNames("admin IncludeTrashed=true sees all folders",
+		storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, nil,
+		[]string{
+			"only-asset-restricted",
+			"only-secondary-series-restricted",
+			"only-series-restricted",
+			"only-trashed-asset",
+			"only-trashed-series",
+			"only-trashed-vol",
+			"only-unallowed-vol-in-clean",
+			"only-vol-restricted",
+			"user-labeled-folder",
+			"visible-mixed",
+		}, nil)
+	assertFolderNames("admin IncludeTrashed=true inside visible-mixed sees all 3 files",
+		storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, []byte("visible-mixed"),
+		nil, []string{aMixClean, aMixNSFW, aMixTrash})
 }
 
 func TestCatalogueRepository_MissingAndRetiredAssetsExcludedFromAvailableReads(t *testing.T) {

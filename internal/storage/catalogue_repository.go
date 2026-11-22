@@ -39,6 +39,58 @@ type ReadingProgressReadFilter struct {
 	Offset    int
 }
 
+const (
+	// DefaultFolderBrowseLimit is the default page size when FolderBrowseFilter.Limit is zero.
+	DefaultFolderBrowseLimit = 50
+	// MaxFolderBrowseLimit is the hard maximum page size enforced on folder-browse reads (ADR-0020 §7).
+	MaxFolderBrowseLimit = 200
+)
+
+// FolderEntryKind distinguishes immediate child folders from immediate child files
+// in a library folder-browse listing (ADR-0019 §4).
+type FolderEntryKind string
+
+const (
+	FolderEntryKindFolder FolderEntryKind = "FOLDER"
+	FolderEntryKindFile   FolderEntryKind = "FILE"
+)
+
+// FolderBrowseFilter specifies the target library, root-relative folder bytes, and
+// pagination parameters for CatalogueRepository.BrowseFolder (ADR-0019 §4, ADR-0020 §7).
+// FolderPathBytes may be nil or empty to browse immediate children of the library's roots;
+// non-empty values must pass domain.ValidateRelativePathBytes.
+type FolderBrowseFilter struct {
+	LibraryID       string
+	FolderPathBytes []byte
+	Limit           int
+	Offset          int
+}
+
+// FolderEntry represents one immediate child folder or available file in a library's
+// folder-browse listing (ADR-0019 §4).
+type FolderEntry struct {
+	Kind          FolderEntryKind
+	Name          domain.PathIdentity
+	RelPath       domain.PathIdentity
+	AssetID       string
+	VolumeID      string
+	LibraryRootID string
+	Format        domain.MediaFormat
+	FileSize      int64
+	PageCount     int
+}
+
+// FolderBrowseResult holds one server-paginated slice of immediate child folders and files
+// across all roots of a library, respecting label enforcement and asset availability.
+type FolderBrowseResult struct {
+	LibraryID  string
+	FolderPath domain.PathIdentity
+	Entries    []FolderEntry
+	TotalCount int64
+	Limit      int
+	Offset     int
+}
+
 // AuthorizedAssetFile holds the authorized manifestation and root path projection needed
 // to stream pages, render thumbnails, or download a media asset (ADR-0003, ADR-0006 §5).
 // Path projections are returned exclusively for assets authorized by the label predicate.
@@ -75,6 +127,10 @@ type AuthorizedAssetFile struct {
 //     even when scope.IncludeTrashed is true for an admin.
 //   - Reading progress methods bind ownership strictly to the exact scope.Principal.User.ID
 //     in addition to enforcing volume visibility.
+//   - BrowseFolder lists immediate child folders (merged across all roots of the library by
+//     exact root-relative bytes) and available file manifestations (missing_since IS NULL AND
+//     retired_at IS NULL) under FolderPathBytes, applying LabelPredicate and server-side
+//     pagination capped at MaxFolderBrowseLimit.
 type CatalogueRepository interface {
 	GetSeriesByID(ctx context.Context, scope CatalogueReadScope, id string) (*domain.Series, error)
 	ListSeries(ctx context.Context, scope CatalogueReadScope, filter SeriesReadFilter) ([]domain.Series, error)
@@ -94,4 +150,6 @@ type CatalogueRepository interface {
 	GetReadingProgress(ctx context.Context, scope CatalogueReadScope, volumeID string) (*domain.ReadingProgress, error)
 	ListReadingProgress(ctx context.Context, scope CatalogueReadScope, filter ReadingProgressReadFilter) ([]domain.ReadingProgress, error)
 	CountReadingProgress(ctx context.Context, scope CatalogueReadScope, filter ReadingProgressReadFilter) (int64, error)
+
+	BrowseFolder(ctx context.Context, scope CatalogueReadScope, filter FolderBrowseFilter) (*FolderBrowseResult, error)
 }
