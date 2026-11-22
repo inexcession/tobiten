@@ -222,7 +222,7 @@ func TestDaemonEventsSSE_RealStreamOrderVisibilityAndLogging(t *testing.T) {
 	var mu sync.Mutex
 	var sharedRunner *jobs.Runner
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		jobRepo := postgres.NewJobRepository(db.Pool)
 
@@ -309,7 +309,7 @@ func TestDaemonEventsSSE_RealStreamOrderVisibilityAndLogging(t *testing.T) {
 			t.Fatal("expected daemon to wire services.Events")
 		}
 		testLogger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		reg := buildDaemonRegistry(cfg, services)
+		reg := buildDaemonRegistry(cfg, services, RegistryDeps{})
 		srv, err := api.NewServer(api.ServerOptions{
 			Config:   cfg,
 			Logger:   testLogger,
@@ -628,7 +628,7 @@ func TestDaemonEventsSSE_OpenStreamRoleDowngradeRevocationAndGracefulShutdown(t 
 	slowStarted := make(chan struct{})
 	allowSlowFinish := make(chan struct{})
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		jobRepo := postgres.NewJobRepository(db.Pool)
 
@@ -717,7 +717,7 @@ func TestDaemonEventsSSE_OpenStreamRoleDowngradeRevocationAndGracefulShutdown(t 
 	}, 1)
 
 	startServer = func(ctx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
-		reg := buildDaemonRegistry(cfg, services)
+		reg := buildDaemonRegistry(cfg, services, RegistryDeps{})
 		srv, err := api.NewServer(api.ServerOptions{
 			Config:   cfg,
 			Logger:   logger,

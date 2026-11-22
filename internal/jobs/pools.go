@@ -89,6 +89,21 @@ func (r *Runner) PoolSize(kind domain.JobKind) (int, bool) {
 	return size, true
 }
 
+// ActivePoolSize returns the running worker pool size for kind if a pool is currently started.
+func (r *Runner) ActivePoolSize(kind domain.JobKind) (int, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.activePools == nil {
+		return 0, false
+	}
+	pool := r.activePools.pools[kind]
+	if pool == nil {
+		return 0, false
+	}
+	return pool.size, true
+}
+
 // Err returns the fatal worker pool error that stopped the most recent pool run, if any.
 func (r *Runner) Err() error {
 	r.mu.RLock()

@@ -48,7 +48,7 @@ func TestRunDaemonRecoversInterruptedJobsUnderOwnershipBeforeServing(t *testing.
 	var scanHookCalls, repackHookCalls int
 	var serveCalled bool
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		_ = reg.Register(&module.SimpleModule{
 			ModuleName: "test-job-recovery",
@@ -247,8 +247,10 @@ func TestRunDaemonFailsStartupAndPreservesUnresolvedJobs(t *testing.T) {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
-		// Default compiled-in registry declares no job kinds.
-		buildDaemonRegistry = BuildRegistryWithServices
+		// BuildRegistryWithServices registers no job kinds when runtime ScannerDeps are unset.
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
+			return BuildRegistryWithServices(cfg, services)
+		}
 		served := false
 		err = runDaemon(ctx, hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
 			served = true
@@ -294,7 +296,7 @@ func TestRunDaemonFailsStartupAndPreservesUnresolvedJobs(t *testing.T) {
 			t.Fatalf("SaveCheckpoint: %v", err)
 		}
 
-		buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 			reg := BuildRegistryWithServices(cfg, services)
 			_ = reg.Register(&module.SimpleModule{
 				ModuleName: "intake-missing-hook",

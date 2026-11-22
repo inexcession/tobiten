@@ -17,6 +17,9 @@ import (
 	"github.com/inexcession/tobiten/internal/api"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/container/cbz"
+	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 )
 
 func TestVersionString(t *testing.T) {
@@ -530,6 +533,35 @@ func TestBuildRegistry(t *testing.T) {
 		}
 		if !reg.IsEnabled("system") {
 			t.Errorf("expected 'system' module to remain enabled")
+		}
+	})
+
+	t.Run("wires scanner module with SCAN job kind and CBZ format when scanner supplied", func(t *testing.T) {
+		sc := &scanner.Scanner{}
+		reg := BuildRegistryWithDeps(nil, nil, RegistryDeps{Scanner: sc, ScannerWorkers: 3})
+		if reg.Module(scanner.ModuleName) == nil {
+			t.Fatal("expected 'scanner' module to be registered")
+		}
+		if !reg.IsEnabled(scanner.ModuleName) {
+			t.Fatal("expected 'scanner' module to be enabled")
+		}
+		kinds := reg.JobKinds()
+		if len(kinds) != 1 || kinds[0].Name() != string(domain.JobKindScan) || kinds[0].ResumePolicy() != domain.JobResumeRestart {
+			t.Fatalf("JobKinds() = %+v, want [SCAN/RESTART]", kinds)
+		}
+		fmts := reg.ContainerFormats()
+		if len(fmts) != 1 || fmts[0].Name != cbz.FormatName {
+			t.Fatalf("ContainerFormats() = %+v, want [%s]", fmts, cbz.FormatName)
+		}
+
+		disabledReg := BuildRegistryWithDeps(&config.Config{
+			DisabledModules: []string{scanner.ModuleName},
+		}, nil, RegistryDeps{Scanner: sc})
+		if disabledReg.IsEnabled(scanner.ModuleName) {
+			t.Fatal("expected 'scanner' module to be disabled by config")
+		}
+		if len(disabledReg.JobKinds()) != 0 {
+			t.Fatalf("disabled scanner JobKinds() = %+v, want empty", disabledReg.JobKinds())
 		}
 	})
 }

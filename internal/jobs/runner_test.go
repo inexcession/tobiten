@@ -1278,3 +1278,131 @@ func TestRunner_BlockedProgressLookupDoesNotBlockCompletionOrShutdown(t *testing
 		}
 	})
 }
+
+func TestRunner_PlainHandlerErrorRetriesWithBackoffAndAppendsSingleJobFailed(t *testing.T) {
+	t.Parallel()
+	db, repo := setupRunnerTestDB(t)
+	ctx := t.Context()
+
+	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	now := t0
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	setClock := func(ts time.Time) {
+		clockMu.Lock()
+		now = ts
+		clockMu.Unlock()
+	}
+
+	var attemptsSeen []int
+	runner := jobs.NewRunner(repo, jobs.RunnerOptions{Now: nowFn})
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindScan,
+		ResumePolicy: domain.JobResumeRestart,
+		Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+			attemptsSeen = append(attemptsSeen, exec.Job().Attempts)
+			return errors.New("boom: transient scan error")
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	dedupe := "SCAN:retry-gap-lib"
+	j := &domain.Job{
+		Kind:        domain.JobKindScan,
+		Payload:     json.RawMessage(`{"library_id":"retry-gap-lib"}`),
+		DedupeKey:   &dedupe,
+		MaxAttempts: 3,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := repo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	countFailedEvents := func() int {
+		var cnt int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.failed'`, j.ID).Scan(&cnt); err != nil {
+			t.Fatalf("count job.failed: %v", err)
+		}
+		return cnt
+	}
+
+	// Attempt 1 fails -> requeued with 5s backoff, attempts=1, no job.failed, dedupe still active.
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext attempt 1 = (%v, %v)", claimed, err)
+	}
+	got1, err := repo.GetJobByID(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID after attempt 1: %v", err)
+	}
+	if got1.State != domain.JobStateQueued || got1.Attempts != 1 {
+		t.Fatalf("after attempt 1 = (%s, attempts=%d), want (QUEUED, 1)", got1.State, got1.Attempts)
+	}
+	if wantRunAfter := t0.Add(domain.JobRetryBackoff(1)); !got1.RunAfter.Equal(wantRunAfter) {
+		t.Fatalf("after attempt 1 RunAfter = %v, want %v", got1.RunAfter, wantRunAfter)
+	}
+	if got1.LastError == nil || *got1.LastError != "boom: transient scan error" {
+		t.Fatalf("after attempt 1 LastError = %v, want 'boom: transient scan error'", got1.LastError)
+	}
+	if countFailedEvents() != 0 {
+		t.Fatalf("job.failed count after attempt 1 = %d, want 0", countFailedEvents())
+	}
+	if claimedBeforeBackoff, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || claimedBeforeBackoff {
+		t.Fatalf("ClaimAndRunNext before backoff elapsed = (%v, %v), want (false, nil)", claimedBeforeBackoff, err)
+	}
+
+	// Attempt 2 fails -> requeued with 10s backoff, attempts=2, still no job.failed.
+	t1 := t0.Add(domain.JobRetryBackoff(1))
+	setClock(t1)
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext attempt 2 = (%v, %v)", claimed, err)
+	}
+	got2, err := repo.GetJobByID(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID after attempt 2: %v", err)
+	}
+	if got2.State != domain.JobStateQueued || got2.Attempts != 2 {
+		t.Fatalf("after attempt 2 = (%s, attempts=%d), want (QUEUED, 2)", got2.State, got2.Attempts)
+	}
+	if wantRunAfter := t1.Add(domain.JobRetryBackoff(2)); !got2.RunAfter.Equal(wantRunAfter) {
+		t.Fatalf("after attempt 2 RunAfter = %v, want %v", got2.RunAfter, wantRunAfter)
+	}
+	if countFailedEvents() != 0 {
+		t.Fatalf("job.failed count after attempt 2 = %d, want 0", countFailedEvents())
+	}
+
+	// Attempt 3 exhausts max_attempts -> FAILED, attempts=3, exactly one job.failed, dedupe released.
+	t2 := t1.Add(domain.JobRetryBackoff(2))
+	setClock(t2)
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext attempt 3 = (%v, %v)", claimed, err)
+	}
+	got3, err := repo.GetJobByID(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID after attempt 3: %v", err)
+	}
+	if got3.State != domain.JobStateFailed || got3.Attempts != 3 || got3.FinishedAt == nil {
+		t.Fatalf("after attempt 3 = %+v, want FAILED attempts=3 finished", got3)
+	}
+	if countFailedEvents() != 1 {
+		t.Fatalf("job.failed count after attempt 3 = %d, want 1", countFailedEvents())
+	}
+	if !slices.Equal(attemptsSeen, []int{1, 2, 3}) {
+		t.Fatalf("attemptsSeen = %v, want [1 2 3]", attemptsSeen)
+	}
+
+	// Dedupe key must now be released.
+	retryJob := &domain.Job{Kind: domain.JobKindScan, DedupeKey: &dedupe, CreatedAt: t2, RunAfter: t2}
+	created, err := repo.Enqueue(ctx, retryJob)
+	if err != nil || !created || retryJob.ID == j.ID {
+		t.Fatalf("post-failure Enqueue = (created=%v, err=%v, id=%s), want new job", created, err, retryJob.ID)
+	}
+}

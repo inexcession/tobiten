@@ -18,6 +18,7 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/events"
 	"github.com/inexcession/tobiten/internal/jobs"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
@@ -152,11 +153,19 @@ func (d *daemonStorage) open(ctx context.Context, cfg *config.Config) (err error
 	return applyStartupSettings(cfg, settings, frozen)
 }
 
-var buildDaemonRegistry = BuildRegistryWithServices
+var buildDaemonRegistry = BuildRegistryWithDeps
 
 var configureDaemonJobRunner = func(*jobs.Runner, module.Registry, *config.Config, *app.Services) error {
 	return nil
 }
+
+var newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+	return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{})
+}
+
+var inspectDaemonWorkers = func(*daemonWorkers) {}
+
+var attachDaemonScanTrigger = func(*scanner.ScanTrigger) {}
 
 type parsedPoolSetting struct {
 	rawKey string
@@ -227,7 +236,7 @@ func parsePoolSettings(cfg *config.Config) (parsedPoolConfig, error) {
 	return out, nil
 }
 
-func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.JobKind, scannerWorkers int) (map[domain.JobKind]int, error) {
+func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.JobKind) (map[domain.JobKind]int, error) {
 	exactRegistered := make(map[domain.JobKind]struct{}, len(registeredKinds))
 	normRegistered := make(map[string][]domain.JobKind, len(registeredKinds))
 	for _, kind := range registeredKinds {
@@ -284,9 +293,6 @@ func resolvePoolSizesForKinds(parsed parsedPoolConfig, registeredKinds []domain.
 		}
 	}
 
-	if scannerWorkers > 0 {
-		poolSizes[domain.JobKindScan] = scannerWorkers
-	}
 	if len(poolSizes) == 0 {
 		return nil, nil
 	}
@@ -315,6 +321,58 @@ func (w *daemonWorkers) stopAndWait() {
 	}
 }
 
+func buildDaemonJobComponents(
+	cancel context.CancelCauseFunc,
+	pool *pgxpool.Pool,
+	defaultPoolSize int,
+) (*jobs.Runner, *events.DeliveryCoordinator, *events.Dispatcher, *events.ProgressHub, error) {
+	onFatal := func(fatalErr error) {
+		if cancel != nil {
+			cancel(fatalErr)
+		}
+	}
+
+	eventRepo := postgres.NewEventRepository(pool)
+	jobRepo := postgres.NewJobRepository(pool)
+	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{})
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("initializing job progress hub: %w", err)
+	}
+	var dispatcher *events.Dispatcher
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{
+		Logger:          slog.Default(),
+		DefaultPoolSize: defaultPoolSize,
+		OnFatal:         onFatal,
+		ProgressHub:     progressHub,
+		OnTransition: func(job domain.Job) {
+			if dispatcher != nil && !job.Kind.IsInternal() {
+				dispatcher.Notify()
+			}
+		},
+	})
+	delivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
+		Logger:  slog.Default(),
+		OnFatal: onFatal,
+	})
+	dispatcher = events.NewDispatcher(eventRepo,
+		events.WithDispatcherLogger(slog.Default()),
+		events.WithOnPublished(func(_ context.Context, _ []domain.DomainEvent) error {
+			delivery.Wake()
+			return nil
+		}),
+		events.WithOnFatal(onFatal),
+	)
+	return runner, delivery, dispatcher, progressHub, nil
+}
+
+func applyDaemonPoolSizes(parsed parsedPoolConfig, runner *jobs.Runner) error {
+	sizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds())
+	if err != nil {
+		return err
+	}
+	return runner.SetPoolSizes(sizes)
+}
+
 func startDaemonJobs(
 	ctx context.Context,
 	cancel context.CancelCauseFunc,
@@ -330,45 +388,22 @@ func startDaemonJobs(
 	if cfg != nil {
 		scannerWorkers = cfg.ScannerWorkers
 	}
-
-	onFatal := func(fatalErr error) {
-		if cancel != nil {
-			cancel(fatalErr)
-		}
+	if scannerWorkers < 0 {
+		return nil, scanner.ErrInvalidWorkerCount
 	}
-
-	reg := buildDaemonRegistry(cfg, services)
-	eventRepo := postgres.NewEventRepository(pool)
-	jobRepo := postgres.NewJobRepository(pool)
-	progressHub, err := events.NewProgressHub(events.ProgressHubOptions{})
+	sc, err := newDaemonScanner(pool, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("initializing job progress hub: %w", err)
+		return nil, fmt.Errorf("initializing library scanner: %w", err)
 	}
-	var dispatcher *events.Dispatcher
-	runnerOpts := jobs.RunnerOptions{
-		Logger:          slog.Default(),
-		DefaultPoolSize: parsed.defaultPoolSize,
-		OnFatal:         onFatal,
-		ProgressHub:     progressHub,
-		OnTransition: func(job domain.Job) {
-			if dispatcher != nil && !job.Kind.IsInternal() {
-				dispatcher.Notify()
-			}
-		},
-	}
-	runner := jobs.NewRunner(jobRepo, runnerOpts)
-	delivery := events.NewDeliveryCoordinator(eventRepo, jobRepo, runner, events.DeliveryOptions{
-		Logger:  slog.Default(),
-		OnFatal: onFatal,
+
+	reg := buildDaemonRegistry(cfg, services, RegistryDeps{
+		Scanner:        sc,
+		ScannerWorkers: scannerWorkers,
 	})
-	dispatcher = events.NewDispatcher(eventRepo,
-		events.WithDispatcherLogger(slog.Default()),
-		events.WithOnPublished(func(_ context.Context, _ []domain.DomainEvent) error {
-			delivery.Wake()
-			return nil
-		}),
-		events.WithOnFatal(onFatal),
-	)
+	runner, delivery, dispatcher, progressHub, err := buildDaemonJobComponents(cancel, pool, parsed.defaultPoolSize)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := runner.RegisterModuleKinds(reg); err != nil {
 		return nil, fmt.Errorf("registering module job kinds: %w", err)
@@ -383,23 +418,13 @@ func startDaemonJobs(
 		return nil, fmt.Errorf("registering internal EVENT_DELIVERY job kind: %w", err)
 	}
 
-	initialSizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds(), scannerWorkers)
-	if err != nil {
+	if err := applyDaemonPoolSizes(parsed, runner); err != nil {
 		return nil, err
 	}
-	if err := runner.SetPoolSizes(initialSizes); err != nil {
-		return nil, err
-	}
-
 	if err := configureDaemonJobRunner(runner, reg, cfg, services); err != nil {
 		return nil, fmt.Errorf("configuring daemon job runner: %w", err)
 	}
-
-	finalSizes, err := resolvePoolSizesForKinds(parsed, runner.Kinds(), scannerWorkers)
-	if err != nil {
-		return nil, err
-	}
-	if err := runner.SetPoolSizes(finalSizes); err != nil {
+	if err := applyDaemonPoolSizes(parsed, runner); err != nil {
 		return nil, err
 	}
 
@@ -421,12 +446,65 @@ func startDaemonJobs(
 		runner.Stop()
 		return nil, fmt.Errorf("starting domain event dispatcher: %w", err)
 	}
-	return &daemonWorkers{
+	workers := &daemonWorkers{
 		runner:      runner,
 		delivery:    delivery,
 		dispatcher:  dispatcher,
 		progressHub: progressHub,
-	}, nil
+	}
+	inspectDaemonWorkers(workers)
+	return workers, nil
+}
+
+func buildDaemonServices(
+	pool *pgxpool.Pool,
+	setup *bootstrap.Setup,
+	userRepo *postgres.UserRepository,
+) (*app.Services, *jobs.Service, *events.StreamService, error) {
+	hashLimiter, err := auth.NewHashLimiter(auth.HashLimiterOptions{})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	basicAuth, err := auth.NewBasicAuthenticator(userRepo, auth.BasicOptions{
+		Logger:  slog.Default(),
+		Limiter: hashLimiter,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	patAuth, err := auth.NewPATAuthenticator(userRepo, auth.PATOptions{
+		Logger:  slog.Default(),
+		Limiter: hashLimiter,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sessionRepo := postgres.NewSessionRepository(pool)
+	sessionService, err := auth.NewSessionService(basicAuth, userRepo, sessionRepo, auth.SessionOptions{})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sessionAuth, err := auth.NewSessionAuthenticator(userRepo, sessionRepo, auth.SessionOptions{})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	eventRepo := postgres.NewEventRepository(pool)
+	jobRepo := postgres.NewJobRepository(pool)
+	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
+		Users:    userRepo,
+		Sessions: sessionRepo,
+	})
+	services := app.NewAuthorizingServices(&app.Services{
+		Setup:       setup,
+		BasicAuth:   basicAuth,
+		PATAuth:     patAuth,
+		Session:     sessionService,
+		SessionAuth: sessionAuth,
+		Jobs:        jobService,
+		Events:      eventService,
+	})
+	return services, jobService, eventService, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -464,49 +542,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		return err
 	}
 	defer setup.Close()
-	hashLimiter, err := auth.NewHashLimiter(auth.HashLimiterOptions{})
+	services, jobService, eventService, err := buildDaemonServices(d.pool, setup, userRepo)
 	if err != nil {
 		return err
 	}
-	basicAuth, err := auth.NewBasicAuthenticator(userRepo, auth.BasicOptions{
-		Logger:  slog.Default(),
-		Limiter: hashLimiter,
-	})
-	if err != nil {
-		return err
-	}
-	patAuth, err := auth.NewPATAuthenticator(userRepo, auth.PATOptions{
-		Logger:  slog.Default(),
-		Limiter: hashLimiter,
-	})
-	if err != nil {
-		return err
-	}
-	sessionRepo := postgres.NewSessionRepository(d.pool)
-	sessionService, err := auth.NewSessionService(basicAuth, userRepo, sessionRepo, auth.SessionOptions{})
-	if err != nil {
-		return err
-	}
-	sessionAuth, err := auth.NewSessionAuthenticator(userRepo, sessionRepo, auth.SessionOptions{})
-	if err != nil {
-		return err
-	}
-	eventRepo := postgres.NewEventRepository(d.pool)
-	jobRepo := postgres.NewJobRepository(d.pool)
-	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
-	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
-		Users:    userRepo,
-		Sessions: sessionRepo,
-	})
-	services := app.NewAuthorizingServices(&app.Services{
-		Setup:       setup,
-		BasicAuth:   basicAuth,
-		PATAuth:     patAuth,
-		Session:     sessionService,
-		SessionAuth: sessionAuth,
-		Jobs:        jobService,
-		Events:      eventService,
-	})
 	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
 	if err != nil {
 		return err
@@ -519,6 +558,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 			workers.dispatcher.Notify()
 		}
 	})
+	attachDaemonScanTrigger(scanner.NewScanTrigger(jobService))
 	defer func() {
 		cancel(nil)
 		workers.stopAndWait()

@@ -41,6 +41,9 @@ type Options struct {
 	// MissingGracePeriod optionally overrides the MissingGraceDaysSettingKey
 	// system_settings value when non-nil (ADR-0019 §6).
 	MissingGracePeriod *time.Duration
+	// Open optionally overrides default read-only file opening for archive
+	// inspection when ScanOptions.Open is nil.
+	Open func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 }
 
 // ScanOptions configures a single library scan pass.
@@ -64,6 +67,11 @@ type ScanOptions struct {
 
 	// Open optionally overrides read-only file opening for archive inspection.
 	Open func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+
+	// OnProgress, when non-nil, is called sequentially as scanned files are observed
+	// across the library's roots with the cumulative scanned file count and the
+	// root-relative display path of the current file.
+	OnProgress func(scannedCount int64, currentPath string)
 }
 
 // ChangedFile pairs an existing media asset with fresh disk inspection data when
@@ -120,6 +128,7 @@ type Scanner struct {
 	outbox             *events.Outbox
 	now                func() time.Time
 	missingGracePeriod *time.Duration
+	open               func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 }
 
 // NewScanner constructs a Scanner backed by tx.
@@ -153,6 +162,7 @@ func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
 		outbox:             outbox,
 		now:                nowFn,
 		missingGracePeriod: graceOverride,
+		open:               opts.Open,
 	}, nil
 }
 
@@ -207,6 +217,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 
 	assetsByRoot := indexPreWalkAssetsByRoot(preWalkAssets, len(preCheck.Roots))
 	obs := newLibraryWalkObservations()
+	var scannedCount int64
 
 	res.Complete = true
 	res.Roots = make([]RootScanResult, 0, len(preCheck.Roots))
@@ -223,7 +234,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 			Path:      checkedRoot.RootPath,
 			State:     checkedRoot.State,
 		}
-		rootRes := s.scanOneRoot(ctx, root, assetsByRoot[root.ID], obs, opts)
+		rootRes := s.scanOneRoot(ctx, root, assetsByRoot[root.ID], obs, &scannedCount, opts)
 		res.recordRoot(rootRes)
 		if rootRes.Err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -445,20 +456,31 @@ func (s *Scanner) scanOneRoot(
 	root domain.LibraryRoot,
 	assets []domain.MediaAsset,
 	obs *libraryWalkObservations,
+	scannedCount *int64,
 	opts ScanOptions,
 ) RootScanResult {
+	if scannedCount == nil {
+		var local int64
+		scannedCount = &local
+	}
 	knownByPath, knownForWalk := buildKnownMaps(assets)
 	state := &rootScanState{
-		ctx:         ctx,
-		rootID:      root.ID,
-		knownByPath: knownByPath,
-		obs:         obs,
+		ctx:          ctx,
+		rootID:       root.ID,
+		knownByPath:  knownByPath,
+		obs:          obs,
+		scannedCount: scannedCount,
+		onProgress:   opts.OnProgress,
 		result: RootScanResult{
 			LibraryRootID: root.ID,
 			RootPath:      root.Path,
 		},
 	}
 
+	openFn := opts.Open
+	if openFn == nil {
+		openFn = s.open
+	}
 	walkOpts := WalkOptions{
 		Workers: opts.Workers,
 		Known:   knownForWalk,
@@ -466,7 +488,7 @@ func (s *Scanner) scanOneRoot(
 		OnEntry: state.handleEntry,
 		ReadDir: opts.ReadDir,
 		Stat:    opts.Stat,
-		Open:    opts.Open,
+		Open:    openFn,
 	}
 	walkRes, walkErr := WalkRoot(ctx, root.Path.Bytes, walkOpts)
 	state.result.Err = walkErr
@@ -491,11 +513,23 @@ func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, m
 }
 
 type rootScanState struct {
-	ctx         context.Context
-	rootID      string
-	knownByPath map[string]domain.MediaAsset
-	obs         *libraryWalkObservations
-	result      RootScanResult
+	ctx          context.Context
+	rootID       string
+	knownByPath  map[string]domain.MediaAsset
+	obs          *libraryWalkObservations
+	scannedCount *int64
+	onProgress   func(scannedCount int64, currentPath string)
+	result       RootScanResult
+}
+
+func (st *rootScanState) reportFileProgress(displayPath string) {
+	if st.scannedCount == nil {
+		return
+	}
+	*st.scannedCount++
+	if st.onProgress != nil && displayPath != "" {
+		st.onProgress(*st.scannedCount, displayPath)
+	}
 }
 
 func (st *rootScanState) handleEntry(entry WalkEntry) error {
@@ -511,6 +545,7 @@ func (st *rootScanState) handleEntry(entry WalkEntry) error {
 				relPathBytes: string(entry.Unchanged.RelPath.Bytes),
 			}
 			st.obs.seenUnchanged[loc] = struct{}{}
+			st.reportFileProgress(entry.Unchanged.RelPath.Display)
 		}
 		return nil
 	case EntrySkipped:
@@ -530,7 +565,11 @@ func (st *rootScanState) handleEntry(entry WalkEntry) error {
 		if entry.Inspected == nil {
 			return nil
 		}
-		return st.handleInspected(*entry.Inspected)
+		if err := st.handleInspected(*entry.Inspected); err != nil {
+			return err
+		}
+		st.reportFileProgress(entry.Inspected.RelPath.Display)
+		return nil
 	default:
 		return nil
 	}

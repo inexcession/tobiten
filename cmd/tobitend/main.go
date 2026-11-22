@@ -14,6 +14,7 @@ import (
 	"github.com/inexcession/tobiten/internal/api/openapi"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
 )
@@ -54,6 +55,12 @@ func setupLogging(cfg *config.Config) error {
 	return nil
 }
 
+// RegistryDeps holds runtime module dependencies supplied by the daemon composition root.
+type RegistryDeps struct {
+	Scanner        *scanner.Scanner
+	ScannerWorkers int
+}
+
 // BuildRegistry constructs the composition root module registry for tobitend.
 // Compiled-in modules are registered here (ADR-0018 §1).
 // Defaults fail closed with nil services; the daemon supplies its owned application services.
@@ -64,6 +71,12 @@ func BuildRegistry(cfg *config.Config) module.Registry {
 // BuildRegistryWithServices constructs the composition root module registry
 // wired with the specified application services.
 func BuildRegistryWithServices(cfg *config.Config, services *app.Services) module.Registry {
+	return BuildRegistryWithDeps(cfg, services, RegistryDeps{})
+}
+
+// BuildRegistryWithDeps constructs the composition root module registry wired with
+// application services and runtime module dependencies.
+func BuildRegistryWithDeps(cfg *config.Config, services *app.Services, deps RegistryDeps) module.Registry {
 	reg := module.NewRegistry()
 
 	// Register compiled-in modules
@@ -86,6 +99,16 @@ func BuildRegistryWithServices(cfg *config.Config, services *app.Services) modul
 			ModuleName: "auth",
 			Auths:      auths,
 		})
+	}
+	if deps.Scanner != nil {
+		mod, err := scanner.NewModule(deps.Scanner, scanner.ModuleOptions{
+			Workers: deps.ScannerWorkers,
+		})
+		if err != nil {
+			slog.Error("failed to initialize scanner module", logging.Err(err))
+		} else {
+			_ = reg.Register(mod)
+		}
 	}
 
 	// Apply configuration (e.g. disabled modules) after registering real modules

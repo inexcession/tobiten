@@ -47,6 +47,7 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 	db := testdb.New(t)
 	migrateStartupDB(t, db)
 	putSetting(t, db, "jobs.pool.repack", "1")
+	putSetting(t, db, "jobs.pool.scan", "2")
 
 	originalRegistryBuilder := buildDaemonRegistry
 	originalConfigHook := configureDaemonJobRunner
@@ -77,7 +78,7 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 	var seenScanPoolSize, seenRepackPoolSize int
 	var runnerHasRecoveredBeforeServe atomic.Bool
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		_ = reg.Register(&testJobRegistrarModule{
 			SimpleModule: &module.SimpleModule{
@@ -185,7 +186,6 @@ func TestRunDaemonBoundedWorkerPoolsNoStarvationAndJoinBeforeCleanup(t *testing.
 		"TOBITEN_DATABASE_URL=" + db.URL,
 		"TOBITEN_ADMIN_USER=alice",
 		"TOBITEN_ADMIN_PASS=initial-password",
-		"TOBITEN_SCANNER_WORKERS=2",
 	}))
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
@@ -400,7 +400,7 @@ func TestRunDaemonPoolConfigValidation(t *testing.T) {
 			configureDaemonJobRunner = originalConfigHook
 		})
 
-		buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 			reg := BuildRegistryWithServices(cfg, services)
 			_ = reg.Register(&module.SimpleModule{
 				ModuleName: "default-pool-check",
@@ -446,7 +446,7 @@ func TestRunDaemonPoolConfigValidation(t *testing.T) {
 		entered := make(chan struct{}, 4)
 		release := make(chan struct{})
 
-		buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+		buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 			reg := BuildRegistryWithServices(cfg, services)
 			_ = reg.Register(&testJobRegistrarModule{
 				SimpleModule: &module.SimpleModule{

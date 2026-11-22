@@ -108,7 +108,7 @@ func TestDaemonJobsTriggerDetailAndCancelAPI(t *testing.T) {
 	runningEntered := make(chan string, 4)
 	releaseRunning := make(chan struct{})
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		jobRepo := postgres.NewJobRepository(db.Pool)
 
@@ -231,7 +231,7 @@ func TestDaemonJobsTriggerDetailAndCancelAPI(t *testing.T) {
 		if services == nil || services.Jobs == nil {
 			t.Fatal("expected daemon to wire services.Jobs")
 		}
-		reg := buildDaemonRegistry(cfg, services)
+		reg := buildDaemonRegistry(cfg, services, RegistryDeps{})
 		srv, err := api.NewServer(api.ServerOptions{
 			Config:   cfg,
 			Logger:   logger,

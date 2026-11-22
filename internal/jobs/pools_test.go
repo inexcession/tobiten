@@ -165,14 +165,23 @@ func TestRunner_PoolSizeResolutionAndStartValidation(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("RegisterKind SCAN handler: %v", err)
 		}
+		// Before Start, no pool is active even when a handler is registered.
+		if sz, active := r.ActivePoolSize(domain.JobKindScan); active || sz != 0 {
+			t.Fatalf("ActivePoolSize before Start = (%d, %v), want (0, false)", sz, active)
+		}
 		if _, err := r.Recover(t.Context()); err != nil {
 			t.Fatalf("Recover: %v", err)
 		}
 		if err := r.Start(t.Context()); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-		defer r.Stop()
-
+		// Only kinds with a registered handler actually start a pool; handlerless kinds are skipped.
+		if sz, active := r.ActivePoolSize(domain.JobKindScan); !active || sz != 1 {
+			t.Fatalf("SCAN ActivePoolSize = (%d, %v), want (1, true)", sz, active)
+		}
+		if sz, active := r.ActivePoolSize(domain.JobKindRepack); active || sz != 0 {
+			t.Fatalf("handlerless REPACK ActivePoolSize = (%d, %v), want (0, false)", sz, active)
+		}
 		if err := r.Start(t.Context()); !errors.Is(err, jobs.ErrPoolsAlreadyRunning) {
 			t.Fatalf("second Start = %v, want ErrPoolsAlreadyRunning", err)
 		}
@@ -181,6 +190,10 @@ func TestRunner_PoolSizeResolutionAndStartValidation(t *testing.T) {
 			ResumePolicy: domain.JobResumeCheckpoint,
 		}); !errors.Is(err, jobs.ErrPoolsAlreadyRunning) {
 			t.Fatalf("RegisterKind while running = %v, want ErrPoolsAlreadyRunning", err)
+		}
+		r.Stop()
+		if sz, active := r.ActivePoolSize(domain.JobKindScan); active || sz != 0 {
+			t.Fatalf("SCAN ActivePoolSize after Stop = (%d, %v), want (0, false)", sz, active)
 		}
 	})
 }

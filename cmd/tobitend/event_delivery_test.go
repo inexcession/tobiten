@@ -72,7 +72,7 @@ func TestRunDaemonEventDeliveryPipelineAndLifecycleSuppression(t *testing.T) {
 	var seenSeqs []int64
 	var seenIDs []string
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		_ = reg.Register(&module.SimpleModule{
 			ModuleName: "test-event-delivery",
@@ -152,7 +152,7 @@ func TestRunDaemonRegularJobPositiveControlAndEventDeliverySuppression(t *testin
 	var mu sync.Mutex
 	var delivered []domain.EventKind
 
-	buildDaemonRegistry = func(cfg *config.Config, services *app.Services) module.Registry {
+	buildDaemonRegistry = func(cfg *config.Config, services *app.Services, _ RegistryDeps) module.Registry {
 		reg := BuildRegistryWithServices(cfg, services)
 		_ = reg.Register(&module.SimpleModule{
 			ModuleName: "test-regular-job-pos-control",
