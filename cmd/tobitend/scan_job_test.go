@@ -2,16 +2,19 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -836,4 +839,934 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 			t.Fatalf("runDaemon err = %v", err)
 		}
 	})
+}
+
+type daemonAssetCommitHookTransactor struct {
+	inner            storage.Transactor
+	createdAssets    atomic.Int32
+	onAfterCommit    func(ctx context.Context, createCount int32)
+	blockNextReadTx  atomic.Bool
+	onBlockedNextTx  func()
+	unblockNextReadT chan struct{}
+}
+
+func (h *daemonAssetCommitHookTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return h.inner.WithTx(ctx, fn)
+}
+
+func (h *daemonAssetCommitHookTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	if h.blockNextReadTx.Load() {
+		if h.onBlockedNextTx != nil {
+			h.onBlockedNextTx()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-h.unblockNextReadT:
+		}
+	}
+	var created bool
+	err := h.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return fn(&daemonAssetCommitHookTx{Tx: tx, created: &created})
+	})
+	if err == nil && created {
+		n := h.createdAssets.Add(1)
+		if h.onAfterCommit != nil {
+			h.onAfterCommit(ctx, n)
+		}
+	}
+	return err
+}
+
+type daemonAssetCommitHookTx struct {
+	storage.Tx
+	created *bool
+}
+
+func (h *daemonAssetCommitHookTx) CatalogueWrites() storage.CatalogueWriteRepository {
+	return &daemonAssetCommitHookRepo{
+		CatalogueWriteRepository: h.Tx.CatalogueWrites(),
+		created:                  h.created,
+	}
+}
+
+type daemonAssetCommitHookRepo struct {
+	storage.CatalogueWriteRepository
+	created *bool
+}
+
+func (r *daemonAssetCommitHookRepo) CreateAsset(ctx context.Context, asset *domain.MediaAsset) error {
+	if err := r.CatalogueWriteRepository.CreateAsset(ctx, asset); err != nil {
+		return err
+	}
+	*r.created = true
+	return nil
+}
+
+func TestRunDaemonScanJob_CancelAtFileBoundary(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	t.Run("cancel mid-walk stops at next file boundary without missing marks or partial move/modify", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		dsPtr, _ := captureDaemonAssembly(t)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "cancel-walk-root")
+		existingPath := filepath.Join(rootDir, "Existing/v01.cbz")
+		modifyPath := filepath.Join(rootDir, "Modify/m01.cbz")
+		oldMovePath := filepath.Join(rootDir, "Move/old.cbz")
+		renamedMovePath := filepath.Join(rootDir, "Move/renamed.cbz")
+		gonePath := filepath.Join(rootDir, "Vanish/gone.cbz")
+		blockNewPath := filepath.Join(rootDir, "Zebra/01_block.cbz")
+		pipelineNewPath := filepath.Join(rootDir, "Zebra/02_pipeline.cbz")
+		unopenedNewPath := filepath.Join(rootDir, "Zebra/03_unopened.cbz")
+
+		writeTestFile(t, existingPath, buildTestCBZ(t, "Existing", "One", "1"))
+		writeTestFile(t, modifyPath, buildTestCBZ(t, "Modify", "One", "1"))
+		writeTestFile(t, oldMovePath, buildTestCBZ(t, "Move", "One", "1"))
+		writeTestFile(t, gonePath, buildTestCBZ(t, "Vanish", "One", "1"))
+
+		lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Cancel Walk Lib", rootDir)
+
+		var blockActive atomic.Bool
+		enteredBlock := make(chan struct{}, 1)
+		releaseBlock := make(chan struct{})
+		var openMu sync.Mutex
+		openedOnCancel := make(map[string]int)
+
+		newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+			return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+				Open: func(openCtx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+					p := string(rawPath)
+					if blockActive.Load() {
+						openMu.Lock()
+						openedOnCancel[p]++
+						openMu.Unlock()
+						if p == blockNewPath {
+							select {
+							case enteredBlock <- struct{}{}:
+							default:
+							}
+							select {
+							case <-releaseBlock:
+							case <-openCtx.Done():
+								return nil, openCtx.Err()
+							}
+						}
+					}
+					return os.Open(p)
+				},
+			})
+		}
+
+		cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron([]string{
+			"TOBITEN_STORAGE_MODE=postgres",
+			"TOBITEN_DATABASE_URL=" + db.URL,
+			"TOBITEN_ADMIN_USER=alice",
+			"TOBITEN_ADMIN_PASS=initial-password",
+			"TOBITEN_SCANNER_WORKERS=1",
+		}))
+		if err != nil {
+			t.Fatalf("config.Load: %v", err)
+		}
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		err = runDaemon(ctx, cfg, func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, services *app.Services) error {
+			ds := *dsPtr
+			baseID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			waitDaemonJobState(serveCtx, t, jobRepo, baseID, domain.JobStateSucceeded)
+
+			var origModDigest string
+			if err := db.QueryRow(serveCtx, `
+				SELECT ad.value FROM asset_digests ad
+				JOIN media_assets ma ON ma.id = ad.asset_id
+				WHERE ma.library_root_id = $1 AND ma.rel_path_display = 'Modify/m01.cbz' AND ad.is_current
+			`, root.ID).Scan(&origModDigest); err != nil {
+				return err
+			}
+
+			if err := os.Rename(oldMovePath, renamedMovePath); err != nil {
+				return err
+			}
+			writeTestFile(t, modifyPath, buildTestCBZ(t, "Modify", "One Updated", "1"))
+			if err := os.Remove(gonePath); err != nil {
+				return err
+			}
+			writeTestFile(t, blockNewPath, buildTestCBZ(t, "Zebra", "Z1", "1"))
+			writeTestFile(t, pipelineNewPath, buildTestCBZ(t, "Zebra", "Z2", "2"))
+			writeTestFile(t, unopenedNewPath, buildTestCBZ(t, "Zebra", "Z3", "3"))
+
+			blockActive.Store(true)
+			cancelJobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+
+			select {
+			case <-enteredBlock:
+			case <-time.After(10 * time.Second):
+				return errors.New("timed out waiting for Open(Zebra/01_block.cbz)")
+			}
+
+			adminPrincipal := &domain.Principal{
+				User:        domain.User{ID: "admin-canceller", Username: "alice"},
+				Permissions: []domain.Permission{domain.PermissionJobsReadAll, domain.PermissionJobsCancelAll},
+			}
+			cancelSnap, err := services.Jobs.CancelJob(serveCtx, adminPrincipal, cancelJobID)
+			if err != nil {
+				return fmt.Errorf("CancelJob: %w", err)
+			}
+			if cancelSnap.State != string(domain.JobStateRunning) || !cancelSnap.CancelRequested {
+				return fmt.Errorf("CancelJob snapshot = %+v, want RUNNING with cancel_requested=true", cancelSnap)
+			}
+			close(releaseBlock)
+
+			got := waitDaemonJobState(serveCtx, t, jobRepo, cancelJobID, domain.JobStateCancelled)
+			if got.FinishedAt == nil || got.Attempts != 1 {
+				return fmt.Errorf("cancelled job = %+v, want attempts=1 finished_at!=nil", got)
+			}
+
+			openMu.Lock()
+			unopenedCalls := openedOnCancel[unopenedNewPath]
+			existingCalls := openedOnCancel[existingPath]
+			openMu.Unlock()
+			if unopenedCalls != 0 || existingCalls != 0 {
+				return fmt.Errorf("unexpected opens on cancelled walk: unopened=%d existing=%d", unopenedCalls, existingCalls)
+			}
+
+			var assetCount, missingCount, movedOrModifiedCount, cancelEvents int
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&assetCount, &missingCount); err != nil {
+				return err
+			}
+			if assetCount != 4 || missingCount != 0 {
+				return fmt.Errorf("assets after cancel = (total=%d, missing=%d), want (4, 0)", assetCount, missingCount)
+			}
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM domain_events WHERE kind IN ('asset.moved', 'asset.modified', 'asset.missing')`).Scan(&movedOrModifiedCount); err != nil {
+				return err
+			}
+			if movedOrModifiedCount != 0 {
+				return fmt.Errorf("partial-walk reconcile events = %d, want 0", movedOrModifiedCount)
+			}
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.cancelled'`, cancelJobID).Scan(&cancelEvents); err != nil {
+				return err
+			}
+			if cancelEvents != 1 {
+				return fmt.Errorf("job.cancelled count = %d, want 1", cancelEvents)
+			}
+
+			var curModDigest string
+			if err := db.QueryRow(serveCtx, `
+				SELECT ad.value FROM asset_digests ad
+				JOIN media_assets ma ON ma.id = ad.asset_id
+				WHERE ma.library_root_id = $1 AND ma.rel_path_display = 'Modify/m01.cbz' AND ad.is_current
+			`, root.ID).Scan(&curModDigest); err != nil {
+				return err
+			}
+			if curModDigest != origModDigest {
+				return fmt.Errorf("Modify/m01.cbz digest changed from %q to %q", origModDigest, curModDigest)
+			}
+			var oldMovePresent bool
+			if err := db.QueryRow(serveCtx, `SELECT EXISTS (SELECT 1 FROM media_assets WHERE library_root_id = $1 AND rel_path_display = 'Move/old.cbz')`, root.ID).Scan(&oldMovePresent); err != nil {
+				return err
+			}
+			if !oldMovePresent {
+				return errors.New("Move/old.cbz was unexpectedly moved during cancelled partial walk")
+			}
+
+			// Dedupe key released -> clean follow-up scan succeeds.
+			blockActive.Store(false)
+			followID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			if followID == cancelJobID {
+				return fmt.Errorf("post-cancel trigger reused job ID %q", cancelJobID)
+			}
+			waitDaemonJobState(serveCtx, t, jobRepo, followID, domain.JobStateSucceeded)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+	})
+
+	t.Run("cancel during write phase keeps committed files intact and skips missing marks", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		dsPtr, _ := captureDaemonAssembly(t)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "cancel-write-root")
+		writeTestFile(t, filepath.Join(rootDir, "Existing/v01.cbz"), buildTestCBZ(t, "Existing", "One", "1"))
+		gonePath := filepath.Join(rootDir, "Vanish/gone.cbz")
+		writeTestFile(t, gonePath, buildTestCBZ(t, "Vanish", "One", "1"))
+
+		lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Cancel Write Lib", rootDir)
+
+		var targetJobID atomic.Value
+		var cancelAtCreate atomic.Int32
+		var servicesRef atomic.Pointer[app.Services]
+		adminPrincipal := &domain.Principal{
+			User:        domain.User{ID: "admin-canceller", Username: "alice"},
+			Permissions: []domain.Permission{domain.PermissionJobsReadAll, domain.PermissionJobsCancelAll},
+		}
+
+		newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+			hookTx := &daemonAssetCommitHookTransactor{
+				inner: postgres.NewTransactor(pool),
+				onAfterCommit: func(txCtx context.Context, createCount int32) {
+					if createCount == cancelAtCreate.Load() {
+						svc := servicesRef.Load()
+						jid, _ := targetJobID.Load().(string)
+						if svc != nil && jid != "" {
+							if _, cErr := svc.Jobs.CancelJob(txCtx, adminPrincipal, jid); cErr != nil {
+								t.Errorf("CancelJob after commit %d: %v", createCount, cErr)
+							}
+						}
+					}
+				},
+			}
+			return scanner.NewScanner(hookTx, scanner.Options{})
+		}
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, services *app.Services) error {
+			servicesRef.Store(services)
+			ds := *dsPtr
+
+			baseID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			waitDaemonJobState(serveCtx, t, jobRepo, baseID, domain.JobStateSucceeded)
+
+			if err := os.Remove(gonePath); err != nil {
+				return err
+			}
+			writeTestFile(t, filepath.Join(rootDir, "New/a.cbz"), buildTestCBZ(t, "New", "A", "1"))
+			writeTestFile(t, filepath.Join(rootDir, "New/b.cbz"), buildTestCBZ(t, "New", "B", "2"))
+			writeTestFile(t, filepath.Join(rootDir, "New/c.cbz"), buildTestCBZ(t, "New", "C", "3"))
+
+			cancelAtCreate.Store(3) // 2 baseline + New/a.cbz
+			cancelID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			targetJobID.Store(cancelID)
+
+			waitDaemonJobState(serveCtx, t, jobRepo, cancelID, domain.JobStateCancelled)
+
+			var total, missing int
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&total, &missing); err != nil {
+				return err
+			}
+			if total != 3 || missing != 0 {
+				return fmt.Errorf("assets after write-phase cancel = (total=%d, missing=%d), want (3, 0)", total, missing)
+			}
+			var hasA bool
+			if err := db.QueryRow(serveCtx, `SELECT EXISTS (SELECT 1 FROM media_assets WHERE library_root_id = $1 AND rel_path_display = 'New/a.cbz')`, root.ID).Scan(&hasA); err != nil {
+				return err
+			}
+			if !hasA {
+				return errors.New("expected committed New/a.cbz to remain intact")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+	})
+}
+
+func TestRunDaemonScanJob_StopMidScanAndRestartRecovery(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "stop-restart-root")
+	existingPath := filepath.Join(rootDir, "Existing/v01.cbz")
+	newAPath := filepath.Join(rootDir, "New/a.cbz")
+	newBPath := filepath.Join(rootDir, "New/b.cbz")
+	newCPath := filepath.Join(rootDir, "New/c.cbz")
+	writeTestFile(t, existingPath, buildTestCBZ(t, "Existing", "One", "1"))
+
+	lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Stop Restart Lib", rootDir)
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	// Daemon 1: baseline scan commits Existing/v01.cbz, then second scan commits New/a.cbz
+	// and blocks before New/b.cbz so stopping the daemon leaves the SCAN job RUNNING.
+	dsPtr1, _ := captureDaemonAssembly(t)
+	var blockOnSecondCreate atomic.Int32
+	blockedBeforeNewB := make(chan struct{}, 1)
+	unblockCh := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-unblockCh:
+		default:
+			close(unblockCh)
+		}
+	})
+
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		var hookTx *daemonAssetCommitHookTransactor
+		hookTx = &daemonAssetCommitHookTransactor{
+			inner:            postgres.NewTransactor(pool),
+			unblockNextReadT: unblockCh,
+			onAfterCommit: func(_ context.Context, createCount int32) {
+				if createCount == blockOnSecondCreate.Load() {
+					hookTx.blockNextReadTx.Store(true)
+				}
+			},
+			onBlockedNextTx: func() {
+				select {
+				case blockedBeforeNewB <- struct{}{}:
+				default:
+				}
+			},
+		}
+		return scanner.NewScanner(hookTx, scanner.Options{})
+	}
+
+	var interruptedJobID string
+	err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtr1
+		baseID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+		waitDaemonJobState(serveCtx, t, jobRepo, baseID, domain.JobStateSucceeded)
+
+		writeTestFile(t, newAPath, buildTestCBZ(t, "New", "A", "1"))
+		writeTestFile(t, newBPath, buildTestCBZ(t, "New", "B", "2"))
+		writeTestFile(t, newCPath, buildTestCBZ(t, "New", "C", "3"))
+
+		blockOnSecondCreate.Store(2) // 1 baseline + New/a.cbz
+		interruptedJobID, err = ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+
+		select {
+		case <-blockedBeforeNewB:
+		case <-time.After(10 * time.Second):
+			return errors.New("timed out waiting for scan #2 to commit New/a.cbz and reach New/b.cbz")
+		}
+		// Returning from serve cancels runDaemon's worker context and stops workers mid-scan.
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("daemon 1 runDaemon err = %v", err)
+	}
+
+	midJob, err := jobRepo.GetJobByID(ctx, interruptedJobID)
+	if err != nil {
+		t.Fatalf("GetJobByID mid-stop: %v", err)
+	}
+	if midJob.State != domain.JobStateRunning || midJob.Attempts != 1 {
+		t.Fatalf("job after daemon stop = (state=%s, attempts=%d), want (RUNNING, 1)", midJob.State, midJob.Attempts)
+	}
+
+	// Daemon 2: startup recovery requeues the RUNNING job and completes without re-opening committed unchanged files.
+	var openMu sync.Mutex
+	openedOnRestart := make(map[string]int)
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				openMu.Lock()
+				openedOnRestart[p]++
+				openMu.Unlock()
+				return os.Open(p)
+			},
+		})
+	}
+
+	err = runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		got := waitDaemonJobState(serveCtx, t, jobRepo, interruptedJobID, domain.JobStateSucceeded)
+		if got.Attempts != 2 {
+			return fmt.Errorf("recovered job Attempts = %d, want 2", got.Attempts)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("daemon 2 runDaemon err = %v", err)
+	}
+
+	openMu.Lock()
+	existingOpens := openedOnRestart[existingPath]
+	newAOpens := openedOnRestart[newAPath]
+	newBOpens := openedOnRestart[newBPath]
+	newCOpens := openedOnRestart[newCPath]
+	openMu.Unlock()
+	if existingOpens != 0 || newAOpens != 0 || newBOpens != 1 || newCOpens != 1 {
+		returnErr := fmt.Sprintf("restart opens = (existing=%d, newA=%d, newB=%d, newC=%d), want (0, 0, 1, 1)",
+			existingOpens, newAOpens, newBOpens, newCOpens)
+		t.Fatal(returnErr)
+	}
+
+	var totalAssets, missingAssets, missingEvents int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&totalAssets, &missingAssets); err != nil {
+		t.Fatalf("count media_assets: %v", err)
+	}
+	if totalAssets != 4 || missingAssets != 0 {
+		t.Fatalf("final media_assets = (total=%d, missing=%d), want (4, 0)", totalAssets, missingAssets)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind = 'asset.missing'`).Scan(&missingEvents); err != nil {
+		t.Fatalf("count asset.missing: %v", err)
+	}
+	if missingEvents != 0 {
+		t.Fatalf("asset.missing count = %d, want 0", missingEvents)
+	}
+}
+
+func TestScanKillRecoveryHelperProcess(t *testing.T) {
+	if os.Getenv("TOBITEN_SCAN_KILL_HELPER") != "crash" {
+		return
+	}
+	dbURL := os.Getenv("TOBITEN_SCAN_KILL_DB_URL")
+	libID := os.Getenv("TOBITEN_SCAN_KILL_LIB_ID")
+	if dbURL == "" || libID == "" {
+		t.Fatal("missing TOBITEN_SCAN_KILL_DB_URL or TOBITEN_SCAN_KILL_LIB_ID")
+	}
+
+	originalNewScanner := newDaemonScanner
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+	})
+
+	readyOnce := sync.Once{}
+	unblock := make(chan struct{})
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		var hookTx *daemonAssetCommitHookTransactor
+		hookTx = &daemonAssetCommitHookTransactor{
+			inner:            postgres.NewTransactor(pool),
+			unblockNextReadT: unblock,
+			onAfterCommit: func(_ context.Context, createCount int32) {
+				if createCount == 1 {
+					hookTx.blockNextReadTx.Store(true)
+				}
+			},
+			onBlockedNextTx: func() {
+				readyOnce.Do(func() {
+					fmt.Println("SCAN_KILL_HELPER_READY")
+				})
+			},
+		}
+		return scanner.NewScanner(hookTx, scanner.Options{})
+	}
+
+	dsPtr, _ := captureDaemonAssembly(t)
+	ctx := context.Background()
+	err := runDaemon(ctx, hostedConfig(t, dbURL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtr
+		if _, err := ds.triggerScan(serveCtx, libID, scanner.TriggerScanOptions{}); err != nil {
+			return err
+		}
+		<-serveCtx.Done()
+		return serveCtx.Err()
+	})
+	if err != nil {
+		t.Fatalf("helper runDaemon: %v", err)
+	}
+}
+
+func TestRunDaemonScanJob_ProcessKilledMidScanRecovers(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "kill-recover-root")
+	existingPath := filepath.Join(rootDir, "Existing/v01.cbz")
+	newAPath := filepath.Join(rootDir, "New/a.cbz")
+	newBPath := filepath.Join(rootDir, "New/b.cbz")
+	newCPath := filepath.Join(rootDir, "New/c.cbz")
+	writeTestFile(t, existingPath, buildTestCBZ(t, "Existing", "One", "1"))
+
+	lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Kill Recover Lib", rootDir)
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	// Daemon 1: baseline scan commits Existing/v01.cbz, then exits before launching crash subprocess.
+	dsPtr1, _ := captureDaemonAssembly(t)
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtr1
+		baseID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+		waitDaemonJobState(serveCtx, t, jobRepo, baseID, domain.JobStateSucceeded)
+		return nil
+	}); err != nil {
+		t.Fatalf("baseline runDaemon err = %v", err)
+	}
+
+	writeTestFile(t, newAPath, buildTestCBZ(t, "New", "A", "1"))
+	writeTestFile(t, newBPath, buildTestCBZ(t, "New", "B", "2"))
+	writeTestFile(t, newCPath, buildTestCBZ(t, "New", "C", "3"))
+
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	crashCmd := exec.Command(exePath, "-test.run=^TestScanKillRecoveryHelperProcess$")
+	crashCmd.Env = append(os.Environ(),
+		"TOBITEN_TEST_DATABASE_URL="+db.URL,
+		"TOBITEN_SCAN_KILL_HELPER=crash",
+		"TOBITEN_SCAN_KILL_DB_URL="+db.URL,
+		"TOBITEN_SCAN_KILL_LIB_ID="+lib.ID,
+	)
+	stdout, err := crashCmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderrBuf strings.Builder
+	var stderrMu sync.Mutex
+	crashCmd.Stderr = &lockedWriter{mu: &stderrMu, sb: &stderrBuf}
+	if err := crashCmd.Start(); err != nil {
+		t.Fatalf("start crash helper: %v", err)
+	}
+	t.Cleanup(func() {
+		if crashCmd.Process != nil {
+			_ = crashCmd.Process.Kill()
+			_ = crashCmd.Wait()
+		}
+	})
+
+	readyCh := make(chan bool, 1)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			if strings.TrimSpace(sc.Text()) == "SCAN_KILL_HELPER_READY" {
+				readyCh <- true
+				return
+			}
+		}
+		readyCh <- false
+	}()
+
+	select {
+	case ok := <-readyCh:
+		if !ok {
+			_ = crashCmd.Wait()
+			stderrMu.Lock()
+			msg := stderrBuf.String()
+			stderrMu.Unlock()
+			t.Fatalf("crash helper exited before ready; stderr:\n%s", msg)
+		}
+	case <-time.After(15 * time.Second):
+		stderrMu.Lock()
+		msg := stderrBuf.String()
+		stderrMu.Unlock()
+		t.Fatalf("timed out waiting for crash helper; stderr:\n%s", msg)
+	}
+
+	running, err := jobRepo.ListRunningJobs(ctx)
+	if err != nil || len(running) != 1 {
+		t.Fatalf("running jobs before SIGKILL = (%d, %v), want 1", len(running), err)
+	}
+	killedJobID := running[0].ID
+
+	if err := crashCmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL crash helper: %v", err)
+	}
+	if waitErr := crashCmd.Wait(); waitErr == nil {
+		t.Fatal("expected non-nil exit error after SIGKILL")
+	}
+
+	// Wait briefly for PostgreSQL backend to tear down the killed helper's advisory lock.
+	lockDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(lockDeadline) {
+		var locks int
+		if qErr := db.QueryRow(ctx, `SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'`).Scan(&locks); qErr == nil && locks == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Recovery daemon: tracks opened files and verifies committed files are not re-opened.
+	var openMu sync.Mutex
+	openedOnRecover := make(map[string]int)
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				openMu.Lock()
+				openedOnRecover[p]++
+				openMu.Unlock()
+				return os.Open(p)
+			},
+		})
+	}
+
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		got := waitDaemonJobState(serveCtx, t, jobRepo, killedJobID, domain.JobStateSucceeded)
+		if got.Attempts != 2 {
+			return fmt.Errorf("recovered killed job Attempts = %d, want 2", got.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("recovery runDaemon err = %v", err)
+	}
+
+	openMu.Lock()
+	existingOpens := openedOnRecover[existingPath]
+	newAOpens := openedOnRecover[newAPath]
+	newBOpens := openedOnRecover[newBPath]
+	newCOpens := openedOnRecover[newCPath]
+	openMu.Unlock()
+	if existingOpens != 0 || newAOpens != 0 || newBOpens != 1 || newCOpens != 1 {
+		t.Fatalf("post-SIGKILL opens = (existing=%d, newA=%d, newB=%d, newC=%d), want (0, 0, 1, 1)",
+			existingOpens, newAOpens, newBOpens, newCOpens)
+	}
+
+	var totalAssets, missingAssets, missingEvents int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&totalAssets, &missingAssets); err != nil {
+		t.Fatalf("count media_assets: %v", err)
+	}
+	if totalAssets != 4 || missingAssets != 0 {
+		t.Fatalf("final media_assets = (total=%d, missing=%d), want (4, 0)", totalAssets, missingAssets)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind = 'asset.missing'`).Scan(&missingEvents); err != nil {
+		t.Fatalf("count asset.missing: %v", err)
+	}
+	if missingEvents != 0 {
+		t.Fatalf("asset.missing count = %d, want 0", missingEvents)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	sb *strings.Builder
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sb.Write(p)
+}
+
+func TestRunDaemonScanJob_InterruptionsExhaustMaxAttemptsAndFreshTriggerCompletes(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "exhaust-restart-root")
+	existingPath := filepath.Join(rootDir, "Existing/v01.cbz")
+	newAPath := filepath.Join(rootDir, "New/a.cbz")
+	newBPath := filepath.Join(rootDir, "New/b.cbz")
+	writeTestFile(t, existingPath, buildTestCBZ(t, "Existing", "One", "1"))
+
+	lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Exhaust Interruption Lib", rootDir)
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	// Baseline scan commits Existing/v01.cbz.
+	dsPtrBase, _ := captureDaemonAssembly(t)
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtrBase
+		baseID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+		waitDaemonJobState(serveCtx, t, jobRepo, baseID, domain.JobStateSucceeded)
+		return nil
+	}); err != nil {
+		t.Fatalf("baseline runDaemon err = %v", err)
+	}
+
+	writeTestFile(t, newAPath, buildTestCBZ(t, "New", "A", "1"))
+	writeTestFile(t, newBPath, buildTestCBZ(t, "New", "B", "2"))
+
+	// Trigger and interrupt 3 attempts (DefaultScanMaxAttempts = 3):
+	// Attempt 1 commits New/a.cbz then blocks before New/b.cbz; attempts 2 & 3 interrupt on Open(New/b.cbz).
+	var exhaustedJobID string
+	for attempt := 1; attempt <= scanner.DefaultScanMaxAttempts; attempt++ {
+		interrupted := make(chan struct{}, 1)
+		unblock := make(chan struct{})
+		if attempt == 1 {
+			newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+				var hookTx *daemonAssetCommitHookTransactor
+				hookTx = &daemonAssetCommitHookTransactor{
+					inner:            postgres.NewTransactor(pool),
+					unblockNextReadT: unblock,
+					onAfterCommit: func(_ context.Context, createCount int32) {
+						if createCount == 1 {
+							hookTx.blockNextReadTx.Store(true)
+						}
+					},
+					onBlockedNextTx: func() {
+						select {
+						case interrupted <- struct{}{}:
+						default:
+						}
+					},
+				}
+				return scanner.NewScanner(hookTx, scanner.Options{})
+			}
+		} else {
+			newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+				return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+					Open: func(openCtx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+						if string(rawPath) == newBPath {
+							select {
+							case interrupted <- struct{}{}:
+							default:
+							}
+							<-openCtx.Done()
+							return nil, openCtx.Err()
+						}
+						return os.Open(string(rawPath))
+					},
+				})
+			}
+		}
+
+		dsPtr, _ := captureDaemonAssembly(t)
+		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			if attempt == 1 {
+				ds := *dsPtr
+				var tErr error
+				exhaustedJobID, tErr = ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+				if tErr != nil {
+					return tErr
+				}
+			}
+			select {
+			case <-interrupted:
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("attempt %d timed out waiting for interruption point", attempt)
+			}
+			return nil
+		})
+		close(unblock)
+		if err != nil {
+			t.Fatalf("attempt %d runDaemon err = %v", attempt, err)
+		}
+
+		got, err := jobRepo.GetJobByID(ctx, exhaustedJobID)
+		if err != nil {
+			t.Fatalf("GetJobByID after attempt %d: %v", attempt, err)
+		}
+		if got.State != domain.JobStateRunning || got.Attempts != attempt {
+			t.Fatalf("after attempt %d: job = (state=%s, attempts=%d), want (RUNNING, %d)", attempt, got.State, got.Attempts, attempt)
+		}
+	}
+
+	// Daemon 4: startup recovery transitions exhausted job to FAILED, preserves catalogue consistency,
+	// releases dedupe key, and a fresh trigger completes the scan without re-opening committed files.
+	var openMu sync.Mutex
+	openedOnFresh := make(map[string]int)
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				openMu.Lock()
+				openedOnFresh[p]++
+				openMu.Unlock()
+				return os.Open(p)
+			},
+		})
+	}
+
+	dsPtrFinal, _ := captureDaemonAssembly(t)
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtrFinal
+		failedJob, err := jobRepo.GetJobByID(serveCtx, exhaustedJobID)
+		if err != nil {
+			return err
+		}
+		if failedJob.State != domain.JobStateFailed || failedJob.Attempts != scanner.DefaultScanMaxAttempts || failedJob.FinishedAt == nil {
+			return fmt.Errorf("recovered exhausted job = %+v, want FAILED attempts=%d finished_at!=nil", failedJob, scanner.DefaultScanMaxAttempts)
+		}
+		var failedEvents int
+		if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.failed'`, exhaustedJobID).Scan(&failedEvents); err != nil {
+			return err
+		}
+		if failedEvents != 1 {
+			return fmt.Errorf("job.failed count = %d, want 1", failedEvents)
+		}
+
+		// Verify consistent pre-fresh catalogue (Existing + New/a.cbz intact, no missing marks).
+		var preTotal, preMissing int
+		if err := db.QueryRow(serveCtx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&preTotal, &preMissing); err != nil {
+			return err
+		}
+		if preTotal != 2 || preMissing != 0 {
+			return fmt.Errorf("pre-fresh catalogue = (total=%d, missing=%d), want (2, 0)", preTotal, preMissing)
+		}
+
+		freshJobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+		if freshJobID == exhaustedJobID {
+			return fmt.Errorf("dedupe key not released after recovery failure: reused %q", exhaustedJobID)
+		}
+		gotSucc := waitDaemonJobState(serveCtx, t, jobRepo, freshJobID, domain.JobStateSucceeded)
+		if gotSucc.Attempts != 1 {
+			return fmt.Errorf("fresh job Attempts = %d, want 1", gotSucc.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("final runDaemon err = %v", err)
+	}
+
+	openMu.Lock()
+	existingOpens := openedOnFresh[existingPath]
+	newAOpens := openedOnFresh[newAPath]
+	newBOpens := openedOnFresh[newBPath]
+	openMu.Unlock()
+	if existingOpens != 0 || newAOpens != 0 || newBOpens != 1 {
+		t.Fatalf("fresh scan opens = (existing=%d, newA=%d, newB=%d), want (0, 0, 1)", existingOpens, newAOpens, newBOpens)
+	}
+
+	var totalAssets, missingAssets, missingEvents int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&totalAssets, &missingAssets); err != nil {
+		t.Fatalf("count final media_assets: %v", err)
+	}
+	if totalAssets != 3 || missingAssets != 0 {
+		t.Fatalf("final media_assets = (total=%d, missing=%d), want (3, 0)", totalAssets, missingAssets)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind = 'asset.missing'`).Scan(&missingEvents); err != nil {
+		t.Fatalf("count asset.missing: %v", err)
+	}
+	if missingEvents != 0 {
+		t.Fatalf("asset.missing count = %d, want 0", missingEvents)
+	}
 }

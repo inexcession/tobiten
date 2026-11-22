@@ -94,6 +94,36 @@ type ScanOptions struct {
 	// across the library's roots with the cumulative scanned file count and the
 	// root-relative display path of the current file.
 	OnProgress func(scannedCount int64, currentPath string)
+
+	// CheckCancel, when non-nil, is called at scan and file boundaries during
+	// walking and reconciliation. Returning a non-nil error aborts the scan
+	// immediately before further files or reconciliation writes run.
+	CheckCancel func(context.Context) error
+}
+
+type cancelProbeError struct {
+	err error
+}
+
+func (e cancelProbeError) Error() string { return e.err.Error() }
+func (e cancelProbeError) Unwrap() error { return e.err }
+
+func checkScanCancel(ctx context.Context, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	if err := fn(ctx); err != nil {
+		return cancelProbeError{err: err}
+	}
+	return nil
+}
+
+func isScanAbortErr(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	var probe cancelProbeError
+	return errors.As(err, &probe)
 }
 
 // ChangedFile pairs an existing media asset with fresh disk inspection data when
@@ -190,26 +220,84 @@ func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
 	}, nil
 }
 
+func (s *Scanner) validateScanRequest(ctx context.Context, libraryID string, opts ScanOptions) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil || s.tx == nil || s.indexer == nil || s.outbox == nil || s.now == nil {
+		return ctx, errors.New("scanner: scanner is not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return ctx, err
+	}
+	if strings.TrimSpace(libraryID) == "" {
+		return ctx, domain.ErrEmptyLibraryID
+	}
+	if opts.Workers < 0 {
+		return ctx, ErrInvalidWorkerCount
+	}
+	return ctx, checkScanCancel(ctx, opts.CheckCancel)
+}
+
+func (s *Scanner) walkOnlineRoots(
+	ctx context.Context,
+	preCheck PreCheckResult,
+	assetsByRoot map[string][]domain.MediaAsset,
+	obs *libraryWalkObservations,
+	opts ScanOptions,
+	res *ScanResult,
+) ([]error, error) {
+	var scannedCount int64
+	res.Complete = true
+	res.Roots = make([]RootScanResult, 0, len(preCheck.Roots))
+	var rootErrs []error
+
+	for _, checkedRoot := range preCheck.Roots {
+		if err := ctx.Err(); err != nil {
+			res.Complete = false
+			res.ApplyRemovals = false
+			return nil, err
+		}
+		if err := checkScanCancel(ctx, opts.CheckCancel); err != nil {
+			res.Complete = false
+			res.ApplyRemovals = false
+			return nil, err
+		}
+		root := domain.LibraryRoot{
+			ID:        checkedRoot.LibraryRootID,
+			LibraryID: preCheck.LibraryID,
+			Path:      checkedRoot.RootPath,
+			State:     checkedRoot.State,
+		}
+		rootRes := s.scanOneRoot(ctx, root, assetsByRoot[root.ID], obs, &scannedCount, opts)
+		res.recordRoot(rootRes)
+		if rootRes.Err == nil {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			res.Complete = false
+			res.ApplyRemovals = false
+			return nil, ctxErr
+		}
+		if isScanAbortErr(ctx, rootRes.Err) {
+			res.Complete = false
+			res.ApplyRemovals = false
+			return nil, rootRes.Err
+		}
+		rootErrs = append(rootErrs, rootRes.Err)
+	}
+	return rootErrs, nil
+}
+
 // ScanLibrary pre-checks every root of libraryID and stops if any failed
 // (M1B-D10). When all roots are online, it walks every root, skips files
 // matching recorded size and mtime without opening them, records inspection
 // data for changed existing paths, and indexes new CBZ files through Indexer
 // from a single sequential writer.
 func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOptions) (ScanResult, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if s == nil || s.tx == nil || s.indexer == nil || s.outbox == nil || s.now == nil {
-		return ScanResult{}, errors.New("scanner: scanner is not initialized")
-	}
-	if err := ctx.Err(); err != nil {
+	ctx, err := s.validateScanRequest(ctx, libraryID, opts)
+	if err != nil {
 		return ScanResult{}, err
-	}
-	if strings.TrimSpace(libraryID) == "" {
-		return ScanResult{}, domain.ErrEmptyLibraryID
-	}
-	if opts.Workers < 0 {
-		return ScanResult{}, ErrInvalidWorkerCount
 	}
 
 	readDirFn := opts.ReadDir
@@ -230,6 +318,9 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		PreCheck:  preCheck,
 		Offline:   !preCheck.ShouldScan,
 	}
+	if err := checkScanCancel(ctx, opts.CheckCancel); err != nil {
+		return res, err
+	}
 	if !preCheck.ShouldScan {
 		res.Complete = false
 		return res, nil
@@ -245,36 +336,12 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 
 	assetsByRoot := indexPreWalkAssetsByRoot(preWalkAssets, len(preCheck.Roots))
 	obs := newLibraryWalkObservations()
-	var scannedCount int64
-
-	res.Complete = true
-	res.Roots = make([]RootScanResult, 0, len(preCheck.Roots))
-	var rootErrs []error
-	for _, checkedRoot := range preCheck.Roots {
-		if err := ctx.Err(); err != nil {
-			res.Complete = false
-			res.ApplyRemovals = false
-			return res, err
-		}
-		root := domain.LibraryRoot{
-			ID:        checkedRoot.LibraryRootID,
-			LibraryID: preCheck.LibraryID,
-			Path:      checkedRoot.RootPath,
-			State:     checkedRoot.State,
-		}
-		rootRes := s.scanOneRoot(ctx, root, assetsByRoot[root.ID], obs, &scannedCount, opts)
-		res.recordRoot(rootRes)
-		if rootRes.Err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				res.Complete = false
-				res.ApplyRemovals = false
-				return res, ctxErr
-			}
-			rootErrs = append(rootErrs, rootRes.Err)
-		}
+	rootErrs, abortErr := s.walkOnlineRoots(ctx, preCheck, assetsByRoot, obs, opts, &res)
+	if abortErr != nil {
+		return res, abortErr
 	}
 	if res.Complete && len(rootErrs) == 0 && ctx.Err() == nil {
-		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, &res); err != nil {
+		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, opts.CheckCancel, &res); err != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
 			return res, err
@@ -499,6 +566,7 @@ func (s *Scanner) scanOneRoot(
 		obs:          obs,
 		scannedCount: scannedCount,
 		onProgress:   opts.OnProgress,
+		checkCancel:  opts.CheckCancel,
 		result: RootScanResult{
 			LibraryRootID: root.ID,
 			RootPath:      root.Path,
@@ -551,6 +619,7 @@ type rootScanState struct {
 	obs          *libraryWalkObservations
 	scannedCount *int64
 	onProgress   func(scannedCount int64, currentPath string)
+	checkCancel  func(context.Context) error
 	result       RootScanResult
 }
 
@@ -566,6 +635,9 @@ func (st *rootScanState) reportFileProgress(displayPath string) {
 
 func (st *rootScanState) handleEntry(entry WalkEntry) error {
 	if err := st.ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkScanCancel(st.ctx, st.checkCancel); err != nil {
 		return err
 	}
 	switch entry.Kind {

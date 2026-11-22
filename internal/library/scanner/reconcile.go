@@ -128,9 +128,13 @@ func (s *Scanner) reconcileLibraryPass(
 	preWalkAssets []domain.MediaAsset,
 	obs *libraryWalkObservations,
 	gracePeriod time.Duration,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkScanCancel(ctx, checkCancel); err != nil {
 		return err
 	}
 
@@ -144,34 +148,43 @@ func (s *Scanner) reconcileLibraryPass(
 
 	var writeErrs []error
 	for _, step := range []func() error{
-		func() error { return s.executeMoves(ctx, libraryID, checkedRoots, plan.MoveComponents, res) },
-		func() error { return s.executeModifies(ctx, libraryID, checkedRoots, plan.Modifies, res) },
-		func() error { return s.executeRestores(ctx, libraryID, checkedRoots, plan.Restores, res) },
 		func() error {
-			return s.executeMtimeRefreshes(ctx, libraryID, checkedRoots, plan.MtimeRefreshes, res)
+			return s.executeMoves(ctx, libraryID, checkedRoots, plan.MoveComponents, checkCancel, res)
+		},
+		func() error {
+			return s.executeModifies(ctx, libraryID, checkedRoots, plan.Modifies, checkCancel, res)
+		},
+		func() error {
+			return s.executeRestores(ctx, libraryID, checkedRoots, plan.Restores, checkCancel, res)
+		},
+		func() error {
+			return s.executeMtimeRefreshes(ctx, libraryID, checkedRoots, plan.MtimeRefreshes, checkCancel, res)
 		},
 	} {
 		if err := step(); err != nil {
-			if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
+			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 				return errors.Join(append(writeErrs, err)...)
 			}
 			writeErrs = append(writeErrs, err)
 		}
 	}
-	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, res); err != nil {
+	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, checkCancel, res); err != nil {
 		return errors.Join(append(writeErrs, err)...)
 	}
 	if len(writeErrs) > 0 {
 		return errors.Join(writeErrs...)
 	}
 
-	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, res); err != nil {
-		if errors.Is(err, ErrStalePreCheck) || ctx.Err() != nil {
+	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, checkCancel, res); err != nil {
+		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 			return err
 		}
 		writeErrs = append(writeErrs, err)
 	}
-	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, plan.RetireMissing, gracePeriod, reconcileNow, res); err != nil {
+	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, plan.RetireMissing, gracePeriod, reconcileNow, checkCancel, res); err != nil {
+		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
+			return errors.Join(append(writeErrs, err)...)
+		}
 		writeErrs = append(writeErrs, err)
 	}
 	return errors.Join(writeErrs...)
@@ -677,18 +690,22 @@ func (s *Scanner) executeMoves(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	components [][]plannedMove,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	var writeErrs []error
 	for _, comp := range components {
 		if err := ctx.Err(); err != nil {
-			return err
+			return errors.Join(append(writeErrs, err)...)
+		}
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
+			return errors.Join(append(writeErrs, err)...)
 		}
 		if err := s.applyMoveComponent(ctx, libraryID, checkedRoots, comp); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return errors.Join(append(writeErrs, ctxErr)...)
 			}
-			if errors.Is(err, ErrStalePreCheck) {
+			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 				return errors.Join(append(writeErrs, err)...)
 			}
 			for _, mv := range comp {
@@ -1015,10 +1032,12 @@ func (s *Scanner) executeModifies(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	modifies []plannedModify,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	return runReconcileStep(
 		ctx,
+		checkCancel,
 		modifies,
 		func(mod plannedModify) error {
 			applied, wasMissing, err := s.applyExternalModify(ctx, libraryID, checkedRoots, mod)
@@ -1283,6 +1302,7 @@ func isImmutableModifyPrimary(m domain.SeriesMembership) bool {
 
 func runReconcileStep[T any](
 	ctx context.Context,
+	checkCancel func(context.Context) error,
 	items []T,
 	apply func(T) error,
 	onSkip func(T, error),
@@ -1292,11 +1312,14 @@ func runReconcileStep[T any](
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(writeErrs, err)...)
 		}
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
+			return errors.Join(append(writeErrs, err)...)
+		}
 		if err := apply(item); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return errors.Join(append(writeErrs, ctxErr)...)
 			}
-			if errors.Is(err, ErrStalePreCheck) {
+			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 				return errors.Join(append(writeErrs, err)...)
 			}
 			if onSkip != nil {
@@ -1347,10 +1370,12 @@ func (s *Scanner) executeRestores(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	restores []plannedRestore,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	return runReconcileStep(
 		ctx,
+		checkCancel,
 		restores,
 		func(r plannedRestore) error {
 			if err := s.applySamePathRestore(ctx, libraryID, checkedRoots, r); err != nil {
@@ -1417,10 +1442,12 @@ func (s *Scanner) executeMtimeRefreshes(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	refreshes []plannedModify,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	return runReconcileStep(
 		ctx,
+		checkCancel,
 		refreshes,
 		func(ref plannedModify) error {
 			return s.applyMtimeRefresh(ctx, libraryID, checkedRoots, ref)
@@ -1466,10 +1493,12 @@ func (s *Scanner) executeMarkMissing(
 	checkedRoots []RootCheckResult,
 	items []plannedAssetTransition,
 	missingAt time.Time,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	return runReconcileStep(
 		ctx,
+		checkCancel,
 		items,
 		func(item plannedAssetTransition) error {
 			if err := s.applyMarkMissing(ctx, libraryID, checkedRoots, item, missingAt); err != nil {
@@ -1516,10 +1545,12 @@ func (s *Scanner) executeRetireMissing(
 	items []plannedAssetTransition,
 	grace time.Duration,
 	retiredAt time.Time,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	return runReconcileStep(
 		ctx,
+		checkCancel,
 		items,
 		func(item plannedAssetTransition) error {
 			if err := s.applyRetireMissing(ctx, libraryID, checkedRoots, item, grace, retiredAt); err != nil {
@@ -1562,10 +1593,14 @@ func (s *Scanner) executeDeferredIndexes(
 	libraryID string,
 	checkedRoots []RootCheckResult,
 	toIndex []observedFile,
+	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
 	for _, item := range toIndex {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
 			return err
 		}
 		_, err := s.indexer.indexFileWithRootSnapshot(ctx, IndexFileInput{
@@ -1577,7 +1612,7 @@ func (s *Scanner) executeDeferredIndexes(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			if errors.Is(err, ErrStalePreCheck) {
+			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 				return err
 			}
 			res.recordReconcileSkipped(item.rootID, SkippedEntry{

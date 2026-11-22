@@ -38,6 +38,11 @@ type JobTrigger interface {
 	Trigger(ctx context.Context, req jobs.TriggerRequest) (string, error)
 }
 
+// DefaultScanMaxAttempts is the default attempt budget for durable SCAN jobs (ADR-0017 §1, §7).
+// Interrupted attempts count toward max_attempts on startup recovery, so 3 attempts allows
+// two restarts or crashes to recover cleanly before failing a third interrupted attempt.
+const DefaultScanMaxAttempts = domain.DefaultJobMaxAttempts
+
 // TriggerScanOptions configures an individual library scan job trigger.
 type TriggerScanOptions struct {
 	CreatedBy   *string
@@ -58,11 +63,15 @@ func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts
 	if err != nil {
 		return "", fmt.Errorf("marshaling scan job payload: %w", err)
 	}
+	maxAttempts := opts.MaxAttempts
+	if maxAttempts == 0 {
+		maxAttempts = DefaultScanMaxAttempts
+	}
 	return trigger.Trigger(ctx, jobs.TriggerRequest{
 		Kind:        domain.JobKindScan,
 		Payload:     payload,
 		DedupeKey:   &dedupeKey,
-		MaxAttempts: opts.MaxAttempts,
+		MaxAttempts: maxAttempts,
 		CreatedBy:   opts.CreatedBy,
 		RunAfter:    opts.RunAfter,
 	})
@@ -179,8 +188,21 @@ func (m *Module) handleScanJob(ctx context.Context, exec *jobs.Execution) error 
 		OnProgress: func(scannedCount int64, currentPath string) {
 			exec.ReportProgress(ctx, scannedCount, currentPath)
 		},
+		CheckCancel: func(checkCtx context.Context) error {
+			cancelled, cancelErr := exec.CheckCancelled(checkCtx)
+			if cancelErr != nil {
+				return cancelErr
+			}
+			if cancelled {
+				return jobs.ErrJobCancelled
+			}
+			return nil
+		},
 	})
 	if err != nil {
+		if errors.Is(err, jobs.ErrJobCancelled) {
+			return err
+		}
 		if errors.Is(err, ErrLibraryNotFound) ||
 			errors.Is(err, domain.ErrEmptyLibraryID) ||
 			errors.Is(err, ErrInvalidWorkerCount) {
