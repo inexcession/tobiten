@@ -7,8 +7,13 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
@@ -536,18 +541,20 @@ func TestCatalogueRepository_BrowseFolderPaginationAndHardMaximum(t *testing.T) 
 		}
 	}
 
-	// 3. Offset at/past TotalCount returns empty slice while preserving exact TotalCount
-	pastEnd, err := fx.repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
-		LibraryID:       fx.libraryID,
-		FolderPathBytes: []byte("Shelf"),
-		Limit:           25,
-		Offset:          totalEntries,
-	})
-	if err != nil {
-		t.Fatalf("BrowseFolder pastEnd: %v", err)
-	}
-	if pastEnd.TotalCount != totalEntries || len(pastEnd.Entries) != 0 || pastEnd.Offset != totalEntries || pastEnd.Limit != 25 {
-		t.Fatalf("pastEnd = %+v, want TotalCount=%d len=0 Limit=25 Offset=%d", pastEnd, totalEntries, totalEntries)
+	// 3. Offset at or beyond TotalCount returns empty slice while preserving exact TotalCount
+	for _, off := range []int{totalEntries, totalEntries + 10} {
+		pastEnd, err := fx.repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
+			LibraryID:       fx.libraryID,
+			FolderPathBytes: []byte("Shelf"),
+			Limit:           25,
+			Offset:          off,
+		})
+		if err != nil {
+			t.Fatalf("BrowseFolder pastEnd(offset=%d): %v", off, err)
+		}
+		if pastEnd.TotalCount != totalEntries || len(pastEnd.Entries) != 0 || pastEnd.Offset != off || pastEnd.Limit != 25 {
+			t.Fatalf("pastEnd(offset=%d) = %+v, want TotalCount=%d len=0 Limit=25 Offset=%d", off, pastEnd, totalEntries, off)
+		}
 	}
 
 	// 4. Invalid negative or overflowing pagination fails closed
@@ -613,4 +620,226 @@ func TestCatalogueRepository_BrowseFolderExcludesMissingAndRetiredAssets(t *test
 			t.Fatalf("BrowseFolder(MixedAvail) = (%+v, %v), want [%s]", mixRes, err, aMixLive)
 		}
 	}
+}
+
+type interveningCatalogueDBTX struct {
+	mu               sync.Mutex
+	inner            postgres.DBTX
+	predicateQueries int
+	catalogueQueries int
+	onSecondCatQuery func(context.Context) error
+	hookErr          error
+}
+
+func (d *interveningCatalogueDBTX) recordQuery(ctx context.Context, sql string) {
+	d.mu.Lock()
+	if strings.Contains(sql, "user_label_policies") {
+		d.predicateQueries++
+		d.mu.Unlock()
+		return
+	}
+	d.catalogueQueries++
+	shouldTrigger := d.catalogueQueries == 2 && d.onSecondCatQuery != nil
+	fn := d.onSecondCatQuery
+	d.mu.Unlock()
+
+	if shouldTrigger {
+		if err := fn(ctx); err != nil {
+			d.mu.Lock()
+			if d.hookErr == nil {
+				d.hookErr = err
+			}
+			d.mu.Unlock()
+		}
+	}
+}
+
+func (d *interveningCatalogueDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	d.recordQuery(ctx, sql)
+	return d.inner.Exec(ctx, sql, args...)
+}
+
+func (d *interveningCatalogueDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	d.recordQuery(ctx, sql)
+	return d.inner.Query(ctx, sql, args...)
+}
+
+func (d *interveningCatalogueDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	d.recordQuery(ctx, sql)
+	return d.inner.QueryRow(ctx, sql, args...)
+}
+
+func TestCatalogueRepository_BrowseFolderSingleSnapshotUnderInterveningChange(t *testing.T) {
+	t.Run("trashing sole visible asset cannot produce stale TotalCount with empty page", func(t *testing.T) {
+		fx := setupFolderBrowseFixture(t, "/mnt/snap-trash")
+		labelRepo := postgres.NewLabelRepository(fx.tdb.Pool)
+		scope := storage.CatalogueReadScope{Principal: fx.reader}
+
+		aOnly := fx.insertAsset(t, fx.rootIDs[0], fx.volumeID, []byte("FolderA/only.cbz"), domain.MediaFormatCBZ, 100, 10, nil, nil)
+
+		db := &interveningCatalogueDBTX{
+			inner: fx.tdb.Pool,
+			onSecondCatQuery: func(ctx context.Context) error {
+				return labelRepo.AssignItemLabel(ctx, &domain.ItemLabel{
+					LabelID:  domain.LabelMarkedForDeletionID,
+					ItemType: domain.ItemTypeAsset,
+					ItemID:   aOnly,
+				})
+			},
+		}
+		repo := postgres.NewCatalogueRepository(db)
+
+		res, err := repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
+			LibraryID: fx.libraryID,
+			Limit:     10,
+			Offset:    0,
+		})
+		if err != nil {
+			t.Fatalf("BrowseFolder: %v", err)
+		}
+		if db.hookErr != nil {
+			t.Fatalf("intervening hook failed: %v", db.hookErr)
+		}
+		if db.catalogueQueries != 1 {
+			t.Fatalf("BrowseFolder executed %d catalogue statements, want 1", db.catalogueQueries)
+		}
+		if res.TotalCount != 1 || len(res.Entries) != 1 || res.Entries[0].Name.Display != "FolderA" {
+			t.Fatalf("BrowseFolder returned inconsistent snapshot (TotalCount=%d, Entries=%+v), want TotalCount=1 and [FolderA]",
+				res.TotalCount, res.Entries)
+		}
+
+		// Apply the trash mark now and confirm subsequent browse sees 0 and empty.
+		if err := labelRepo.AssignItemLabel(fx.ctx, &domain.ItemLabel{
+			LabelID:  domain.LabelMarkedForDeletionID,
+			ItemType: domain.ItemTypeAsset,
+			ItemID:   aOnly,
+		}); err != nil {
+			t.Fatalf("AssignItemLabel(marked_for_deletion): %v", err)
+		}
+		after, err := fx.repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
+			LibraryID: fx.libraryID,
+			Limit:     10,
+			Offset:    0,
+		})
+		if err != nil {
+			t.Fatalf("BrowseFolder after trash: %v", err)
+		}
+		if after.TotalCount != 0 || len(after.Entries) != 0 {
+			t.Fatalf("BrowseFolder after trash = (TotalCount=%d, Entries=%+v), want 0 and empty", after.TotalCount, after.Entries)
+		}
+	})
+
+	t.Run("adding visible asset cannot produce page longer than TotalCount", func(t *testing.T) {
+		fx := setupFolderBrowseFixture(t, "/mnt/snap-add")
+		scope := storage.CatalogueReadScope{Principal: fx.reader}
+
+		_ = fx.insertAsset(t, fx.rootIDs[0], fx.volumeID, []byte("FolderA/initial.cbz"), domain.MediaFormatCBZ, 100, 10, nil, nil)
+
+		db := &interveningCatalogueDBTX{
+			inner: fx.tdb.Pool,
+			onSecondCatQuery: func(ctx context.Context) error {
+				pid, err := domain.NewRelativePathIdentity([]byte("FolderB/added.cbz"))
+				if err != nil {
+					return err
+				}
+				_, err = fx.tdb.Exec(ctx, `
+					INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format, page_count)
+					VALUES ($1, $2, $3, $4, $5, $6, 100, 'CBZ', 10)`,
+					domain.MustNewID(), fx.volumeID, fx.rootIDs[0], pid.Bytes, pid.Display, pid.Match,
+				)
+				return err
+			},
+		}
+		repo := postgres.NewCatalogueRepository(db)
+
+		res, err := repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
+			LibraryID: fx.libraryID,
+			Limit:     10,
+			Offset:    0,
+		})
+		if err != nil {
+			t.Fatalf("BrowseFolder: %v", err)
+		}
+		if db.hookErr != nil {
+			t.Fatalf("intervening hook failed: %v", db.hookErr)
+		}
+		if db.catalogueQueries != 1 {
+			t.Fatalf("BrowseFolder executed %d catalogue statements, want 1", db.catalogueQueries)
+		}
+		if res.TotalCount != 1 || len(res.Entries) != 1 || res.Entries[0].Name.Display != "FolderA" {
+			t.Fatalf("BrowseFolder returned inconsistent snapshot (TotalCount=%d, Entries=%+v), want TotalCount=1 and [FolderA]",
+				res.TotalCount, res.Entries)
+		}
+	})
+
+	t.Run("concurrent additions and trash mutations always yield matching TotalCount and page", func(t *testing.T) {
+		fx := setupFolderBrowseFixture(t, "/mnt/snap-conc")
+		labelRepo := postgres.NewLabelRepository(fx.tdb.Pool)
+		scope := storage.CatalogueReadScope{Principal: fx.reader}
+
+		aToggle := fx.insertAsset(t, fx.rootIDs[0], fx.volumeID, []byte("Toggle/book.cbz"), domain.MediaFormatCBZ, 100, 10, nil, nil)
+		_ = fx.insertAsset(t, fx.rootIDs[0], fx.volumeID, []byte("Static/book.cbz"), domain.MediaFormatCBZ, 100, 10, nil, nil)
+
+		stop := make(chan struct{})
+		mutErrCh := make(chan error, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			trashed := false
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				itemLbl := &domain.ItemLabel{
+					LabelID:  domain.LabelMarkedForDeletionID,
+					ItemType: domain.ItemTypeAsset,
+					ItemID:   aToggle,
+				}
+				var err error
+				if !trashed {
+					err = labelRepo.AssignItemLabel(fx.ctx, itemLbl)
+				} else {
+					err = labelRepo.RemoveItemLabel(fx.ctx, itemLbl)
+				}
+				if err != nil {
+					select {
+					case mutErrCh <- err:
+					default:
+					}
+					return
+				}
+				trashed = !trashed
+			}
+		}()
+
+		for i := range 25 {
+			res, err := fx.repo.BrowseFolder(fx.ctx, scope, storage.FolderBrowseFilter{
+				LibraryID: fx.libraryID,
+				Limit:     10,
+				Offset:    0,
+			})
+			if err != nil {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("iteration %d BrowseFolder: %v", i, err)
+			}
+			if int64(len(res.Entries)) != res.TotalCount {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("iteration %d inconsistent snapshot: TotalCount=%d len(Entries)=%d (%+v)",
+					i, res.TotalCount, len(res.Entries), res.Entries)
+			}
+		}
+
+		close(stop)
+		wg.Wait()
+		select {
+		case err := <-mutErrCh:
+			t.Fatalf("concurrent mutator failed: %v", err)
+		default:
+		}
+	})
 }

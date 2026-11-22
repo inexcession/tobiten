@@ -72,28 +72,12 @@ const (
 		FROM series_memberships sm
 		JOIN series s_m ON s_m.id = sm.series_id`
 
-	selectFolderBrowseCount = `
-		SELECT
-			COUNT(DISTINCT CASE WHEN entry.is_folder THEN entry.child_name_bytes END)
-			+ COUNT(CASE WHEN NOT entry.is_folder THEN 1 END)
-		FROM media_assets a
-		JOIN library_roots r ON r.id = a.library_root_id
-		CROSS JOIN LATERAL (
-			SELECT
-				(p.slash_pos > 0) AS is_folder,
-				CASE
-					WHEN p.slash_pos > 0 THEN substring(a.rel_path_bytes FROM $2::int FOR p.slash_pos - 1)
-					ELSE NULL::bytea
-				END AS child_name_bytes
-			FROM (SELECT position('/'::bytea IN substring(a.rel_path_bytes FROM $2::int)) AS slash_pos) p
-		) entry`
-
 	selectFolderBrowseEntries = `
 		SELECT
-			entry.is_folder,
-			entry.child_name_bytes,
-			entry.entry_rel_path_bytes,
-			entry.asset_id,
+			entry.is_folder AS is_folder,
+			entry.child_name_bytes AS child_name_bytes,
+			entry.entry_rel_path_bytes AS entry_rel_path_bytes,
+			entry.asset_id AS asset_id,
 			MAX(CASE WHEN NOT entry.is_folder THEN a.volume_id END) AS volume_id,
 			MAX(CASE WHEN NOT entry.is_folder THEN a.library_root_id END) AS library_root_id,
 			MAX(CASE WHEN NOT entry.is_folder THEN a.file_size END) AS file_size,
@@ -120,10 +104,30 @@ const (
 		) entry`
 )
 
+var folderBrowseColumns = []string{
+	"is_folder",
+	"child_name_bytes",
+	"entry_rel_path_bytes",
+	"asset_id",
+	"volume_id",
+	"library_root_id",
+	"file_size",
+	"format",
+	"page_count",
+}
+
 // predicateClause binds a table alias in the query to a LabelPredicate SQL fragment generator.
 type predicateClause struct {
 	alias      string
 	fragmentFn func(*LabelPredicate, string, int) (SQLFragment, error)
+}
+
+// guardedPagedTotalSpec wraps a guarded grouped/filtered entry query into a single
+// snapshot statement that returns total_count alongside the ordered, paginated page rows,
+// preserving total_count even when zero entries exist or offset >= total_count.
+type guardedPagedTotalSpec struct {
+	columns []string
+	orderBy string
 }
 
 // guardedQuerySpec describes a parameterized SQL query executed through guardedCatalogueDB.
@@ -136,6 +140,7 @@ type guardedQuerySpec struct {
 	orderBy    string
 	limit      int
 	offset     int
+	pagedTotal *guardedPagedTotalSpec
 }
 
 // guardedCatalogueDB is the shared query boundary for CatalogueRepository.
@@ -190,6 +195,24 @@ func (g *guardedCatalogueDB) prepare(pred *LabelPredicate, spec guardedQuerySpec
 		args = append(args, frag.Args...)
 	}
 
+	if spec.pagedTotal != nil {
+		if spec.limit <= 0 {
+			return "", nil, fmt.Errorf("paged total query requires positive limit, got %d", spec.limit)
+		}
+		if len(spec.pagedTotal.columns) == 0 || strings.TrimSpace(spec.pagedTotal.orderBy) == "" {
+			return "", nil, errors.New("paged total query requires columns and orderBy")
+		}
+		baseQuery := spec.selectFrom + " WHERE " + strings.Join(whereParts, " AND ") + spec.groupBy
+		args = append(args, spec.limit)
+		limitParam := len(args)
+		offsetParam := 0
+		if spec.offset > 0 {
+			args = append(args, spec.offset)
+			offsetParam = len(args)
+		}
+		return wrapPagedTotalQuery(baseQuery, spec.pagedTotal, limitParam, offsetParam), args, nil
+	}
+
 	query := spec.selectFrom + " WHERE " + strings.Join(whereParts, " AND ") + spec.groupBy + spec.orderBy
 	if spec.limit > 0 {
 		args = append(args, spec.limit)
@@ -200,6 +223,36 @@ func (g *guardedCatalogueDB) prepare(pred *LabelPredicate, spec guardedQuerySpec
 		query += fmt.Sprintf(" OFFSET $%d", len(args))
 	}
 	return query, args, nil
+}
+
+func wrapPagedTotalQuery(baseQuery string, paged *guardedPagedTotalSpec, limitParam, offsetParam int) string {
+	eCols := make([]string, len(paged.columns))
+	pCols := make([]string, len(paged.columns))
+	for i, col := range paged.columns {
+		eCols[i] = "e." + col
+		pCols[i] = "p." + col
+	}
+	offsetClause := ""
+	if offsetParam > 0 {
+		offsetClause = fmt.Sprintf(" OFFSET $%d", offsetParam)
+	}
+	return fmt.Sprintf(`WITH entries AS (%s),
+total AS (SELECT COUNT(*)::bigint AS total_count FROM entries),
+paged AS (
+	SELECT ROW_NUMBER() OVER (ORDER BY %s) AS _row_ord, %s
+	FROM entries e
+	ORDER BY %s
+	LIMIT $%d%s
+)
+SELECT t.total_count, (p._row_ord IS NOT NULL) AS has_row, %s
+FROM total t
+LEFT JOIN paged p ON TRUE
+ORDER BY p._row_ord ASC NULLS LAST`,
+		baseQuery,
+		paged.orderBy, strings.Join(eCols, ", "),
+		paged.orderBy, limitParam, offsetClause,
+		strings.Join(pCols, ", "),
+	)
 }
 
 func (g *guardedCatalogueDB) query(ctx context.Context, pred *LabelPredicate, spec guardedQuerySpec) (pgx.Rows, error) {
@@ -288,6 +341,37 @@ func queryCount(
 		return 0, err
 	}
 	return scanCountRow(row)
+}
+
+func queryPagedTotal[T any](
+	ctx context.Context,
+	g *guardedCatalogueDB,
+	pred *LabelPredicate,
+	spec guardedQuerySpec,
+	scanFn func(pgx.Row) (int64, bool, *T, error),
+) ([]T, int64, error) {
+	rows, err := g.query(ctx, pred, spec)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var total int64
+	out := []T{}
+	for rows.Next() {
+		rowTotal, hasRow, item, err := scanFn(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		total = rowTotal
+		if hasRow {
+			out = append(out, *item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, mapPgError(err)
+	}
+	return out, total, nil
 }
 
 // CatalogueRepository implements storage.CatalogueRepository backed by PostgreSQL,
@@ -683,6 +767,7 @@ func (r *CatalogueRepository) CountReadingProgress(ctx context.Context, scope st
 // BrowseFolder returns a server-paginated slice of immediate child folders and available
 // file manifestations under filter.FolderPathBytes across all roots of filter.LibraryID,
 // enforcing LabelPredicate visibility and capping page size at storage.MaxFolderBrowseLimit.
+// Both TotalCount and Entries are computed in one guarded snapshot statement.
 func (r *CatalogueRepository) BrowseFolder(ctx context.Context, scope storage.CatalogueReadScope, filter storage.FolderBrowseFilter) (*storage.FolderBrowseResult, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -694,31 +779,21 @@ func (r *CatalogueRepository) BrowseFolder(ctx context.Context, scope storage.Ca
 	}
 
 	whereParts, args := buildFolderBrowseWhereAndArgs(filter.LibraryID, folderPath.Bytes)
-	total, err := queryCount(ctx, &r.guard, pred, guardedQuerySpec{
-		selectFrom: selectFolderBrowseCount,
+	entries, total, err := queryPagedTotal(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectFolderBrowseEntries,
 		whereParts: whereParts,
 		args:       args,
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
-	})
+		groupBy:    " GROUP BY entry.is_folder, entry.child_name_bytes, entry.entry_rel_path_bytes, entry.asset_id",
+		limit:      limit,
+		offset:     filter.Offset,
+		pagedTotal: &guardedPagedTotalSpec{
+			columns: folderBrowseColumns,
+			orderBy: "e.is_folder DESC, e.child_name_bytes ASC, e.asset_id ASC NULLS FIRST",
+		},
+	}, scanFolderBrowseRow)
 	if err != nil {
 		return nil, err
-	}
-
-	entries := []storage.FolderEntry{}
-	if total > 0 && int64(filter.Offset) < total {
-		entries, err = queryList(ctx, &r.guard, pred, guardedQuerySpec{
-			selectFrom: selectFolderBrowseEntries,
-			whereParts: whereParts,
-			args:       args,
-			predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
-			groupBy:    " GROUP BY entry.is_folder, entry.child_name_bytes, entry.entry_rel_path_bytes, entry.asset_id",
-			orderBy:    " ORDER BY entry.is_folder DESC, entry.child_name_bytes ASC, entry.asset_id ASC NULLS FIRST",
-			limit:      limit,
-			offset:     filter.Offset,
-		}, scanFolderEntryRow)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	return &storage.FolderBrowseResult{
@@ -1290,9 +1365,11 @@ func int32SliceToInt(in []int32) []int {
 	return out
 }
 
-func scanFolderEntryRow(row pgx.Row) (*storage.FolderEntry, error) {
+func scanFolderBrowseRow(row pgx.Row) (int64, bool, *storage.FolderEntry, error) {
 	var (
-		isFolder       bool
+		totalCount     int64
+		hasRow         bool
+		isFolder       *bool
 		childNameBytes []byte
 		relPathBytes   []byte
 		assetID        *string
@@ -1303,6 +1380,8 @@ func scanFolderEntryRow(row pgx.Row) (*storage.FolderEntry, error) {
 		pageCount      *int32
 	)
 	err := row.Scan(
+		&totalCount,
+		&hasRow,
 		&isFolder,
 		&childNameBytes,
 		&relPathBytes,
@@ -1314,19 +1393,25 @@ func scanFolderEntryRow(row pgx.Row) (*storage.FolderEntry, error) {
 		&pageCount,
 	)
 	if err != nil {
-		return nil, mapPgError(err)
+		return 0, false, nil, mapPgError(err)
+	}
+	if !hasRow {
+		return totalCount, false, nil, nil
+	}
+	if isFolder == nil {
+		return 0, false, nil, errors.New("folder entry row missing is_folder")
 	}
 
 	entry := &storage.FolderEntry{
 		Name:    domain.NewPathIdentity(childNameBytes),
 		RelPath: domain.NewPathIdentity(relPathBytes),
 	}
-	if isFolder {
+	if *isFolder {
 		entry.Kind = storage.FolderEntryKindFolder
-		return entry, nil
+		return totalCount, true, entry, nil
 	}
 	if assetID == nil || volumeID == nil || libraryRootID == nil || fileSize == nil || format == nil || pageCount == nil {
-		return nil, errors.New("folder file entry missing required asset metadata")
+		return 0, false, nil, errors.New("folder file entry missing required asset metadata")
 	}
 	entry.Kind = storage.FolderEntryKindFile
 	entry.AssetID = *assetID
@@ -1335,5 +1420,5 @@ func scanFolderEntryRow(row pgx.Row) (*storage.FolderEntry, error) {
 	entry.FileSize = *fileSize
 	entry.Format = domain.MediaFormat(*format)
 	entry.PageCount = int(*pageCount)
-	return entry, nil
+	return totalCount, true, entry, nil
 }
