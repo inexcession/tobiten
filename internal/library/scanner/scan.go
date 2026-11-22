@@ -571,7 +571,6 @@ func (s *Scanner) scanOneRoot(
 		obs:          obs,
 		scannedCount: scannedCount,
 		onProgress:   opts.OnProgress,
-		checkCancel:  opts.CheckCancel,
 		result: RootScanResult{
 			LibraryRootID: root.ID,
 			RootPath:      root.Path,
@@ -631,7 +630,6 @@ type rootScanState struct {
 	obs          *libraryWalkObservations
 	scannedCount *int64
 	onProgress   func(scannedCount int64, currentPath string)
-	checkCancel  func(context.Context) error
 	result       RootScanResult
 }
 
@@ -647,9 +645,6 @@ func (st *rootScanState) reportFileProgress(displayPath string) {
 
 func (st *rootScanState) handleEntry(entry WalkEntry) error {
 	if err := st.ctx.Err(); err != nil {
-		return err
-	}
-	if err := checkScanCancel(st.ctx, st.checkCancel); err != nil {
 		return err
 	}
 	switch entry.Kind {

@@ -195,29 +195,10 @@ type walkRuntime struct {
 	stat              func([]byte) (os.FileInfo, error)
 	open              func(context.Context, []byte) (ReadAtCloser, error)
 	subtreeIncomplete atomic.Bool
-	abortMu           sync.Mutex
-	abortErr          error
 }
 
 func (rt *walkRuntime) markSubtreeIncomplete() {
 	rt.subtreeIncomplete.Store(true)
-}
-
-func (rt *walkRuntime) recordAbort(err error) {
-	if err == nil {
-		return
-	}
-	rt.abortMu.Lock()
-	if rt.abortErr == nil {
-		rt.abortErr = err
-	}
-	rt.abortMu.Unlock()
-}
-
-func (rt *walkRuntime) getAbortErr() error {
-	rt.abortMu.Lock()
-	defer rt.abortMu.Unlock()
-	return rt.abortErr
 }
 
 // WalkRoot sequentially walks rootBytes (reading one directory at a time in
@@ -322,8 +303,8 @@ func trimTrailingSlashes(raw []byte) []byte {
 }
 
 func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkResult, error) {
-	walkCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	walkCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
 	tasksCh := make(chan inspectTask)
 	resultsCh := make(chan WalkEntry)
@@ -333,49 +314,50 @@ func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkR
 	for range rt.workers {
 		go func() {
 			defer workersWG.Done()
-			rt.runWorker(ctx, walkCtx, cancel, tasksCh, resultsCh)
+			rt.runWorker(walkCtx, cancel, tasksCh, resultsCh)
 		}()
 	}
 
-	var walkErr error
 	go func() {
 		defer close(resultsCh)
 		defer workersWG.Wait()
 		defer close(tasksCh)
 		if err := rt.walkDir(walkCtx, nil, rt.root, []os.FileInfo{rootInfo}, true, tasksCh, resultsCh); err != nil {
-			walkErr = err
-			cancel()
+			cancel(err)
 		}
 	}()
 
-	res, cbErr := rt.collectResults(resultsCh, cancel)
-	if cbErr != nil {
+	res := rt.collectResults(walkCtx, cancel, resultsCh)
+	if cause := context.Cause(walkCtx); cause != nil {
 		res.Complete = false
-		return res, cbErr
-	}
-	if abortErr := rt.getAbortErr(); abortErr != nil {
-		res.Complete = false
-		return res, abortErr
-	}
-	if walkErr != nil {
-		res.Complete = false
-		return res, walkErr
-	}
-	if err := ctx.Err(); err != nil {
-		res.Complete = false
-		return res, err
+		return res, cause
 	}
 
 	res.Complete = !rt.subtreeIncomplete.Load()
 	return res, nil
 }
 
-func (rt *walkRuntime) collectResults(resultsCh <-chan WalkEntry, cancel context.CancelFunc) (WalkResult, error) {
+func (rt *walkRuntime) collectResults(
+	walkCtx context.Context,
+	cancel context.CancelCauseFunc,
+	resultsCh <-chan WalkEntry,
+) WalkResult {
 	var res WalkResult
-	var cbErr error
+	var aborted bool
 	collectSlices := rt.opts.OnEntry == nil
 
 	for entry := range resultsCh {
+		if !aborted && walkCtx.Err() != nil {
+			aborted = true
+		}
+		if !aborted && rt.opts.CheckCancel != nil {
+			if err := rt.opts.CheckCancel(walkCtx); err != nil {
+				cancel(err)
+				aborted = true
+				continue
+			}
+		}
+
 		switch entry.Kind {
 		case EntryInspected:
 			res.InspectedCount++
@@ -394,14 +376,14 @@ func (rt *walkRuntime) collectResults(resultsCh <-chan WalkEntry, cancel context
 			}
 		}
 
-		if rt.opts.OnEntry != nil && cbErr == nil {
+		if rt.opts.OnEntry != nil && !aborted {
 			if err := rt.opts.OnEntry(entry); err != nil {
-				cbErr = err
-				cancel()
+				cancel(err)
+				aborted = true
 			}
 		}
 	}
-	return res, cbErr
+	return res
 }
 
 func (rt *walkRuntime) walkDir(
@@ -606,9 +588,8 @@ func (rt *walkRuntime) handleCBZFile(
 }
 
 func (rt *walkRuntime) runWorker(
-	parentCtx context.Context,
 	walkCtx context.Context,
-	cancel context.CancelFunc,
+	cancel context.CancelCauseFunc,
 	tasksCh <-chan inspectTask,
 	resultsCh chan<- WalkEntry,
 ) {
@@ -624,11 +605,8 @@ func (rt *walkRuntime) runWorker(
 				return
 			}
 			if rt.opts.CheckCancel != nil {
-				if err := rt.opts.CheckCancel(parentCtx); err != nil {
-					if walkCtx.Err() == nil {
-						rt.recordAbort(err)
-						cancel()
-					}
+				if err := rt.opts.CheckCancel(walkCtx); err != nil {
+					cancel(err)
 					return
 				}
 			}

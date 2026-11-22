@@ -1312,3 +1312,77 @@ func TestWalkRoot_CancelBeforeNextArchiveAdmission_OneWorker(t *testing.T) {
 		}
 	}
 }
+
+func TestWalkRoot_TwoWorkersAbortStopsOutstandingAdmissionCheck(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	cbzBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "001.jpg", data: []byte("page1"), method: zip.Store},
+	)
+	for _, name := range []string{"01_first.cbz", "02_second.cbz"} {
+		if err := os.WriteFile(filepath.Join(root, name), cbzBytes, 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+
+	parentCtx, parentCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer parentCancel()
+
+	sentinelCancel := errors.New("walk cancel requested")
+	var callNum atomic.Int32
+	var entered atomic.Int32
+	bothEntered := make(chan struct{})
+	var openCalls atomic.Int32
+
+	type outcome struct {
+		res scanner.WalkResult
+		err error
+	}
+	doneCh := make(chan outcome, 1)
+	go func() {
+		res, err := scanner.WalkRoot(parentCtx, []byte(root), scanner.WalkOptions{
+			Workers: 2,
+			CheckCancel: func(checkCtx context.Context) error {
+				id := callNum.Add(1)
+				if entered.Add(1) == 2 {
+					close(bothEntered)
+				}
+				select {
+				case <-bothEntered:
+				case <-checkCtx.Done():
+					return checkCtx.Err()
+				}
+				if id == 1 {
+					return sentinelCancel
+				}
+				// Sibling worker stays in CheckCancel until walkCtx is cancelled; parentCtx remains live.
+				<-checkCtx.Done()
+				return checkCtx.Err()
+			},
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				openCalls.Add(1)
+				return os.Open(string(rawPath))
+			},
+		})
+		doneCh <- outcome{res: res, err: err}
+	}()
+
+	select {
+	case out := <-doneCh:
+		if parentCtx.Err() != nil {
+			t.Fatalf("parentCtx unexpectedly cancelled: %v", parentCtx.Err())
+		}
+		if !errors.Is(out.err, sentinelCancel) {
+			t.Fatalf("WalkRoot err = %v, want errors.Is(_, %v)", out.err, sentinelCancel)
+		}
+		if out.res.Complete {
+			t.Fatalf("WalkRoot Complete = true, want false")
+		}
+		if got := openCalls.Load(); got != 0 {
+			t.Fatalf("Open called %d times, want 0", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WalkRoot hung waiting for outstanding sibling CheckCancel while parent context remained live")
+	}
+}
