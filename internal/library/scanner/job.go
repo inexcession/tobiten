@@ -15,7 +15,6 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/module"
-	"github.com/inexcession/tobiten/internal/storage"
 )
 
 // ModuleName is the canonical compiled-in module name for the library scanner (ADR-0018 §1).
@@ -67,24 +66,6 @@ func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts
 		CreatedBy:   opts.CreatedBy,
 		RunAfter:    opts.RunAfter,
 	})
-}
-
-// ScanTrigger enqueues deduplicated SCAN jobs through a concrete *jobs.Service.
-type ScanTrigger struct {
-	jobs *jobs.Service
-}
-
-// NewScanTrigger constructs a ScanTrigger backed by jobService.
-func NewScanTrigger(jobService *jobs.Service) *ScanTrigger {
-	return &ScanTrigger{jobs: jobService}
-}
-
-// TriggerScan enqueues a deduplicated durable SCAN job for libraryID (ADR-0017 §§1–2).
-func (t *ScanTrigger) TriggerScan(ctx context.Context, libraryID string, opts TriggerScanOptions) (string, error) {
-	if t == nil || t.jobs == nil {
-		return "", fmt.Errorf("%w: job service is unavailable", app.ErrServiceBusy)
-	}
-	return TriggerScan(ctx, t.jobs, libraryID, opts)
 }
 
 // ModuleOptions configures the compiled-in scanner job module.
@@ -192,7 +173,7 @@ func (m *Module) handleScanJob(ctx context.Context, exec *jobs.Execution) error 
 		return err
 	}
 
-	_, err = m.scanner.ScanLibrary(ctx, payload.LibraryID, ScanOptions{
+	res, err := m.scanner.ScanLibrary(ctx, payload.LibraryID, ScanOptions{
 		Workers: m.workers,
 		Formats: m.formats,
 		OnProgress: func(scannedCount int64, currentPath string) {
@@ -200,12 +181,15 @@ func (m *Module) handleScanJob(ctx context.Context, exec *jobs.Execution) error 
 		},
 	})
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) ||
+		if errors.Is(err, ErrLibraryNotFound) ||
 			errors.Is(err, domain.ErrEmptyLibraryID) ||
 			errors.Is(err, ErrInvalidWorkerCount) {
 			return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, err)
 		}
 		return err
+	}
+	if !res.Offline && !res.Complete {
+		return fmt.Errorf("%w: library %q", ErrIncompleteWalk, payload.LibraryID)
 	}
 	return nil
 }

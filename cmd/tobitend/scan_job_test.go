@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/app"
+	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/events"
@@ -111,23 +112,44 @@ func waitDaemonJobState(ctx context.Context, t *testing.T, repo storage.JobRepos
 	return nil
 }
 
+func captureDaemonAssembly(t *testing.T) (**daemonServices, **daemonWorkers) {
+	t.Helper()
+	var services *daemonServices
+	var workers *daemonWorkers
+
+	originalBuild := buildDaemonServices
+	originalStart := startDaemonJobs
+	buildDaemonServices = func(pool *pgxpool.Pool, setup *bootstrap.Setup, userRepo *postgres.UserRepository) (*daemonServices, error) {
+		ds, err := originalBuild(pool, setup, userRepo)
+		if err == nil {
+			services = ds
+		}
+		return ds, err
+	}
+	startDaemonJobs = func(ctx context.Context, cancel context.CancelCauseFunc, pool *pgxpool.Pool, cfg *config.Config, appServices *app.Services) (*daemonWorkers, error) {
+		w, err := originalStart(ctx, cancel, pool, cfg, appServices)
+		if err == nil {
+			workers = w
+		}
+		return w, err
+	}
+	t.Cleanup(func() {
+		buildDaemonServices = originalBuild
+		startDaemonJobs = originalStart
+	})
+	return &services, &workers
+}
+
 func TestRunDaemonScanJob_ProductionWiringCatalogueMissingAndProgress(t *testing.T) {
 	db := testdb.New(t)
 	migrateStartupDB(t, db)
 
-	originalInspect := inspectDaemonWorkers
-	originalAttach := attachDaemonScanTrigger
 	originalLogger := slog.Default()
 	t.Cleanup(func() {
-		inspectDaemonWorkers = originalInspect
-		attachDaemonScanTrigger = originalAttach
 		slog.SetDefault(originalLogger)
 	})
 
-	var workers *daemonWorkers
-	var scanTrigger *scanner.ScanTrigger
-	inspectDaemonWorkers = func(w *daemonWorkers) { workers = w }
-	attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+	dsPtr, workersPtr := captureDaemonAssembly(t)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -142,11 +164,13 @@ func TestRunDaemonScanJob_ProductionWiringCatalogueMissingAndProgress(t *testing
 	jobRepo := postgres.NewJobRepository(db.Pool)
 
 	err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		workers := *workersPtr
+		ds := *dsPtr
 		if workers == nil || workers.runner == nil || workers.progressHub == nil {
 			return errors.New("daemonWorkers not initialized")
 		}
-		if scanTrigger == nil {
-			return errors.New("scanTrigger not wired in runDaemon")
+		if ds == nil || ds.triggerScan == nil {
+			return errors.New("daemonServices.triggerScan not wired in runDaemon")
 		}
 		if sz, active := workers.runner.ActivePoolSize(domain.JobKindScan); !active || sz != jobs.DefaultWorkerPoolSize {
 			return fmt.Errorf("SCAN ActivePoolSize = (%d, %v), want (%d, true)", sz, active, jobs.DefaultWorkerPoolSize)
@@ -165,7 +189,7 @@ func TestRunDaemonScanJob_ProductionWiringCatalogueMissingAndProgress(t *testing
 		}
 		defer unsub()
 
-		jobID, err := scanTrigger.TriggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		jobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
 		if err != nil {
 			return fmt.Errorf("TriggerScan #1: %w", err)
 		}
@@ -210,7 +234,7 @@ func TestRunDaemonScanJob_ProductionWiringCatalogueMissingAndProgress(t *testing
 		if err := os.Remove(file2); err != nil {
 			return err
 		}
-		jobID2, err := scanTrigger.TriggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		jobID2, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
 		if err != nil {
 			return fmt.Errorf("TriggerScan #2: %w", err)
 		}
@@ -234,13 +258,9 @@ func TestRunDaemonScanJob_ProductionWiringCatalogueMissingAndProgress(t *testing
 }
 
 func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
-	originalInspect := inspectDaemonWorkers
-	originalAttach := attachDaemonScanTrigger
 	originalNewScanner := newDaemonScanner
 	originalLogger := slog.Default()
 	t.Cleanup(func() {
-		inspectDaemonWorkers = originalInspect
-		attachDaemonScanTrigger = originalAttach
 		newDaemonScanner = originalNewScanner
 		slog.SetDefault(originalLogger)
 	})
@@ -250,10 +270,7 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 		migrateStartupDB(t, db)
 		putSetting(t, db, "jobs.pool.scan", "1")
 
-		var workers *daemonWorkers
-		var scanTrigger *scanner.ScanTrigger
-		inspectDaemonWorkers = func(w *daemonWorkers) { workers = w }
-		attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+		dsPtr, workersPtr := captureDaemonAssembly(t)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
@@ -310,11 +327,13 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 
 		jobRepo := postgres.NewJobRepository(db.Pool)
 		err = runDaemon(ctx, cfg, func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			workers := *workersPtr
+			ds := *dsPtr
 			if sz, active := workers.runner.ActivePoolSize(domain.JobKindScan); !active || sz != 1 {
 				return fmt.Errorf("SCAN ActivePoolSize = (%d, %v), want (1, true)", sz, active)
 			}
 
-			jobA1, err := scanTrigger.TriggerScan(serveCtx, libA.ID, scanner.TriggerScanOptions{})
+			jobA1, err := ds.triggerScan(serveCtx, libA.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
@@ -328,7 +347,7 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 			}
 
 			// Duplicate trigger for libA must return the exact same active job_id.
-			jobA2, err := scanTrigger.TriggerScan(serveCtx, libA.ID, scanner.TriggerScanOptions{})
+			jobA2, err := ds.triggerScan(serveCtx, libA.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
@@ -337,7 +356,7 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 			}
 
 			// Trigger for libB gets a distinct job_id and must remain QUEUED while SCAN pool (size=1) runs libA.
-			jobB, err := scanTrigger.TriggerScan(serveCtx, libB.ID, scanner.TriggerScanOptions{})
+			jobB, err := ds.triggerScan(serveCtx, libB.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
@@ -372,10 +391,7 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 		migrateStartupDB(t, db)
 		putSetting(t, db, "jobs.pool.scan", "2")
 
-		var workers *daemonWorkers
-		var scanTrigger *scanner.ScanTrigger
-		inspectDaemonWorkers = func(w *daemonWorkers) { workers = w }
-		attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+		dsPtr, workersPtr := captureDaemonAssembly(t)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
@@ -446,19 +462,21 @@ func TestRunDaemonScanJob_DedupeAndPoolIsolationM1BD2(t *testing.T) {
 
 		jobRepo := postgres.NewJobRepository(db.Pool)
 		err = runDaemon(ctx, cfg, func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			workers := *workersPtr
+			ds := *dsPtr
 			if sz, active := workers.runner.ActivePoolSize(domain.JobKindScan); !active || sz != 2 {
 				return fmt.Errorf("SCAN ActivePoolSize = (%d, %v), want (2, true)", sz, active)
 			}
 
-			j1, err := scanTrigger.TriggerScan(serveCtx, lib1.ID, scanner.TriggerScanOptions{})
+			j1, err := ds.triggerScan(serveCtx, lib1.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
-			j2, err := scanTrigger.TriggerScan(serveCtx, lib2.ID, scanner.TriggerScanOptions{})
+			j2, err := ds.triggerScan(serveCtx, lib2.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
-			j3, err := scanTrigger.TriggerScan(serveCtx, lib3.ID, scanner.TriggerScanOptions{})
+			j3, err := ds.triggerScan(serveCtx, lib3.ID, scanner.TriggerScanOptions{})
 			if err != nil {
 				return err
 			}
@@ -530,11 +548,9 @@ func (f *failNTimesTransactor) WithReadCommittedTx(ctx context.Context, fn func(
 }
 
 func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T) {
-	originalAttach := attachDaemonScanTrigger
 	originalNewScanner := newDaemonScanner
 	originalLogger := slog.Default()
 	t.Cleanup(func() {
-		attachDaemonScanTrigger = originalAttach
 		newDaemonScanner = originalNewScanner
 		slog.SetDefault(originalLogger)
 	})
@@ -543,15 +559,15 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 		db := testdb.New(t)
 		migrateStartupDB(t, db)
 
-		var scanTrigger *scanner.ScanTrigger
-		attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+		dsPtr, _ := captureDaemonAssembly(t)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 		defer cancel()
 		jobRepo := postgres.NewJobRepository(db.Pool)
 
 		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
-			jobID, err := scanTrigger.TriggerScan(serveCtx, "nonexistent-lib", scanner.TriggerScanOptions{MaxAttempts: 3})
+			ds := *dsPtr
+			jobID, err := ds.triggerScan(serveCtx, "nonexistent-lib", scanner.TriggerScanOptions{MaxAttempts: 3})
 			if err != nil {
 				return err
 			}
@@ -566,7 +582,7 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 			if failedEvents != 1 {
 				return fmt.Errorf("job.failed count = %d, want 1", failedEvents)
 			}
-			retriggeredID, err := scanTrigger.TriggerScan(serveCtx, "nonexistent-lib", scanner.TriggerScanOptions{MaxAttempts: 3})
+			retriggeredID, err := ds.triggerScan(serveCtx, "nonexistent-lib", scanner.TriggerScanOptions{MaxAttempts: 3})
 			if err != nil {
 				return err
 			}
@@ -585,8 +601,7 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 		db := testdb.New(t)
 		migrateStartupDB(t, db)
 
-		var scanTrigger *scanner.ScanTrigger
-		attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+		dsPtr, _ := captureDaemonAssembly(t)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
@@ -607,7 +622,8 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 
 		jobRepo := postgres.NewJobRepository(db.Pool)
 		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
-			jobID, err := scanTrigger.TriggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
+			ds := *dsPtr
+			jobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
 			if err != nil {
 				return err
 			}
@@ -661,8 +677,7 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 		db := testdb.New(t)
 		migrateStartupDB(t, db)
 
-		var scanTrigger *scanner.ScanTrigger
-		attachDaemonScanTrigger = func(st *scanner.ScanTrigger) { scanTrigger = st }
+		dsPtr, _ := captureDaemonAssembly(t)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
@@ -682,7 +697,8 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 
 		jobRepo := postgres.NewJobRepository(db.Pool)
 		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
-			jobID, err := scanTrigger.TriggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
+			ds := *dsPtr
+			jobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
 			if err != nil {
 				return err
 			}
@@ -700,12 +716,119 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 			}
 
 			// Dedupe key must be released so a fresh trigger gets a new job ID.
-			newJobID, err := scanTrigger.TriggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
+			newJobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
 			if err != nil {
 				return err
 			}
 			if newJobID == jobID {
 				return fmt.Errorf("dedupe key not released after exhaustion: reused %q", jobID)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+	})
+
+	t.Run("incomplete ONLINE walk retries with backoff then succeeds on recovery", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+
+		dsPtr, _ := captureDaemonAssembly(t)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "incomplete-root")
+		blockedDir := filepath.Join(rootDir, "Blocked")
+		writeTestFile(t, filepath.Join(blockedDir, "v01.cbz"), buildTestCBZ(t, "BlockedSaga", "One", "1"))
+		writeTestFile(t, filepath.Join(rootDir, "Good/v02.cbz"), buildTestCBZ(t, "GoodSaga", "Two", "2"))
+		lib, root := seedTestLibrary(ctx, t, db.Pool, "Incomplete Daemon Lib", rootDir)
+
+		var blockSubdir atomic.Bool
+		blockSubdir.Store(true)
+		newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+			return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+				ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+					if blockSubdir.Load() && string(rawDir) == blockedDir {
+						return nil, os.ErrPermission
+					}
+					return os.ReadDir(string(rawDir))
+				},
+			})
+		}
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			ds := *dsPtr
+			jobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
+			if err != nil {
+				return err
+			}
+
+			deadline := time.Now().Add(5 * time.Second)
+			var requeued *domain.Job
+			for time.Now().Before(deadline) {
+				got, err := jobRepo.GetJobByID(serveCtx, jobID)
+				if err == nil && got.State == domain.JobStateQueued && got.Attempts == 1 {
+					requeued = got
+					break
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			if requeued == nil {
+				got, _ := jobRepo.GetJobByID(serveCtx, jobID)
+				return fmt.Errorf("expected incomplete ONLINE walk requeue after attempt 1, got %+v", got)
+			}
+			var assetCountBefore int
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&assetCountBefore); err != nil {
+				return err
+			}
+			if assetCountBefore != 0 {
+				return fmt.Errorf("assets after incomplete walk = %d, want 0", assetCountBefore)
+			}
+
+			blockSubdir.Store(false)
+			gotSucc := waitDaemonJobState(serveCtx, t, jobRepo, jobID, domain.JobStateSucceeded)
+			if gotSucc.Attempts != 2 {
+				return fmt.Errorf("recovered walk Attempts = %d, want 2", gotSucc.Attempts)
+			}
+			var assetCountAfter int
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&assetCountAfter); err != nil {
+				return err
+			}
+			if assetCountAfter != 2 {
+				return fmt.Errorf("assets after recovered walk = %d, want 2", assetCountAfter)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+	})
+
+	t.Run("offline library stops cleanly without retrying", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+
+		dsPtr, _ := captureDaemonAssembly(t)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		missingRoot := filepath.Join(t.TempDir(), "unmounted-drive")
+		lib, _ := seedTestLibrary(ctx, t, db.Pool, "Offline Daemon Lib", missingRoot)
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+			ds := *dsPtr
+			jobID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 3})
+			if err != nil {
+				return err
+			}
+			got := waitDaemonJobState(serveCtx, t, jobRepo, jobID, domain.JobStateSucceeded)
+			if got.Attempts != 1 {
+				return fmt.Errorf("offline library Attempts = %d, want 1", got.Attempts)
 			}
 			return nil
 		})

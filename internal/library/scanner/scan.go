@@ -30,9 +30,28 @@ const (
 	DefaultMissingGracePeriod = DefaultMissingGraceDays * 24 * time.Hour
 )
 
-// ErrInvalidMissingGracePeriod is returned when the configured missing grace period is
-// negative or cannot be parsed as a non-negative integer number of days.
-var ErrInvalidMissingGracePeriod = errors.New("scanner: invalid missing grace period")
+var (
+	// ErrInvalidMissingGracePeriod is returned when the configured missing grace period is
+	// negative or cannot be parsed as a non-negative integer number of days.
+	ErrInvalidMissingGracePeriod = errors.New("scanner: invalid missing grace period")
+
+	// ErrLibraryNotFound is returned when the requested library does not exist.
+	// It wraps storage.ErrNotFound while distinguishing library absence from stale
+	// volume or asset lookups during reconciliation.
+	ErrLibraryNotFound = errors.New("scanner: library not found")
+
+	// ErrIncompleteWalk is returned by the SCAN job handler when an ONLINE library's
+	// walk finishes incomplete (for example, due to an unreadable subtree) so the
+	// job retries with backoff instead of succeeding without indexing.
+	ErrIncompleteWalk = errors.New("scanner: incomplete walk of online library")
+)
+
+func wrapLibraryNotFound(err error) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("%w: %w", ErrLibraryNotFound, err)
+	}
+	return err
+}
 
 // Options configures a Scanner instance.
 type Options struct {
@@ -44,6 +63,9 @@ type Options struct {
 	// Open optionally overrides default read-only file opening for archive
 	// inspection when ScanOptions.Open is nil.
 	Open func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+	// ReadDir optionally overrides directory reads during pre-check and root
+	// walks when ScanOptions.ReadDir is nil.
+	ReadDir func(rawDir []byte) ([]os.DirEntry, error)
 }
 
 // ScanOptions configures a single library scan pass.
@@ -129,6 +151,7 @@ type Scanner struct {
 	now                func() time.Time
 	missingGracePeriod *time.Duration
 	open               func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+	readDir            func(rawDir []byte) ([]os.DirEntry, error)
 }
 
 // NewScanner constructs a Scanner backed by tx.
@@ -163,6 +186,7 @@ func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
 		now:                nowFn,
 		missingGracePeriod: graceOverride,
 		open:               opts.Open,
+		readDir:            opts.ReadDir,
 	}, nil
 }
 
@@ -188,10 +212,14 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return ScanResult{}, ErrInvalidWorkerCount
 	}
 
+	readDirFn := opts.ReadDir
+	if readDirFn == nil {
+		readDirFn = s.readDir
+	}
 	preCheck, err := s.PreCheckLibrary(ctx, libraryID, PreCheckOptions{
 		Stat:    opts.Stat,
 		OpenDir: opts.OpenDir,
-		ReadDir: opts.ReadDir,
+		ReadDir: readDirFn,
 	})
 	if err != nil {
 		return ScanResult{}, err
@@ -367,7 +395,7 @@ func (s *Scanner) loadLibraryAndRoots(ctx context.Context, libraryID string) (*d
 		var err error
 		lib, err = repo.GetLibraryByID(ctx, libraryID)
 		if err != nil {
-			return err
+			return wrapLibraryNotFound(err)
 		}
 		roots, err = repo.ListLibraryRoots(ctx, lib.ID)
 		return err
@@ -395,7 +423,7 @@ func (s *Scanner) loadLibraryScanSnapshot(ctx context.Context, libraryID string)
 		}
 		lib, err := repo.GetLibraryByID(ctx, libraryID)
 		if err != nil {
-			return err
+			return wrapLibraryNotFound(err)
 		}
 		roots, err = repo.ListLibraryRoots(ctx, lib.ID)
 		if err != nil {
@@ -481,12 +509,16 @@ func (s *Scanner) scanOneRoot(
 	if openFn == nil {
 		openFn = s.open
 	}
+	readDirFn := opts.ReadDir
+	if readDirFn == nil {
+		readDirFn = s.readDir
+	}
 	walkOpts := WalkOptions{
 		Workers: opts.Workers,
 		Known:   knownForWalk,
 		Formats: opts.Formats,
 		OnEntry: state.handleEntry,
-		ReadDir: opts.ReadDir,
+		ReadDir: readDirFn,
 		Stat:    opts.Stat,
 		Open:    openFn,
 	}

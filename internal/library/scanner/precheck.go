@@ -164,7 +164,7 @@ func (s *Scanner) commitPreCheckTx(
 		return PreCheckResult{}, errors.New("scanner: library repository is required")
 	}
 	if err := repo.LockLibrary(ctx, libraryID); err != nil {
-		return PreCheckResult{}, err
+		return PreCheckResult{}, wrapLibraryNotFound(err)
 	}
 	currentRoots, err := repo.ListLibraryRoots(ctx, libraryID)
 	if err != nil {

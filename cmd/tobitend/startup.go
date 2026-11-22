@@ -163,9 +163,16 @@ var newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scan
 	return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{})
 }
 
-var inspectDaemonWorkers = func(*daemonWorkers) {}
+var startDaemonJobs = runDaemonJobs
 
-var attachDaemonScanTrigger = func(*scanner.ScanTrigger) {}
+var buildDaemonServices = newDaemonServices
+
+type daemonServices struct {
+	app         *app.Services
+	jobs        *jobs.Service
+	events      *events.StreamService
+	triggerScan func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error)
+}
 
 type parsedPoolSetting struct {
 	rawKey string
@@ -373,7 +380,7 @@ func applyDaemonPoolSizes(parsed parsedPoolConfig, runner *jobs.Runner) error {
 	return runner.SetPoolSizes(sizes)
 }
 
-func startDaemonJobs(
+func runDaemonJobs(
 	ctx context.Context,
 	cancel context.CancelCauseFunc,
 	pool *pgxpool.Pool,
@@ -452,41 +459,40 @@ func startDaemonJobs(
 		dispatcher:  dispatcher,
 		progressHub: progressHub,
 	}
-	inspectDaemonWorkers(workers)
 	return workers, nil
 }
 
-func buildDaemonServices(
+func newDaemonServices(
 	pool *pgxpool.Pool,
 	setup *bootstrap.Setup,
 	userRepo *postgres.UserRepository,
-) (*app.Services, *jobs.Service, *events.StreamService, error) {
+) (*daemonServices, error) {
 	hashLimiter, err := auth.NewHashLimiter(auth.HashLimiterOptions{})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	basicAuth, err := auth.NewBasicAuthenticator(userRepo, auth.BasicOptions{
 		Logger:  slog.Default(),
 		Limiter: hashLimiter,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	patAuth, err := auth.NewPATAuthenticator(userRepo, auth.PATOptions{
 		Logger:  slog.Default(),
 		Limiter: hashLimiter,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	sessionRepo := postgres.NewSessionRepository(pool)
 	sessionService, err := auth.NewSessionService(basicAuth, userRepo, sessionRepo, auth.SessionOptions{})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	sessionAuth, err := auth.NewSessionAuthenticator(userRepo, sessionRepo, auth.SessionOptions{})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	eventRepo := postgres.NewEventRepository(pool)
 	jobRepo := postgres.NewJobRepository(pool)
@@ -504,7 +510,14 @@ func buildDaemonServices(
 		Jobs:        jobService,
 		Events:      eventService,
 	})
-	return services, jobService, eventService, nil
+	return &daemonServices{
+		app:    services,
+		jobs:   jobService,
+		events: eventService,
+		triggerScan: func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error) {
+			return scanner.TriggerScan(ctx, jobService, libraryID, opts)
+		},
+	}, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -542,29 +555,28 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		return err
 	}
 	defer setup.Close()
-	services, jobService, eventService, err := buildDaemonServices(d.pool, setup, userRepo)
+	ds, err := buildDaemonServices(d.pool, setup, userRepo)
 	if err != nil {
 		return err
 	}
-	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, services)
+	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, ds.app)
 	if err != nil {
 		return err
 	}
-	eventService.SetProgressHub(workers.progressHub)
-	eventService.SetWakeSource(workers.dispatcher)
-	jobService.SetNotifier(workers.runner)
-	jobService.SetOnTransition(func(job domain.Job) {
+	ds.events.SetProgressHub(workers.progressHub)
+	ds.events.SetWakeSource(workers.dispatcher)
+	ds.jobs.SetNotifier(workers.runner)
+	ds.jobs.SetOnTransition(func(job domain.Job) {
 		if workers != nil && workers.dispatcher != nil && !job.Kind.IsInternal() {
 			workers.dispatcher.Notify()
 		}
 	})
-	attachDaemonScanTrigger(scanner.NewScanTrigger(jobService))
 	defer func() {
 		cancel(nil)
 		workers.stopAndWait()
 	}()
 	slog.Info("starting server daemon", slog.String("version", Version))
-	err = serve(ctx, cfg, slog.Default(), services)
+	err = serve(ctx, cfg, slog.Default(), ds.app)
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
 		return errors.Join(err, cause)
 	}
