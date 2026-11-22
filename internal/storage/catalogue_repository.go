@@ -40,11 +40,33 @@ type ReadingProgressReadFilter struct {
 }
 
 const (
+	// DefaultCataloguePageLimit is the default page size when series/volume filter Limit is zero.
+	DefaultCataloguePageLimit = 50
+	// MaxCataloguePageLimit is the hard maximum page size enforced on paged catalogue reads (ADR-0020 §7).
+	MaxCataloguePageLimit = 200
 	// DefaultFolderBrowseLimit is the default page size when FolderBrowseFilter.Limit is zero.
 	DefaultFolderBrowseLimit = 50
 	// MaxFolderBrowseLimit is the hard maximum page size enforced on folder-browse reads (ADR-0020 §7).
 	MaxFolderBrowseLimit = 200
 )
+
+// SeriesPageResult holds one server-paginated slice of visible series together
+// with the exact total count computed in the same query snapshot (ADR-0020 §7).
+type SeriesPageResult struct {
+	Items      []domain.Series
+	TotalCount int64
+	Limit      int
+	Offset     int
+}
+
+// VolumePageResult holds one server-paginated slice of visible volumes together
+// with the exact total count computed in the same query snapshot (ADR-0020 §7).
+type VolumePageResult struct {
+	Items      []domain.Volume
+	TotalCount int64
+	Limit      int
+	Offset     int
+}
 
 // FolderEntryKind distinguishes immediate child folders from immediate child files
 // in a library folder-browse listing (ADR-0019 §4).
@@ -134,10 +156,12 @@ type AuthorizedAssetFile struct {
 type CatalogueRepository interface {
 	GetSeriesByID(ctx context.Context, scope CatalogueReadScope, id string) (*domain.Series, error)
 	ListSeries(ctx context.Context, scope CatalogueReadScope, filter SeriesReadFilter) ([]domain.Series, error)
+	ListSeriesPaged(ctx context.Context, scope CatalogueReadScope, filter SeriesReadFilter) (*SeriesPageResult, error)
 	CountSeries(ctx context.Context, scope CatalogueReadScope, filter SeriesReadFilter) (int64, error)
 
 	GetVolumeByID(ctx context.Context, scope CatalogueReadScope, id string) (*domain.Volume, error)
 	ListVolumes(ctx context.Context, scope CatalogueReadScope, filter VolumeReadFilter) ([]domain.Volume, error)
+	ListVolumesPaged(ctx context.Context, scope CatalogueReadScope, filter VolumeReadFilter) (*VolumePageResult, error)
 	CountVolumes(ctx context.Context, scope CatalogueReadScope, filter VolumeReadFilter) (int64, error)
 
 	GetAssetByID(ctx context.Context, scope CatalogueReadScope, id string) (*domain.MediaAsset, error)

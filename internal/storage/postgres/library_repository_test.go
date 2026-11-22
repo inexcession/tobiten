@@ -185,6 +185,51 @@ func TestLibraryRepository_CRUDAndMultiRootViaTx(t *testing.T) {
 			t.Fatalf("unexpected ListLibraries result: %+v", libs)
 		}
 
+		page1, err := repo.ListLibrariesPaged(ctx, 1, 0)
+		if err != nil {
+			t.Fatalf("ListLibrariesPaged(1, 0): %v", err)
+		}
+		if page1.TotalCount != 2 || page1.Limit != 1 || page1.Offset != 0 || len(page1.Items) != 1 || page1.Items[0].ID != lib1ID {
+			t.Fatalf("unexpected ListLibrariesPaged(1, 0): %+v", page1)
+		}
+
+		pagePastEnd, err := repo.ListLibrariesPaged(ctx, 999, 10)
+		if err != nil {
+			t.Fatalf("ListLibrariesPaged(999, 10): %v", err)
+		}
+		if pagePastEnd.TotalCount != 2 || pagePastEnd.Limit != storage.MaxLibraryPageLimit || len(pagePastEnd.Items) != 0 {
+			t.Fatalf("unexpected ListLibrariesPaged(999, 10): %+v", pagePastEnd)
+		}
+		if _, err := repo.ListLibrariesPaged(ctx, -1, 0); err == nil {
+			t.Fatal("expected error for negative Limit in ListLibrariesPaged")
+		}
+
+		rootsByIDs, err := repo.ListLibraryRootsByLibraryIDs(ctx, []string{lib2ID})
+		if err != nil {
+			t.Fatalf("ListLibraryRootsByLibraryIDs: %v", err)
+		}
+		if len(rootsByIDs) != 1 || rootsByIDs[0].LibraryID != lib2ID {
+			t.Fatalf("unexpected ListLibraryRootsByLibraryIDs result: %+v", rootsByIDs)
+		}
+
+		emptyRoots, err := repo.ListLibraryRootsByLibraryIDs(ctx, nil)
+		if err != nil || len(emptyRoots) != 0 {
+			t.Fatalf("unexpected empty ListLibraryRootsByLibraryIDs result: (%v, %v)", emptyRoots, err)
+		}
+
+		if err := transactor.WithRepeatableReadTx(ctx, func(rtx storage.ReadTx) error {
+			rrLibs, err := rtx.Libraries().ListLibrariesPaged(ctx, 0, 0)
+			if err != nil {
+				return err
+			}
+			if rrLibs.TotalCount != 2 || rrLibs.Limit != storage.DefaultLibraryPageLimit || len(rrLibs.Items) != 2 {
+				return fmt.Errorf("unexpected read tx libraries page: %+v", rrLibs)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithRepeatableReadTx: %v", err)
+		}
+
 		rootsLib1, err := repo.ListLibraryRoots(ctx, lib1ID)
 		if err != nil {
 			t.Fatalf("ListLibraryRoots(lib1): %v", err)

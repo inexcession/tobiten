@@ -30,15 +30,25 @@ type StubLibraryService struct {
 
 // NewStubLibraryService creates a new StubLibraryService with sensible defaults.
 func NewStubLibraryService() *StubLibraryService {
+	now := time.Now().UTC()
 	return &StubLibraryService{
 		Libraries: []Library{
 			{
-				ID:        "lib-stub-1",
-				Name:      "Default Manga",
-				Path:      "/media/manga",
-				Mode:      "VIRTUAL",
-				CreatedAt: time.Now().UTC(),
-				UpdatedAt: time.Now().UTC(),
+				ID:    "lib-stub-1",
+				Name:  "Default Manga",
+				Mode:  "VIRTUAL",
+				State: string(domain.LibraryRootStateOnline),
+				Roots: []LibraryRoot{
+					{
+						ID:        "root-stub-1",
+						LibraryID: "lib-stub-1",
+						State:     string(domain.LibraryRootStateOnline),
+					},
+				},
+				ResolverChain:      []string{},
+				MetadataPrecedence: string(domain.MetadataPrecedenceEmbeddedOverOnline),
+				DefaultCoverPolicy: string(domain.CoverPolicyFirst),
+				CreatedAt:          now,
 			},
 		},
 		Series: []Series{
@@ -46,30 +56,55 @@ func NewStubLibraryService() *StubLibraryService {
 				ID:        "ser-stub-1",
 				LibraryID: "lib-stub-1",
 				Title:     "Sample Series",
-				CreatedAt: time.Now().UTC(),
-				UpdatedAt: time.Now().UTC(),
+				TitleSort: "Sample Series",
+				Status:    string(domain.SeriesStatusOngoing),
+				Genres:    []string{},
+				Tags:      []string{},
+				CreatedAt: now,
+				UpdatedAt: now,
 			},
 		},
 		Volumes: []Volume{
 			{
 				ID:         "vol-stub-1",
 				LibraryID:  "lib-stub-1",
+				Kind:       string(domain.VolumeKindVolume),
 				Title:      "Volume 1",
 				NumberSort: 1.0,
 				AssetCount: 1,
-				CreatedAt:  time.Now().UTC(),
-				UpdatedAt:  time.Now().UTC(),
+				CreatedAt:  now,
+				UpdatedAt:  now,
 			},
 		},
 	}
 }
 
-func (s *StubLibraryService) ListLibraries(_ context.Context, _ *domain.Principal) ([]Library, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Library, len(s.Libraries))
-	copy(out, s.Libraries)
-	return out, nil
+func clampStubPageLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultLibraryPageLimit
+	}
+	if limit > MaxLibraryPageLimit {
+		return MaxLibraryPageLimit
+	}
+	return limit
+}
+
+func cloneStubItems[T any](mu *sync.RWMutex, src []T) []T {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]T, len(src))
+	copy(out, src)
+	return out
+}
+
+func (s *StubLibraryService) ListLibraries(_ context.Context, _ *domain.Principal, filter LibraryFilter) (*LibraryPage, error) {
+	items := cloneStubItems(&s.mu, s.Libraries)
+	return &LibraryPage{
+		Items:      items,
+		TotalCount: int64(len(items)),
+		Limit:      clampStubPageLimit(filter.Limit),
+		Offset:     filter.Offset,
+	}, nil
 }
 
 func (s *StubLibraryService) GetLibrary(_ context.Context, _ *domain.Principal, id string) (*Library, error) {
@@ -83,12 +118,30 @@ func (s *StubLibraryService) GetLibrary(_ context.Context, _ *domain.Principal, 
 	return nil, ErrNotFound
 }
 
-func (s *StubLibraryService) ListSeries(_ context.Context, _ *domain.Principal, _ SeriesFilter) ([]Series, error) {
+func (s *StubLibraryService) BrowseFolder(_ context.Context, _ *domain.Principal, filter FolderBrowseFilter) (*FolderBrowseResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]Series, len(s.Series))
-	copy(out, s.Series)
-	return out, nil
+	for _, l := range s.Libraries {
+		if l.ID == filter.LibraryID {
+			return &FolderBrowseResult{
+				LibraryID: filter.LibraryID,
+				Entries:   []FolderEntry{},
+				Limit:     clampStubPageLimit(filter.Limit),
+				Offset:    filter.Offset,
+			}, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (s *StubLibraryService) ListSeries(_ context.Context, _ *domain.Principal, filter SeriesFilter) (*SeriesPage, error) {
+	items := cloneStubItems(&s.mu, s.Series)
+	return &SeriesPage{
+		Items:      items,
+		TotalCount: int64(len(items)),
+		Limit:      clampStubPageLimit(filter.Limit),
+		Offset:     filter.Offset,
+	}, nil
 }
 
 func (s *StubLibraryService) GetSeries(_ context.Context, _ *domain.Principal, id string) (*Series, error) {
@@ -102,12 +155,14 @@ func (s *StubLibraryService) GetSeries(_ context.Context, _ *domain.Principal, i
 	return nil, ErrNotFound
 }
 
-func (s *StubLibraryService) ListVolumes(_ context.Context, _ *domain.Principal, _ VolumeFilter) ([]Volume, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Volume, len(s.Volumes))
-	copy(out, s.Volumes)
-	return out, nil
+func (s *StubLibraryService) ListVolumes(_ context.Context, _ *domain.Principal, filter VolumeFilter) (*VolumePage, error) {
+	items := cloneStubItems(&s.mu, s.Volumes)
+	return &VolumePage{
+		Items:      items,
+		TotalCount: int64(len(items)),
+		Limit:      clampStubPageLimit(filter.Limit),
+		Offset:     filter.Offset,
+	}, nil
 }
 
 func (s *StubLibraryService) GetVolume(_ context.Context, _ *domain.Principal, id string) (*Volume, error) {

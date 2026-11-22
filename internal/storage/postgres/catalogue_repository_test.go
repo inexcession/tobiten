@@ -50,6 +50,13 @@ var catalogueReadEnforcementSpecs = map[string]catalogueReadEnforcementSpec{
 			return err
 		},
 	},
+	"ListSeriesPaged": {
+		runEnforcement: enforceListSeriesPaged,
+		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
+			_, err := repo.ListSeriesPaged(ctx, scope, storage.SeriesReadFilter{})
+			return err
+		},
+	},
 	"CountSeries": {
 		runEnforcement: enforceCountSeries,
 		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
@@ -68,6 +75,13 @@ var catalogueReadEnforcementSpecs = map[string]catalogueReadEnforcementSpec{
 		runEnforcement: enforceListVolumes,
 		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
 			_, err := repo.ListVolumes(ctx, scope, storage.VolumeReadFilter{})
+			return err
+		},
+	},
+	"ListVolumesPaged": {
+		runEnforcement: enforceListVolumesPaged,
+		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
+			_, err := repo.ListVolumesPaged(ctx, scope, storage.VolumeReadFilter{})
 			return err
 		},
 	},
@@ -379,6 +393,49 @@ func enforceListSeries(t *testing.T, ec *catalogueEnforcementCtx) {
 	}
 }
 
+func enforceListSeriesPaged(t *testing.T, ec *catalogueEnforcementCtx) {
+	assertPage := func(name string, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter, wantTotal int64, wantLimit int, wantIDs []string) {
+		t.Helper()
+		res, err := ec.repo.ListSeriesPaged(ec.ctx, scope, filter)
+		if err != nil {
+			t.Fatalf("%s: ListSeriesPaged err: %v", name, err)
+		}
+		if res.TotalCount != wantTotal || res.Limit != wantLimit || res.Offset != filter.Offset {
+			t.Fatalf("%s: page meta = (total=%d limit=%d offset=%d), want (%d %d %d)", name, res.TotalCount, res.Limit, res.Offset, wantTotal, wantLimit, filter.Offset)
+		}
+		got := make([]string, len(res.Items))
+		for i, s := range res.Items {
+			got[i] = s.ID
+		}
+		slices.Sort(got)
+		wantSorted := slices.Clone(wantIDs)
+		slices.Sort(wantSorted)
+		if !slices.Equal(got, wantSorted) {
+			t.Fatalf("%s: ListSeriesPaged IDs = %v, want %v", name, got, wantSorted)
+		}
+	}
+
+	assertPage("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, storage.SeriesReadFilter{}, 0, storage.DefaultCataloguePageLimit, nil)
+	assertPage("multiRole fail closed", storage.CatalogueReadScope{Principal: ec.multiRole, IncludeTrashed: true}, storage.SeriesReadFilter{}, 0, storage.DefaultCataloguePageLimit, nil)
+	assertPage("timmy ALLOW kids + RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.timmy}, storage.SeriesReadFilter{}, 1, storage.DefaultCataloguePageLimit, []string{ec.cat.sKids})
+	assertPage("reader RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.reader}, storage.SeriesReadFilter{Limit: 999}, 4, storage.MaxCataloguePageLimit, []string{
+		ec.cat.sClean, ec.cat.sKids, ec.cat.sAllAges, ec.cat.sUserKidsOnly,
+	})
+	assertPage("reader offset past end retains total_count", storage.CatalogueReadScope{Principal: ec.reader}, storage.SeriesReadFilter{Limit: 2, Offset: 100}, 4, 2, nil)
+	assertPage("admin IncludeTrashed=true Search=Trashed", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, storage.SeriesReadFilter{Search: "Trashed"}, 1, storage.DefaultCataloguePageLimit, []string{ec.cat.sTrashed})
+
+	paged, err := ec.repo.ListSeriesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, storage.SeriesReadFilter{Limit: 2, Offset: 1})
+	if err != nil || len(paged.Items) != 2 || paged.TotalCount != 4 {
+		t.Fatalf("reader ListSeriesPaged(Limit=2, Offset=1) = (len=%d total=%d err=%v), want (2, 4, nil)", len(paged.Items), paged.TotalCount, err)
+	}
+	if _, err := ec.repo.ListSeriesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, storage.SeriesReadFilter{Limit: -1}); err == nil {
+		t.Fatal("expected error for negative Limit")
+	}
+	if _, err := ec.repo.ListSeriesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, storage.SeriesReadFilter{Offset: -1}); err == nil {
+		t.Fatal("expected error for negative Offset")
+	}
+}
+
 func enforceCountSeries(t *testing.T, ec *catalogueEnforcementCtx) {
 	assertCount := func(name string, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter, want int64) {
 		t.Helper()
@@ -559,6 +616,61 @@ func enforceListVolumes(t *testing.T, ec *catalogueEnforcementCtx) {
 	paged, err := ec.repo.ListVolumes(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{Limit: 2, Offset: 1})
 	if err != nil || len(paged) != 2 {
 		t.Fatalf("timmy ListVolumes(Limit=2, Offset=1) = (%d, %v), want 2", len(paged), err)
+	}
+}
+
+func enforceListVolumesPaged(t *testing.T, ec *catalogueEnforcementCtx) {
+	assertPage := func(name string, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter, wantTotal int64, wantLimit int, wantIDs []string) []domain.Volume {
+		t.Helper()
+		res, err := ec.repo.ListVolumesPaged(ec.ctx, scope, filter)
+		if err != nil {
+			t.Fatalf("%s: ListVolumesPaged err: %v", name, err)
+		}
+		if res.TotalCount != wantTotal || res.Limit != wantLimit || res.Offset != filter.Offset {
+			t.Fatalf("%s: page meta = (total=%d limit=%d offset=%d), want (%d %d %d)", name, res.TotalCount, res.Limit, res.Offset, wantTotal, wantLimit, filter.Offset)
+		}
+		got := make([]string, len(res.Items))
+		for i, v := range res.Items {
+			got[i] = v.ID
+		}
+		slices.Sort(got)
+		wantSorted := slices.Clone(wantIDs)
+		slices.Sort(wantSorted)
+		if !slices.Equal(got, wantSorted) {
+			t.Fatalf("%s: ListVolumesPaged IDs = %v, want %v", name, got, wantSorted)
+		}
+		return res.Items
+	}
+
+	assertPage("nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, storage.VolumeReadFilter{}, 0, storage.DefaultCataloguePageLimit, nil)
+	assertPage("multiRole fail closed", storage.CatalogueReadScope{Principal: ec.multiRole}, storage.VolumeReadFilter{}, 0, storage.DefaultCataloguePageLimit, nil)
+	timmyVols := assertPage("timmy ALLOW kids + RESTRICT nsfw", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{Limit: 999}, 4, storage.MaxCataloguePageLimit, []string{
+		ec.cat.vInKids, ec.cat.vInKidsAndClean, ec.cat.vZeroAssetsInKids, ec.cat.vStandaloneKids,
+	})
+	for _, v := range timmyVols {
+		if v.ID == ec.cat.vInKidsAndClean && (len(v.Memberships) != 1 || v.Memberships[0].SeriesID != ec.cat.sKids) {
+			t.Fatalf("timmy ListVolumesPaged leaked unauthorized membership on vInKidsAndClean: %+v", v.Memberships)
+		}
+		if v.ID == ec.cat.vInKids && (len(v.Assets) != 1 || v.Assets[0].ID != ec.cat.aKidsClean) {
+			t.Fatalf("timmy ListVolumesPaged leaked restricted/trashed asset on vInKids: %+v", v.Assets)
+		}
+	}
+
+	assertPage("timmy SeriesID=sClean hides vInKidsAndClean", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{SeriesID: ec.cat.sClean}, 0, storage.DefaultCataloguePageLimit, nil)
+	assertPage("timmy SeriesID=sKids preserves total_count when offset past end", storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{SeriesID: ec.cat.sKids, Limit: 2, Offset: 100}, 3, 2, nil)
+	assertPage("admin IncludeTrashed=true Search=Trashed", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, storage.VolumeReadFilter{Search: "Trashed"}, 3, storage.DefaultCataloguePageLimit, []string{
+		ec.cat.vInTrashedSeries, ec.cat.vTrashedInKids, ec.cat.vStandaloneTrashed,
+	})
+
+	paged, err := ec.repo.ListVolumesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, storage.VolumeReadFilter{Limit: 2, Offset: 1})
+	if err != nil || len(paged.Items) != 2 || paged.TotalCount != 4 {
+		t.Fatalf("timmy ListVolumesPaged(Limit=2, Offset=1) = (len=%d total=%d err=%v), want (2, 4, nil)", len(paged.Items), paged.TotalCount, err)
+	}
+	if _, err := ec.repo.ListVolumesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, storage.VolumeReadFilter{Limit: -1}); err == nil {
+		t.Fatal("expected error for negative Limit")
+	}
+	if _, err := ec.repo.ListVolumesPaged(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, storage.VolumeReadFilter{Offset: -1}); err == nil {
+		t.Fatal("expected error for negative Offset")
 	}
 }
 

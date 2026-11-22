@@ -354,7 +354,25 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 	})
 
 	t.Run("both direct and subpath protected endpoints return 401", func(t *testing.T) {
-		for _, path := range []string{"/api/v1/users", "/comics/api/v1/users"} {
+		protectedPaths := []string{
+			"/api/v1/users",
+			"/comics/api/v1/users",
+			"/api/v1/libraries",
+			"/comics/api/v1/libraries",
+			"/api/v1/libraries/lib-1",
+			"/comics/api/v1/libraries/lib-1",
+			"/api/v1/libraries/lib-1/folders",
+			"/comics/api/v1/libraries/lib-1/folders",
+			"/api/v1/series",
+			"/comics/api/v1/series",
+			"/api/v1/series/ser-1",
+			"/comics/api/v1/series/ser-1",
+			"/api/v1/volumes",
+			"/comics/api/v1/volumes",
+			"/api/v1/volumes/vol-1",
+			"/comics/api/v1/volumes/vol-1",
+		}
+		for _, path := range protectedPaths {
 			resp, err := client.Get(baseURL + path)
 			if err != nil {
 				t.Fatalf("GET %s failed: %v", path, err)

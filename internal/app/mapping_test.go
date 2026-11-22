@@ -1,6 +1,8 @@
 package app
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,8 +61,81 @@ func TestDomainToAppMappings(t *testing.T) {
 		UpdatedAt: now,
 	}
 	standaloneDTO := VolumeFromDomain(standalone)
-	if standaloneDTO.SeriesID != nil || standaloneDTO.AssetCount != 0 {
-		t.Fatalf("expected standalone nil SeriesID and 0 AssetCount, got %+v", standaloneDTO)
+	if standaloneDTO.SeriesID != nil || standaloneDTO.AssetCount != 0 || !standaloneDTO.IsMissing {
+		t.Fatalf("expected standalone nil SeriesID, 0 AssetCount, IsMissing=true, got %+v", standaloneDTO)
+	}
+	rawStandalone, err := json.Marshal(standaloneDTO)
+	if err != nil {
+		t.Fatalf("Marshal standaloneDTO: %v", err)
+	}
+	if !strings.Contains(string(rawStandalone), `"series_id":null`) {
+		t.Fatalf("expected explicit null series_id in JSON, got %s", rawStandalone)
+	}
+
+	// Library mapping: ONLINE/OFFLINE aggregate state + admin vs reader path/error redaction.
+	intake := domain.NewPathIdentity([]byte("/srv/intake"))
+	rootErr := "stat root: permission denied"
+	lib := domain.Library{
+		ID:                    "lib-1",
+		Name:                  "Manga",
+		Mode:                  domain.LibraryModeManaged,
+		IntakePath:            &intake,
+		AutoMetadataWriteback: true,
+		ResolverChain:         []domain.ResolverName{domain.ResolverFolder},
+		MetadataPrecedence:    domain.MetadataPrecedenceEmbeddedOverOnline,
+		DefaultCoverPolicy:    domain.CoverPolicyFirst,
+		CreatedAt:             now,
+	}
+	roots := []domain.LibraryRoot{
+		{
+			ID:        "root-1",
+			LibraryID: "lib-1",
+			Path:      domain.NewPathIdentity([]byte("/mnt/r1")),
+			State:     domain.LibraryRootStateOnline,
+		},
+		{
+			ID:        "root-2",
+			LibraryID: "lib-1",
+			Path:      domain.NewPathIdentity([]byte("/mnt/r2")),
+			State:     domain.LibraryRootStateOffline,
+			LastError: &rootErr,
+		},
+	}
+
+	adminRole := domain.Role{
+		ID:          domain.RoleAdminID,
+		Name:        "Admin",
+		Permissions: []domain.Permission{domain.PermissionLibraryRead, domain.PermissionLibraryAdmin},
+	}
+	readerRole := domain.Role{
+		ID:          domain.RoleReaderID,
+		Name:        "Reader",
+		Permissions: []domain.Permission{domain.PermissionLibraryRead},
+	}
+	adminPrincipal := domain.NewPrincipal(domain.User{ID: "u-admin", Username: "admin"}, []domain.Role{adminRole}, domain.CredentialKindPassword, "c1", nil)
+	readerPrincipal := domain.NewPrincipal(domain.User{ID: "u-reader", Username: "reader"}, []domain.Role{readerRole}, domain.CredentialKindPassword, "c2", nil)
+
+	adminLib := LibraryFromDomain(lib, roots, adminPrincipal)
+	if adminLib.State != "OFFLINE" || adminLib.IntakePathDisplay == nil || *adminLib.IntakePathDisplay != "/srv/intake" {
+		t.Fatalf("unexpected admin LibraryFromDomain projection: %+v", adminLib)
+	}
+	if len(adminLib.Roots) != 2 || adminLib.Roots[0].PathDisplay == nil || *adminLib.Roots[0].PathDisplay != "/mnt/r1" || adminLib.Roots[1].LastError == nil {
+		t.Fatalf("expected admin root display paths and last_error preserved: %+v", adminLib.Roots)
+	}
+
+	readerLib := LibraryFromDomain(lib, roots, readerPrincipal)
+	if readerLib.State != "OFFLINE" || readerLib.IntakePathDisplay != nil {
+		t.Fatalf("expected reader intake_path_display redacted, got %+v", readerLib)
+	}
+	for _, r := range readerLib.Roots {
+		if r.PathDisplay != nil || r.LastError != nil {
+			t.Fatalf("expected reader root path_display and last_error redacted, got %+v", r)
+		}
+	}
+
+	onlineLib := LibraryFromDomain(lib, roots[:1], readerPrincipal)
+	if onlineLib.State != "ONLINE" {
+		t.Fatalf("expected ONLINE state when all roots are ONLINE, got %q", onlineLib.State)
 	}
 }
 

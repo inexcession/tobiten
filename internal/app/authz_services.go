@@ -52,12 +52,12 @@ func NewAuthorizingLibraryService(next LibraryService) LibraryService {
 	return &authorizingLibraryService{next: next}
 }
 
-func (s *authorizingLibraryService) ListLibraries(ctx context.Context, principal *domain.Principal) ([]Library, error) {
-	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() ([]Library, error) {
+func (s *authorizingLibraryService) ListLibraries(ctx context.Context, principal *domain.Principal, filter LibraryFilter) (*LibraryPage, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() (*LibraryPage, error) {
 		if s.next == nil {
 			return nil, ErrNotImplemented
 		}
-		return s.next.ListLibraries(ctx, principal)
+		return s.next.ListLibraries(ctx, principal, filter)
 	})
 }
 
@@ -70,8 +70,17 @@ func (s *authorizingLibraryService) GetLibrary(ctx context.Context, principal *d
 	})
 }
 
-func (s *authorizingLibraryService) ListSeries(ctx context.Context, principal *domain.Principal, filter SeriesFilter) ([]Series, error) {
-	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() ([]Series, error) {
+func (s *authorizingLibraryService) BrowseFolder(ctx context.Context, principal *domain.Principal, filter FolderBrowseFilter) (*FolderBrowseResult, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() (*FolderBrowseResult, error) {
+		if s.next == nil {
+			return nil, ErrNotImplemented
+		}
+		return s.next.BrowseFolder(ctx, principal, filter)
+	})
+}
+
+func (s *authorizingLibraryService) ListSeries(ctx context.Context, principal *domain.Principal, filter SeriesFilter) (*SeriesPage, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() (*SeriesPage, error) {
 		if s.next == nil {
 			return nil, ErrNotImplemented
 		}
@@ -88,8 +97,8 @@ func (s *authorizingLibraryService) GetSeries(ctx context.Context, principal *do
 	})
 }
 
-func (s *authorizingLibraryService) ListVolumes(ctx context.Context, principal *domain.Principal, filter VolumeFilter) ([]Volume, error) {
-	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() ([]Volume, error) {
+func (s *authorizingLibraryService) ListVolumes(ctx context.Context, principal *domain.Principal, filter VolumeFilter) (*VolumePage, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() (*VolumePage, error) {
 		if s.next == nil {
 			return nil, ErrNotImplemented
 		}

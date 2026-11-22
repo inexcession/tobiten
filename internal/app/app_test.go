@@ -31,20 +31,20 @@ func TestStubLibraryService(t *testing.T) {
 	svc := NewStubLibraryService()
 	ctx := context.Background()
 
-	libs, err := svc.ListLibraries(ctx, nil)
+	libPage, err := svc.ListLibraries(ctx, nil, LibraryFilter{})
 	if err != nil {
 		t.Fatalf("ListLibraries error: %v", err)
 	}
-	if len(libs) == 0 {
-		t.Errorf("expected at least 1 library, got %d", len(libs))
+	if len(libPage.Items) == 0 {
+		t.Errorf("expected at least 1 library, got %d", len(libPage.Items))
 	}
 
-	lib, err := svc.GetLibrary(ctx, nil, libs[0].ID)
+	lib, err := svc.GetLibrary(ctx, nil, libPage.Items[0].ID)
 	if err != nil {
 		t.Fatalf("GetLibrary error: %v", err)
 	}
-	if lib.Name != libs[0].Name {
-		t.Errorf("GetLibrary got %q, want %q", lib.Name, libs[0].Name)
+	if lib.Name != libPage.Items[0].Name {
+		t.Errorf("GetLibrary got %q, want %q", lib.Name, libPage.Items[0].Name)
 	}
 
 	_, err = svc.GetLibrary(ctx, nil, "nonexistent")
@@ -52,36 +52,44 @@ func TestStubLibraryService(t *testing.T) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 
-	seriesList, err := svc.ListSeries(ctx, nil, SeriesFilter{})
+	folderRes, err := svc.BrowseFolder(ctx, nil, FolderBrowseFilter{LibraryID: libPage.Items[0].ID})
+	if err != nil {
+		t.Fatalf("BrowseFolder error: %v", err)
+	}
+	if folderRes.LibraryID != libPage.Items[0].ID {
+		t.Errorf("BrowseFolder LibraryID got %q, want %q", folderRes.LibraryID, libPage.Items[0].ID)
+	}
+
+	seriesPage, err := svc.ListSeries(ctx, nil, SeriesFilter{})
 	if err != nil {
 		t.Fatalf("ListSeries error: %v", err)
 	}
-	if len(seriesList) == 0 {
-		t.Errorf("expected at least 1 series, got %d", len(seriesList))
+	if len(seriesPage.Items) == 0 {
+		t.Errorf("expected at least 1 series, got %d", len(seriesPage.Items))
 	}
 
-	ser, err := svc.GetSeries(ctx, nil, seriesList[0].ID)
+	ser, err := svc.GetSeries(ctx, nil, seriesPage.Items[0].ID)
 	if err != nil {
 		t.Fatalf("GetSeries error: %v", err)
 	}
-	if ser.Title != seriesList[0].Title {
-		t.Errorf("GetSeries got %q, want %q", ser.Title, seriesList[0].Title)
+	if ser.Title != seriesPage.Items[0].Title {
+		t.Errorf("GetSeries got %q, want %q", ser.Title, seriesPage.Items[0].Title)
 	}
 
-	vols, err := svc.ListVolumes(ctx, nil, VolumeFilter{})
+	volPage, err := svc.ListVolumes(ctx, nil, VolumeFilter{})
 	if err != nil {
 		t.Fatalf("ListVolumes error: %v", err)
 	}
-	if len(vols) == 0 {
-		t.Errorf("expected at least 1 volume, got %d", len(vols))
+	if len(volPage.Items) == 0 {
+		t.Errorf("expected at least 1 volume, got %d", len(volPage.Items))
 	}
 
-	vol, err := svc.GetVolume(ctx, nil, vols[0].ID)
+	vol, err := svc.GetVolume(ctx, nil, volPage.Items[0].ID)
 	if err != nil {
 		t.Fatalf("GetVolume error: %v", err)
 	}
-	if vol.Title != vols[0].Title {
-		t.Errorf("GetVolume got %q, want %q", vol.Title, vols[0].Title)
+	if vol.Title != volPage.Items[0].Title {
+		t.Errorf("GetVolume got %q, want %q", vol.Title, volPage.Items[0].Title)
 	}
 
 	jobID, err := svc.ScanLibrary(ctx, nil, "lib-1")

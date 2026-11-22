@@ -10,6 +10,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -33,6 +34,20 @@ const (
 		SELECT v.id, v.library_id, v.kind, v.number, v.chapter_start, v.chapter_end,
 		       v.chapter_range_source, v.title, v.summary, v.release_date, v.page_count,
 		       v.preferred_asset_id, v.external_ids, v.locked_fields, v.created_at, v.updated_at
+		FROM volumes v`
+
+	selectVolumePagedColumnsWithSeries = `
+		SELECT v.id, v.library_id, v.kind, v.number, v.chapter_start, v.chapter_end,
+		       v.chapter_range_source, v.title, v.summary, v.release_date, v.page_count,
+		       v.preferred_asset_id, v.external_ids, v.locked_fields, v.created_at, v.updated_at,
+		       sm_f.position AS membership_position
+		FROM volumes v`
+
+	selectVolumePagedColumnsNoSeries = `
+		SELECT v.id, v.library_id, v.kind, v.number, v.chapter_start, v.chapter_end,
+		       v.chapter_range_source, v.title, v.summary, v.release_date, v.page_count,
+		       v.preferred_asset_id, v.external_ids, v.locked_fields, v.created_at, v.updated_at,
+		       NULL::double precision AS membership_position
 		FROM volumes v`
 
 	selectAssetColumns = `
@@ -103,6 +118,54 @@ const (
 			FROM (SELECT position('/'::bytea IN substring(a.rel_path_bytes FROM $2::int)) AS slash_pos) p
 		) entry`
 )
+
+var seriesPagedColumns = []string{
+	"id",
+	"library_id",
+	"title",
+	"title_sort",
+	"language",
+	"original_title",
+	"romaji_title",
+	"franchise",
+	"edition_name",
+	"publisher",
+	"imprint",
+	"status",
+	"summary",
+	"age_rating",
+	"genres",
+	"tags",
+	"cover_policy",
+	"cover_volume_id",
+	"cover_image_digest",
+	"locked_fields",
+	"external_ids",
+	"total_volumes",
+	"release_year",
+	"created_at",
+	"updated_at",
+}
+
+var volumePagedColumns = []string{
+	"id",
+	"library_id",
+	"kind",
+	"number",
+	"chapter_start",
+	"chapter_end",
+	"chapter_range_source",
+	"title",
+	"summary",
+	"release_date",
+	"page_count",
+	"preferred_asset_id",
+	"external_ids",
+	"locked_fields",
+	"created_at",
+	"updated_at",
+	"membership_position",
+}
 
 var folderBrowseColumns = []string{
 	"is_folder",
@@ -412,6 +475,36 @@ func (r *CatalogueRepository) ListSeries(ctx context.Context, scope storage.Cata
 	return queryList(ctx, &r.guard, pred, spec, scanSeriesRow)
 }
 
+// ListSeriesPaged returns one server-paginated slice of visible series together with
+// total_count computed in one guarded snapshot statement, capping page size at MaxCataloguePageLimit.
+func (r *CatalogueRepository) ListSeriesPaged(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) (*storage.SeriesPageResult, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := normalizeCataloguePageFilter(filter.Limit, filter.Offset)
+	if err != nil {
+		return nil, err
+	}
+	spec := buildSeriesQuerySpec(selectSeriesColumns, filter, "", false)
+	spec.limit = limit
+	spec.offset = filter.Offset
+	spec.pagedTotal = &guardedPagedTotalSpec{
+		columns: seriesPagedColumns,
+		orderBy: "e.title_sort ASC, e.id ASC",
+	}
+	items, total, err := queryPagedTotal(ctx, &r.guard, pred, spec, scanSeriesPagedRow)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.SeriesPageResult{
+		Items:      items,
+		TotalCount: total,
+		Limit:      limit,
+		Offset:     filter.Offset,
+	}, nil
+}
+
 // CountSeries returns the count of series visible under the principal's label predicate matching filter.
 func (r *CatalogueRepository) CountSeries(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) (int64, error) {
 	pred, err := r.loadPredicate(ctx, scope)
@@ -471,6 +564,61 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 		}
 	}
 	return out, nil
+}
+
+// ListVolumesPaged returns one server-paginated slice of visible volumes together with
+// total_count computed in one guarded snapshot statement, populating authorized Memberships
+// and Assets and capping page size at MaxCataloguePageLimit.
+func (r *CatalogueRepository) ListVolumesPaged(ctx context.Context, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter) (*storage.VolumePageResult, error) {
+	pred, err := r.loadPredicate(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := normalizeCataloguePageFilter(filter.Limit, filter.Offset)
+	if err != nil {
+		return nil, err
+	}
+	baseSelect := selectVolumePagedColumnsNoSeries
+	orderBy := "e.created_at ASC, e.id ASC"
+	if filter.SeriesID != "" {
+		baseSelect = selectVolumePagedColumnsWithSeries
+		orderBy = "e.membership_position ASC NULLS LAST, e.number ASC NULLS LAST, e.id ASC"
+	}
+	spec := buildVolumeQuerySpec(baseSelect, filter, "", false)
+	spec.limit = limit
+	spec.offset = filter.Offset
+	spec.pagedTotal = &guardedPagedTotalSpec{
+		columns: volumePagedColumns,
+		orderBy: orderBy,
+	}
+	out, total, err := queryPagedTotal(ctx, &r.guard, pred, spec, scanVolumePagedRow)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > 0 {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, out); err != nil {
+			return nil, err
+		}
+	}
+	return &storage.VolumePageResult{
+		Items:      out,
+		TotalCount: total,
+		Limit:      limit,
+		Offset:     filter.Offset,
+	}, nil
+}
+
+func normalizeCataloguePageFilter(limit, offset int) (int, error) {
+	if limit < 0 || offset < 0 || offset > math.MaxInt32 {
+		return 0, fmt.Errorf("invalid pagination limit=%d offset=%d", limit, offset)
+	}
+	if limit == 0 {
+		return storage.DefaultCataloguePageLimit, nil
+	}
+	if limit > storage.MaxCataloguePageLimit {
+		return storage.MaxCataloguePageLimit, nil
+	}
+	return limit, nil
 }
 
 func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, volumes []domain.Volume) error {
@@ -978,6 +1126,46 @@ func buildProgressQuerySpec(selectFrom, userID string, filter storage.ReadingPro
 	return spec
 }
 
+func buildDomainSeriesFromScanned(
+	s *domain.Series,
+	status string,
+	coverPolicy *string,
+	lockedBytes []byte,
+	externalBytes []byte,
+	totalVolumes pgtype.Int4,
+	releaseYear pgtype.Int4,
+) error {
+	s.Status = domain.SeriesStatus(status)
+	if coverPolicy != nil {
+		cp := domain.CoverPolicy(*coverPolicy)
+		s.CoverPolicy = &cp
+	}
+	if totalVolumes.Valid {
+		tv := int(totalVolumes.Int32)
+		s.TotalVolumes = &tv
+	}
+	if releaseYear.Valid {
+		ry := int(releaseYear.Int32)
+		s.ReleaseYear = &ry
+	}
+	var err error
+	s.LockedFields, err = decodeFieldLocks(lockedBytes)
+	if err != nil {
+		return fmt.Errorf("decoding series locked_fields: %w", err)
+	}
+	s.ExternalIDs, err = decodeJSONMap(externalBytes)
+	if err != nil {
+		return fmt.Errorf("decoding series external_ids: %w", err)
+	}
+	if s.Genres == nil {
+		s.Genres = []string{}
+	}
+	if s.Tags == nil {
+		s.Tags = []string{}
+	}
+	return nil
+}
+
 func scanSeriesRow(row pgx.Row) (*domain.Series, error) {
 	var (
 		s             domain.Series
@@ -1018,28 +1206,124 @@ func scanSeriesRow(row pgx.Row) (*domain.Series, error) {
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	s.Status = domain.SeriesStatus(status)
-	if coverPolicy != nil {
-		cp := domain.CoverPolicy(*coverPolicy)
-		s.CoverPolicy = &cp
-	}
-	if totalVolumes.Valid {
-		tv := int(totalVolumes.Int32)
-		s.TotalVolumes = &tv
-	}
-	if releaseYear.Valid {
-		ry := int(releaseYear.Int32)
-		s.ReleaseYear = &ry
-	}
-	s.LockedFields, err = decodeFieldLocks(lockedBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decoding series locked_fields: %w", err)
-	}
-	s.ExternalIDs, err = decodeJSONMap(externalBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decoding series external_ids: %w", err)
+	if err := buildDomainSeriesFromScanned(&s, status, coverPolicy, lockedBytes, externalBytes, totalVolumes, releaseYear); err != nil {
+		return nil, err
 	}
 	return &s, nil
+}
+
+func scanSeriesPagedRow(row pgx.Row) (int64, bool, *domain.Series, error) {
+	var (
+		totalCount    int64
+		hasRow        bool
+		id            *string
+		libraryID     *string
+		title         *string
+		titleSort     *string
+		status        *string
+		createdAt     *time.Time
+		updatedAt     *time.Time
+		s             domain.Series
+		coverPolicy   *string
+		lockedBytes   []byte
+		externalBytes []byte
+		totalVolumes  pgtype.Int4
+		releaseYear   pgtype.Int4
+	)
+	err := row.Scan(
+		&totalCount,
+		&hasRow,
+		&id,
+		&libraryID,
+		&title,
+		&titleSort,
+		&s.Language,
+		&s.OriginalTitle,
+		&s.RomajiTitle,
+		&s.Franchise,
+		&s.EditionName,
+		&s.Publisher,
+		&s.Imprint,
+		&status,
+		&s.Summary,
+		&s.AgeRating,
+		&s.Genres,
+		&s.Tags,
+		&coverPolicy,
+		&s.CoverVolumeID,
+		&s.CoverImageDigest,
+		&lockedBytes,
+		&externalBytes,
+		&totalVolumes,
+		&releaseYear,
+		&createdAt,
+		&updatedAt,
+	)
+	if err != nil {
+		return 0, false, nil, mapPgError(err)
+	}
+	if !hasRow {
+		return totalCount, false, nil, nil
+	}
+	if id == nil || libraryID == nil || title == nil || titleSort == nil || status == nil || createdAt == nil || updatedAt == nil {
+		return 0, false, nil, errors.New("paged series row missing required series metadata")
+	}
+	s.ID = *id
+	s.LibraryID = *libraryID
+	s.Title = *title
+	s.TitleSort = *titleSort
+	s.CreatedAt = *createdAt
+	s.UpdatedAt = *updatedAt
+	if err := buildDomainSeriesFromScanned(&s, *status, coverPolicy, lockedBytes, externalBytes, totalVolumes, releaseYear); err != nil {
+		return 0, false, nil, err
+	}
+	return totalCount, true, &s, nil
+}
+
+func buildDomainVolumeFromScanned(
+	v *domain.Volume,
+	kind string,
+	number pgtype.Float8,
+	chapterStart pgtype.Float8,
+	chapterEnd pgtype.Float8,
+	chapterRangeSource *string,
+	releaseDate pgtype.Date,
+	pageCount int32,
+	externalBytes []byte,
+	lockedBytes []byte,
+) error {
+	v.Kind = domain.VolumeKind(kind)
+	if number.Valid {
+		n := number.Float64
+		v.Number = &n
+	}
+	if chapterStart.Valid {
+		cs := chapterStart.Float64
+		v.ChapterStart = &cs
+	}
+	if chapterEnd.Valid {
+		ce := chapterEnd.Float64
+		v.ChapterEnd = &ce
+	}
+	if chapterRangeSource != nil {
+		crs := domain.ChapterRangeSource(*chapterRangeSource)
+		v.ChapterRangeSource = &crs
+	}
+	if releaseDate.Valid {
+		rd := releaseDate.Time
+		v.ReleaseDate = &rd
+	}
+	v.PageCount = int(pageCount)
+	var err error
+	v.ExternalIDs, err = decodeJSONMap(externalBytes)
+	if err != nil {
+		return fmt.Errorf("decoding volume external_ids: %w", err)
+	}
+	v.LockedFields, err = decodeFieldLocks(lockedBytes)
+	if err != nil {
+		return fmt.Errorf("decoding volume locked_fields: %w", err)
+	}
+	return nil
 }
 
 func scanVolumeRow(row pgx.Row) (*domain.Volume, error) {
@@ -1076,37 +1360,70 @@ func scanVolumeRow(row pgx.Row) (*domain.Volume, error) {
 	if err != nil {
 		return nil, mapPgError(err)
 	}
-	v.Kind = domain.VolumeKind(kind)
-	if number.Valid {
-		n := number.Float64
-		v.Number = &n
-	}
-	if chapterStart.Valid {
-		cs := chapterStart.Float64
-		v.ChapterStart = &cs
-	}
-	if chapterEnd.Valid {
-		ce := chapterEnd.Float64
-		v.ChapterEnd = &ce
-	}
-	if chapterRangeSource != nil {
-		crs := domain.ChapterRangeSource(*chapterRangeSource)
-		v.ChapterRangeSource = &crs
-	}
-	if releaseDate.Valid {
-		rd := releaseDate.Time
-		v.ReleaseDate = &rd
-	}
-	v.PageCount = int(pageCount)
-	v.ExternalIDs, err = decodeJSONMap(externalBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decoding volume external_ids: %w", err)
-	}
-	v.LockedFields, err = decodeFieldLocks(lockedBytes)
-	if err != nil {
-		return nil, fmt.Errorf("decoding volume locked_fields: %w", err)
+	if err := buildDomainVolumeFromScanned(&v, kind, number, chapterStart, chapterEnd, chapterRangeSource, releaseDate, pageCount, externalBytes, lockedBytes); err != nil {
+		return nil, err
 	}
 	return &v, nil
+}
+
+func scanVolumePagedRow(row pgx.Row) (int64, bool, *domain.Volume, error) {
+	var (
+		totalCount         int64
+		hasRow             bool
+		id                 *string
+		libraryID          *string
+		kind               *string
+		number             pgtype.Float8
+		chapterStart       pgtype.Float8
+		chapterEnd         pgtype.Float8
+		chapterRangeSource *string
+		releaseDate        pgtype.Date
+		pageCount          *int32
+		externalBytes      []byte
+		lockedBytes        []byte
+		createdAt          *time.Time
+		updatedAt          *time.Time
+		membershipPos      pgtype.Float8
+		v                  domain.Volume
+	)
+	err := row.Scan(
+		&totalCount,
+		&hasRow,
+		&id,
+		&libraryID,
+		&kind,
+		&number,
+		&chapterStart,
+		&chapterEnd,
+		&chapterRangeSource,
+		&v.Title,
+		&v.Summary,
+		&releaseDate,
+		&pageCount,
+		&v.PreferredAssetID,
+		&externalBytes,
+		&lockedBytes,
+		&createdAt,
+		&updatedAt,
+		&membershipPos,
+	)
+	if err != nil {
+		return 0, false, nil, mapPgError(err)
+	}
+	if !hasRow {
+		return totalCount, false, nil, nil
+	}
+	if id == nil || libraryID == nil || kind == nil || pageCount == nil || createdAt == nil || updatedAt == nil {
+		return 0, false, nil, errors.New("paged volume row missing required volume metadata")
+	}
+	v.ID = *id
+	v.LibraryID = *libraryID
+	v.CreatedAt = *createdAt
+	v.UpdatedAt = *updatedAt
+	if err := buildDomainVolumeFromScanned(&v, *kind, number, chapterStart, chapterEnd, chapterRangeSource, releaseDate, *pageCount, externalBytes, lockedBytes); err != nil {
+		return 0, false, nil, err
+	}
+	return totalCount, true, &v, nil
 }
 
 func scanSeriesMembershipRow(row pgx.Row) (domain.SeriesMembership, error) {

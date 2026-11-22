@@ -2,18 +2,103 @@ package app
 
 import (
 	"encoding/json"
+	"slices"
+	"time"
 
 	"github.com/inexcession/tobiten/internal/domain"
 )
 
+// ComputeLibraryState computes a library's aggregate ONLINE/OFFLINE state from its configured roots (ADR-0019 §5).
+// A library is ONLINE iff every configured root is ONLINE.
+func ComputeLibraryState(roots []domain.LibraryRoot) domain.LibraryRootState {
+	for _, r := range roots {
+		if r.State != domain.LibraryRootStateOnline {
+			return domain.LibraryRootStateOffline
+		}
+	}
+	return domain.LibraryRootStateOnline
+}
+
+// LibraryFromDomain projects a domain Library and its roots into the application Library DTO,
+// redacting host filesystem display paths (and root last_error values that embed path errors)
+// unless principal holds domain.PermissionLibraryAdmin.
+func LibraryFromDomain(lib domain.Library, roots []domain.LibraryRoot, principal *domain.Principal) Library {
+	isAdmin := principal != nil && principal.HasPermission(domain.PermissionLibraryAdmin)
+
+	rootDTOs := make([]LibraryRoot, 0, len(roots))
+	for _, r := range roots {
+		dto := LibraryRoot{
+			ID:            r.ID,
+			LibraryID:     r.LibraryID,
+			InvalidUTF8:   r.Path.InvalidUTF8,
+			State:         string(r.State),
+			LastCheckedAt: cloneTimePtr(r.LastCheckedAt),
+		}
+		if isAdmin {
+			display := r.Path.Display
+			dto.PathDisplay = &display
+			dto.LastError = cloneStringPtr(r.LastError)
+		}
+		rootDTOs = append(rootDTOs, dto)
+	}
+
+	var intakeDisplay *string
+	if isAdmin && lib.IntakePath != nil {
+		display := lib.IntakePath.Display
+		intakeDisplay = &display
+	}
+
+	resolvers := make([]string, len(lib.ResolverChain))
+	for i, r := range lib.ResolverChain {
+		resolvers[i] = string(r)
+	}
+
+	return Library{
+		ID:                    lib.ID,
+		Name:                  lib.Name,
+		Mode:                  string(lib.Mode),
+		State:                 string(ComputeLibraryState(roots)),
+		Roots:                 rootDTOs,
+		IntakePathDisplay:     intakeDisplay,
+		AutoMetadataWriteback: lib.AutoMetadataWriteback,
+		ResolverChain:         resolvers,
+		MetadataPrecedence:    string(lib.MetadataPrecedence),
+		DefaultCoverPolicy:    string(lib.DefaultCoverPolicy),
+		CreatedAt:             lib.CreatedAt.UTC(),
+	}
+}
+
 // SeriesFromDomain projects a domain Series into the application Series DTO.
 func SeriesFromDomain(s domain.Series) Series {
+	genres := []string{}
+	if len(s.Genres) > 0 {
+		genres = slices.Clone(s.Genres)
+	}
+	tags := []string{}
+	if len(s.Tags) > 0 {
+		tags = slices.Clone(s.Tags)
+	}
 	return Series{
-		ID:        s.ID,
-		LibraryID: s.LibraryID,
-		Title:     s.Title,
-		CreatedAt: s.CreatedAt,
-		UpdatedAt: s.UpdatedAt,
+		ID:            s.ID,
+		LibraryID:     s.LibraryID,
+		Title:         s.Title,
+		TitleSort:     s.TitleSort,
+		Language:      cloneStringPtr(s.Language),
+		OriginalTitle: cloneStringPtr(s.OriginalTitle),
+		RomajiTitle:   cloneStringPtr(s.RomajiTitle),
+		Franchise:     cloneStringPtr(s.Franchise),
+		EditionName:   cloneStringPtr(s.EditionName),
+		Publisher:     cloneStringPtr(s.Publisher),
+		Imprint:       cloneStringPtr(s.Imprint),
+		Status:        string(s.Status),
+		Summary:       cloneStringPtr(s.Summary),
+		AgeRating:     cloneStringPtr(s.AgeRating),
+		Genres:        genres,
+		Tags:          tags,
+		TotalVolumes:  cloneIntPtr(s.TotalVolumes),
+		ReleaseYear:   cloneIntPtr(s.ReleaseYear),
+		CreatedAt:     s.CreatedAt,
+		UpdatedAt:     s.UpdatedAt,
 	}
 }
 
@@ -38,15 +123,56 @@ func VolumeFromDomain(v domain.Volume) Volume {
 	}
 
 	return Volume{
-		ID:         v.ID,
-		LibraryID:  v.LibraryID,
-		SeriesID:   seriesID,
-		Title:      title,
-		NumberSort: numberSort,
-		AssetCount: len(v.AvailableAssets()),
-		CreatedAt:  v.CreatedAt,
-		UpdatedAt:  v.UpdatedAt,
+		ID:               v.ID,
+		LibraryID:        v.LibraryID,
+		SeriesID:         seriesID,
+		Kind:             string(v.Kind),
+		Number:           cloneFloat64Ptr(v.Number),
+		ChapterStart:     cloneFloat64Ptr(v.ChapterStart),
+		ChapterEnd:       cloneFloat64Ptr(v.ChapterEnd),
+		Title:            title,
+		Summary:          cloneStringPtr(v.Summary),
+		ReleaseDate:      cloneTimePtr(v.ReleaseDate),
+		NumberSort:       numberSort,
+		PageCount:        v.PageCount,
+		AssetCount:       len(v.AvailableAssets()),
+		PreferredAssetID: cloneStringPtr(v.PreferredAssetID),
+		IsMissing:        v.IsMissing(),
+		CreatedAt:        v.CreatedAt,
+		UpdatedAt:        v.UpdatedAt,
 	}
+}
+
+func cloneStringPtr(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+func cloneIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+func cloneFloat64Ptr(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
+}
+
+func cloneTimePtr(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	cp := v.UTC()
+	return &cp
 }
 
 // LocatorFromDomain converts a typed domain Locator into the application Locator DTO.

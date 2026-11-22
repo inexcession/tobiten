@@ -27,9 +27,9 @@ type spyLibraryService struct {
 	calls int
 }
 
-func (s *spyLibraryService) ListLibraries(context.Context, *domain.Principal) ([]Library, error) {
+func (s *spyLibraryService) ListLibraries(context.Context, *domain.Principal, LibraryFilter) (*LibraryPage, error) {
 	s.calls++
-	return []Library{{ID: "lib-1"}}, nil
+	return &LibraryPage{Items: []Library{{ID: "lib-1"}}, TotalCount: 1, Limit: DefaultLibraryPageLimit}, nil
 }
 
 func (s *spyLibraryService) GetLibrary(context.Context, *domain.Principal, string) (*Library, error) {
@@ -37,9 +37,14 @@ func (s *spyLibraryService) GetLibrary(context.Context, *domain.Principal, strin
 	return &Library{ID: "lib-1"}, nil
 }
 
-func (s *spyLibraryService) ListSeries(context.Context, *domain.Principal, SeriesFilter) ([]Series, error) {
+func (s *spyLibraryService) BrowseFolder(context.Context, *domain.Principal, FolderBrowseFilter) (*FolderBrowseResult, error) {
 	s.calls++
-	return []Series{{ID: "ser-1"}}, nil
+	return &FolderBrowseResult{LibraryID: "lib-1", Entries: []FolderEntry{}, Limit: DefaultLibraryPageLimit}, nil
+}
+
+func (s *spyLibraryService) ListSeries(context.Context, *domain.Principal, SeriesFilter) (*SeriesPage, error) {
+	s.calls++
+	return &SeriesPage{Items: []Series{{ID: "ser-1"}}, TotalCount: 1, Limit: DefaultLibraryPageLimit}, nil
 }
 
 func (s *spyLibraryService) GetSeries(context.Context, *domain.Principal, string) (*Series, error) {
@@ -47,9 +52,9 @@ func (s *spyLibraryService) GetSeries(context.Context, *domain.Principal, string
 	return &Series{ID: "ser-1"}, nil
 }
 
-func (s *spyLibraryService) ListVolumes(context.Context, *domain.Principal, VolumeFilter) ([]Volume, error) {
+func (s *spyLibraryService) ListVolumes(context.Context, *domain.Principal, VolumeFilter) (*VolumePage, error) {
 	s.calls++
-	return []Volume{{ID: "vol-1"}}, nil
+	return &VolumePage{Items: []Volume{{ID: "vol-1"}}, TotalCount: 1, Limit: DefaultLibraryPageLimit}, nil
 }
 
 func (s *spyLibraryService) GetVolume(context.Context, *domain.Principal, string) (*Volume, error) {
@@ -335,8 +340,11 @@ func TestAuthorizingServices_ReadScopedPATCannotWriteProgressOrMetadata(t *testi
 	readPATPrincipal := domain.NewPrincipal(testUser("u-admin"), []domain.Role{adminRole}, domain.CredentialKindPAT, "cred-pat-read", []domain.PATScope{domain.ScopeRead})
 
 	// Permitted reads still work.
-	if _, err := svcs.Library.ListLibraries(ctx, readPATPrincipal); err != nil {
+	if _, err := svcs.Library.ListLibraries(ctx, readPATPrincipal, LibraryFilter{}); err != nil {
 		t.Fatalf("ListLibraries(read PAT) = %v, want nil", err)
+	}
+	if _, err := svcs.Library.BrowseFolder(ctx, readPATPrincipal, FolderBrowseFilter{LibraryID: "lib-1"}); err != nil {
+		t.Fatalf("BrowseFolder(read PAT) = %v, want nil", err)
 	}
 	if _, err := svcs.Library.ListSeries(ctx, readPATPrincipal, SeriesFilter{}); err != nil {
 		t.Fatalf("ListSeries(read PAT) = %v, want nil", err)
@@ -347,7 +355,7 @@ func TestAuthorizingServices_ReadScopedPATCannotWriteProgressOrMetadata(t *testi
 	if _, err := svcs.Curation.GetCover(ctx, readPATPrincipal, "vol-1"); err != nil {
 		t.Fatalf("GetCover(read PAT) = %v, want nil", err)
 	}
-	if libSpy.calls != 2 || readSpy.readCalls != 1 || curSpy.readCalls != 1 {
+	if libSpy.calls != 3 || readSpy.readCalls != 1 || curSpy.readCalls != 1 {
 		t.Fatalf("unexpected read spy counts: lib=%d read=%d cur=%d", libSpy.calls, readSpy.readCalls, curSpy.readCalls)
 	}
 
@@ -407,7 +415,7 @@ func TestAuthorizingServices_ReadScopedPATCannotWriteProgressOrMetadata(t *testi
 	if err := svcs.Admin.DeleteUser(ctx, readPATPrincipal, "u-1"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("DeleteUser(read PAT) = %v, want ErrForbidden", err)
 	}
-	if metadataCallbackCalls != 0 || curSpy.writeCalls != 0 || adminSpy.adminCalls != 0 || libSpy.calls != 2 {
+	if metadataCallbackCalls != 0 || curSpy.writeCalls != 0 || adminSpy.adminCalls != 0 || libSpy.calls != 3 {
 		t.Fatalf("denied metadata/admin mutations invoked callback/service: cb=%d curWrite=%d admin=%d lib=%d",
 			metadataCallbackCalls, curSpy.writeCalls, adminSpy.adminCalls, libSpy.calls)
 	}
@@ -433,8 +441,11 @@ func TestAuthorizingServices_NilAndRestrictedReaderFlagAndCuratorPermittedOps(t 
 	if !restricted.RequiresAllowLabels() {
 		t.Fatal("Restricted reader principal should expose RequiresAllowLabels() == true (M1-T9.2 seam)")
 	}
-	if _, err := directNilLib.ListLibraries(ctx, restricted); !errors.Is(err, ErrNotImplemented) {
+	if _, err := directNilLib.ListLibraries(ctx, restricted, LibraryFilter{}); !errors.Is(err, ErrNotImplemented) {
 		t.Fatalf("permitted call against nil inner service = %v, want ErrNotImplemented", err)
+	}
+	if _, err := directNilLib.BrowseFolder(ctx, nil, FolderBrowseFilter{LibraryID: "lib-1"}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("BrowseFolder(nil) = %v, want ErrUnauthorized", err)
 	}
 	if _, err := directNilLib.ScanLibrary(ctx, restricted, "lib-1"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("denied call against nil inner service = %v, want ErrForbidden", err)

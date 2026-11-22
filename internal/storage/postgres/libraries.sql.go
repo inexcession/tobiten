@@ -8,6 +8,8 @@ package postgres
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const acquireLibraryConfigLock = `-- name: AcquireLibraryConfigLock :exec
@@ -333,6 +335,88 @@ func (q *Queries) ListLibraries(ctx context.Context) ([]Library, error) {
 	return items, nil
 }
 
+const listLibrariesPaged = `-- name: ListLibrariesPaged :many
+WITH ordered AS (
+    SELECT id, name, mode, intake_path_bytes, intake_path_display, intake_path_match,
+           auto_metadata_writeback, resolver_chain, metadata_precedence, default_cover_policy, created_at
+    FROM libraries
+    ORDER BY created_at ASC, id ASC
+),
+total AS (
+    SELECT COUNT(*)::bigint AS total_count FROM ordered
+),
+paged AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY o.created_at ASC, o.id ASC) AS _row_ord,
+           o.id, o.name, o.mode, o.intake_path_bytes, o.intake_path_display, o.intake_path_match,
+           o.auto_metadata_writeback, o.resolver_chain, o.metadata_precedence, o.default_cover_policy, o.created_at
+    FROM ordered o
+    ORDER BY o.created_at ASC, o.id ASC
+    LIMIT $2::int OFFSET $1::int
+)
+SELECT t.total_count,
+       (p._row_ord IS NOT NULL)::boolean AS has_row,
+       p.id, p.name, p.mode, p.intake_path_bytes, p.intake_path_display, p.intake_path_match,
+       p.auto_metadata_writeback, p.resolver_chain, p.metadata_precedence, p.default_cover_policy, p.created_at
+FROM total t
+LEFT JOIN paged p ON TRUE
+ORDER BY p._row_ord ASC NULLS LAST
+`
+
+type ListLibrariesPagedParams struct {
+	PageOffset int32
+	PageLimit  int32
+}
+
+type ListLibrariesPagedRow struct {
+	TotalCount            int64
+	HasRow                bool
+	ID                    *string
+	Name                  *string
+	Mode                  *string
+	IntakePathBytes       []byte
+	IntakePathDisplay     *string
+	IntakePathMatch       *string
+	AutoMetadataWriteback pgtype.Bool
+	ResolverChain         []string
+	MetadataPrecedence    *string
+	DefaultCoverPolicy    *string
+	CreatedAt             *time.Time
+}
+
+func (q *Queries) ListLibrariesPaged(ctx context.Context, arg ListLibrariesPagedParams) ([]ListLibrariesPagedRow, error) {
+	rows, err := q.db.Query(ctx, listLibrariesPaged, arg.PageOffset, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLibrariesPagedRow
+	for rows.Next() {
+		var i ListLibrariesPagedRow
+		if err := rows.Scan(
+			&i.TotalCount,
+			&i.HasRow,
+			&i.ID,
+			&i.Name,
+			&i.Mode,
+			&i.IntakePathBytes,
+			&i.IntakePathDisplay,
+			&i.IntakePathMatch,
+			&i.AutoMetadataWriteback,
+			&i.ResolverChain,
+			&i.MetadataPrecedence,
+			&i.DefaultCoverPolicy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLibraryRootsByLibrary = `-- name: ListLibraryRootsByLibrary :many
 SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
 FROM library_roots
@@ -379,6 +463,42 @@ FOR NO KEY UPDATE
 
 func (q *Queries) ListLibraryRootsByLibraryForNoKeyUpdate(ctx context.Context, libraryID string) ([]LibraryRoot, error) {
 	rows, err := q.db.Query(ctx, listLibraryRootsByLibraryForNoKeyUpdate, libraryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LibraryRoot
+	for rows.Next() {
+		var i LibraryRoot
+		if err := rows.Scan(
+			&i.ID,
+			&i.LibraryID,
+			&i.PathBytes,
+			&i.PathDisplay,
+			&i.PathMatch,
+			&i.State,
+			&i.LastCheckedAt,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLibraryRootsByLibraryIDs = `-- name: ListLibraryRootsByLibraryIDs :many
+SELECT id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
+FROM library_roots
+WHERE library_id = ANY($1::text[])
+ORDER BY library_id ASC, path_match ASC, id ASC
+`
+
+func (q *Queries) ListLibraryRootsByLibraryIDs(ctx context.Context, dollar_1 []string) ([]LibraryRoot, error) {
+	rows, err := q.db.Query(ctx, listLibraryRootsByLibraryIDs, dollar_1)
 	if err != nil {
 		return nil, err
 	}

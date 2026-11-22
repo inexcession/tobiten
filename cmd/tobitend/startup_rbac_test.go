@@ -27,7 +27,7 @@ type spyProbeLibrary struct {
 	scanCalls atomic.Int32
 }
 
-func (s *spyProbeLibrary) ListSeries(ctx context.Context, principal *domain.Principal, filter app.SeriesFilter) ([]app.Series, error) {
+func (s *spyProbeLibrary) ListSeries(ctx context.Context, principal *domain.Principal, filter app.SeriesFilter) (*app.SeriesPage, error) {
 	s.readCalls.Add(1)
 	return s.LibraryService.ListSeries(ctx, principal, filter)
 }

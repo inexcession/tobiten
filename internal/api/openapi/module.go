@@ -56,6 +56,15 @@ func (m *Module) buildRouter() http.Handler {
 	// Shared authenticated SSE event stream (ADR-0013 §3, ADR-0018 S3).
 	mux.HandleFunc("GET /api/v1/events", m.handleEvents)
 
+	// Native library and catalogue read routes (M1-T21.4, ADR-0019, ADR-0020).
+	mux.HandleFunc("GET /api/v1/libraries", m.handleListLibraries)
+	mux.HandleFunc("GET /api/v1/libraries/{id}", m.handleGetLibrary)
+	mux.HandleFunc("GET /api/v1/libraries/{id}/folders", m.handleBrowseLibraryFolder)
+	mux.HandleFunc("GET /api/v1/series", m.handleListSeries)
+	mux.HandleFunc("GET /api/v1/series/{id}", m.handleGetSeries)
+	mux.HandleFunc("GET /api/v1/volumes", m.handleListVolumes)
+	mux.HandleFunc("GET /api/v1/volumes/{id}", m.handleGetVolume)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path
 		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {

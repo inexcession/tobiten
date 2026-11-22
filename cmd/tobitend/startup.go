@@ -18,6 +18,7 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/events"
 	"github.com/inexcession/tobiten/internal/jobs"
+	"github.com/inexcession/tobiten/internal/library"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
@@ -496,6 +497,11 @@ func newDaemonServices(
 	}
 	eventRepo := postgres.NewEventRepository(pool)
 	jobRepo := postgres.NewJobRepository(pool)
+	transactor := postgres.NewTransactor(pool)
+	libraryService, err := library.NewService(transactor)
+	if err != nil {
+		return nil, err
+	}
 	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
 		Users:    userRepo,
@@ -509,6 +515,7 @@ func newDaemonServices(
 		SessionAuth: sessionAuth,
 		Jobs:        jobService,
 		Events:      eventService,
+		Library:     libraryService,
 	})
 	return &daemonServices{
 		app:    services,

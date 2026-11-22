@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -113,6 +114,47 @@ func (r *LibraryRepository) ListLibraries(ctx context.Context) ([]domain.Library
 		return nil, mapPgError(err)
 	}
 	return toDomainLibraries(rows), nil
+}
+
+// ListLibrariesPaged returns one server-paginated slice of libraries together with total_count
+// computed in the same query snapshot, capping page size at storage.MaxLibraryPageLimit (ADR-0020 §7).
+func (r *LibraryRepository) ListLibrariesPaged(ctx context.Context, limit, offset int) (*storage.LibraryPageResult, error) {
+	if limit < 0 || offset < 0 || offset > math.MaxInt32 {
+		return nil, fmt.Errorf("invalid pagination limit=%d offset=%d", limit, offset)
+	}
+	if limit == 0 {
+		limit = storage.DefaultLibraryPageLimit
+	} else if limit > storage.MaxLibraryPageLimit {
+		limit = storage.MaxLibraryPageLimit
+	}
+
+	rows, err := r.q.ListLibrariesPaged(ctx, ListLibrariesPagedParams{
+		PageLimit:  int32(limit),
+		PageOffset: int32(offset),
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+
+	var total int64
+	items := []domain.Library{}
+	for _, row := range rows {
+		total = row.TotalCount
+		if !row.HasRow {
+			continue
+		}
+		lib, err := toDomainLibraryFromPagedRow(row)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, lib)
+	}
+	return &storage.LibraryPageResult{
+		Items:      items,
+		TotalCount: total,
+		Limit:      limit,
+		Offset:     offset,
+	}, nil
 }
 
 // UpdateLibrary persists changes to an existing library record.
@@ -245,6 +287,19 @@ func (r *LibraryRepository) ListLibraryRootsForNoKeyUpdate(ctx context.Context, 
 // ListAllLibraryRoots returns all roots across all libraries ordered by library ID, match key, and ID.
 func (r *LibraryRepository) ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error) {
 	rows, err := r.q.ListAllLibraryRoots(ctx)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return toDomainLibraryRoots(rows), nil
+}
+
+// ListLibraryRootsByLibraryIDs returns all roots belonging to any library in libraryIDs,
+// ordered by library ID, match key, and ID.
+func (r *LibraryRepository) ListLibraryRootsByLibraryIDs(ctx context.Context, libraryIDs []string) ([]domain.LibraryRoot, error) {
+	if len(libraryIDs) == 0 {
+		return []domain.LibraryRoot{}, nil
+	}
+	rows, err := r.q.ListLibraryRootsByLibraryIDs(ctx, libraryIDs)
 	if err != nil {
 		return nil, mapPgError(err)
 	}
@@ -458,25 +513,73 @@ func stringsToResolverChain(raw []string) []domain.ResolverName {
 }
 
 func toDomainLibrary(row Library) domain.Library {
+	return toDomainLibraryFields(
+		row.ID,
+		row.Name,
+		row.Mode,
+		row.IntakePathBytes,
+		row.IntakePathDisplay,
+		row.IntakePathMatch,
+		row.AutoMetadataWriteback,
+		row.ResolverChain,
+		row.MetadataPrecedence,
+		row.DefaultCoverPolicy,
+		row.CreatedAt,
+	)
+}
+
+func toDomainLibraryFromPagedRow(row ListLibrariesPagedRow) (domain.Library, error) {
+	if row.ID == nil || row.Name == nil || row.Mode == nil || !row.AutoMetadataWriteback.Valid ||
+		row.MetadataPrecedence == nil || row.DefaultCoverPolicy == nil || row.CreatedAt == nil {
+		return domain.Library{}, errors.New("paged library row missing required library metadata")
+	}
+	return toDomainLibraryFields(
+		*row.ID,
+		*row.Name,
+		*row.Mode,
+		row.IntakePathBytes,
+		row.IntakePathDisplay,
+		row.IntakePathMatch,
+		row.AutoMetadataWriteback.Bool,
+		row.ResolverChain,
+		*row.MetadataPrecedence,
+		*row.DefaultCoverPolicy,
+		*row.CreatedAt,
+	), nil
+}
+
+func toDomainLibraryFields(
+	id string,
+	name string,
+	mode string,
+	intakeBytes []byte,
+	intakeDisplay *string,
+	intakeMatch *string,
+	autoWriteback bool,
+	resolverChain []string,
+	metadataPrecedence string,
+	defaultCoverPolicy string,
+	createdAt time.Time,
+) domain.Library {
 	var intake *domain.PathIdentity
-	if row.IntakePathBytes != nil && row.IntakePathDisplay != nil && row.IntakePathMatch != nil {
+	if intakeBytes != nil && intakeDisplay != nil && intakeMatch != nil {
 		intake = &domain.PathIdentity{
-			Bytes:       slices.Clone(row.IntakePathBytes),
-			Display:     *row.IntakePathDisplay,
-			Match:       *row.IntakePathMatch,
-			InvalidUTF8: !utf8.Valid(row.IntakePathBytes),
+			Bytes:       slices.Clone(intakeBytes),
+			Display:     *intakeDisplay,
+			Match:       *intakeMatch,
+			InvalidUTF8: !utf8.Valid(intakeBytes),
 		}
 	}
 	return domain.Library{
-		ID:                    row.ID,
-		Name:                  row.Name,
-		Mode:                  domain.LibraryMode(row.Mode),
+		ID:                    id,
+		Name:                  name,
+		Mode:                  domain.LibraryMode(mode),
 		IntakePath:            intake,
-		AutoMetadataWriteback: row.AutoMetadataWriteback,
-		ResolverChain:         stringsToResolverChain(row.ResolverChain),
-		MetadataPrecedence:    domain.MetadataPrecedence(row.MetadataPrecedence),
-		DefaultCoverPolicy:    domain.CoverPolicy(row.DefaultCoverPolicy),
-		CreatedAt:             row.CreatedAt.UTC(),
+		AutoMetadataWriteback: autoWriteback,
+		ResolverChain:         stringsToResolverChain(resolverChain),
+		MetadataPrecedence:    domain.MetadataPrecedence(metadataPrecedence),
+		DefaultCoverPolicy:    domain.CoverPolicy(defaultCoverPolicy),
+		CreatedAt:             createdAt.UTC(),
 	}
 }
 

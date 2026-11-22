@@ -14,7 +14,18 @@ import (
 
 const txRollbackTimeout = 5 * time.Second
 
-var _ storage.Transactor = (*Transactor)(nil)
+var (
+	_ storage.Transactor     = (*Transactor)(nil)
+	_ storage.ReadTransactor = (*Transactor)(nil)
+)
+
+type txIsolationMode uint8
+
+const (
+	txModeDefault txIsolationMode = iota
+	txModeReadCommitted
+	txModeRepeatableReadReadOnly
+)
 
 // Transactor implements storage.Transactor over a PostgreSQL pool or transaction beginner.
 type Transactor struct {
@@ -30,16 +41,18 @@ func NewTransactor(db TxBeginner) *Transactor {
 // backed by an existing pgx.Tx) and commits only when fn returns nil.
 // Unconfirmed savepoint cleanup may close the caller's connection to abort the transaction.
 func (t *Transactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
-	return t.withTx(ctx, false, fn)
+	return t.withTx(ctx, txModeDefault, fn)
 }
 
 // WithReadCommittedTx executes fn inside a READ COMMITTED PostgreSQL transaction when
 // backed by a pool, or a nested savepoint when backed by an existing pgx.Tx.
 func (t *Transactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
-	return t.withTx(ctx, true, fn)
+	return t.withTx(ctx, txModeReadCommitted, fn)
 }
 
-func (t *Transactor) withTx(ctx context.Context, forceReadCommitted bool, fn func(tx storage.Tx) error) error {
+// WithRepeatableReadTx executes fn inside a REPEATABLE READ READ ONLY PostgreSQL transaction
+// when backed by a pool, or a nested savepoint when backed by an existing pgx.Tx.
+func (t *Transactor) WithRepeatableReadTx(ctx context.Context, fn func(tx storage.ReadTx) error) error {
 	if t == nil {
 		return errors.New("transactor database handle is required")
 	}
@@ -50,7 +63,23 @@ func (t *Transactor) withTx(ctx context.Context, forceReadCommitted bool, fn fun
 	if extTx, ok := t.db.(pgx.Tx); ok {
 		parentScope = newCallerTxScope(extTx)
 	}
-	return runTxWithOptions(ctx, t.db, parentScope, "storage", forceReadCommitted, func(child *txScope) error {
+	return runTxWithOptions(ctx, t.db, parentScope, "read", txModeRepeatableReadReadOnly, func(child *txScope) error {
+		return fn(&pgReadTx{scope: child, q: New(child.tx)})
+	})
+}
+
+func (t *Transactor) withTx(ctx context.Context, mode txIsolationMode, fn func(tx storage.Tx) error) error {
+	if t == nil {
+		return errors.New("transactor database handle is required")
+	}
+	if fn == nil {
+		return errors.New("transaction callback cannot be nil")
+	}
+	var parentScope *txScope
+	if extTx, ok := t.db.(pgx.Tx); ok {
+		parentScope = newCallerTxScope(extTx)
+	}
+	return runTxWithOptions(ctx, t.db, parentScope, "storage", mode, func(child *txScope) error {
 		return fn(&pgTx{scope: child, q: New(child.tx)})
 	})
 }
@@ -118,38 +147,47 @@ func (s *txScope) abortAncestors(rollbackCtx context.Context, cause error) error
 	return errors.Join(errs...)
 }
 
-func beginScopedTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, forceReadCommitted bool) (pgx.Tx, error) {
-	if forceReadCommitted && parentScope == nil {
-		if bt, ok := db.(readCommittedTxBeginner); ok {
-			return bt.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+func beginScopedTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, mode txIsolationMode) (pgx.Tx, error) {
+	if parentScope == nil {
+		switch mode {
+		case txModeReadCommitted:
+			return beginPoolTxWithSQLFallback(ctx, db, label, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+		case txModeRepeatableReadReadOnly:
+			return beginPoolTxWithSQLFallback(ctx, db, label, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 		}
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if _, isoErr := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); isoErr != nil {
-			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txRollbackTimeout)
-			_ = tx.Rollback(rollbackCtx)
-			cancel()
-			return nil, fmt.Errorf("setting READ COMMITTED isolation for %s transaction: %w", label, isoErr)
-		}
-		return tx, nil
 	}
 	return db.Begin(ctx)
 }
 
-func runTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, fn func(scope *txScope) error) error {
-	return runTxWithOptions(ctx, db, parentScope, label, false, fn)
+func beginPoolTxWithSQLFallback(ctx context.Context, db TxBeginner, label string, opts pgx.TxOptions, fallbackSQL string) (pgx.Tx, error) {
+	if bt, ok := db.(readCommittedTxBeginner); ok {
+		return bt.BeginTx(ctx, opts)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, isoErr := tx.Exec(ctx, fallbackSQL); isoErr != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), txRollbackTimeout)
+		_ = tx.Rollback(rollbackCtx)
+		cancel()
+		return nil, fmt.Errorf("setting isolation mode for %s transaction: %w", label, isoErr)
+	}
+	return tx, nil
 }
 
-func runTxWithOptions(ctx context.Context, db TxBeginner, parentScope *txScope, label string, forceReadCommitted bool, fn func(scope *txScope) error) (retErr error) {
+func runTx(ctx context.Context, db TxBeginner, parentScope *txScope, label string, fn func(scope *txScope) error) error {
+	return runTxWithOptions(ctx, db, parentScope, label, txModeDefault, fn)
+}
+
+func runTxWithOptions(ctx context.Context, db TxBeginner, parentScope *txScope, label string, mode txIsolationMode, fn func(scope *txScope) error) (retErr error) {
 	if db == nil {
 		return errors.New("db connection does not support transactions")
 	}
 	if err := parentScope.unconfirmed(); err != nil {
 		return err
 	}
-	tx, err := beginScopedTx(ctx, db, parentScope, label, forceReadCommitted)
+	tx, err := beginScopedTx(ctx, db, parentScope, label, mode)
 	if err != nil {
 		return fmt.Errorf("beginning %s transaction: %w", label, err)
 	}
@@ -324,4 +362,17 @@ func (s *pgTx) Credits() storage.CreditRepository {
 
 func (s *pgTx) Entities() storage.EntityRepository {
 	return &EntityRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
+
+type pgReadTx struct {
+	scope *txScope
+	q     *Queries
+}
+
+func (s *pgReadTx) Libraries() storage.LibraryRepository {
+	return &LibraryRepository{q: s.q, tx: s.scope.tx, scope: s.scope}
+}
+
+func (s *pgReadTx) Catalogue() storage.CatalogueRepository {
+	return NewCatalogueRepository(s.scope.tx)
 }
