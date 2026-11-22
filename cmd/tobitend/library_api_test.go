@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/library/paths"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
@@ -52,12 +55,12 @@ func TestDaemonLibraryAndCatalogueReadAPI(t *testing.T) {
 	}
 	defer setup.Close()
 
-	daemonSvcs, err := newDaemonServices(db.Pool, setup, userRepo)
+	daemonSvcs, err := newDaemonServices(db.Pool, cfg, setup, userRepo)
 	if err != nil {
 		t.Fatalf("newDaemonServices: %v", err)
 	}
-	if daemonSvcs.app == nil || daemonSvcs.app.Library == nil {
-		t.Fatal("expected newDaemonServices to wire LibraryService")
+	if daemonSvcs.app == nil || daemonSvcs.app.Library == nil || daemonSvcs.app.LibraryConfig == nil {
+		t.Fatal("expected newDaemonServices to wire LibraryService and LibraryConfigService")
 	}
 
 	reg := BuildRegistryWithServices(cfg, daemonSvcs.app)
@@ -574,5 +577,417 @@ func mustUnmarshal(t *testing.T, raw string, dst any) {
 	t.Helper()
 	if err := json.Unmarshal([]byte(raw), dst); err != nil {
 		t.Fatalf("Unmarshal JSON %q: %v", raw, err)
+	}
+}
+
+func startLibraryTestServer(t *testing.T, db *testdb.TestDB, env []string) (*httptest.Server, *postgres.UserRepository) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
+		t.Fatalf("migrations.RunFS: %v", err)
+	}
+
+	baseEnv := []string{
+		"TOBITEN_STORAGE_MODE=postgres",
+		"TOBITEN_DATABASE_URL=" + db.URL,
+		"TOBITEN_BASE_URL=http://localhost:8080/comics",
+		"TOBITEN_LOG_FORMAT=json",
+	}
+	baseEnv = append(baseEnv, env...)
+	cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron(baseEnv))
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	userRepo := postgres.NewUserRepository(db.Pool)
+	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	setup, err := bootstrap.NewSetup(ctx, userRepo, discardLogger, "http://localhost:8080/comics/api/v1/auth/setup")
+	if err != nil {
+		t.Fatalf("bootstrap.NewSetup: %v", err)
+	}
+	t.Cleanup(func() { setup.Close() })
+
+	daemonSvcs, err := newDaemonServices(db.Pool, cfg, setup, userRepo)
+	if err != nil {
+		t.Fatalf("newDaemonServices: %v", err)
+	}
+
+	reg := BuildRegistryWithServices(cfg, daemonSvcs.app)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv, err := api.NewServer(api.ServerOptions{
+		Config:   cfg,
+		Logger:   discardLogger,
+		Listener: ln,
+		Registry: reg,
+	})
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("api.NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, userRepo
+}
+
+func countLibraryAndRootRows(ctx context.Context, t *testing.T, db *testdb.TestDB) (int, int) {
+	t.Helper()
+	var libs, roots int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM libraries`).Scan(&libs); err != nil {
+		t.Fatalf("count libraries: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM library_roots`).Scan(&roots); err != nil {
+		t.Fatalf("count library_roots: %v", err)
+	}
+	return libs, roots
+}
+
+func TestDaemonLibraryProvisioningRoutes(t *testing.T) {
+	db := testdb.New(t)
+	ts, userRepo := startLibraryTestServer(t, db, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	admin := createTestUserWithPassword(ctx, t, userRepo, "provadmin", "admin-pass-123", domain.RoleAdminID)
+	_ = createTestUserWithPassword(ctx, t, userRepo, "provreader", "reader-pass-123", domain.RoleReaderID)
+	_ = createTestUserWithPassword(ctx, t, userRepo, "provcurator", "curator-pass-123", domain.RoleCuratorID)
+
+	readPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeRead})
+	metaPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeMetadataWrite})
+	libAdminPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeLibraryAdmin})
+
+	baseDir := t.TempDir()
+	canonBase, err := paths.CanonicalPath(baseDir)
+	if err != nil {
+		t.Fatalf("CanonicalPath(baseDir): %v", err)
+	}
+	root1 := filepath.Join(canonBase, "root1")
+	root1Sub := filepath.Join(root1, "nested")
+	root2 := filepath.Join(canonBase, "root2")
+	root3 := filepath.Join(canonBase, "root3")
+	parentDir := filepath.Join(canonBase, "parent")
+	parentChild := filepath.Join(parentDir, "child")
+	intakeDir := filepath.Join(canonBase, "intake")
+	for _, d := range []string{root1Sub, root2, root3, parentChild, intakeDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+	aliasRoot1 := filepath.Join(canonBase, "alias-root1")
+	if err := os.Symlink(root1, aliasRoot1); err != nil {
+		t.Fatalf("Symlink(alias-root1): %v", err)
+	}
+	aliasParent := filepath.Join(canonBase, "alias-parent")
+	if err := os.Symlink(parentDir, aliasParent); err != nil {
+		t.Fatalf("Symlink(alias-parent): %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	doJSONPost := func(url, body string, mutate func(*http.Request)) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("NewRequest(%s): %v", url, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if mutate != nil {
+			mutate(req)
+		}
+		return execReq(t, client, req)
+	}
+
+	t.Run("unauthenticated requests return 401 on direct and subpath routes", func(t *testing.T) {
+		for _, p := range []string{
+			"/api/v1/libraries",
+			"/comics/api/v1/libraries",
+			"/api/v1/libraries/lib-1/roots",
+			"/comics/api/v1/libraries/lib-1/roots",
+		} {
+			code, _ := doJSONPost(ts.URL+p, `{"name":"X","root_path":"`+root1+`"}`, nil)
+			if code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated POST %s = %d, want 401", p, code)
+			}
+		}
+	})
+
+	t.Run("missing library:admin returns 403 and writes no row", func(t *testing.T) {
+		beforeLibs, beforeRoots := countLibraryAndRootRows(ctx, t, db)
+
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"reader basic", func(r *http.Request) { r.SetBasicAuth("provreader", "reader-pass-123") }},
+			{"curator basic", func(r *http.Request) { r.SetBasicAuth("provcurator", "curator-pass-123") }},
+			{"read PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+readPAT) }},
+			{"metadata PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+metaPAT) }},
+		} {
+			for _, p := range []string{"/api/v1/libraries", "/api/v1/libraries/lib-1/roots"} {
+				code, _ := doJSONPost(ts.URL+p, `{malformed`, tc.mutate)
+				if code != http.StatusForbidden {
+					t.Fatalf("%s POST %s = %d, want 403", tc.name, p, code)
+				}
+			}
+		}
+
+		afterLibs, afterRoots := countLibraryAndRootRows(ctx, t, db)
+		if afterLibs != beforeLibs || afterRoots != beforeRoots {
+			t.Fatalf("unauthorized requests mutated DB: before=(%d,%d) after=(%d,%d)", beforeLibs, beforeRoots, afterLibs, afterRoots)
+		}
+	})
+
+	t.Run("cookie session enforces CSRF and creates library and root when valid", func(t *testing.T) {
+		loginReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"username":"provadmin","password":"admin-pass-123"}`))
+		if err != nil {
+			t.Fatalf("NewRequest login: %v", err)
+		}
+		loginResp, err := client.Do(loginReq)
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+		loginRaw, _ := io.ReadAll(loginResp.Body)
+		_ = loginResp.Body.Close()
+		if loginResp.StatusCode != http.StatusOK {
+			t.Fatalf("login status = %d (%s)", loginResp.StatusCode, string(loginRaw))
+		}
+		var sessCookie *http.Cookie
+		for _, c := range loginResp.Cookies() {
+			if c.Name == app.NativeSessionCookieName {
+				sessCookie = c
+			}
+		}
+		csrfToken := loginResp.Header.Get("X-CSRF-Token")
+		if sessCookie == nil || csrfToken == "" {
+			t.Fatalf("expected session cookie and X-CSRF-Token, got cookie=%v csrf=%q", sessCookie, csrfToken)
+		}
+
+		beforeLibs, beforeRoots := countLibraryAndRootRows(ctx, t, db)
+
+		// Cookie without CSRF or with wrong CSRF or foreign origin -> 403 and no DB write.
+		for _, tc := range []struct {
+			name   string
+			csrf   string
+			origin string
+			fetch  string
+		}{
+			{"missing csrf", "", "", ""},
+			{"wrong csrf", "wrong-csrf-token", "", ""},
+			{"foreign origin", csrfToken, "https://evil.example", ""},
+			{"cross-site fetch", csrfToken, "http://localhost:8080", "cross-site"},
+		} {
+			code, _ := doJSONPost(ts.URL+"/api/v1/libraries", `{"name":"CSRF Blocked","root_path":"`+root1+`"}`, func(r *http.Request) {
+				r.AddCookie(&http.Cookie{Name: app.NativeSessionCookieName, Value: sessCookie.Value})
+				if tc.csrf != "" {
+					r.Header.Set("X-CSRF-Token", tc.csrf)
+				}
+				if tc.origin != "" {
+					r.Header.Set("Origin", tc.origin)
+				}
+				if tc.fetch != "" {
+					r.Header.Set("Sec-Fetch-Site", tc.fetch)
+				}
+			})
+			if code != http.StatusForbidden {
+				t.Fatalf("create library (%s) = %d, want 403", tc.name, code)
+			}
+		}
+
+		afterDeniedLibs, afterDeniedRoots := countLibraryAndRootRows(ctx, t, db)
+		if afterDeniedLibs != beforeLibs || afterDeniedRoots != beforeRoots {
+			t.Fatalf("CSRF-denied requests mutated DB: before=(%d,%d) after=(%d,%d)", beforeLibs, beforeRoots, afterDeniedLibs, afterDeniedRoots)
+		}
+
+		// Valid cookie + valid CSRF creates VIRTUAL library (default mode) and its first root in one tx.
+		createBody := `{"name":"Cookie Manga","root_path":"` + root1 + `"}`
+		code, respBody := doJSONPost(ts.URL+"/comics/api/v1/libraries", createBody, func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: app.NativeSessionCookieName, Value: sessCookie.Value})
+			r.Header.Set("X-CSRF-Token", csrfToken)
+			r.Header.Set("Origin", "http://localhost:8080")
+			r.Header.Set("Sec-Fetch-Site", "same-origin")
+		})
+		if code != http.StatusCreated {
+			t.Fatalf("valid cookie POST /libraries = %d (%s), want 201", code, respBody)
+		}
+		var created app.Library
+		mustUnmarshal(t, respBody, &created)
+		if created.Name != "Cookie Manga" || created.Mode != "VIRTUAL" || len(created.Roots) != 1 ||
+			created.Roots[0].PathDisplay == nil || *created.Roots[0].PathDisplay != root1 {
+			t.Fatalf("unexpected created library: %+v", created)
+		}
+
+		// Cookie without CSRF on POST /libraries/{id}/roots -> 403 and no row.
+		addNoCSRFCode, _ := doJSONPost(ts.URL+"/api/v1/libraries/"+created.ID+"/roots", `{"path":"`+root2+`"}`, func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: app.NativeSessionCookieName, Value: sessCookie.Value})
+		})
+		if addNoCSRFCode != http.StatusForbidden {
+			t.Fatalf("cookie POST /roots without CSRF = %d, want 403", addNoCSRFCode)
+		}
+
+		// Valid cookie + CSRF adds a second root.
+		addCode, addBody := doJSONPost(ts.URL+"/comics/api/v1/libraries/"+created.ID+"/roots", `{"path":"`+root2+`"}`, func(r *http.Request) {
+			r.AddCookie(&http.Cookie{Name: app.NativeSessionCookieName, Value: sessCookie.Value})
+			r.Header.Set("X-CSRF-Token", csrfToken)
+		})
+		if addCode != http.StatusCreated {
+			t.Fatalf("valid cookie POST /roots = %d (%s), want 201", addCode, addBody)
+		}
+		var addedRoot app.LibraryRoot
+		mustUnmarshal(t, addBody, &addedRoot)
+		if addedRoot.LibraryID != created.ID || addedRoot.PathDisplay == nil || *addedRoot.PathDisplay != root2 {
+			t.Fatalf("unexpected added root: %+v", addedRoot)
+		}
+
+		// GET /api/v1/libraries/{id} reflects both persisted roots.
+		getCode, getBody := doBearerGet(t, client, ts.URL+"/api/v1/libraries/"+created.ID, libAdminPAT)
+		if getCode != http.StatusOK {
+			t.Fatalf("GET /libraries/%s = %d (%s)", created.ID, getCode, getBody)
+		}
+		var fetched app.Library
+		mustUnmarshal(t, getBody, &fetched)
+		if len(fetched.Roots) != 2 {
+			t.Fatalf("expected 2 persisted roots, got %+v", fetched.Roots)
+		}
+	})
+
+	t.Run("overlap rejections (equal, nested, containing, symlink-aliased) return 409 and write no row", func(t *testing.T) {
+		// Create a library anchored at parentChild (/parent/child) using library:admin PAT.
+		code, body := doJSONPost(ts.URL+"/api/v1/libraries", `{"name":"PAT Managed","mode":"MANAGED","intake_path":"`+intakeDir+`","root_path":"`+parentChild+`"}`, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if code != http.StatusCreated {
+			t.Fatalf("PAT POST /libraries = %d (%s), want 201", code, body)
+		}
+		var patLib app.Library
+		mustUnmarshal(t, body, &patLib)
+
+		beforeLibs, beforeRoots := countLibraryAndRootRows(ctx, t, db)
+
+		overlapPaths := []struct {
+			name string
+			path string
+		}{
+			{"equal root", root1},
+			{"nested inside existing root", root1Sub},
+			{"containing existing root", parentDir},
+			{"equal via symlink", aliasRoot1},
+			{"nested via symlink", filepath.Join(aliasRoot1, "nested")},
+			{"containing via symlink", aliasParent},
+			{"overlaps existing managed intake", filepath.Join(intakeDir, "sub")},
+		}
+
+		for _, tc := range overlapPaths {
+			c1, b1 := doJSONPost(ts.URL+"/api/v1/libraries", `{"name":"Overlap-`+tc.name+`","root_path":"`+tc.path+`"}`, func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+			})
+			if c1 != http.StatusConflict {
+				t.Fatalf("CreateLibrary(%s) = %d (%s), want 409", tc.name, c1, b1)
+			}
+
+			c2, b2 := doJSONPost(ts.URL+"/api/v1/libraries/"+patLib.ID+"/roots", `{"path":"`+tc.path+`"}`, func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+			})
+			if c2 != http.StatusConflict {
+				t.Fatalf("AddRoot(%s) = %d (%s), want 409", tc.name, c2, b2)
+			}
+		}
+
+		// Duplicate library name also returns 409 and writes no root row.
+		dupCode, dupBody := doJSONPost(ts.URL+"/api/v1/libraries", `{"name":"PAT Managed","root_path":"`+root3+`"}`, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if dupCode != http.StatusConflict {
+			t.Fatalf("duplicate library name = %d (%s), want 409", dupCode, dupBody)
+		}
+
+		afterLibs, afterRoots := countLibraryAndRootRows(ctx, t, db)
+		if afterLibs != beforeLibs || afterRoots != beforeRoots {
+			t.Fatalf("409 rejections mutated DB: before=(%d,%d) after=(%d,%d)", beforeLibs, beforeRoots, afterLibs, afterRoots)
+		}
+
+		// Disjoint root succeeds via PAT, and missing library returns 404.
+		okCode, _ := doJSONPost(ts.URL+"/api/v1/libraries/"+patLib.ID+"/roots", `{"path":"`+root3+`"}`, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if okCode != http.StatusCreated {
+			t.Fatalf("PAT AddRoot(disjoint) = %d, want 201", okCode)
+		}
+
+		notFoundCode, _ := doJSONPost(ts.URL+"/api/v1/libraries/does-not-exist/roots", `{"path":"`+filepath.Join(canonBase, "root4")+`"}`, func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if notFoundCode != http.StatusNotFound {
+			t.Fatalf("AddRoot(missing lib) = %d, want 404", notFoundCode)
+		}
+	})
+}
+
+func TestDaemonLibraryProvisioningDefaultModeFromEnv(t *testing.T) {
+	db := testdb.New(t)
+	ts, userRepo := startLibraryTestServer(t, db, []string{"TOBITEN_LIBRARY_MODE=managed"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_ = createTestUserWithPassword(ctx, t, userRepo, "modeadmin", "admin-pass-123", domain.RoleAdminID)
+
+	baseDir := t.TempDir()
+	canonBase, err := paths.CanonicalPath(baseDir)
+	if err != nil {
+		t.Fatalf("CanonicalPath(baseDir): %v", err)
+	}
+	intake := filepath.Join(canonBase, "intake")
+	rootManaged := filepath.Join(canonBase, "managed-root")
+	rootVirtual := filepath.Join(canonBase, "virtual-root")
+	rootNoIntake := filepath.Join(canonBase, "no-intake-root")
+	for _, d := range []string{intake, rootManaged, rootVirtual, rootNoIntake} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	postAsAdmin := func(body string) (int, string) {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/libraries", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth("modeadmin", "admin-pass-123")
+		return execReq(t, client, req)
+	}
+
+	// 1. Mode omitted with TOBITEN_LIBRARY_MODE=managed defaults to MANAGED (requires intake_path).
+	badCode, badBody := postAsAdmin(`{"name":"Missing Intake","root_path":"` + rootNoIntake + `"}`)
+	if badCode != http.StatusBadRequest {
+		t.Fatalf("omitted mode under TOBITEN_LIBRARY_MODE=managed without intake = %d (%s), want 400", badCode, badBody)
+	}
+
+	// 2. Mode omitted with intake_path creates MANAGED library.
+	okCode, okBody := postAsAdmin(`{"name":"Default Managed","root_path":"` + rootManaged + `","intake_path":"` + intake + `"}`)
+	if okCode != http.StatusCreated {
+		t.Fatalf("omitted mode with intake = %d (%s), want 201", okCode, okBody)
+	}
+	var managedLib app.Library
+	mustUnmarshal(t, okBody, &managedLib)
+	if managedLib.Mode != "MANAGED" || managedLib.IntakePathDisplay == nil || *managedLib.IntakePathDisplay != intake {
+		t.Fatalf("expected MANAGED library from TOBITEN_LIBRARY_MODE=managed, got %+v", managedLib)
+	}
+
+	// 3. Explicit VIRTUAL mode overrides TOBITEN_LIBRARY_MODE=managed.
+	vCode, vBody := postAsAdmin(`{"name":"Explicit Virtual","mode":"VIRTUAL","root_path":"` + rootVirtual + `"}`)
+	if vCode != http.StatusCreated {
+		t.Fatalf("explicit VIRTUAL = %d (%s), want 201", vCode, vBody)
+	}
+	var virtualLib app.Library
+	mustUnmarshal(t, vBody, &virtualLib)
+	if virtualLib.Mode != "VIRTUAL" || virtualLib.IntakePathDisplay != nil {
+		t.Fatalf("expected explicit VIRTUAL library, got %+v", virtualLib)
 	}
 }

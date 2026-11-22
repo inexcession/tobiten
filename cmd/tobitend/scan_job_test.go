@@ -122,8 +122,8 @@ func captureDaemonAssembly(t *testing.T) (**daemonServices, **daemonWorkers) {
 
 	originalBuild := buildDaemonServices
 	originalStart := startDaemonJobs
-	buildDaemonServices = func(pool *pgxpool.Pool, setup *bootstrap.Setup, userRepo *postgres.UserRepository) (*daemonServices, error) {
-		ds, err := originalBuild(pool, setup, userRepo)
+	buildDaemonServices = func(pool *pgxpool.Pool, cfg *config.Config, setup *bootstrap.Setup, userRepo *postgres.UserRepository) (*daemonServices, error) {
+		ds, err := originalBuild(pool, cfg, setup, userRepo)
 		if err == nil {
 			services = ds
 		}

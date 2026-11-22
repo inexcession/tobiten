@@ -65,6 +65,10 @@ func (m *Module) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/v1/volumes", m.handleListVolumes)
 	mux.HandleFunc("GET /api/v1/volumes/{id}", m.handleGetVolume)
 
+	// Native library provisioning routes (M1-T21.5, M1B-D1, ADR-0019 §§3, 7).
+	mux.HandleFunc("POST /api/v1/libraries", m.handleCreateLibrary)
+	mux.HandleFunc("POST /api/v1/libraries/{id}/roots", m.handleAddLibraryRoot)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path
 		if reqPath == "/api/v1/auth/login" || reqPath == "/api/v1/auth/setup" {

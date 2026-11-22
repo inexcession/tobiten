@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 )
@@ -315,5 +316,318 @@ func TestLibraryReadRoutes_QueryValidationJSONContractAndHEAD(t *testing.T) {
 				t.Fatalf("GET %s = %d, want 404", p, rec.Code)
 			}
 		}
+	})
+}
+
+type recordingLibraryConfigService struct {
+	lastCreateReq app.CreateLibraryRequest
+	lastAddReq    app.AddLibraryRootRequest
+	defaultMode   domain.LibraryMode
+	conflictErr   bool
+	notFoundErr   bool
+	invalidErr    bool
+}
+
+func (r *recordingLibraryConfigService) CreateLibrary(_ context.Context, _ *domain.Principal, req app.CreateLibraryRequest) (*app.CreateLibraryResult, error) {
+	r.lastCreateReq = req
+	if r.conflictErr {
+		return nil, app.ErrConflict
+	}
+	if r.invalidErr {
+		return nil, app.ErrInvalidInput
+	}
+	mode := req.Mode
+	if mode == "" {
+		mode = r.defaultMode
+		if mode == "" {
+			mode = domain.LibraryModeVirtual
+		}
+	}
+	var intake *domain.PathIdentity
+	if len(req.IntakePath) > 0 {
+		id := domain.NewPathIdentity(req.IntakePath)
+		intake = &id
+	}
+	chain := req.ResolverChain
+	if chain == nil {
+		chain = domain.DefaultResolverChain()
+	}
+	prec := req.MetadataPrecedence
+	if prec == "" {
+		prec = domain.MetadataPrecedenceEmbeddedOverOnline
+	}
+	cov := req.DefaultCoverPolicy
+	if cov == "" {
+		cov = domain.CoverPolicyFirst
+	}
+	lib := domain.Library{
+		ID:                    "lib-created-1",
+		Name:                  req.Name,
+		Mode:                  mode,
+		IntakePath:            intake,
+		AutoMetadataWriteback: req.AutoMetadataWriteback,
+		ResolverChain:         chain,
+		MetadataPrecedence:    prec,
+		DefaultCoverPolicy:    cov,
+		CreatedAt:             time.Unix(1700000000, 0).UTC(),
+	}
+	var roots []domain.LibraryRoot
+	for _, raw := range req.Roots {
+		roots = append(roots, domain.LibraryRoot{
+			ID:        "root-created-1",
+			LibraryID: lib.ID,
+			Path:      domain.NewPathIdentity(raw),
+			State:     domain.LibraryRootStateOnline,
+		})
+	}
+	return &app.CreateLibraryResult{Library: lib, Roots: roots}, nil
+}
+
+func (r *recordingLibraryConfigService) AddRoot(_ context.Context, _ *domain.Principal, req app.AddLibraryRootRequest) (*domain.LibraryRoot, error) {
+	r.lastAddReq = req
+	if r.conflictErr {
+		return nil, app.ErrConflict
+	}
+	if r.notFoundErr {
+		return nil, app.ErrNotFound
+	}
+	if r.invalidErr {
+		return nil, app.ErrInvalidInput
+	}
+	return &domain.LibraryRoot{
+		ID:        "root-added-1",
+		LibraryID: req.LibraryID,
+		Path:      domain.NewPathIdentity(req.Path),
+		State:     domain.LibraryRootStateOnline,
+	}, nil
+}
+
+func (r *recordingLibraryConfigService) SetManagedIntakePath(context.Context, *domain.Principal, app.SetManagedIntakePathRequest) (*domain.Library, error) {
+	return nil, app.ErrNotImplemented
+}
+
+func TestLibraryProvisioningRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
+	recCfg := &recordingLibraryConfigService{defaultMode: domain.LibraryModeVirtual}
+	mod := NewModule(app.NewAuthorizingServices(&app.Services{LibraryConfig: recCfg}))
+	modNil := NewModule(nil)
+
+	reader := libraryTestPrincipal(domain.PermissionLibraryRead)
+	admin := libraryTestPrincipal(domain.PermissionLibraryRead, domain.PermissionLibraryAdmin)
+
+	routes := []string{
+		"/api/v1/libraries",
+		"/api/v1/libraries/lib-1/roots",
+	}
+
+	for _, path := range routes {
+		// 1. Unauthenticated -> 401
+		reqUnauth := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		recUnauth := httptest.NewRecorder()
+		mod.router.ServeHTTP(recUnauth, reqUnauth)
+		if recUnauth.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated POST %s = %d, want 401", path, recUnauth.Code)
+		}
+
+		// 2. Unverified CSRF -> 403
+		reqCSRF := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		ctxCSRF := middleware.WithCSRFUnverified(domain.ContextWithPrincipal(reqCSRF.Context(), admin))
+		recCSRF := httptest.NewRecorder()
+		mod.router.ServeHTTP(recCSRF, reqCSRF.WithContext(ctxCSRF))
+		if recCSRF.Code != http.StatusForbidden {
+			t.Fatalf("unverified CSRF POST %s = %d, want 403", path, recCSRF.Code)
+		}
+
+		// 3. Missing library:admin -> 403 EVEN with malformed JSON body
+		reqNoPerm := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{invalid`))
+		reqNoPerm = reqNoPerm.WithContext(domain.ContextWithPrincipal(reqNoPerm.Context(), reader))
+		recNoPerm := httptest.NewRecorder()
+		mod.router.ServeHTTP(recNoPerm, reqNoPerm)
+		if recNoPerm.Code != http.StatusForbidden {
+			t.Fatalf("no library:admin POST %s = %d, want 403", path, recNoPerm.Code)
+		}
+
+		// 4. Nil service -> 503
+		reqUnavail := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		reqUnavail = reqUnavail.WithContext(domain.ContextWithPrincipal(reqUnavail.Context(), admin))
+		recUnavail := httptest.NewRecorder()
+		modNil.router.ServeHTTP(recUnavail, reqUnavail)
+		if recUnavail.Code != http.StatusServiceUnavailable {
+			t.Fatalf("nil service POST %s = %d, want 503", path, recUnavail.Code)
+		}
+	}
+
+	// Wrong methods return 405
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPut, "/api/v1/libraries"},
+		{http.MethodGet, "/api/v1/libraries/lib-1/roots"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+		rec := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s = %d, want 405", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	t.Run("POST /api/v1/libraries forwards fields and hex paths and returns 201", func(t *testing.T) {
+		body := `{
+			"name": "  Manga Vault  ",
+			"mode": "managed",
+			"root_path_hex": "2f6d6e742fff",
+			"intake_path": "/mnt/intake",
+			"auto_metadata_writeback": true,
+			"resolver_chain": ["folder", "metadata"],
+			"metadata_precedence": "online_over_embedded",
+			"default_cover_policy": "latest"
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/libraries", strings.NewReader(body))
+		req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+		rec := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST /api/v1/libraries = %d (%s), want 201", rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("expected Cache-Control: no-store, got %q", rec.Header().Get("Cache-Control"))
+		}
+		if recCfg.lastCreateReq.Name != "Manga Vault" ||
+			recCfg.lastCreateReq.Mode != domain.LibraryModeManaged ||
+			!bytes.Equal(recCfg.lastCreateReq.Roots[0], []byte{0x2f, 0x6d, 0x6e, 0x74, 0x2f, 0xff}) ||
+			string(recCfg.lastCreateReq.IntakePath) != "/mnt/intake" ||
+			!recCfg.lastCreateReq.AutoMetadataWriteback ||
+			len(recCfg.lastCreateReq.ResolverChain) != 2 ||
+			recCfg.lastCreateReq.MetadataPrecedence != domain.MetadataPrecedenceOnlineOverEmbedded ||
+			recCfg.lastCreateReq.DefaultCoverPolicy != domain.CoverPolicyLatest {
+			t.Fatalf("unexpected CreateLibraryRequest: %+v", recCfg.lastCreateReq)
+		}
+		var out app.Library
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if out.ID != "lib-created-1" || out.Mode != "MANAGED" || len(out.Roots) != 1 || !out.Roots[0].InvalidUTF8 {
+			t.Fatalf("unexpected created Library DTO: %+v", out)
+		}
+	})
+
+	t.Run("POST /api/v1/libraries/{id}/roots forwards path and path_hex and returns 201", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-42/roots", strings.NewReader(`{"path":"/mnt/extra"}`))
+		req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+		rec := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST /roots = %d (%s), want 201", rec.Code, rec.Body.String())
+		}
+		if recCfg.lastAddReq.LibraryID != "lib-42" || string(recCfg.lastAddReq.Path) != "/mnt/extra" {
+			t.Fatalf("unexpected AddLibraryRootRequest: %+v", recCfg.lastAddReq)
+		}
+		var out app.LibraryRoot
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal root DTO: %v", err)
+		}
+		if out.LibraryID != "lib-42" || out.PathDisplay == nil || *out.PathDisplay != "/mnt/extra" {
+			t.Fatalf("unexpected root DTO: %+v", out)
+		}
+
+		reqHex := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-42/roots", strings.NewReader(`{"path_hex":"2f6d6e742fff"}`))
+		reqHex = reqHex.WithContext(domain.ContextWithPrincipal(reqHex.Context(), admin))
+		recHex := httptest.NewRecorder()
+		mod.router.ServeHTTP(recHex, reqHex)
+		if recHex.Code != http.StatusCreated {
+			t.Fatalf("POST /roots (path_hex) = %d (%s), want 201", recHex.Code, recHex.Body.String())
+		}
+		if !bytes.Equal(recCfg.lastAddReq.Path, []byte{0x2f, 0x6d, 0x6e, 0x74, 0x2f, 0xff}) {
+			t.Fatalf("unexpected path_hex bytes: %x", recCfg.lastAddReq.Path)
+		}
+		var outHex app.LibraryRoot
+		if err := json.Unmarshal(recHex.Body.Bytes(), &outHex); err != nil {
+			t.Fatalf("unmarshal root hex DTO: %v", err)
+		}
+		if !outHex.InvalidUTF8 || outHex.PathDisplay == nil || *outHex.PathDisplay != `/mnt/\xff` {
+			t.Fatalf("unexpected root hex DTO: %+v", outHex)
+		}
+	})
+
+	t.Run("invalid payloads return 400 and service errors map to 409/404", func(t *testing.T) {
+		badCreateBodies := []string{
+			``,
+			`{`,
+			`{"name":"Lib"} {}`,
+			`{"name":"Lib"}`,
+			`{"name":"Lib","root_path":""}`,
+			`{"name":"Lib","root_path":"/a","root_path_hex":"2f61"}`,
+			`{"name":"Lib","root_path_hex":"zzzz"}`,
+			`{"name":"Lib","root_path":"/a","intake_path":"/b","intake_path_hex":"2f62"}`,
+			`{"name":"Lib","root_path":"/a","intake_path":""}`,
+			`{"name":"Lib","root_path":"/a","mode":"BOGUS"}`,
+		}
+		for _, body := range badCreateBodies {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/libraries", strings.NewReader(body))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST /libraries body=%q got %d, want 400", body, rec.Code)
+			}
+		}
+
+		badRootBodies := []string{
+			``,
+			`{}`,
+			`{"path":""}`,
+			`{"path":"/a","path_hex":"2f61"}`,
+			`{"path_hex":"zzzz"}`,
+		}
+		for _, body := range badRootBodies {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-1/roots", strings.NewReader(body))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST /roots body=%q got %d, want 400", body, rec.Code)
+			}
+		}
+
+		// Whitespace library ID -> 400
+		reqBadID := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/%20/roots", strings.NewReader(`{"path":"/a"}`))
+		reqBadID = reqBadID.WithContext(domain.ContextWithPrincipal(reqBadID.Context(), admin))
+		recBadID := httptest.NewRecorder()
+		mod.router.ServeHTTP(recBadID, reqBadID)
+		if recBadID.Code != http.StatusBadRequest {
+			t.Fatalf("POST /libraries/%%20/roots = %d, want 400", recBadID.Code)
+		}
+
+		// Conflict -> 409
+		recCfg.conflictErr = true
+		for _, tc := range []struct {
+			path string
+			body string
+		}{
+			{"/api/v1/libraries", `{"name":"Lib","root_path":"/mnt/a"}`},
+			{"/api/v1/libraries/lib-1/roots", `{"path":"/mnt/a"}`},
+		} {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("conflict POST %s = %d, want 409", tc.path, rec.Code)
+			}
+		}
+		recCfg.conflictErr = false
+
+		// Missing library on AddRoot -> 404
+		recCfg.notFoundErr = true
+		req404 := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/missing/roots", strings.NewReader(`{"path":"/mnt/a"}`))
+		req404 = req404.WithContext(domain.ContextWithPrincipal(req404.Context(), admin))
+		rec404 := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec404, req404)
+		if rec404.Code != http.StatusNotFound {
+			t.Fatalf("missing library AddRoot = %d, want 404", rec404.Code)
+		}
+		recCfg.notFoundErr = false
 	})
 }

@@ -20,6 +20,26 @@ func ComputeLibraryState(roots []domain.LibraryRoot) domain.LibraryRootState {
 	return domain.LibraryRootStateOnline
 }
 
+// LibraryRootFromDomain projects a domain LibraryRoot into the application LibraryRoot DTO,
+// redacting host filesystem display paths and root last_error values unless principal holds
+// domain.PermissionLibraryAdmin.
+func LibraryRootFromDomain(r domain.LibraryRoot, principal *domain.Principal) LibraryRoot {
+	isAdmin := principal != nil && principal.HasPermission(domain.PermissionLibraryAdmin)
+	dto := LibraryRoot{
+		ID:            r.ID,
+		LibraryID:     r.LibraryID,
+		InvalidUTF8:   r.Path.InvalidUTF8,
+		State:         string(r.State),
+		LastCheckedAt: cloneTimePtr(r.LastCheckedAt),
+	}
+	if isAdmin {
+		display := r.Path.Display
+		dto.PathDisplay = &display
+		dto.LastError = cloneStringPtr(r.LastError)
+	}
+	return dto
+}
+
 // LibraryFromDomain projects a domain Library and its roots into the application Library DTO,
 // redacting host filesystem display paths (and root last_error values that embed path errors)
 // unless principal holds domain.PermissionLibraryAdmin.
@@ -28,19 +48,7 @@ func LibraryFromDomain(lib domain.Library, roots []domain.LibraryRoot, principal
 
 	rootDTOs := make([]LibraryRoot, 0, len(roots))
 	for _, r := range roots {
-		dto := LibraryRoot{
-			ID:            r.ID,
-			LibraryID:     r.LibraryID,
-			InvalidUTF8:   r.Path.InvalidUTF8,
-			State:         string(r.State),
-			LastCheckedAt: cloneTimePtr(r.LastCheckedAt),
-		}
-		if isAdmin {
-			display := r.Path.Display
-			dto.PathDisplay = &display
-			dto.LastError = cloneStringPtr(r.LastError)
-		}
-		rootDTOs = append(rootDTOs, dto)
+		rootDTOs = append(rootDTOs, LibraryRootFromDomain(r, principal))
 	}
 
 	var intakeDisplay *string

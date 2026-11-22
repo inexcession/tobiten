@@ -354,7 +354,7 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 	})
 
 	t.Run("both direct and subpath protected endpoints return 401", func(t *testing.T) {
-		protectedPaths := []string{
+		protectedGetPaths := []string{
 			"/api/v1/users",
 			"/comics/api/v1/users",
 			"/api/v1/libraries",
@@ -372,7 +372,7 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			"/api/v1/volumes/vol-1",
 			"/comics/api/v1/volumes/vol-1",
 		}
-		for _, path := range protectedPaths {
+		for _, path := range protectedGetPaths {
 			resp, err := client.Get(baseURL + path)
 			if err != nil {
 				t.Fatalf("GET %s failed: %v", path, err)
@@ -380,6 +380,23 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Errorf("GET %s status = %d, want 401", path, resp.StatusCode)
+			}
+		}
+
+		protectedPostPaths := []string{
+			"/api/v1/libraries",
+			"/comics/api/v1/libraries",
+			"/api/v1/libraries/lib-1/roots",
+			"/comics/api/v1/libraries/lib-1/roots",
+		}
+		for _, path := range protectedPostPaths {
+			resp, err := client.Post(baseURL+path, "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatalf("POST %s failed: %v", path, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("POST %s status = %d, want 401", path, resp.StatusCode)
 			}
 		}
 	})

@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -15,11 +16,20 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 )
 
+const maxLibraryJSONBodyBytes = 1 << 20
+
 func (m *Module) libraryService() app.LibraryService {
 	if m.services == nil {
 		return nil
 	}
 	return m.services.Library
+}
+
+func (m *Module) libraryConfigService() app.LibraryConfigService {
+	if m.services == nil {
+		return nil
+	}
+	return m.services.LibraryConfig
 }
 
 func (m *Module) handleListLibraries(w http.ResponseWriter, r *http.Request) {
@@ -222,15 +232,23 @@ func (m *Module) handleGetVolume(w http.ResponseWriter, r *http.Request) {
 	writeLibraryJSON(w, r, vol)
 }
 
-func (m *Module) prepareLibraryRequest(w http.ResponseWriter, r *http.Request) (*domain.Principal, app.LibraryService, bool) {
+func (m *Module) preparePrincipalPermission(w http.ResponseWriter, r *http.Request, perm domain.Permission) (*domain.Principal, bool) {
 	w.Header().Set("Cache-Control", "no-store")
 	p, ok := domain.PrincipalFromContext(r.Context())
 	if !ok || p == nil {
 		middleware.WriteUnauthorized(w, r)
-		return nil, nil, false
+		return nil, false
 	}
-	if !p.HasPermission(domain.PermissionLibraryRead) {
+	if !p.HasPermission(perm) {
 		middleware.WriteAppError(w, r, app.ErrForbidden)
+		return nil, false
+	}
+	return p, true
+}
+
+func (m *Module) prepareLibraryRequest(w http.ResponseWriter, r *http.Request) (*domain.Principal, app.LibraryService, bool) {
+	p, ok := m.preparePrincipalPermission(w, r, domain.PermissionLibraryRead)
+	if !ok {
 		return nil, nil, false
 	}
 	svc := m.libraryService()
@@ -239,6 +257,177 @@ func (m *Module) prepareLibraryRequest(w http.ResponseWriter, r *http.Request) (
 		return nil, nil, false
 	}
 	return p, svc, true
+}
+
+func (m *Module) prepareLibraryConfigRequest(w http.ResponseWriter, r *http.Request) (*domain.Principal, app.LibraryConfigService, bool) {
+	p, ok := m.preparePrincipalPermission(w, r, domain.PermissionLibraryAdmin)
+	if !ok {
+		return nil, nil, false
+	}
+	svc := m.libraryConfigService()
+	if svc == nil {
+		writeError(w, http.StatusServiceUnavailable, "service unavailable")
+		return nil, nil, false
+	}
+	return p, svc, true
+}
+
+type createLibraryHTTPRequest struct {
+	Name                  string   `json:"name"`
+	Mode                  string   `json:"mode"`
+	RootPath              *string  `json:"root_path"`
+	RootPathHex           *string  `json:"root_path_hex"`
+	IntakePath            *string  `json:"intake_path"`
+	IntakePathHex         *string  `json:"intake_path_hex"`
+	AutoMetadataWriteback bool     `json:"auto_metadata_writeback"`
+	ResolverChain         []string `json:"resolver_chain"`
+	MetadataPrecedence    string   `json:"metadata_precedence"`
+	DefaultCoverPolicy    string   `json:"default_cover_policy"`
+}
+
+type addLibraryRootHTTPRequest struct {
+	Path    *string `json:"path"`
+	PathHex *string `json:"path_hex"`
+}
+
+func (m *Module) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
+	p, svc, ok := m.prepareLibraryConfigRequest(w, r)
+	if !ok {
+		return
+	}
+	var body createLibraryHTTPRequest
+	if err := decodeLibraryJSONBody(r, &body); err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	req, err := buildCreateLibraryRequest(body)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	res, err := svc.CreateLibrary(r.Context(), p, req)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, app.LibraryFromDomain(res.Library, res.Roots, p))
+}
+
+func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
+	p, svc, ok := m.prepareLibraryConfigRequest(w, r)
+	if !ok {
+		return
+	}
+	id, err := requireIDParam(r)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	var body addLibraryRootHTTPRequest
+	if err := decodeLibraryJSONBody(r, &body); err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	pathBytes, err := parseJSONPathPair(body.Path, body.PathHex, "path", "path_hex", true)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	root, err := svc.AddRoot(r.Context(), p, app.AddLibraryRootRequest{
+		LibraryID: id,
+		Path:      pathBytes,
+	})
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, app.LibraryRootFromDomain(*root, p))
+}
+
+func buildCreateLibraryRequest(body createLibraryHTTPRequest) (app.CreateLibraryRequest, error) {
+	rootBytes, err := parseJSONPathPair(body.RootPath, body.RootPathHex, "root_path", "root_path_hex", true)
+	if err != nil {
+		return app.CreateLibraryRequest{}, err
+	}
+	intakeBytes, err := parseJSONPathPair(body.IntakePath, body.IntakePathHex, "intake_path", "intake_path_hex", false)
+	if err != nil {
+		return app.CreateLibraryRequest{}, err
+	}
+
+	var mode domain.LibraryMode
+	if strings.TrimSpace(body.Mode) != "" {
+		mode, err = domain.ParseLibraryMode(body.Mode)
+		if err != nil {
+			return app.CreateLibraryRequest{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		}
+	}
+
+	var chain []domain.ResolverName
+	if body.ResolverChain != nil {
+		chain = make([]domain.ResolverName, len(body.ResolverChain))
+		for i, raw := range body.ResolverChain {
+			chain[i] = domain.ResolverName(strings.ToLower(strings.TrimSpace(raw)))
+		}
+	}
+
+	var precedence domain.MetadataPrecedence
+	if strings.TrimSpace(body.MetadataPrecedence) != "" {
+		precedence = domain.MetadataPrecedence(strings.ToUpper(strings.TrimSpace(body.MetadataPrecedence)))
+	}
+
+	var coverPolicy domain.CoverPolicy
+	if strings.TrimSpace(body.DefaultCoverPolicy) != "" {
+		coverPolicy = domain.CoverPolicy(strings.ToUpper(strings.TrimSpace(body.DefaultCoverPolicy)))
+	}
+
+	return app.CreateLibraryRequest{
+		Name:                  strings.TrimSpace(body.Name),
+		Mode:                  mode,
+		IntakePath:            intakeBytes,
+		Roots:                 [][]byte{rootBytes},
+		AutoMetadataWriteback: body.AutoMetadataWriteback,
+		ResolverChain:         chain,
+		MetadataPrecedence:    precedence,
+		DefaultCoverPolicy:    coverPolicy,
+	}, nil
+}
+
+func decodeLibraryJSONBody(r *http.Request, dst any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxLibraryJSONBodyBytes))
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("%w: invalid json body: %v", app.ErrInvalidInput, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("%w: trailing data after json body", app.ErrInvalidInput)
+	}
+	return nil
+}
+
+func parseJSONPathPair(raw, rawHex *string, field, hexField string, required bool) ([]byte, error) {
+	if raw != nil && rawHex != nil {
+		return nil, fmt.Errorf("%w: specify either %s or %s, not both", app.ErrInvalidInput, field, hexField)
+	}
+	if raw == nil && rawHex == nil {
+		if required {
+			return nil, fmt.Errorf("%w: %s or %s is required", app.ErrInvalidInput, field, hexField)
+		}
+		return nil, nil
+	}
+	if raw != nil {
+		if *raw == "" {
+			return nil, fmt.Errorf("%w: %s must not be empty", app.ErrInvalidInput, field)
+		}
+		return []byte(*raw), nil
+	}
+	if *rawHex == "" {
+		return nil, fmt.Errorf("%w: %s must not be empty", app.ErrInvalidInput, hexField)
+	}
+	decoded, err := hex.DecodeString(*rawHex)
+	if err != nil || len(decoded) == 0 {
+		return nil, fmt.Errorf("%w: invalid %s", app.ErrInvalidInput, hexField)
+	}
+	return decoded, nil
 }
 
 func writeLibraryJSON(w http.ResponseWriter, r *http.Request, v any) {

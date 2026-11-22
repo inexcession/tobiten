@@ -19,6 +19,7 @@ import (
 	"github.com/inexcession/tobiten/internal/events"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/library"
+	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
@@ -465,6 +466,7 @@ func runDaemonJobs(
 
 func newDaemonServices(
 	pool *pgxpool.Pool,
+	cfg *config.Config,
 	setup *bootstrap.Setup,
 	userRepo *postgres.UserRepository,
 ) (*daemonServices, error) {
@@ -502,20 +504,35 @@ func newDaemonServices(
 	if err != nil {
 		return nil, err
 	}
+	var defaultLibraryMode domain.LibraryMode
+	if cfg != nil && strings.TrimSpace(cfg.LibraryMode) != "" {
+		parsedMode, err := domain.ParseLibraryMode(cfg.LibraryMode)
+		if err != nil {
+			return nil, fmt.Errorf("parsing default library mode: %w", err)
+		}
+		defaultLibraryMode = parsedMode
+	}
+	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
+		DefaultMode: defaultLibraryMode,
+	})
+	if err != nil {
+		return nil, err
+	}
 	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
 		Users:    userRepo,
 		Sessions: sessionRepo,
 	})
 	services := app.NewAuthorizingServices(&app.Services{
-		Setup:       setup,
-		BasicAuth:   basicAuth,
-		PATAuth:     patAuth,
-		Session:     sessionService,
-		SessionAuth: sessionAuth,
-		Jobs:        jobService,
-		Events:      eventService,
-		Library:     libraryService,
+		Setup:         setup,
+		BasicAuth:     basicAuth,
+		PATAuth:       patAuth,
+		Session:       sessionService,
+		SessionAuth:   sessionAuth,
+		Jobs:          jobService,
+		Events:        eventService,
+		Library:       libraryService,
+		LibraryConfig: libraryConfigService,
 	})
 	return &daemonServices{
 		app:    services,
@@ -562,7 +579,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 		return err
 	}
 	defer setup.Close()
-	ds, err := buildDaemonServices(d.pool, setup, userRepo)
+	ds, err := buildDaemonServices(d.pool, cfg, setup, userRepo)
 	if err != nil {
 		return err
 	}
