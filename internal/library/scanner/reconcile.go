@@ -172,6 +172,9 @@ func (s *Scanner) reconcileLibraryPass(
 		return errors.Join(append(writeErrs, err)...)
 	}
 	if len(writeErrs) > 0 {
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
+			return errors.Join(append(writeErrs, err)...)
+		}
 		return errors.Join(writeErrs...)
 	}
 
@@ -187,7 +190,13 @@ func (s *Scanner) reconcileLibraryPass(
 		}
 		writeErrs = append(writeErrs, err)
 	}
-	return errors.Join(writeErrs...)
+	if len(writeErrs) > 0 {
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
+			return errors.Join(append(writeErrs, err)...)
+		}
+		return errors.Join(writeErrs...)
+	}
+	return checkScanCancel(ctx, checkCancel)
 }
 
 func planReconciliation(

@@ -168,6 +168,11 @@ type WalkOptions struct {
 
 	// Open optionally overrides read-only file opening for archive inspection.
 	Open func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+
+	// CheckCancel, when non-nil, is called before admitting each new archive
+	// inspection task in a worker. Returning a non-nil error aborts the walk
+	// and propagates that error. It may be called concurrently when Workers > 1.
+	CheckCancel func(context.Context) error
 }
 
 type inspectTask struct {
@@ -190,10 +195,29 @@ type walkRuntime struct {
 	stat              func([]byte) (os.FileInfo, error)
 	open              func(context.Context, []byte) (ReadAtCloser, error)
 	subtreeIncomplete atomic.Bool
+	abortMu           sync.Mutex
+	abortErr          error
 }
 
 func (rt *walkRuntime) markSubtreeIncomplete() {
 	rt.subtreeIncomplete.Store(true)
+}
+
+func (rt *walkRuntime) recordAbort(err error) {
+	if err == nil {
+		return
+	}
+	rt.abortMu.Lock()
+	if rt.abortErr == nil {
+		rt.abortErr = err
+	}
+	rt.abortMu.Unlock()
+}
+
+func (rt *walkRuntime) getAbortErr() error {
+	rt.abortMu.Lock()
+	defer rt.abortMu.Unlock()
+	return rt.abortErr
 }
 
 // WalkRoot sequentially walks rootBytes (reading one directory at a time in
@@ -309,7 +333,7 @@ func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkR
 	for range rt.workers {
 		go func() {
 			defer workersWG.Done()
-			rt.runWorker(walkCtx, tasksCh, resultsCh)
+			rt.runWorker(ctx, walkCtx, cancel, tasksCh, resultsCh)
 		}()
 	}
 
@@ -328,6 +352,10 @@ func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkR
 	if cbErr != nil {
 		res.Complete = false
 		return res, cbErr
+	}
+	if abortErr := rt.getAbortErr(); abortErr != nil {
+		res.Complete = false
+		return res, abortErr
 	}
 	if walkErr != nil {
 		res.Complete = false
@@ -577,23 +605,38 @@ func (rt *walkRuntime) handleCBZFile(
 	}
 }
 
-func (rt *walkRuntime) runWorker(ctx context.Context, tasksCh <-chan inspectTask, resultsCh chan<- WalkEntry) {
+func (rt *walkRuntime) runWorker(
+	parentCtx context.Context,
+	walkCtx context.Context,
+	cancel context.CancelFunc,
+	tasksCh <-chan inspectTask,
+	resultsCh chan<- WalkEntry,
+) {
 	for {
 		select {
-		case <-ctx.Done():
+		case <-walkCtx.Done():
 			return
 		case task, ok := <-tasksCh:
 			if !ok {
 				return
 			}
-			if ctx.Err() != nil {
+			if walkCtx.Err() != nil {
 				return
 			}
-			entry, cancelled := rt.inspectOne(ctx, task)
+			if rt.opts.CheckCancel != nil {
+				if err := rt.opts.CheckCancel(parentCtx); err != nil {
+					if walkCtx.Err() == nil {
+						rt.recordAbort(err)
+						cancel()
+					}
+					return
+				}
+			}
+			entry, cancelled := rt.inspectOne(walkCtx, task)
 			if cancelled {
 				return
 			}
-			if err := emitEntry(ctx, resultsCh, entry); err != nil {
+			if err := emitEntry(walkCtx, resultsCh, entry); err != nil {
 				return
 			}
 		}

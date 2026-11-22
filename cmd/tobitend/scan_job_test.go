@@ -1038,11 +1038,13 @@ func TestRunDaemonScanJob_CancelAtFileBoundary(t *testing.T) {
 			}
 
 			openMu.Lock()
+			pipelineCalls := openedOnCancel[pipelineNewPath]
 			unopenedCalls := openedOnCancel[unopenedNewPath]
 			existingCalls := openedOnCancel[existingPath]
 			openMu.Unlock()
-			if unopenedCalls != 0 || existingCalls != 0 {
-				return fmt.Errorf("unexpected opens on cancelled walk: unopened=%d existing=%d", unopenedCalls, existingCalls)
+			if pipelineCalls != 0 || unopenedCalls != 0 || existingCalls != 0 {
+				return fmt.Errorf("unexpected opens on cancelled walk (workers=1): pipeline=%d unopened=%d existing=%d",
+					pipelineCalls, unopenedCalls, existingCalls)
 			}
 
 			var assetCount, missingCount, movedOrModifiedCount, cancelEvents int
@@ -1183,6 +1185,99 @@ func TestRunDaemonScanJob_CancelAtFileBoundary(t *testing.T) {
 			if !hasA {
 				return errors.New("expected committed New/a.cbz to remain intact")
 			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("runDaemon err = %v", err)
+		}
+	})
+
+	t.Run("cancel accepted during final write with no other work ends CANCELLED with committed asset and released dedupe key", func(t *testing.T) {
+		db := testdb.New(t)
+		migrateStartupDB(t, db)
+		dsPtr, _ := captureDaemonAssembly(t)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "cancel-final-write-root")
+		soloPath := filepath.Join(rootDir, "Solo/v01.cbz")
+		writeTestFile(t, soloPath, buildTestCBZ(t, "Solo", "One", "1"))
+		lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Cancel Final Write Lib", rootDir)
+
+		var targetJobID atomic.Value
+		var cancelIssued atomic.Bool
+		var servicesRef atomic.Pointer[app.Services]
+		adminPrincipal := &domain.Principal{
+			User:        domain.User{ID: "admin-canceller", Username: "alice"},
+			Permissions: []domain.Permission{domain.PermissionJobsReadAll, domain.PermissionJobsCancelAll},
+		}
+
+		newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+			hookTx := &daemonAssetCommitHookTransactor{
+				inner: postgres.NewTransactor(pool),
+				onAfterCommit: func(txCtx context.Context, createCount int32) {
+					if createCount == 1 && cancelIssued.CompareAndSwap(false, true) {
+						svc := servicesRef.Load()
+						var jid string
+						for jid == "" && txCtx.Err() == nil {
+							jid, _ = targetJobID.Load().(string)
+							if jid == "" {
+								time.Sleep(time.Millisecond)
+							}
+						}
+						if svc != nil && jid != "" {
+							snap, cErr := svc.Jobs.CancelJob(txCtx, adminPrincipal, jid)
+							if cErr != nil {
+								t.Errorf("CancelJob during final write: %v", cErr)
+							} else if snap.State != string(domain.JobStateRunning) || !snap.CancelRequested {
+								t.Errorf("CancelJob snapshot = %+v, want RUNNING with cancel_requested=true", snap)
+							}
+						}
+					}
+				},
+			}
+			return scanner.NewScanner(hookTx, scanner.Options{})
+		}
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, services *app.Services) error {
+			servicesRef.Store(services)
+			ds := *dsPtr
+
+			cancelID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			targetJobID.Store(cancelID)
+
+			got := waitDaemonJobState(serveCtx, t, jobRepo, cancelID, domain.JobStateCancelled)
+			if got.FinishedAt == nil || got.Attempts != 1 {
+				return fmt.Errorf("cancelled final-write job = %+v, want attempts=1 finished_at!=nil", got)
+			}
+
+			var total, missing, cancelEvents int
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&total, &missing); err != nil {
+				return err
+			}
+			if total != 1 || missing != 0 {
+				return fmt.Errorf("assets after final-write cancel = (total=%d, missing=%d), want (1, 0)", total, missing)
+			}
+			if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.cancelled'`, cancelID).Scan(&cancelEvents); err != nil {
+				return err
+			}
+			if cancelEvents != 1 {
+				return fmt.Errorf("job.cancelled count = %d, want 1", cancelEvents)
+			}
+
+			followID, err := ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+			if err != nil {
+				return err
+			}
+			if followID == cancelID {
+				return fmt.Errorf("dedupe key not released after final-write cancel: reused %q", cancelID)
+			}
+			waitDaemonJobState(serveCtx, t, jobRepo, followID, domain.JobStateSucceeded)
 			return nil
 		})
 		if err != nil {
@@ -1337,6 +1432,108 @@ func TestRunDaemonScanJob_StopMidScanAndRestartRecovery(t *testing.T) {
 	}
 	if missingEvents != 0 {
 		t.Fatalf("asset.missing count = %d, want 0", missingEvents)
+	}
+}
+
+func TestRunDaemonScanJob_StopOnFinalWriteRemainsRecoverable(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "stop-final-write-root")
+	soloPath := filepath.Join(rootDir, "Solo/v01.cbz")
+	writeTestFile(t, soloPath, buildTestCBZ(t, "Solo", "One", "1"))
+	lib, root := seedTestLibrary(ctx, t, db.Pool, "Daemon Stop Final Write Lib", rootDir)
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	dsPtr1, _ := captureDaemonAssembly(t)
+	finalCommitted := make(chan struct{}, 1)
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		hookTx := &daemonAssetCommitHookTransactor{
+			inner: postgres.NewTransactor(pool),
+			onAfterCommit: func(txCtx context.Context, createCount int32) {
+				if createCount == 1 {
+					select {
+					case finalCommitted <- struct{}{}:
+					default:
+					}
+					<-txCtx.Done()
+				}
+			},
+		}
+		return scanner.NewScanner(hookTx, scanner.Options{})
+	}
+
+	var interruptedID string
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		ds := *dsPtr1
+		var err error
+		interruptedID, err = ds.triggerScan(serveCtx, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return err
+		}
+		select {
+		case <-finalCommitted:
+		case <-time.After(10 * time.Second):
+			return errors.New("timed out waiting for final write commit")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("daemon 1 runDaemon err = %v", err)
+	}
+
+	midJob, err := jobRepo.GetJobByID(ctx, interruptedID)
+	if err != nil {
+		t.Fatalf("GetJobByID mid-stop: %v", err)
+	}
+	if midJob.State != domain.JobStateRunning || midJob.Attempts != 1 {
+		t.Fatalf("job after final-write daemon stop = (state=%s, attempts=%d), want (RUNNING, 1)", midJob.State, midJob.Attempts)
+	}
+
+	var openMu sync.Mutex
+	openedOnRecover := make(map[string]int)
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				openMu.Lock()
+				openedOnRecover[p]++
+				openMu.Unlock()
+				return os.Open(p)
+			},
+		})
+	}
+
+	if err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		got := waitDaemonJobState(serveCtx, t, jobRepo, interruptedID, domain.JobStateSucceeded)
+		if got.Attempts != 2 {
+			return fmt.Errorf("recovered job Attempts = %d, want 2", got.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("daemon 2 runDaemon err = %v", err)
+	}
+
+	openMu.Lock()
+	soloOpens := openedOnRecover[soloPath]
+	openMu.Unlock()
+	if soloOpens != 0 {
+		t.Fatalf("Solo/v01.cbz re-opened %d times on recovery, want 0", soloOpens)
+	}
+	var total, missing int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE missing_since IS NOT NULL) FROM media_assets WHERE library_root_id = $1`, root.ID).Scan(&total, &missing); err != nil {
+		t.Fatalf("count media_assets: %v", err)
+	}
+	if total != 1 || missing != 0 {
+		t.Fatalf("final media_assets = (total=%d, missing=%d), want (1, 0)", total, missing)
 	}
 }
 

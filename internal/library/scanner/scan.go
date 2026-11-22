@@ -347,6 +347,11 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 			return res, err
 		}
 	}
+	if err := checkScanCancel(ctx, opts.CheckCancel); err != nil {
+		res.Complete = false
+		res.ApplyRemovals = false
+		return res, err
+	}
 	res.ApplyRemovals = res.Complete && len(rootErrs) == 0 && ctx.Err() == nil && preCheck.ApplyRemovals
 	if len(rootErrs) > 0 {
 		return res, errors.Join(rootErrs...)
@@ -581,14 +586,21 @@ func (s *Scanner) scanOneRoot(
 	if readDirFn == nil {
 		readDirFn = s.readDir
 	}
+	var walkCheckCancel func(context.Context) error
+	if opts.CheckCancel != nil {
+		walkCheckCancel = func(checkCtx context.Context) error {
+			return checkScanCancel(checkCtx, opts.CheckCancel)
+		}
+	}
 	walkOpts := WalkOptions{
-		Workers: opts.Workers,
-		Known:   knownForWalk,
-		Formats: opts.Formats,
-		OnEntry: state.handleEntry,
-		ReadDir: readDirFn,
-		Stat:    opts.Stat,
-		Open:    openFn,
+		Workers:     opts.Workers,
+		Known:       knownForWalk,
+		Formats:     opts.Formats,
+		OnEntry:     state.handleEntry,
+		CheckCancel: walkCheckCancel,
+		ReadDir:     readDirFn,
+		Stat:        opts.Stat,
+		Open:        openFn,
 	}
 	walkRes, walkErr := WalkRoot(ctx, root.Path.Bytes, walkOpts)
 	state.result.Err = walkErr

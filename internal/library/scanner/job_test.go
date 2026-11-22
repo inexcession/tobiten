@@ -866,9 +866,13 @@ func TestScanModuleRunner_CancelAtFileBoundary(t *testing.T) {
 		}
 
 		openMu.Lock()
+		pipelineCalls := openedOnCancelScan[pipelineNewPath]
 		unopenedCalls := openedOnCancelScan[unopenedNewPath]
 		existingCalls := openedOnCancelScan[existingPath]
 		openMu.Unlock()
+		if pipelineCalls != 0 {
+			t.Fatalf("Zebra/02_pipeline.cbz was opened %d times after cancel with Workers=1, want 0", pipelineCalls)
+		}
 		if unopenedCalls != 0 {
 			t.Fatalf("Zebra/03_unopened.cbz was opened %d times after cancel, want 0", unopenedCalls)
 		}
@@ -1039,6 +1043,140 @@ func TestScanModuleRunner_CancelAtFileBoundary(t *testing.T) {
 		}
 		if gone := byPath["Vanish/gone.cbz"]; gone.MissingSince != nil {
 			t.Fatalf("expected Vanish/gone.cbz not marked missing, got %v", gone.MissingSince)
+		}
+	})
+
+	t.Run("cancel accepted during final write transaction ends CANCELLED with committed asset and released dedupe key", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		soloPath := filepath.Join(rootDir, "Solo/v01.cbz")
+		writeDiskFile(t, soloPath, buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Solo</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("solo-1"), method: zip.Store},
+		))
+
+		var lib domain.Library
+		var root domain.LibraryRoot
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Final Write Cancel Lib", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seedLibraryAndRoots: %v", err)
+		}
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+		var targetJobID atomic.Value
+		var cancelIssued atomic.Bool
+		hookTx := &hookAfterAssetCommitTransactor{
+			inner: transactor,
+			onAfterCommit: func(createCount int32) {
+				if createCount == 1 && cancelIssued.CompareAndSwap(false, true) {
+					jid, _ := targetJobID.Load().(string)
+					snap, cErr := jobService.CancelJob(ctx, adminPrincipal, jid)
+					if cErr != nil {
+						t.Errorf("CancelJob during final write: %v", cErr)
+					} else if snap.State != string(domain.JobStateRunning) || !snap.CancelRequested {
+						t.Errorf("CancelJob snapshot = %+v, want RUNNING with cancel_requested=true", snap)
+					}
+				}
+			},
+		}
+
+		var openMu sync.Mutex
+		openedOnFollowUp := make(map[string]int)
+		var trackOpens atomic.Bool
+		sc, err := scanner.NewScanner(hookTx, scanner.Options{
+			Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				if trackOpens.Load() {
+					openMu.Lock()
+					openedOnFollowUp[p]++
+					openMu.Unlock()
+				}
+				return os.Open(p)
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		mod, err := scanner.NewModule(sc, scanner.ModuleOptions{Workers: 1})
+		if err != nil {
+			t.Fatalf("NewModule: %v", err)
+		}
+		reg := module.NewRegistry()
+		if err := reg.Register(mod); err != nil {
+			t.Fatalf("reg.Register: %v", err)
+		}
+		runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{})
+		if err := runner.RegisterModuleKinds(reg); err != nil {
+			t.Fatalf("RegisterModuleKinds: %v", err)
+		}
+		if err := runner.RegisterModuleHandlers(reg); err != nil {
+			t.Fatalf("RegisterModuleHandlers: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+
+		cancelJobID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			t.Fatalf("TriggerScan: %v", err)
+		}
+		targetJobID.Store(cancelJobID)
+
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+		}
+		got, err := jobRepo.GetJobByID(ctx, cancelJobID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		if got.State != domain.JobStateCancelled || got.FinishedAt == nil || got.Attempts != 1 {
+			t.Fatalf("final-write cancelled job = %+v, want CANCELLED attempts=1 finished_at!=nil", got)
+		}
+
+		var cancelEvents int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.cancelled'`, cancelJobID).Scan(&cancelEvents); err != nil {
+			t.Fatalf("count job.cancelled: %v", err)
+		}
+		if cancelEvents != 1 {
+			t.Fatalf("job.cancelled count = %d, want 1", cancelEvents)
+		}
+
+		assets := listAssetsForRoot(ctx, t, transactor, root.ID)
+		if len(assets) != 1 || assets[0].RelPathDisplay != "Solo/v01.cbz" {
+			t.Fatalf("committed assets after final-write cancel = %+v, want [Solo/v01.cbz]", assets)
+		}
+
+		// Dedupe key released; clean rescan succeeds without re-opening Solo/v01.cbz.
+		trackOpens.Store(true)
+		followID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			t.Fatalf("follow-up TriggerScan: %v", err)
+		}
+		if followID == cancelJobID {
+			t.Fatalf("dedupe key not released after final-write cancel: reused %q", cancelJobID)
+		}
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext follow-up = (%v, %v)", claimed, err)
+		}
+		gotFollow, err := jobRepo.GetJobByID(ctx, followID)
+		if err != nil || gotFollow.State != domain.JobStateSucceeded {
+			t.Fatalf("follow-up job = (%+v, %v), want SUCCEEDED", gotFollow, err)
+		}
+		openMu.Lock()
+		soloOpens := openedOnFollowUp[soloPath]
+		openMu.Unlock()
+		if soloOpens != 0 {
+			t.Fatalf("Solo/v01.cbz re-opened %d times on follow-up scan, want 0", soloOpens)
 		}
 	})
 }

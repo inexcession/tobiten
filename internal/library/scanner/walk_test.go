@@ -1227,3 +1227,88 @@ func (f syntheticFileInfo) IsDir() bool        { return f.mode.IsDir() }
 func (f syntheticFileInfo) Sys() any           { return f.id }
 
 var _ io.ReaderAt = (*bytesReadAtCloser)(nil)
+
+func TestWalkRoot_CancelBeforeNextArchiveAdmission_OneWorker(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	first := filepath.Join(root, "01_first.cbz")
+	second := filepath.Join(root, "02_second.cbz")
+	cbzBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "001.jpg", data: []byte("page1"), method: zip.Store},
+	)
+	if err := os.WriteFile(first, cbzBytes, 0o600); err != nil {
+		t.Fatalf("WriteFile(first): %v", err)
+	}
+	if err := os.WriteFile(second, cbzBytes, 0o600); err != nil {
+		t.Fatalf("WriteFile(second): %v", err)
+	}
+
+	sentinelCancel := errors.New("cancel requested before next archive")
+
+	// Run multiple iterations to eliminate scheduling luck between worker admission and OnEntry.
+	for iter := range 10 {
+		var cancelPending atomic.Bool
+		var secondOpens atomic.Int32
+		enteredFirst := make(chan struct{}, 1)
+		releaseFirst := make(chan struct{})
+
+		type walkOutcome struct {
+			res scanner.WalkResult
+			err error
+		}
+		doneCh := make(chan walkOutcome, 1)
+		go func() {
+			res, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+				Workers: 1,
+				CheckCancel: func(_ context.Context) error {
+					if cancelPending.Load() {
+						return sentinelCancel
+					}
+					return nil
+				},
+				Open: func(ctx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+					p := string(rawPath)
+					if p == second {
+						secondOpens.Add(1)
+					}
+					if p == first {
+						select {
+						case enteredFirst <- struct{}{}:
+						default:
+						}
+						select {
+						case <-releaseFirst:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+					}
+					return os.Open(p)
+				},
+				OnEntry: func(_ scanner.WalkEntry) error {
+					if cancelPending.Load() {
+						return sentinelCancel
+					}
+					return nil
+				},
+			})
+			doneCh <- walkOutcome{res: res, err: err}
+		}()
+
+		select {
+		case <-enteredFirst:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: timed out waiting for Open(first)", iter)
+		}
+		cancelPending.Store(true)
+		close(releaseFirst)
+
+		out := <-doneCh
+		if !errors.Is(out.err, sentinelCancel) || out.res.Complete {
+			t.Fatalf("iter %d: WalkRoot = (%+v, %v), want Complete=false err=%v", iter, out.res, out.err, sentinelCancel)
+		}
+		if got := secondOpens.Load(); got != 0 {
+			t.Fatalf("iter %d: 02_second.cbz opened %d times after cancel, want 0", iter, got)
+		}
+	}
+}
