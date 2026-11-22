@@ -201,7 +201,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if !rootSnapshotPathsMatch(preCheck.Roots, currentRoots) || !allRootsOnline(currentRoots) {
+	if !rootSnapshotMatches(preCheck.Roots, currentRoots) || !allRootsOnline(currentRoots) {
 		return ScanResult{}, ErrStalePreCheck
 	}
 
@@ -323,7 +323,7 @@ func (r *ScanResult) recordReconcileSkipped(rootID string, skip SkippedEntry) {
 	}
 }
 
-func rootSnapshotPathsMatch(checked []RootCheckResult, current []domain.LibraryRoot) bool {
+func rootSnapshotMatches(checked []RootCheckResult, current []domain.LibraryRoot) bool {
 	if len(checked) != len(current) {
 		return false
 	}
@@ -334,6 +334,9 @@ func rootSnapshotPathsMatch(checked []RootCheckResult, current []domain.LibraryR
 	for _, item := range checked {
 		cur, ok := byID[item.LibraryRootID]
 		if !ok || !bytes.Equal(item.RootPath.Bytes, cur.Path.Bytes) {
+			return false
+		}
+		if cur.LastCheckedAt == nil || !cur.LastCheckedAt.UTC().Equal(item.CheckedAt.UTC()) {
 			return false
 		}
 	}

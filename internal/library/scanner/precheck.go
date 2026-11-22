@@ -176,6 +176,16 @@ func (s *Scanner) commitPreCheckTx(
 		return PreCheckResult{}, err
 	}
 
+	effectiveCheckedAt := checkedAt
+	for _, item := range matched {
+		if item.root.LastCheckedAt == nil {
+			continue
+		}
+		if prev := item.root.LastCheckedAt.UTC(); !effectiveCheckedAt.After(prev) {
+			effectiveCheckedAt = prev.Add(time.Microsecond)
+		}
+	}
+
 	wasOnline := allRootsOnline(currentRoots)
 	rootResults := make([]RootCheckResult, 0, len(matched))
 	failedRootIDs := make([]string, 0)
@@ -191,7 +201,7 @@ func (s *Scanner) commitPreCheckTx(
 			failedRootIDs = append(failedRootIDs, root.ID)
 		}
 
-		if err := repo.UpdateLibraryRootStatus(ctx, root, nextState, checkedAt, lastErr); errors.Is(err, storage.ErrNotFound) {
+		if err := repo.UpdateLibraryRootStatus(ctx, root, nextState, effectiveCheckedAt, lastErr); errors.Is(err, storage.ErrNotFound) {
 			return PreCheckResult{}, ErrStalePreCheck
 		} else if err != nil {
 			return PreCheckResult{}, err
@@ -202,7 +212,7 @@ func (s *Scanner) commitPreCheckTx(
 			RootPath:      root.Path,
 			PreviousState: root.State,
 			State:         nextState,
-			CheckedAt:     checkedAt,
+			CheckedAt:     effectiveCheckedAt,
 			LastError:     lastErr,
 			Err:           item.err,
 		})
@@ -231,7 +241,7 @@ func (s *Scanner) commitPreCheckTx(
 		State:         nextLibState,
 		ApplyRemovals: isOnline,
 		ShouldScan:    isOnline,
-		CheckedAt:     checkedAt,
+		CheckedAt:     effectiveCheckedAt,
 		Roots:         rootResults,
 		FailedRootIDs: failedRootIDs,
 		Event:         transitionEv,

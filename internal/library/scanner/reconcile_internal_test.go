@@ -434,4 +434,25 @@ func TestPlanReconciliation_MissingRetirementAndRevivalPrecedence(t *testing.T) 
 			t.Fatalf("expected different file at missing path to plan modify, got %+v", planDiff)
 		}
 	})
+
+	t.Run("skipped missing original path stays excluded from revival move matching", func(t *testing.T) {
+		t.Parallel()
+		missingAsset := makeTestAssetForPlanner("a-skip-miss", "a.cbz", t0, true,
+			domain.AssetDigest{AssetID: "a-skip-miss", Kind: domain.DigestKindXXH364Partial, Value: "d-skip", IsCurrent: true, Reason: domain.DigestReasonScan, RecordedAt: t0},
+		)
+		obs := newLibraryWalkObservations()
+		obs.seenSkipped[assetLocation{rootID: testPlannerRootID, relPathBytes: "a.cbz"}] = struct{}{}
+		candCopy := makeTestCandidateForPlanner("copy.cbz", "d-skip")
+		obs.newFiles = []observedFile{{rootID: testPlannerRootID, inspected: candCopy.inspected}}
+		roots := []RootScanResult{{
+			LibraryRootID: testPlannerRootID,
+			Complete:      true,
+		}}
+
+		plan := planReconciliation(roots, []domain.MediaAsset{missingAsset}, obs, t0.Add(8*24*time.Hour), DefaultMissingGracePeriod)
+		if len(plan.MoveComponents) != 0 || len(plan.Restores) != 0 || len(plan.RetireMissing) != 0 ||
+			len(plan.ToIndex) != 1 || plan.ToIndex[0].inspected.RelPath.Display != "copy.cbz" {
+			t.Fatalf("expected skipped missing asset excluded from move/retire and copy.cbz indexed as new, got %+v", plan)
+		}
+	})
 }

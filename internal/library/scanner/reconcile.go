@@ -115,7 +115,7 @@ func lockAndVerifyRootSnapshot(
 	if err != nil {
 		return err
 	}
-	if !rootSnapshotPathsMatch(checkedRoots, currentRoots) || !allRootsOnline(currentRoots) {
+	if !rootSnapshotMatches(checkedRoots, currentRoots) || !allRootsOnline(currentRoots) {
 		return ErrStalePreCheck
 	}
 	return nil
@@ -202,7 +202,7 @@ func planReconciliation(
 
 	confirmedInPlace, mtimeRefreshes, samePathRestores, candidates := collectReconciliationObservations(roots, obs)
 	unconfirmedActive := collectUnconfirmedAssets(activeAssets, obs, confirmedInPlace)
-	unconfirmedMissing := collectUnconfirmedMissingAssets(missingAssets, confirmedInPlace)
+	unconfirmedMissing := collectUnconfirmedAssets(missingAssets, obs, confirmedInPlace)
 	unconfirmed := make([]domain.MediaAsset, 0, len(unconfirmedActive)+len(unconfirmedMissing))
 	unconfirmed = append(unconfirmed, unconfirmedActive...)
 	unconfirmed = append(unconfirmed, unconfirmedMissing...)
@@ -308,21 +308,6 @@ func collectReconciliationObservations(
 		})
 	}
 	return confirmedInPlace, mtimeRefreshes, samePathRestores, candidates
-}
-
-func collectUnconfirmedMissingAssets(
-	missingAssets []domain.MediaAsset,
-	confirmedInPlace map[string]struct{},
-) []domain.MediaAsset {
-	unconfirmed := make([]domain.MediaAsset, 0, len(missingAssets))
-	for _, asset := range missingAssets {
-		if _, ok := confirmedInPlace[asset.ID]; ok {
-			continue
-		}
-		unconfirmed = append(unconfirmed, asset)
-	}
-	slices.SortFunc(unconfirmed, compareAssetOrderForReconcile)
-	return unconfirmed
 }
 
 func collectMissingAndRetiredTransitions(

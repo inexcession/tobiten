@@ -16,7 +16,6 @@ import (
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
-	"github.com/inexcession/tobiten/internal/testdb"
 )
 
 type fakeScannerClock struct {
@@ -45,30 +44,6 @@ func (c *fakeScannerClock) Set(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = t.UTC()
-}
-
-func listOutboxEventRows(ctx context.Context, t *testing.T, db *testdb.TestDB) []domain.DomainEvent {
-	t.Helper()
-	rows, err := db.Query(ctx, `
-		SELECT id, kind, version, aggregate_type, aggregate_id, payload, created_at
-		FROM domain_events
-		ORDER BY id ASC`)
-	if err != nil {
-		t.Fatalf("query domain_events: %v", err)
-	}
-	defer rows.Close()
-	var out []domain.DomainEvent
-	for rows.Next() {
-		var ev domain.DomainEvent
-		if err := rows.Scan(&ev.ID, &ev.Kind, &ev.Version, &ev.AggregateType, &ev.AggregateID, &ev.Payload, &ev.CreatedAt); err != nil {
-			t.Fatalf("scan domain_event: %v", err)
-		}
-		out = append(out, ev)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate domain_events: %v", err)
-	}
-	return out
 }
 
 func setSystemSetting(ctx context.Context, t *testing.T, transactor *postgres.Transactor, key, jsonLiteral string) {
@@ -280,7 +255,7 @@ func TestMissing_SoftDeleteRetainsCatalogueAndExcludesAvailableReads(t *testing.
 	}
 
 	// Verify asset.missing outbox event payload.
-	events := listOutboxEventRows(ctx, t, db)
+	events := loadOutboxEventsDetailed(ctx, t, db)
 	var missingEvents []domain.DomainEvent
 	for _, ev := range events {
 		if ev.Kind == domain.EventAssetMissing && ev.AggregateID == orig.ID {
@@ -305,7 +280,7 @@ func TestMissing_SoftDeleteRetainsCatalogueAndExcludesAvailableReads(t *testing.
 	if err != nil || afterWait.MissingSince == nil || !afterWait.MissingSince.Equal(tMissing) {
 		t.Fatalf("MissingSince altered on within-grace rescan: %+v (err=%v)", afterWait, err)
 	}
-	events2 := listOutboxEventRows(ctx, t, db)
+	events2 := loadOutboxEventsDetailed(ctx, t, db)
 	var missingCount2 int
 	for _, ev := range events2 {
 		if ev.Kind == domain.EventAssetMissing && ev.AggregateID == orig.ID {
@@ -454,7 +429,7 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 	if got1, _ := cw.GetAssetByID(ctx, a1.ID); got1.MissingSince != nil {
 		t.Fatalf("expected a1 MissingSince rolled back on ErrStalePreCheck, got %+v", got1)
 	}
-	for _, ev := range listOutboxEventRows(ctx, t, db) {
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
 		if ev.Kind == domain.EventAssetMissing {
 			t.Fatalf("unexpected asset.missing event after aborted/incomplete scans: %+v", ev)
 		}
@@ -612,7 +587,7 @@ func TestMissing_RevivalWithinGraceCurrentAndHistoricalBothPaths(t *testing.T) {
 			assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 1)
 
 			var kinds []domain.EventKind
-			for _, ev := range listOutboxEventRows(ctx, t, db) {
+			for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
 				if ev.AggregateID == orig.ID {
 					kinds = append(kinds, ev.Kind)
 				}
@@ -713,7 +688,7 @@ func TestMissing_ConfigurableGracePeriodAndRetirement(t *testing.T) {
 
 		// Retirement must NOT emit another asset.missing event.
 		var missingEventCount int
-		for _, ev := range listOutboxEventRows(ctx, t, db) {
+		for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
 			if ev.Kind == domain.EventAssetMissing && ev.AggregateID == orig.ID {
 				missingEventCount++
 			}
@@ -1070,7 +1045,7 @@ func TestMissing_DifferentFileAtMissingOrRetiredPathRecordsModification(t *testi
 			assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 1)
 
 			var kinds []domain.EventKind
-			for _, ev := range listOutboxEventRows(ctx, t, db) {
+			for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
 				if ev.AggregateID == orig.ID {
 					kinds = append(kinds, ev.Kind)
 				}
@@ -1169,5 +1144,250 @@ func TestMissing_SwapActiveOntoRevivedMissingPath(t *testing.T) {
 	}
 	if gotM.RelPathDisplay != "a.cbz" || !gotM.IsAvailable() {
 		t.Fatalf("expected origM revived at a.cbz and available, got %+v", gotM)
+	}
+}
+
+func TestMissing_SkippedOriginalPathDoesNotReviveOntoCopyThenRestoresAtOwnPath(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "root")
+	writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
+	origPath := filepath.Join(rootDir, "a.cbz")
+	copyPath := filepath.Join(rootDir, "copy.cbz")
+	bookBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Permission</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("same-bytes-skip-revival"), method: zip.Store},
+	)
+	writeDiskFile(t, origPath, bookBytes)
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Skipped Revival Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	t0 := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	sc, err := scanner.NewScanner(transactor, scanner.Options{Now: clock.Now})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+		t.Fatalf("initial scan: res=%+v err=%v", res, err)
+	}
+	orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+	userID := seedUserAndReadingProgress(ctx, t, db, transactor, "skip-reader", orig, 4)
+
+	// Mark a.cbz missing cleanly.
+	clock.Advance(time.Hour)
+	if err := os.Remove(origPath); err != nil {
+		t.Fatalf("remove orig: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.MissingCount != 1 {
+		t.Fatalf("missing scan: res=%+v err=%v", res, err)
+	}
+
+	// Both a.cbz (unreadable/skipped) and matching copy.cbz (readable) appear on disk.
+	clock.Advance(2 * time.Hour)
+	writeDiskFile(t, origPath, bookBytes)
+	writeDiskFile(t, copyPath, bookBytes)
+	resSkip, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+		Open: func(_ context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+			if string(rawPath) == origPath {
+				return nil, os.ErrPermission
+			}
+			return os.Open(string(rawPath))
+		},
+	})
+	if err != nil || !resSkip.Complete || resSkip.IndexedCount != 1 || resSkip.MovedCount != 0 || resSkip.RestoredCount != 0 {
+		t.Fatalf("expected copy.cbz indexed as new and 0 moves/restores while a.cbz skipped, got res=%+v err=%v", resSkip, err)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	gotOrigStillMissing, err := cw.GetAssetByID(ctx, orig.ID)
+	if err != nil || gotOrigStillMissing.MissingSince == nil || gotOrigStillMissing.RelPathDisplay != "a.cbz" || gotOrigStillMissing.VolumeID != orig.VolumeID {
+		t.Fatalf("expected orig asset to remain at a.cbz in missing state on same volume, got %+v (err=%v)", gotOrigStillMissing, err)
+	}
+	assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 4)
+
+	assetsAfterCopy := listAssetsForRoot(ctx, t, transactor, root.ID)
+	if len(assetsAfterCopy) != 2 {
+		t.Fatalf("expected 2 assets (missing orig + new copy.cbz), got %+v", assetsAfterCopy)
+	}
+	var copyAsset domain.MediaAsset
+	for _, a := range assetsAfterCopy {
+		if a.ID != orig.ID {
+			copyAsset = a
+		}
+	}
+	if copyAsset.ID == orig.ID || copyAsset.RelPathDisplay != "copy.cbz" || !copyAsset.IsAvailable() || copyAsset.VolumeID != orig.VolumeID {
+		t.Fatalf("expected copy.cbz indexed as separate asset on volume %s, got %+v (orig=%+v)", orig.VolumeID, copyAsset, orig)
+	}
+
+	// Next readable scan restores orig at a.cbz on its original ID, volume, and progress.
+	clock.Advance(time.Hour)
+	resRestore, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil || !resRestore.Complete || resRestore.RestoredCount != 1 || resRestore.MovedCount != 0 || resRestore.IndexedCount != 0 {
+		t.Fatalf("restore scan: res=%+v err=%v", resRestore, err)
+	}
+	gotRestored, err := cw.GetAssetByID(ctx, orig.ID)
+	if err != nil || !gotRestored.IsAvailable() || gotRestored.RelPathDisplay != "a.cbz" || gotRestored.VolumeID != orig.VolumeID {
+		t.Fatalf("expected orig restored cleanly at a.cbz, got %+v (err=%v)", gotRestored, err)
+	}
+	assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 4)
+
+	var origEvents []domain.EventKind
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.AggregateID == orig.ID {
+			origEvents = append(origEvents, ev.Kind)
+		}
+	}
+	if !slices.Contains(origEvents, domain.EventAssetRestored) || slices.Contains(origEvents, domain.EventAssetMoved) {
+		t.Fatalf("expected asset.restored without asset.moved for orig, got %v", origEvents)
+	}
+}
+
+func TestMissing_StaleAbsenceRejectedAfterNewerOnlinePreCheck(t *testing.T) {
+	t.Parallel()
+
+	for _, advancingClock := range []bool{true, false} {
+		name := "same_clock_timestamp"
+		if advancingClock {
+			name = "advancing_clock_timestamp"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db, transactor := setupIndexerTestDB(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			rootDir := filepath.Join(t.TempDir(), "root")
+			writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
+			bookPath := filepath.Join(rootDir, "a.cbz")
+			bookBytes := buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Race</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("race-bytes"), method: zip.Store},
+			)
+			writeDiskFile(t, bookPath, bookBytes)
+
+			var lib domain.Library
+			var root domain.LibraryRoot
+			if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				var roots []domain.LibraryRoot
+				lib, roots = seedLibraryAndRoots(ctx, t, tx, "Stale Absence Race Lib", nil, []byte(rootDir))
+				root = roots[0]
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed: %v", err)
+			}
+
+			t0 := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+			clock := newFakeClock(t0)
+			scB, err := scanner.NewScanner(transactor, scanner.Options{Now: clock.Now})
+			if err != nil {
+				t.Fatalf("NewScanner(scB): %v", err)
+			}
+			if res, err := scB.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+				t.Fatalf("initial scan: res=%+v err=%v", res, err)
+			}
+			orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+
+			// Delete a.cbz so Scan A walks and sees it absent, then pause right before executeMarkMissing.
+			if err := os.Remove(bookPath); err != nil {
+				t.Fatalf("remove a.cbz: %v", err)
+			}
+			if advancingClock {
+				clock.Advance(time.Minute)
+			}
+
+			scanAPaused := make(chan struct{})
+			releaseScanA := make(chan struct{})
+			var pauseOnce sync.Once
+			hookTx := &reconcileHookTransactor{
+				inner: transactor,
+				beforeSecondReadCommitted: func() error {
+					pauseOnce.Do(func() {
+						close(scanAPaused)
+						select {
+						case <-releaseScanA:
+						case <-ctx.Done():
+						}
+					})
+					return ctx.Err()
+				},
+			}
+			scA, err := scanner.NewScanner(hookTx, scanner.Options{Now: clock.Now})
+			if err != nil {
+				t.Fatalf("NewScanner(scA): %v", err)
+			}
+
+			var (
+				resA scanner.ScanResult
+				errA error
+			)
+			doneA := make(chan struct{})
+			go func() {
+				defer close(doneA)
+				resA, errA = scA.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+			}()
+
+			select {
+			case <-scanAPaused:
+			case <-doneA:
+				t.Fatalf("Scan A exited before pausing at executeMarkMissing: res=%+v err=%v", resA, errA)
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for Scan A pause: %v", ctx.Err())
+			}
+
+			// File returns with its original size and mtime; Scan B completes ONLINE seeing it unchanged.
+			writeDiskFile(t, bookPath, bookBytes)
+			if orig.FileMtime != nil {
+				if err := os.Chtimes(bookPath, *orig.FileMtime, *orig.FileMtime); err != nil {
+					t.Fatalf("Chtimes(a.cbz): %v", err)
+				}
+			}
+			if advancingClock {
+				clock.Advance(time.Minute)
+			}
+			resB, errB := scB.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+			if errB != nil || !resB.Complete || resB.UnchangedCount != 1 || resB.MissingCount != 0 || resB.IndexedCount != 0 {
+				t.Fatalf("expected Scan B to complete cleanly seeing a.cbz unchanged, got res=%+v err=%v", resB, errB)
+			}
+
+			// Release Scan A's missing write; it must reject as stale and preserve availability.
+			close(releaseScanA)
+			<-doneA
+			if !errors.Is(errA, scanner.ErrStalePreCheck) {
+				t.Fatalf("expected stale Scan A to fail with ErrStalePreCheck, got res=%+v err=%v", resA, errA)
+			}
+			if resA.Complete || resA.ApplyRemovals {
+				t.Fatalf("expected Scan A Complete=false ApplyRemovals=false, got %+v", resA)
+			}
+
+			cw := postgres.NewCatalogueWriteRepository(db.Pool)
+			got, err := cw.GetAssetByID(ctx, orig.ID)
+			if err != nil || !got.IsAvailable() || got.MissingSince != nil || got.RetiredAt != nil {
+				t.Fatalf("expected a.cbz to remain available after stale Scan A rejection, got %+v (err=%v)", got, err)
+			}
+			catRepo := postgres.NewCatalogueRepository(db.Pool)
+			adminScope := storage.CatalogueReadScope{Principal: adminPrincipalForReconcileTest(), IncludeTrashed: true}
+			assertAvailableReadsIncludeAsset(ctx, t, catRepo, adminScope, orig.ID, orig.VolumeID)
+
+			for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+				if ev.Kind == domain.EventAssetMissing {
+					t.Fatalf("expected no asset.missing outbox event from superseded Scan A, got %+v", ev)
+				}
+			}
+		})
 	}
 }
