@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -187,6 +188,11 @@ var newDaemonWatcher = func(pool *pgxpool.Pool, cfg *config.Config, ds *daemonSe
 	})
 }
 
+const maxPollIntervalSeconds = math.MaxInt64 / int64(time.Second)
+
+// parseScannerPollInterval reads scanner.poll_interval from PostgreSQL system_settings.
+// Supported values are positive Go duration strings (e.g. "30s", "1m") or positive whole
+// seconds within time.Duration range; blank or unset selects scanner.DefaultPollInterval (1m).
 func parseScannerPollInterval(cfg *config.Config) (time.Duration, error) {
 	if cfg == nil {
 		return 0, nil
@@ -228,15 +234,22 @@ func parseScannerPollInterval(cfg *config.Config) (time.Duration, error) {
 }
 
 func parsePositiveDurationOrSeconds(raw string) (time.Duration, error) {
-	if secs, err := strconv.Atoi(raw); err == nil {
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err == nil {
 		if secs <= 0 {
 			return 0, errors.New("must be positive")
 		}
+		if secs > maxPollIntervalSeconds {
+			return 0, fmt.Errorf("seconds value %d exceeds maximum duration (%d seconds)", secs, maxPollIntervalSeconds)
+		}
 		return time.Duration(secs) * time.Second, nil
 	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		return 0, err
+	if errors.Is(err, strconv.ErrRange) {
+		return 0, errors.New("duration out of range")
+	}
+	d, parseErr := time.ParseDuration(raw)
+	if parseErr != nil {
+		return 0, parseErr
 	}
 	if d <= 0 {
 		return 0, errors.New("must be positive")

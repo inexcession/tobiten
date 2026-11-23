@@ -19,7 +19,9 @@ import (
 
 const (
 	// PollIntervalSettingKey is the PostgreSQL system_settings key configuring
-	// the polling interval for mount watching (ADR-0003 §4).
+	// the polling interval for mount watching (ADR-0003 §4). Supported values are
+	// positive Go duration strings (for example "30s" or "1m") or positive whole
+	// seconds within time.Duration range; blank or unset defaults to DefaultPollInterval (1m).
 	PollIntervalSettingKey = "scanner.poll_interval"
 
 	// DefaultPollInterval is the default polling interval for network mounts and
@@ -197,10 +199,12 @@ type Watcher struct {
 
 	syncCh chan struct{}
 
+	lifecycleMu sync.Mutex
+	running     bool
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+
 	mu         sync.Mutex
-	running    bool
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
 	watched    map[string]*watchedRoot
 	syncErrLog bool
 }
@@ -311,17 +315,17 @@ func (w *Watcher) Start(ctx context.Context) error {
 		return err
 	}
 
-	w.mu.Lock()
+	w.lifecycleMu.Lock()
 	if w.running {
-		w.mu.Unlock()
+		w.lifecycleMu.Unlock()
 		return ErrWatcherAlreadyRunning
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	w.running = true
 	w.cancel = cancel
-	w.mu.Unlock()
-
 	w.wg.Add(1)
+	w.lifecycleMu.Unlock()
+
 	go w.runLoop(runCtx)
 	return nil
 }
@@ -333,19 +337,19 @@ func (w *Watcher) Stop() {
 		return
 	}
 
-	w.mu.Lock()
+	w.lifecycleMu.Lock()
 	if !w.running {
-		w.mu.Unlock()
+		w.lifecycleMu.Unlock()
 		return
 	}
 	cancel := w.cancel
 	w.cancel = nil
 	w.running = false
-	w.mu.Unlock()
-
 	if cancel != nil {
 		cancel()
 	}
+	w.lifecycleMu.Unlock()
+
 	w.wg.Wait()
 
 	if w.osWatcher != nil {
@@ -409,7 +413,10 @@ func (w *Watcher) runLoop(ctx context.Context) {
 	defer w.wg.Done()
 
 	pending := make(map[string]*pendingScan)
-	w.syncAndBaseline(ctx, pending, false)
+	w.syncAndBaseline(ctx, pending)
+	if ctx.Err() != nil {
+		return
+	}
 	nextPollAt := w.clock.Now().Add(w.pollInterval)
 
 	for {
@@ -422,6 +429,9 @@ func (w *Watcher) runLoop(ctx context.Context) {
 
 		if !now.Before(nextPollAt) {
 			w.pollStep(ctx, pending)
+			if ctx.Err() != nil {
+				return
+			}
 			nextPollAt = w.clock.Now().Add(w.pollInterval)
 			w.fireDueScans(ctx, w.clock.Now(), pending)
 		}
@@ -435,7 +445,7 @@ func (w *Watcher) runLoop(ctx context.Context) {
 			return
 		case <-w.syncCh:
 			timer.Stop()
-			w.syncAndBaseline(ctx, pending, false)
+			w.syncAndBaseline(ctx, pending)
 		case <-timer.C():
 		}
 	}
@@ -565,7 +575,10 @@ func (w *Watcher) checkExistingJobQueued(ctx context.Context, jobID string) (boo
 }
 
 func (w *Watcher) pollStep(ctx context.Context, pending map[string]*pendingScan) {
-	baselined := w.syncAndBaseline(ctx, pending, false)
+	baselined := w.syncAndBaseline(ctx, pending)
+	if ctx.Err() != nil {
+		return
+	}
 
 	roots := w.snapshotWatchedRoots()
 	for _, wr := range roots {
@@ -579,12 +592,15 @@ func (w *Watcher) pollStep(ctx context.Context, pending map[string]*pendingScan)
 			markLibraryDirty(pending, wr.root.LibraryID, w.clock.Now().Add(w.debounceWindow))
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if w.onPoll != nil {
 		w.onPoll()
 	}
 }
 
-func (w *Watcher) syncAndBaseline(ctx context.Context, pending map[string]*pendingScan, _ bool) map[string]bool {
+func (w *Watcher) syncAndBaseline(ctx context.Context, pending map[string]*pendingScan) map[string]bool {
 	added, err := w.syncRoots(ctx, pending)
 	if err != nil {
 		if ctx.Err() == nil && !w.syncErrLog {
@@ -624,9 +640,28 @@ func (w *Watcher) snapshotWatchedRoots() []*watchedRoot {
 	return out
 }
 
+type removedRootWatch struct {
+	id        string
+	osWatched bool
+}
+
+type resolvedWatchMode struct {
+	mode          WatchMode
+	fsType        string
+	isNetwork     bool
+	mountDetected bool
+	osWatched     bool
+}
+
 func (w *Watcher) syncRoots(ctx context.Context, pending map[string]*pendingScan) ([]*watchedRoot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	roots, err := w.loadConfiguredRoots(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -637,31 +672,28 @@ func (w *Watcher) syncRoots(ctx context.Context, pending map[string]*pendingScan
 		activeLibs[r.LibraryID] = struct{}{}
 	}
 
-	w.mu.Lock()
-	var toRemove []string
-	for id, existing := range w.watched {
-		fresh, ok := desired[id]
-		if !ok || !bytes.Equal(existing.root.Path.Bytes, fresh.Path.Bytes) {
-			toRemove = append(toRemove, id)
+	removed, toAdd := w.planRootSync(roots, desired)
+	for _, rem := range removed {
+		if rem.osWatched && w.osWatcher != nil {
+			_ = w.osWatcher.RemoveRoot(rem.id)
 		}
-	}
-	for _, id := range toRemove {
-		if wr := w.watched[id]; wr != nil && wr.osWatched && w.osWatcher != nil {
-			_ = w.osWatcher.RemoveRoot(id)
-		}
-		delete(w.watched, id)
 	}
 
 	var added []*watchedRoot
-	for _, r := range roots {
-		if _, exists := w.watched[r.ID]; exists {
-			continue
+	for _, r := range toAdd {
+		if err := ctx.Err(); err != nil {
+			return added, err
 		}
-		wr := w.initWatchedRoot(r)
-		w.watched[r.ID] = wr
-		added = append(added, wr)
+		wr, ok := w.initWatchedRoot(ctx, r)
+		if !ok {
+			return added, ctx.Err()
+		}
+		if w.commitAddedWatchedRoot(ctx, wr) {
+			added = append(added, wr)
+		} else {
+			return added, ctx.Err()
+		}
 	}
-	w.mu.Unlock()
 
 	for libID := range pending {
 		if _, ok := activeLibs[libID]; !ok {
@@ -671,6 +703,51 @@ func (w *Watcher) syncRoots(ctx context.Context, pending map[string]*pendingScan
 	return added, nil
 }
 
+func (w *Watcher) planRootSync(
+	roots []domain.LibraryRoot,
+	desired map[string]domain.LibraryRoot,
+) ([]removedRootWatch, []domain.LibraryRoot) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var removed []removedRootWatch
+	for id, existing := range w.watched {
+		fresh, ok := desired[id]
+		if !ok || !bytes.Equal(existing.root.Path.Bytes, fresh.Path.Bytes) {
+			removed = append(removed, removedRootWatch{id: id, osWatched: existing.osWatched})
+			delete(w.watched, id)
+		}
+	}
+
+	var toAdd []domain.LibraryRoot
+	for _, r := range roots {
+		if _, exists := w.watched[r.ID]; !exists {
+			toAdd = append(toAdd, r)
+		}
+	}
+	return removed, toAdd
+}
+
+func (w *Watcher) commitAddedWatchedRoot(ctx context.Context, wr *watchedRoot) bool {
+	if ctx.Err() != nil {
+		if wr.osWatched && w.osWatcher != nil {
+			_ = w.osWatcher.RemoveRoot(wr.root.ID)
+		}
+		return false
+	}
+	w.mu.Lock()
+	if ctx.Err() != nil {
+		w.mu.Unlock()
+		if wr.osWatched && w.osWatcher != nil {
+			_ = w.osWatcher.RemoveRoot(wr.root.ID)
+		}
+		return false
+	}
+	w.watched[wr.root.ID] = wr
+	w.mu.Unlock()
+	return true
+}
+
 func (w *Watcher) loadConfiguredRoots(ctx context.Context) ([]domain.LibraryRoot, error) {
 	if w.roots != nil {
 		return w.roots.ListAllLibraryRoots(ctx)
@@ -678,43 +755,71 @@ func (w *Watcher) loadConfiguredRoots(ctx context.Context) ([]domain.LibraryRoot
 	return slices.Clone(w.staticRoots), nil
 }
 
-func (w *Watcher) initWatchedRoot(r domain.LibraryRoot) *watchedRoot {
-	wr := &watchedRoot{
-		root:               r,
-		mode:               WatchModePoll,
-		unreadableSubpaths: make(map[string]struct{}),
+func (w *Watcher) initWatchedRoot(ctx context.Context, r domain.LibraryRoot) (*watchedRoot, bool) {
+	resolved, ok := w.resolveRootWatchMode(ctx, r)
+	if !ok {
+		return nil, false
 	}
-	w.detectRootWatchMode(wr)
-	return wr
+	return &watchedRoot{
+		root:               r,
+		mode:               resolved.mode,
+		fsType:             resolved.fsType,
+		isNetwork:          resolved.isNetwork,
+		mountDetected:      resolved.mountDetected,
+		osWatched:          resolved.osWatched,
+		unreadableSubpaths: make(map[string]struct{}),
+	}, true
 }
 
-func (w *Watcher) detectRootWatchMode(wr *watchedRoot) {
-	info, err := w.mountDetector.Detect(wr.root.Path.Bytes)
+func (w *Watcher) resolveRootWatchMode(ctx context.Context, r domain.LibraryRoot) (resolvedWatchMode, bool) {
+	if ctx.Err() != nil {
+		return resolvedWatchMode{}, false
+	}
+	info, err := w.mountDetector.Detect(r.Path.Bytes)
+	if ctx.Err() != nil {
+		return resolvedWatchMode{}, false
+	}
 	if err != nil {
-		wr.mode = WatchModePoll
-		wr.mountDetected = false
-		return
+		return resolvedWatchMode{
+			mode:          WatchModePoll,
+			mountDetected: false,
+		}, true
 	}
-	wr.fsType = info.Type
-	wr.isNetwork = info.IsNetwork
-	wr.mountDetected = true
 
-	if info.IsNetwork || w.osWatcher == nil {
-		wr.mode = WatchModePoll
-		return
+	resolved := resolvedWatchMode{
+		mode:          WatchModePoll,
+		fsType:        info.Type,
+		isNetwork:     info.IsNetwork,
+		mountDetected: true,
 	}
-	if err := w.osWatcher.AddRoot(wr.root); err != nil {
+	if info.IsNetwork || w.osWatcher == nil {
+		return resolved, true
+	}
+	if ctx.Err() != nil {
+		return resolvedWatchMode{}, false
+	}
+	if err := w.osWatcher.AddRoot(r); err != nil {
 		w.logger.Warn("failed to register OS watch; falling back to polling",
-			slog.String("library_id", wr.root.LibraryID),
-			slog.String("library_root_id", wr.root.ID),
-			slog.String("path", wr.root.Path.Display),
+			slog.String("library_id", r.LibraryID),
+			slog.String("library_root_id", r.ID),
+			slog.String("path", r.Path.Display),
 			logging.Err(err),
 		)
-		wr.mode = WatchModePoll
-		return
+		return resolved, true
 	}
-	wr.mode = WatchModeOS
-	wr.osWatched = true
+	resolved.mode = WatchModeOS
+	resolved.osWatched = true
+	return resolved, true
+}
+
+func (w *Watcher) applyWatchMode(wr *watchedRoot, resolved resolvedWatchMode) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	wr.mode = resolved.mode
+	wr.fsType = resolved.fsType
+	wr.isNetwork = resolved.isNetwork
+	wr.mountDetected = resolved.mountDetected
+	wr.osWatched = resolved.osWatched
 }
 
 func (w *Watcher) pollWatchedRoot(ctx context.Context, wr *watchedRoot) bool {
@@ -736,13 +841,21 @@ func (w *Watcher) pollWatchedRoot(ctx context.Context, wr *watchedRoot) bool {
 		return false
 	}
 
+	if ctx.Err() != nil {
+		return false
+	}
+
 	wr.unreadableSubpaths = nextUnreadable
 
 	if wr.unreadable {
-		wr.unreadable = false
 		if !wr.mountDetected {
-			w.detectRootWatchMode(wr)
+			resolved, ok := w.resolveRootWatchMode(ctx, wr.root)
+			if !ok {
+				return false
+			}
+			w.applyWatchMode(wr, resolved)
 		}
+		wr.unreadable = false
 		wr.snapshot = snap
 		wr.hasBaseline = true
 		return true
@@ -764,6 +877,9 @@ func (w *Watcher) captureRootSnapshot(
 	wr *watchedRoot,
 	nextUnreadable map[string]struct{},
 ) (rootSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return rootSnapshot{}, err
+	}
 	rootBytes := trimTrailingSlashes(wr.root.Path.Bytes)
 	rootInfo, err := w.stat(rootBytes)
 	if err != nil {

@@ -1296,6 +1296,11 @@ func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
 
 	readEntered := make(chan struct{})
 	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRead) })
+	}
+	t.Cleanup(release)
 	var readOnce sync.Once
 	var mu sync.Mutex
 	rootStatCalls := 0
@@ -1319,7 +1324,10 @@ func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
 				mu.Unlock()
 				readOnce.Do(func() {
 					close(readEntered)
-					<-releaseRead
+					select {
+					case <-releaseRead:
+					case <-t.Context().Done():
+					}
 				})
 			}
 			return os.Stat(string(rawPath))
@@ -1341,7 +1349,7 @@ func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
 			t.Fatalf("Start: %v", err)
 		}
 	case <-time.After(time.Second):
-		close(releaseRead)
+		release()
 		t.Fatal("Start blocked on mount I/O")
 	}
 	defer w.Stop()
@@ -1350,10 +1358,10 @@ func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
 	select {
 	case <-readEntered:
 	case <-time.After(time.Second):
-		close(releaseRead)
+		release()
 		t.Fatal("background baseline did not start")
 	}
-	close(releaseRead)
+	release()
 
 	// Wait for initial baseline pass to park on the first timer.
 	clk.waitForParked(t, 1)
@@ -1367,4 +1375,176 @@ func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
 	if got := len(trig.snapshot()); got != 0 {
 		t.Fatalf("initial baseline triggered %d scans, want 0", got)
 	}
+}
+
+func TestWatcher_StopCancelsDuringMountProbeAndSkipsSecondRoot(t *testing.T) {
+	t.Run("Stop cancels watcher context during blocked first probe and skips second root", func(t *testing.T) {
+		dir1 := t.TempDir()
+		dir2 := t.TempDir()
+		r1 := makeWatcherTestRoot(t, "lib-1", "root-1", dir1)
+		r2 := makeWatcherTestRoot(t, "lib-2", "root-2", dir2)
+
+		probeEntered := make(chan struct{})
+		releaseProbe := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseProbe) })
+		}
+		t.Cleanup(release)
+
+		var probeOnce sync.Once
+		var mu sync.Mutex
+		probeCalls := 0
+
+		trig := &recordedTrigger{}
+		clk := newFakeWatcherClock(time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC))
+
+		w, err := NewWatcher(WatcherOptions{
+			StaticRoots: []domain.LibraryRoot{r1, r2},
+			Trigger:     trig,
+			Clock:       clk,
+			MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				mu.Lock()
+				probeCalls++
+				mu.Unlock()
+				probeOnce.Do(func() {
+					close(probeEntered)
+					select {
+					case <-releaseProbe:
+					case <-t.Context().Done():
+					}
+				})
+				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+			}),
+			PollInterval:   10 * time.Millisecond,
+			DebounceWindow: 20 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		if err := w.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		select {
+		case <-probeEntered:
+		case <-time.After(time.Second):
+			t.Fatal("watcher did not enter first mount probe")
+		}
+
+		// Stop cancels the watcher context even while the first mount probe is blocked.
+		stopDone := make(chan struct{})
+		go func() {
+			w.Stop()
+			close(stopDone)
+		}()
+
+		// Wait until Stop has acquired lifecycleMu, canceled runCtx, and marked w.running=false
+		// while the first mount probe is still blocked.
+		cancelDeadline := time.Now().Add(time.Second)
+		for {
+			w.lifecycleMu.Lock()
+			stillRunning := w.running
+			w.lifecycleMu.Unlock()
+			if !stillRunning {
+				break
+			}
+			if time.Now().After(cancelDeadline) {
+				release()
+				t.Fatal("Stop blocked on mount probe before canceling watcher context")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		select {
+		case <-stopDone:
+			t.Fatal("Stop returned before blocked first mount probe finished")
+		default:
+		}
+
+		release()
+
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not finish after releasing first mount probe")
+		}
+
+		mu.Lock()
+		calls := probeCalls
+		mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("mount probe calls = %d, want 1 (second root must not be probed after shutdown)", calls)
+		}
+	})
+
+	t.Run("parent context cancellation during first probe skips second root", func(t *testing.T) {
+		dir1 := t.TempDir()
+		dir2 := t.TempDir()
+		r1 := makeWatcherTestRoot(t, "lib-1", "root-1", dir1)
+		r2 := makeWatcherTestRoot(t, "lib-2", "root-2", dir2)
+
+		probeEntered := make(chan struct{})
+		releaseProbe := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseProbe) })
+		}
+		t.Cleanup(release)
+
+		var probeOnce sync.Once
+		var mu sync.Mutex
+		probeCalls := 0
+
+		trig := &recordedTrigger{}
+		clk := newFakeWatcherClock(time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC))
+
+		w, err := NewWatcher(WatcherOptions{
+			StaticRoots: []domain.LibraryRoot{r1, r2},
+			Trigger:     trig,
+			Clock:       clk,
+			MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				mu.Lock()
+				probeCalls++
+				mu.Unlock()
+				probeOnce.Do(func() {
+					close(probeEntered)
+					select {
+					case <-releaseProbe:
+					case <-t.Context().Done():
+					}
+				})
+				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+			}),
+			PollInterval:   10 * time.Millisecond,
+			DebounceWindow: 20 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+
+		parentCtx, cancelParent := context.WithCancel(t.Context())
+		defer cancelParent()
+		if err := w.Start(parentCtx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		select {
+		case <-probeEntered:
+		case <-time.After(time.Second):
+			t.Fatal("watcher did not enter first mount probe")
+		}
+
+		// Cancel parent context while the first probe is blocked, then release it.
+		cancelParent()
+		release()
+		w.Stop()
+
+		mu.Lock()
+		calls := probeCalls
+		mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("mount probe calls = %d, want 1 (second root must not be probed after parent context cancellation)", calls)
+		}
+	})
 }

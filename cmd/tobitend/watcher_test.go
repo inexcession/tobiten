@@ -46,9 +46,12 @@ func TestRunDaemon_WatchersStartAfterRecoveryAndStopBeforeStorageCleanup(t *test
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
-	rootDir := filepath.Join(t.TempDir(), "slow-nas")
-	writeTestFile(t, filepath.Join(rootDir, "Vol01.cbz"), buildTestCBZ(t, "Slow", "One", "1"))
-	seedTestLibrary(ctx, t, db.Pool, "Slow NAS Library", rootDir)
+	rootDir1 := filepath.Join(t.TempDir(), "slow-nas-1")
+	rootDir2 := filepath.Join(t.TempDir(), "slow-nas-2")
+	writeTestFile(t, filepath.Join(rootDir1, "Vol01.cbz"), buildTestCBZ(t, "Slow", "One", "1"))
+	writeTestFile(t, filepath.Join(rootDir2, "Vol02.cbz"), buildTestCBZ(t, "Slow", "Two", "2"))
+	seedTestLibrary(ctx, t, db.Pool, "Slow NAS Library 1", rootDir1)
+	seedTestLibrary(ctx, t, db.Pool, "Slow NAS Library 2", rootDir2)
 
 	// Seed an interrupted RUNNING SCAN job so runner.Recover must reconcile it before watchers start.
 	jobRepo := postgres.NewJobRepository(db.Pool)
@@ -96,36 +99,41 @@ func TestRunDaemon_WatchersStartAfterRecoveryAndStopBeforeStorageCleanup(t *test
 		return reg
 	}
 
-	fsReadEntered := make(chan struct{})
-	releaseFSRead := make(chan struct{})
-	var fsReadOnce sync.Once
-	var fsReadReleased bool
-	t.Cleanup(func() {
-		mu.Lock()
-		alreadyReleased := fsReadReleased
-		fsReadReleased = true
-		mu.Unlock()
-		if !alreadyReleased {
-			close(releaseFSRead)
-		}
-	})
+	probeEntered := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var releaseProbeOnce sync.Once
+	releaseProbeFn := func() {
+		releaseProbeOnce.Do(func() { close(releaseProbe) })
+	}
+	t.Cleanup(releaseProbeFn)
+
+	var probeOnce sync.Once
+	var probeCalls atomic.Int32
+	var watcherRunCtx atomic.Pointer[context.Context]
 
 	newDaemonWatcher = func(pool *pgxpool.Pool, cfg *config.Config, ds *daemonServices) (*scanner.Watcher, error) {
+		repo := postgres.NewLibraryRepository(pool)
 		return scanner.NewWatcher(scanner.WatcherOptions{
-			Roots:        postgres.NewLibraryRepository(pool),
+			Roots: contextCapturingRootLister{
+				inner: repo,
+				onList: func(listCtx context.Context) {
+					watcherRunCtx.CompareAndSwap(nil, &listCtx)
+				},
+			},
 			Trigger:      ds.jobs,
 			Jobs:         postgres.NewJobRepository(pool),
 			PollInterval: 50 * time.Millisecond,
 			MountDetector: scanner.MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				probeCalls.Add(1)
+				probeOnce.Do(func() {
+					close(probeEntered)
+					select {
+					case <-releaseProbe:
+					case <-ctx.Done():
+					}
+				})
 				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
 			}),
-			Stat: func(rawPath []byte) (os.FileInfo, error) {
-				fsReadOnce.Do(func() {
-					close(fsReadEntered)
-					<-releaseFSRead
-				})
-				return os.Stat(string(rawPath))
-			},
 		})
 	}
 
@@ -154,26 +162,61 @@ func TestRunDaemon_WatchersStartAfterRecoveryAndStopBeforeStorageCleanup(t *test
 		if pids := queryDaemonLockPIDs(t, db); len(pids) != 1 {
 			t.Errorf("expected daemon advisory lock held during watcher stop, got pids=%v", pids)
 		}
-		originalStopWatchers(w)
+		// Start watcher shutdown while the first mount probe is still blocked, verify Stop
+		// cancels the watcher context immediately and waits to join the in-flight probe,
+		// then release the first probe so any second root is skipped.
+		stopDone := make(chan struct{})
+		go func() {
+			originalStopWatchers(w)
+			close(stopDone)
+		}()
+		if runCtxPtr := watcherRunCtx.Load(); runCtxPtr == nil {
+			t.Error("expected watcher run context captured before mount probe")
+		} else {
+			select {
+			case <-(*runCtxPtr).Done():
+			case <-time.After(2 * time.Second):
+				t.Error("watcher Stop did not cancel watcher context while first mount probe was blocked")
+			}
+		}
+		select {
+		case <-stopDone:
+			t.Error("watcher Stop returned before blocked first mount probe finished")
+		default:
+		}
+		releaseProbeFn()
+		select {
+		case <-stopDone:
+		case <-time.After(3 * time.Second):
+			t.Error("watcher Stop timed out during shutdown")
+		}
+		if dbPool != nil {
+			if err := dbPool.Ping(context.Background()); err != nil {
+				t.Errorf("storage pool closed before watcher join finished: %v", err)
+			}
+		}
+		if pids := queryDaemonLockPIDs(t, db); len(pids) != 1 {
+			t.Errorf("expected daemon advisory lock still held right after watcher stop, got pids=%v", pids)
+		}
 		record("watcher_stop")
 	}
 
 	err := runDaemon(ctx, hostedConfig(t, db.URL), func(_ context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
 		record("serve")
-		// HTTP serving must begin before the held initial mount filesystem read returns.
+		// HTTP serving must begin before the held initial mount probe returns.
 		select {
-		case <-fsReadEntered:
+		case <-probeEntered:
 		case <-time.After(2 * time.Second):
-			return errors.New("background watcher did not reach initial filesystem read")
+			return errors.New("background watcher did not reach initial mount probe")
 		}
-		mu.Lock()
-		fsReadReleased = true
-		mu.Unlock()
-		close(releaseFSRead)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("runDaemon err = %v", err)
+	}
+
+	if gotProbes := probeCalls.Load(); gotProbes != 1 {
+		t.Fatalf("mount probe calls = %d, want 1 (second root must not be probed after shutdown begins)", gotProbes)
 	}
 
 	if pids := queryDaemonLockPIDs(t, db); len(pids) != 0 {
@@ -187,6 +230,18 @@ func TestRunDaemon_WatchersStartAfterRecoveryAndStopBeforeStorageCleanup(t *test
 	if !slices.Equal(gotOrder, wantOrder) {
 		t.Fatalf("lifecycle order = %v, want %v", gotOrder, wantOrder)
 	}
+}
+
+type contextCapturingRootLister struct {
+	inner  scanner.RootLister
+	onList func(context.Context)
+}
+
+func (c contextCapturingRootLister) ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error) {
+	if c.onList != nil {
+		c.onList(ctx)
+	}
+	return c.inner.ListAllLibraryRoots(ctx)
 }
 
 func TestRunDaemon_PollingWatcherTriggersDurableAutomaticScan(t *testing.T) {
@@ -306,13 +361,23 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 
 	relocStarted := make(chan struct{})
 	releaseReloc := make(chan struct{})
+	var releaseRelocOnce sync.Once
+	releaseRelocFn := func() {
+		releaseRelocOnce.Do(func() { close(releaseReloc) })
+	}
+	t.Cleanup(releaseRelocFn)
+
 	var relocOnce sync.Once
 	newDaemonRelocator = func(pool *pgxpool.Pool, _ *config.Config) (*roots.Relocator, error) {
 		return roots.NewRelocator(postgres.NewTransactor(pool), roots.RelocatorOptions{
-			OnBeforeVerify: func(context.Context, domain.Job) error {
+			OnBeforeVerify: func(hookCtx context.Context, _ domain.Job) error {
 				relocOnce.Do(func() {
 					close(relocStarted)
-					<-releaseReloc
+					select {
+					case <-releaseReloc:
+					case <-hookCtx.Done():
+					case <-ctx.Done():
+					}
 				})
 				return nil
 			},
@@ -321,6 +386,12 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 
 	scanHoldEntered := make(chan struct{})
 	releaseHeldScan := make(chan struct{})
+	var releaseHeldScanOnce sync.Once
+	releaseHeldScanFn := func() {
+		releaseHeldScanOnce.Do(func() { close(releaseHeldScan) })
+	}
+	t.Cleanup(releaseHeldScanFn)
+
 	var holdScanOnce sync.Once
 	var holdFirstRead atomic.Bool
 	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
@@ -329,7 +400,10 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 				if holdFirstRead.Load() {
 					holdScanOnce.Do(func() {
 						close(scanHoldEntered)
-						<-releaseHeldScan
+						select {
+						case <-releaseHeldScan:
+						case <-ctx.Done():
+						}
 					})
 				}
 				return os.ReadDir(string(rawDir))
@@ -371,20 +445,10 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 	dsPtr, _ := captureDaemonAssembly(t)
 	jobRepo := postgres.NewJobRepository(db.Pool)
 
-	t.Cleanup(func() {
-		select {
-		case <-releaseReloc:
-		default:
-			close(releaseReloc)
-		}
-		select {
-		case <-releaseHeldScan:
-		default:
-			close(releaseHeldScan)
-		}
-	})
-
 	err := runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		defer releaseRelocFn()
+		defer releaseHeldScanFn()
+
 		ds := *dsPtr
 		kindScan := domain.JobKindScan
 
@@ -420,7 +484,7 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 			return fmt.Errorf("expected 0 SCAN jobs during active relocation, got %d", len(scansDuringReloc))
 		}
 
-		close(releaseReloc)
+		releaseRelocFn()
 		waitDaemonJobState(serveCtx, t, jobRepo, relocJobID, domain.JobStateSucceeded)
 
 		var scanJobs []domain.Job
@@ -474,7 +538,7 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 		}
 
 		holdFirstRead.Store(false)
-		close(releaseHeldScan)
+		releaseHeldScanFn()
 		waitDaemonJobState(serveCtx, t, jobRepo, manualScanID, domain.JobStateSucceeded)
 
 		deadline = time.Now().Add(5 * time.Second)
@@ -512,52 +576,67 @@ func TestRunDaemon_PollingWatcherRetriesAfterRelocationAndRunningScan(t *testing
 
 func TestRunDaemon_ConfiguredPollIntervalReachesProductionWatcher(t *testing.T) {
 	t.Run("valid system_settings override reaches production watcher", func(t *testing.T) {
-		db := testdb.New(t)
-		migrateStartupDB(t, db)
-		putSetting(t, db, scanner.PollIntervalSettingKey, "25ms")
+		for _, tc := range []struct {
+			name string
+			raw  string
+			want time.Duration
+		}{
+			{name: "duration string", raw: "25ms", want: 25 * time.Millisecond},
+			{name: "integer seconds", raw: "30", want: 30 * time.Second},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				db := testdb.New(t)
+				migrateStartupDB(t, db)
+				putSetting(t, db, scanner.PollIntervalSettingKey, tc.raw)
 
-		originalStartWatchers := startDaemonWatchers
-		originalLogger := slog.Default()
-		t.Cleanup(func() {
-			startDaemonWatchers = originalStartWatchers
-			slog.SetDefault(originalLogger)
-		})
+				originalStartWatchers := startDaemonWatchers
+				originalLogger := slog.Default()
+				t.Cleanup(func() {
+					startDaemonWatchers = originalStartWatchers
+					slog.SetDefault(originalLogger)
+				})
 
-		var observedInterval time.Duration
-		startDaemonWatchers = func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, ds *daemonServices) (*daemonWatchers, error) {
-			w, err := originalStartWatchers(ctx, pool, cfg, ds)
-			if err == nil && w != nil && w.mount != nil {
-				observedInterval = w.mount.PollInterval()
-			}
-			return w, err
-		}
+				var observedInterval time.Duration
+				startDaemonWatchers = func(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, ds *daemonServices) (*daemonWatchers, error) {
+					w, err := originalStartWatchers(ctx, pool, cfg, ds)
+					if err == nil && w != nil && w.mount != nil {
+						observedInterval = w.mount.PollInterval()
+					}
+					return w, err
+				}
 
-		err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("runDaemon err = %v", err)
-		}
-		if observedInterval != 25*time.Millisecond {
-			t.Fatalf("production watcher PollInterval = %v, want 25ms", observedInterval)
+				err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("runDaemon err = %v", err)
+				}
+				if observedInterval != tc.want {
+					t.Fatalf("production watcher PollInterval = %v, want %v", observedInterval, tc.want)
+				}
+			})
 		}
 	})
 
-	t.Run("invalid system_settings poll interval fails startup", func(t *testing.T) {
-		db := testdb.New(t)
-		migrateStartupDB(t, db)
-		putSetting(t, db, scanner.PollIntervalSettingKey, "0s")
+	t.Run("invalid and overflowing system_settings poll intervals fail startup", func(t *testing.T) {
+		for _, raw := range []string{"0s", "-5s", "0", "-1", "18446744074", "99999999999999999999", "not-a-duration"} {
+			t.Run("raw_"+raw, func(t *testing.T) {
+				db := testdb.New(t)
+				migrateStartupDB(t, db)
+				putSetting(t, db, scanner.PollIntervalSettingKey, raw)
 
-		originalLogger := slog.Default()
-		t.Cleanup(func() {
-			slog.SetDefault(originalLogger)
-		})
+				originalLogger := slog.Default()
+				t.Cleanup(func() {
+					slog.SetDefault(originalLogger)
+				})
 
-		err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
-			return nil
-		})
-		if !errors.Is(err, scanner.ErrInvalidPollInterval) {
-			t.Fatalf("runDaemon err = %v, want ErrInvalidPollInterval", err)
+				err := runDaemon(t.Context(), hostedConfig(t, db.URL), func(context.Context, *config.Config, *slog.Logger, *app.Services) error {
+					return nil
+				})
+				if !errors.Is(err, scanner.ErrInvalidPollInterval) {
+					t.Fatalf("runDaemon(%q) err = %v, want ErrInvalidPollInterval", raw, err)
+				}
+			})
 		}
 	})
 }
