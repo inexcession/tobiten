@@ -35,6 +35,13 @@ type JobTrigger interface {
 	Trigger(ctx context.Context, req jobs.TriggerRequest) (string, error)
 }
 
+// DetailedJobTrigger is an optional JobTrigger extension that reports whether a new
+// job was inserted and its state at admission.
+type DetailedJobTrigger interface {
+	JobTrigger
+	TriggerOutcome(ctx context.Context, req jobs.TriggerRequest) (jobs.TriggerOutcome, error)
+}
+
 // DefaultScanMaxAttempts is the default attempt budget for durable SCAN jobs (ADR-0017 §1, §7).
 // Interrupted attempts count toward max_attempts on startup recovery, so 3 attempts allows
 // two restarts or crashes to recover cleanly before failing a third interrupted attempt.
@@ -53,27 +60,35 @@ func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts
 	if trigger == nil {
 		return "", fmt.Errorf("%w: job trigger is unavailable", app.ErrServiceBusy)
 	}
+	req, err := buildScanTriggerRequest(libraryID, opts)
+	if err != nil {
+		return "", err
+	}
+	return trigger.Trigger(ctx, req)
+}
+
+func buildScanTriggerRequest(libraryID string, opts TriggerScanOptions) (jobs.TriggerRequest, error) {
 	dedupeKey, err := ScanDedupeKey(libraryID)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		return jobs.TriggerRequest{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 	}
 	relocateKey, err := domain.RelocateRootJobDedupeKey(libraryID)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		return jobs.TriggerRequest{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 	}
 	lockKey, err := domain.LibraryJobLockKey(libraryID)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		return jobs.TriggerRequest{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 	}
 	payload, err := json.Marshal(ScanJobPayload{LibraryID: libraryID})
 	if err != nil {
-		return "", fmt.Errorf("marshaling scan job payload: %w", err)
+		return jobs.TriggerRequest{}, fmt.Errorf("marshaling scan job payload: %w", err)
 	}
 	maxAttempts := opts.MaxAttempts
 	if maxAttempts == 0 {
 		maxAttempts = DefaultScanMaxAttempts
 	}
-	return trigger.Trigger(ctx, jobs.TriggerRequest{
+	return jobs.TriggerRequest{
 		Kind:               domain.JobKindScan,
 		Payload:            payload,
 		DedupeKey:          &dedupeKey,
@@ -82,7 +97,7 @@ func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts
 		MaxAttempts:        maxAttempts,
 		CreatedBy:          opts.CreatedBy,
 		RunAfter:           opts.RunAfter,
-	})
+	}, nil
 }
 
 // ModuleOptions configures the compiled-in scanner job module.

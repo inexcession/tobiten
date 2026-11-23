@@ -18,6 +18,10 @@ import (
 )
 
 const (
+	// PollIntervalSettingKey is the PostgreSQL system_settings key configuring
+	// the polling interval for mount watching (ADR-0003 §4).
+	PollIntervalSettingKey = "scanner.poll_interval"
+
 	// DefaultPollInterval is the default polling interval for network mounts and
 	// polling-watched library roots (ADR-0003 §4).
 	DefaultPollInterval = time.Minute
@@ -30,10 +34,12 @@ const (
 var (
 	// ErrWatcherAlreadyRunning is returned when Start is called on an active Watcher.
 	ErrWatcherAlreadyRunning = errors.New("scanner: mount watcher is already running")
-	// ErrInvalidPollInterval is returned when WatcherOptions.PollInterval is negative.
-	ErrInvalidPollInterval = errors.New("scanner: poll interval must be non-negative")
+	// ErrInvalidPollInterval is returned when WatcherOptions.PollInterval is negative or invalid.
+	ErrInvalidPollInterval = errors.New("scanner: poll interval must be positive")
 	// ErrInvalidDebounceWindow is returned when WatcherOptions.DebounceWindow is negative.
 	ErrInvalidDebounceWindow = errors.New("scanner: debounce window must be non-negative")
+	// ErrInvalidRetryInterval is returned when WatcherOptions.RetryInterval is negative.
+	ErrInvalidRetryInterval = errors.New("scanner: retry interval must be non-negative")
 	// ErrWatcherNoTrigger is returned when WatcherOptions.Trigger is nil.
 	ErrWatcherNoTrigger = errors.New("scanner: job trigger is required")
 )
@@ -105,6 +111,12 @@ type RootLister interface {
 	ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error)
 }
 
+// JobReader retrieves persisted job state when checking whether a deduplicated
+// active scan can still cover a newly observed filesystem change.
+type JobReader interface {
+	GetJobByID(ctx context.Context, id string) (*domain.Job, error)
+}
+
 // RootWatchStatus reports the resolved watch mode and mount metadata for one root.
 type RootWatchStatus struct {
 	RootID    string
@@ -119,11 +131,13 @@ type WatcherOptions struct {
 	Roots          RootLister
 	StaticRoots    []domain.LibraryRoot
 	Trigger        JobTrigger
+	Jobs           JobReader
 	MountDetector  MountDetector
 	OSWatcher      OSWatcher
 	Clock          Clock
 	PollInterval   time.Duration
 	DebounceWindow time.Duration
+	RetryInterval  time.Duration
 	Logger         *slog.Logger
 	ReadDir        func(rawDir []byte) ([]os.DirEntry, error)
 	Stat           func(rawPath []byte) (os.FileInfo, error)
@@ -133,6 +147,7 @@ type WatcherOptions struct {
 
 type pollEntry struct {
 	isDir      bool
+	isMarker   bool
 	unreadable bool
 	size       int64
 	mtime      time.Time
@@ -155,17 +170,24 @@ type watchedRoot struct {
 	snapshot           rootSnapshot
 }
 
+type pendingScan struct {
+	fireAt    time.Time
+	errLogged bool
+}
+
 // Watcher monitors configured library roots using mount-type detection, sequential
 // read-only size/mtime polling, and per-library debounced automatic SCAN triggers.
 type Watcher struct {
 	roots          RootLister
 	staticRoots    []domain.LibraryRoot
 	trigger        JobTrigger
+	jobs           JobReader
 	mountDetector  MountDetector
 	osWatcher      OSWatcher
 	clock          Clock
 	pollInterval   time.Duration
 	debounceWindow time.Duration
+	retryInterval  time.Duration
 	logger         *slog.Logger
 	readDir        func(rawDir []byte) ([]os.DirEntry, error)
 	stat           func(rawPath []byte) (os.FileInfo, error)
@@ -194,6 +216,9 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 	if opts.DebounceWindow < 0 {
 		return nil, ErrInvalidDebounceWindow
 	}
+	if opts.RetryInterval < 0 {
+		return nil, ErrInvalidRetryInterval
+	}
 
 	pollInterval := opts.PollInterval
 	if pollInterval == 0 {
@@ -202,6 +227,10 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 	debounceWindow := opts.DebounceWindow
 	if debounceWindow == 0 {
 		debounceWindow = DefaultDebounceWindow
+	}
+	retryInterval := opts.RetryInterval
+	if retryInterval == 0 {
+		retryInterval = debounceWindow
 	}
 
 	detector := opts.MountDetector
@@ -234,11 +263,13 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 		roots:          opts.Roots,
 		staticRoots:    slices.Clone(opts.StaticRoots),
 		trigger:        opts.Trigger,
+		jobs:           opts.Jobs,
 		mountDetector:  detector,
 		osWatcher:      opts.OSWatcher,
 		clock:          clk,
 		pollInterval:   pollInterval,
 		debounceWindow: debounceWindow,
+		retryInterval:  retryInterval,
 		logger:         logger,
 		readDir:        readDirFn,
 		stat:           statFn,
@@ -250,8 +281,25 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 	}, nil
 }
 
-// Start synchronizes configured roots, captures initial read-only baselines without
-// enqueueing scans, and starts the background polling and debounce loop.
+// PollInterval returns the effective polling interval configured on w.
+func (w *Watcher) PollInterval() time.Duration {
+	if w == nil {
+		return 0
+	}
+	return w.pollInterval
+}
+
+// RetryInterval returns the effective bounded retry interval used when a scan
+// cannot yet be admitted.
+func (w *Watcher) RetryInterval() time.Duration {
+	if w == nil {
+		return 0
+	}
+	return w.retryInterval
+}
+
+// Start launches the background mount watcher loop without blocking the caller on
+// filesystem or mount I/O. Initial root baselining runs asynchronously inside the loop.
 func (w *Watcher) Start(ctx context.Context) error {
 	if w == nil {
 		return nil
@@ -272,17 +320,6 @@ func (w *Watcher) Start(ctx context.Context) error {
 	w.running = true
 	w.cancel = cancel
 	w.mu.Unlock()
-
-	if err := w.syncRoots(runCtx, nil); err != nil {
-		cancel()
-		w.mu.Lock()
-		w.running = false
-		w.cancel = nil
-		w.mu.Unlock()
-		return err
-	}
-
-	w.captureInitialBaselines(runCtx)
 
 	w.wg.Add(1)
 	go w.runLoop(runCtx)
@@ -371,8 +408,9 @@ func toRootWatchStatus(wr *watchedRoot) RootWatchStatus {
 func (w *Watcher) runLoop(ctx context.Context) {
 	defer w.wg.Done()
 
+	pending := make(map[string]*pendingScan)
+	w.syncAndBaseline(ctx, pending, false)
 	nextPollAt := w.clock.Now().Add(w.pollInterval)
-	pending := make(map[string]time.Time)
 
 	for {
 		if ctx.Err() != nil {
@@ -397,17 +435,17 @@ func (w *Watcher) runLoop(ctx context.Context) {
 			return
 		case <-w.syncCh:
 			timer.Stop()
-			_ = w.syncRoots(ctx, pending)
+			w.syncAndBaseline(ctx, pending, false)
 		case <-timer.C():
 		}
 	}
 }
 
-func nextWakeDelay(now, nextPollAt time.Time, pending map[string]time.Time) time.Duration {
+func nextWakeDelay(now, nextPollAt time.Time, pending map[string]*pendingScan) time.Duration {
 	nextWake := nextPollAt
-	for _, fireAt := range pending {
-		if fireAt.Before(nextWake) {
-			nextWake = fireAt
+	for _, entry := range pending {
+		if entry.fireAt.Before(nextWake) {
+			nextWake = entry.fireAt
 		}
 	}
 	wait := nextWake.Sub(now)
@@ -417,69 +455,128 @@ func nextWakeDelay(now, nextPollAt time.Time, pending map[string]time.Time) time
 	return wait
 }
 
-func (w *Watcher) fireDueScans(ctx context.Context, now time.Time, pending map[string]time.Time) {
+func markLibraryDirty(pending map[string]*pendingScan, libraryID string, fireAt time.Time) {
+	if existing, ok := pending[libraryID]; ok {
+		existing.fireAt = fireAt
+		return
+	}
+	pending[libraryID] = &pendingScan{fireAt: fireAt}
+}
+
+func (w *Watcher) fireDueScans(ctx context.Context, now time.Time, pending map[string]*pendingScan) {
 	if len(pending) == 0 {
 		return
 	}
 	var due []string
-	for libID, fireAt := range pending {
-		if !now.Before(fireAt) {
+	for libID, entry := range pending {
+		if !now.Before(entry.fireAt) {
 			due = append(due, libID)
 		}
 	}
 	slices.Sort(due)
 	for _, libID := range due {
-		delete(pending, libID)
-		w.fireScan(ctx, libID)
+		if ctx.Err() != nil {
+			return
+		}
+		entry := pending[libID]
+		if entry == nil {
+			continue
+		}
+		admitted, jobID, err := w.admitScan(ctx, libID)
+		if ctx.Err() != nil {
+			return
+		}
+		if admitted {
+			delete(pending, libID)
+		} else {
+			entry.fireAt = w.clock.Now().Add(w.retryInterval)
+			w.logDeferredScan(libID, jobID, err, entry)
+		}
+		if w.onTrigger != nil {
+			w.onTrigger(libID, jobID, err)
+		}
 	}
 }
 
-func (w *Watcher) fireScan(ctx context.Context, libraryID string) {
-	if ctx.Err() != nil {
+func (w *Watcher) logDeferredScan(libraryID, jobID string, err error, entry *pendingScan) {
+	if err == nil {
+		entry.errLogged = false
+		w.logger.Debug("deferring automatic library scan until active scan completes",
+			slog.String("library_id", libraryID),
+			slog.String("active_job_id", jobID),
+		)
 		return
 	}
-	jobID, err := TriggerScan(ctx, w.trigger, libraryID, TriggerScanOptions{
-		CreatedBy: nil,
-	})
-	if err != nil && ctx.Err() == nil {
-		if errors.Is(err, app.ErrConflict) {
-			w.logger.Debug("automatic library scan skipped due to active root operation",
-				slog.String("library_id", libraryID),
-				logging.Err(err),
-			)
-		} else {
-			w.logger.Error("failed to enqueue automatic library scan",
-				slog.String("library_id", libraryID),
-				logging.Err(err),
-			)
-		}
+	if errors.Is(err, app.ErrConflict) {
+		entry.errLogged = false
+		w.logger.Debug("automatic library scan deferred due to active root operation",
+			slog.String("library_id", libraryID),
+			logging.Err(err),
+		)
+		return
 	}
-	if w.onTrigger != nil {
-		w.onTrigger(libraryID, jobID, err)
+	if !entry.errLogged {
+		entry.errLogged = true
+		w.logger.Error("failed to enqueue automatic library scan; retaining pending change for retry",
+			slog.String("library_id", libraryID),
+			logging.Err(err),
+		)
 	}
 }
 
-func (w *Watcher) pollStep(ctx context.Context, pending map[string]time.Time) {
-	if err := w.syncRoots(ctx, pending); err != nil && ctx.Err() == nil {
-		if !w.syncErrLog {
-			w.syncErrLog = true
-			w.logger.Error("failed to refresh library roots during watch poll", logging.Err(err))
-		}
-	} else {
-		w.syncErrLog = false
+func (w *Watcher) admitScan(ctx context.Context, libraryID string) (bool, string, error) {
+	req, err := buildScanTriggerRequest(libraryID, TriggerScanOptions{
+		CreatedBy: nil,
+	})
+	if err != nil {
+		return false, "", err
 	}
+
+	if dt, ok := w.trigger.(DetailedJobTrigger); ok {
+		res, err := dt.TriggerOutcome(ctx, req)
+		if err != nil {
+			return false, "", err
+		}
+		if res.Created || res.State == domain.JobStateQueued {
+			return true, res.JobID, nil
+		}
+		if res.State == "" && w.jobs != nil {
+			return w.checkExistingJobQueued(ctx, res.JobID)
+		}
+		return false, res.JobID, nil
+	}
+
+	jobID, err := w.trigger.Trigger(ctx, req)
+	if err != nil {
+		return false, "", err
+	}
+	if w.jobs != nil {
+		return w.checkExistingJobQueued(ctx, jobID)
+	}
+	return true, jobID, nil
+}
+
+func (w *Watcher) checkExistingJobQueued(ctx context.Context, jobID string) (bool, string, error) {
+	job, err := w.jobs.GetJobByID(ctx, jobID)
+	if err != nil {
+		return false, jobID, err
+	}
+	return job.State == domain.JobStateQueued, jobID, nil
+}
+
+func (w *Watcher) pollStep(ctx context.Context, pending map[string]*pendingScan) {
+	baselined := w.syncAndBaseline(ctx, pending, false)
 
 	roots := w.snapshotWatchedRoots()
 	for _, wr := range roots {
 		if ctx.Err() != nil {
 			return
 		}
-		if wr.mode != WatchModePoll {
+		if baselined[wr.root.ID] || wr.mode != WatchModePoll {
 			continue
 		}
-		changed := w.pollWatchedRoot(ctx, wr)
-		if changed {
-			pending[wr.root.LibraryID] = w.clock.Now().Add(w.debounceWindow)
+		if w.pollWatchedRoot(ctx, wr) {
+			markLibraryDirty(pending, wr.root.LibraryID, w.clock.Now().Add(w.debounceWindow))
 		}
 	}
 	if w.onPoll != nil {
@@ -487,16 +584,31 @@ func (w *Watcher) pollStep(ctx context.Context, pending map[string]time.Time) {
 	}
 }
 
-func (w *Watcher) captureInitialBaselines(ctx context.Context) {
-	for _, wr := range w.snapshotWatchedRoots() {
-		if ctx.Err() != nil {
-			return
+func (w *Watcher) syncAndBaseline(ctx context.Context, pending map[string]*pendingScan, _ bool) map[string]bool {
+	added, err := w.syncRoots(ctx, pending)
+	if err != nil {
+		if ctx.Err() == nil && !w.syncErrLog {
+			w.syncErrLog = true
+			w.logger.Error("failed to refresh library roots during watch poll", logging.Err(err))
 		}
-		if wr.mode != WatchModePoll {
-			continue
-		}
-		_ = w.pollWatchedRoot(ctx, wr)
+		return nil
 	}
+	w.syncErrLog = false
+
+	if len(added) == 0 {
+		return nil
+	}
+	baselined := make(map[string]bool, len(added))
+	for _, wr := range added {
+		if ctx.Err() != nil {
+			return baselined
+		}
+		if wr.mode == WatchModePoll && !wr.hasBaseline {
+			_ = w.pollWatchedRoot(ctx, wr)
+			baselined[wr.root.ID] = true
+		}
+	}
+	return baselined
 }
 
 func (w *Watcher) snapshotWatchedRoots() []*watchedRoot {
@@ -512,10 +624,10 @@ func (w *Watcher) snapshotWatchedRoots() []*watchedRoot {
 	return out
 }
 
-func (w *Watcher) syncRoots(ctx context.Context, pending map[string]time.Time) error {
+func (w *Watcher) syncRoots(ctx context.Context, pending map[string]*pendingScan) ([]*watchedRoot, error) {
 	roots, err := w.loadConfiguredRoots(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	desired := make(map[string]domain.LibraryRoot, len(roots))
@@ -551,21 +663,12 @@ func (w *Watcher) syncRoots(ctx context.Context, pending map[string]time.Time) e
 	}
 	w.mu.Unlock()
 
-	for _, wr := range added {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if wr.mode == WatchModePoll && !wr.hasBaseline {
-			_ = w.pollWatchedRoot(ctx, wr)
-		}
-	}
-
 	for libID := range pending {
 		if _, ok := activeLibs[libID]; !ok {
 			delete(pending, libID)
 		}
 	}
-	return nil
+	return added, nil
 }
 
 func (w *Watcher) loadConfiguredRoots(ctx context.Context) ([]domain.LibraryRoot, error) {
@@ -721,7 +824,7 @@ func (w *Watcher) walkSnapshotDir(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := w.visitSnapshotEntry(ctx, wr, relDir, absDir, ancestry, de, out, nextUnreadable); err != nil {
+		if err := w.visitSnapshotEntry(ctx, wr, relDir, absDir, ancestry, isRoot, de, out, nextUnreadable); err != nil {
 			return err
 		}
 	}
@@ -734,18 +837,26 @@ func (w *Watcher) visitSnapshotEntry(
 	relDir []byte,
 	absDir []byte,
 	ancestry []os.FileInfo,
+	isRoot bool,
 	de os.DirEntry,
 	out map[string]pollEntry,
 	nextUnreadable map[string]struct{},
 ) error {
 	nameBytes := []byte(de.Name())
+	absBytes := joinAbsoluteBytes(absDir, nameBytes)
+	entryType := de.Type()
+
+	if isRoot && bytes.Equal(nameBytes, []byte(RootMarkerFilename)) {
+		if isRootMarkerFile(absBytes, entryType, w.customStat, w.stat) {
+			out[RootMarkerFilename] = pollEntry{isMarker: true}
+		}
+		return nil
+	}
 	if isTemporaryName(nameBytes) || isHiddenName(nameBytes) {
 		return nil
 	}
 
 	relBytes := joinRelativeBytes(relDir, nameBytes)
-	absBytes := joinAbsoluteBytes(absDir, nameBytes)
-	entryType := de.Type()
 	needsFollow := entryType&os.ModeSymlink != 0 || entryType == 0
 
 	var (
@@ -803,7 +914,7 @@ func snapshotsEqual(a, b rootSnapshot) bool {
 		if !ok {
 			return false
 		}
-		if va.isDir != vb.isDir || va.unreadable != vb.unreadable || va.size != vb.size || !va.mtime.Equal(vb.mtime) {
+		if va.isDir != vb.isDir || va.isMarker != vb.isMarker || va.unreadable != vb.unreadable || va.size != vb.size || !va.mtime.Equal(vb.mtime) {
 			return false
 		}
 	}

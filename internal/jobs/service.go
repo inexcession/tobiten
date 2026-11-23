@@ -31,6 +31,14 @@ type TriggerRequest struct {
 	RunAfter           time.Time
 }
 
+// TriggerOutcome reports the admitted or deduplicated job ID, whether a new job was
+// inserted, and the persisted job state observed during admission.
+type TriggerOutcome struct {
+	JobID   string
+	Created bool
+	State   domain.JobState
+}
+
 // TriggerJob validates req, enqueues a durable QUEUED job (returning the existing active
 // job ID if an active dedupe_key collides), wakes notifier when newly created outside a
 // caller transaction, and returns the resulting job ID (ADR-0017 §1–§2).
@@ -41,28 +49,44 @@ func TriggerJob(
 	req TriggerRequest,
 	now time.Time,
 ) (string, error) {
+	out, err := TriggerJobOutcome(ctx, repo, notifier, req, now)
+	if err != nil {
+		return "", err
+	}
+	return out.JobID, nil
+}
+
+// TriggerJobOutcome performs TriggerJob and also reports whether a new job was inserted
+// and its observed state at admission.
+func TriggerJobOutcome(
+	ctx context.Context,
+	repo storage.JobRepository,
+	notifier JobNotifier,
+	req TriggerRequest,
+	now time.Time,
+) (TriggerOutcome, error) {
 	if repo == nil {
-		return "", fmt.Errorf("%w: job repository is unavailable", app.ErrServiceBusy)
+		return TriggerOutcome{}, fmt.Errorf("%w: job repository is unavailable", app.ErrServiceBusy)
 	}
 	if strings.TrimSpace(string(req.Kind)) == "" {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyJobKind)
+		return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyJobKind)
 	}
 	if req.DedupeKey != nil && strings.TrimSpace(*req.DedupeKey) == "" {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
+		return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
 	}
 	for _, key := range req.ConflictDedupeKeys {
 		if strings.TrimSpace(key) == "" {
-			return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
+			return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
 		}
 	}
 	if req.CreatedBy != nil && strings.TrimSpace(*req.CreatedBy) == "" {
-		return "", fmt.Errorf("%w: created_by cannot be empty when present", app.ErrInvalidInput)
+		return TriggerOutcome{}, fmt.Errorf("%w: created_by cannot be empty when present", app.ErrInvalidInput)
 	}
 	if len(req.Payload) > 0 && !json.Valid(req.Payload) {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrInvalidJobJSON)
+		return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrInvalidJobJSON)
 	}
 	if req.MaxAttempts < 0 {
-		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrInvalidJobAttempts)
+		return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrInvalidJobAttempts)
 	}
 
 	ts := now.UTC()
@@ -93,25 +117,29 @@ func TriggerJob(
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrJobConflict):
-			return "", fmt.Errorf("%w: %w", app.ErrConflict, err)
+			return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrConflict, err)
 		case errors.Is(err, domain.ErrEmptyJobKind),
 			errors.Is(err, domain.ErrInvalidJobJSON),
 			errors.Is(err, domain.ErrEmptyDedupeKey),
 			errors.Is(err, domain.ErrInvalidJobAttempts),
 			errors.Is(err, domain.ErrInvalidDeliveryPayload),
 			errors.Is(err, domain.ErrInvalidEventDeliveryDedupeKey):
-			return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+			return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 		case errors.Is(err, storage.ErrNotFound):
-			return "", fmt.Errorf("%w: %w", app.ErrNotFound, err)
+			return TriggerOutcome{}, fmt.Errorf("%w: %w", app.ErrNotFound, err)
 		default:
-			return "", err
+			return TriggerOutcome{}, err
 		}
 	}
 
 	if created && notifier != nil && !repo.InTx() {
 		notifier.Notify(job.Kind)
 	}
-	return job.ID, nil
+	return TriggerOutcome{
+		JobID:   job.ID,
+		Created: created,
+		State:   job.State,
+	}, nil
 }
 
 // ServiceOptions configures the concrete application job service.
@@ -200,10 +228,20 @@ func (s *Service) notifyTransition(job domain.Job) {
 
 // Trigger enqueues a background job using the shared durable trigger rules (ADR-0017 §1–§2).
 func (s *Service) Trigger(ctx context.Context, req TriggerRequest) (string, error) {
-	if s == nil || s.repo == nil {
-		return "", fmt.Errorf("%w: job service is unavailable", app.ErrServiceBusy)
+	out, err := s.TriggerOutcome(ctx, req)
+	if err != nil {
+		return "", err
 	}
-	return TriggerJob(ctx, s.repo, s.currentNotifier(), req, s.now())
+	return out.JobID, nil
+}
+
+// TriggerOutcome enqueues a background job and reports whether a new row was created
+// along with its observed state at admission.
+func (s *Service) TriggerOutcome(ctx context.Context, req TriggerRequest) (TriggerOutcome, error) {
+	if s == nil || s.repo == nil {
+		return TriggerOutcome{}, fmt.Errorf("%w: job service is unavailable", app.ErrServiceBusy)
+	}
+	return TriggerJobOutcome(ctx, s.repo, s.currentNotifier(), req, s.now())
 }
 
 // ListJobs returns jobs visible to principal (creator-owned only, or all jobs when holding jobs:read_all).

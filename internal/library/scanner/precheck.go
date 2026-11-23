@@ -592,16 +592,25 @@ func checkDirEntryForFile(
 }
 
 func isMarkerFile(absPath []byte, entryType os.FileMode, probe rootProbeHooks) bool {
+	return isRootMarkerFile(absPath, entryType, probe.customStat, probe.stat)
+}
+
+func isRootMarkerFile(
+	absPath []byte,
+	entryType os.FileMode,
+	customStat bool,
+	statFn func([]byte) (os.FileInfo, error),
+) bool {
 	needsFollow := entryType&os.ModeSymlink != 0 || entryType == 0
 	if !needsFollow {
 		if !entryType.IsRegular() {
 			return false
 		}
-		if !probe.customStat {
+		if !customStat {
 			return true
 		}
 	}
-	info, err := probe.stat(absPath)
+	info, err := statFn(absPath)
 	if err != nil {
 		return false
 	}

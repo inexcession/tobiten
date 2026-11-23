@@ -336,6 +336,7 @@ func TestWatcher_NetworkMountPollsWithNoOSWatch(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer w.Stop()
+	clk.waitForParked(t, 1)
 
 	if osSpy.addedCount() != 0 {
 		t.Fatalf("OSWatcher.AddRoot called %d times for network mounts, want 0", osSpy.addedCount())
@@ -457,6 +458,7 @@ func TestWatcher_DetectsCreateModifyRenameDeleteAndDebounces(t *testing.T) {
 					t.Fatalf("Start: %v", err)
 				}
 				defer w.Stop()
+				clk.waitForParked(t, 1)
 
 				tc.mutate(t, dir)
 
@@ -520,6 +522,7 @@ func TestWatcher_DetectsCreateModifyRenameDeleteAndDebounces(t *testing.T) {
 			t.Fatalf("Start: %v", err)
 		}
 		defer w.Stop()
+		clk.waitForParked(t, 1)
 
 		// Burst part 1 across both roots.
 		writeWatcherFile(t, filepath.Join(dirA, "a2.cbz"), []byte("a2"), t0)
@@ -661,6 +664,7 @@ func TestWatcher_UnreadableRootDeduplicatesLogsAndTriggersOnReturn(t *testing.T)
 		t.Fatalf("Start: %v", err)
 	}
 	defer w.Stop()
+	clk.waitForParked(t, 1)
 
 	// Make root unreadable across 5 poll ticks.
 	mu.Lock()
@@ -843,6 +847,7 @@ func TestWatcher_StopJoinsGoroutinesAndConflictIsNonFatal(t *testing.T) {
 	if err := w.Start(t.Context()); !errors.Is(err, ErrWatcherAlreadyRunning) {
 		t.Fatalf("second Start err = %v, want ErrWatcherAlreadyRunning", err)
 	}
+	clk.waitForParked(t, 1)
 
 	writeWatcherFile(t, filepath.Join(dir, "vol02.cbz"), []byte("v2"), t0)
 	for range 3 {
@@ -907,6 +912,7 @@ func TestWatcher_InvalidOptions(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer w.Stop()
+	clk.waitForParked(t, 1)
 
 	// Relocate root path in RootLister -> re-baselines new path without spurious scan.
 	lister.setRoots([]domain.LibraryRoot{makeWatcherTestRoot(t, "lib-dyn", "root-dyn", dir2)})
@@ -942,4 +948,423 @@ func (s *stubRootLister) setRoots(roots []domain.LibraryRoot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.roots = slices.Clone(roots)
+}
+
+type scriptTriggerStep struct {
+	outcome jobs.TriggerOutcome
+	err     error
+}
+
+type scriptedDetailedTrigger struct {
+	mu    sync.Mutex
+	steps []scriptTriggerStep
+	calls []jobs.TriggerRequest
+}
+
+func (s *scriptedDetailedTrigger) Trigger(ctx context.Context, req jobs.TriggerRequest) (string, error) {
+	out, err := s.TriggerOutcome(ctx, req)
+	return out.JobID, err
+}
+
+func (s *scriptedDetailedTrigger) TriggerOutcome(_ context.Context, req jobs.TriggerRequest) (jobs.TriggerOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, req)
+	if len(s.steps) == 0 {
+		return jobs.TriggerOutcome{
+			JobID:   "job-default",
+			Created: true,
+			State:   domain.JobStateQueued,
+		}, nil
+	}
+	step := s.steps[0]
+	if len(s.steps) > 1 {
+		s.steps = s.steps[1:]
+	} else {
+		s.steps = nil
+	}
+	return step.outcome, step.err
+}
+
+func (s *scriptedDetailedTrigger) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.calls)
+}
+
+func TestWatcher_RetainsPendingUntilScanCoversObservation(t *testing.T) {
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+
+	t.Run("retries after relocation conflict and transient error with unchanged files", func(t *testing.T) {
+		dir := t.TempDir()
+		writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), t0)
+		root := makeWatcherTestRoot(t, "lib-retry", "root-retry", dir)
+
+		trig := &scriptedDetailedTrigger{
+			steps: []scriptTriggerStep{
+				{err: app.ErrConflict},
+				{err: app.ErrConflict},
+				{err: errors.New("transient db error")},
+				{err: errors.New("transient db error")},
+				{outcome: jobs.TriggerOutcome{JobID: "job-admitted", Created: true, State: domain.JobStateQueued}},
+			},
+		}
+		logHandler := &memoryLogHandler{}
+		clk := newFakeWatcherClock(t0)
+
+		w, err := NewWatcher(WatcherOptions{
+			StaticRoots: []domain.LibraryRoot{root},
+			Trigger:     trig,
+			Clock:       clk,
+			Logger:      slog.New(logHandler),
+			MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+			}),
+			PollInterval:   10 * time.Millisecond,
+			DebounceWindow: 20 * time.Millisecond,
+			RetryInterval:  30 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		if err := w.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer w.Stop()
+		clk.waitForParked(t, 1)
+
+		// Single file change; files stay untouched after this point.
+		writeWatcherFile(t, filepath.Join(dir, "vol02.cbz"), []byte("v2"), t0)
+		clk.advanceAndWait(t, 10*time.Millisecond) // t=10ms: poll detects change, debounce -> 30ms
+		clk.advanceAndWait(t, 10*time.Millisecond) // t=20ms: poll unchanged
+		clk.advanceAndWait(t, 10*time.Millisecond) // t=30ms: attempt 1 -> ErrConflict, retry -> 60ms
+
+		if trig.callCount() != 1 {
+			t.Fatalf("callCount after debounce = %d, want 1", trig.callCount())
+		}
+
+		// Retry 2 at t=60ms -> ErrConflict, retry -> 90ms.
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 2 {
+			t.Fatalf("callCount at t=60ms = %d, want 2", trig.callCount())
+		}
+
+		// Retry 3 at t=90ms -> transient error (logged once), retry -> 120ms.
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 3 {
+			t.Fatalf("callCount at t=90ms = %d, want 3", trig.callCount())
+		}
+
+		// Retry 4 at t=120ms -> second transient error (deduplicated log), retry -> 150ms.
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 4 {
+			t.Fatalf("callCount at t=120ms = %d, want 4", trig.callCount())
+		}
+		if errs := logHandler.errorCount(); errs != 1 {
+			t.Fatalf("error log count = %d, want 1 (deduplicated)", errs)
+		}
+
+		// Retry 5 at t=150ms -> admitted!
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 5 {
+			t.Fatalf("callCount at t=150ms = %d, want 5", trig.callCount())
+		}
+
+		// No more retries once admitted.
+		for range 6 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 5 {
+			t.Fatalf("callCount after admission = %d, want 5", trig.callCount())
+		}
+	})
+
+	t.Run("retains pending when deduplicated to RUNNING scan and clears on QUEUED", func(t *testing.T) {
+		dir := t.TempDir()
+		writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), t0)
+		root := makeWatcherTestRoot(t, "lib-dedupe", "root-dedupe", dir)
+
+		trig := &scriptedDetailedTrigger{
+			steps: []scriptTriggerStep{
+				// First attempt deduplicates to an older RUNNING scan.
+				{outcome: jobs.TriggerOutcome{JobID: "scan-old-running", Created: false, State: domain.JobStateRunning}},
+				// Retry finds existing QUEUED scan (not yet started) -> covers observation!
+				{outcome: jobs.TriggerOutcome{JobID: "scan-queued", Created: false, State: domain.JobStateQueued}},
+			},
+		}
+		clk := newFakeWatcherClock(t0)
+
+		w, err := NewWatcher(WatcherOptions{
+			StaticRoots: []domain.LibraryRoot{root},
+			Trigger:     trig,
+			Clock:       clk,
+			MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+			}),
+			PollInterval:   10 * time.Millisecond,
+			DebounceWindow: 20 * time.Millisecond,
+			RetryInterval:  20 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		if err := w.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer w.Stop()
+		clk.waitForParked(t, 1)
+
+		writeWatcherFile(t, filepath.Join(dir, "vol02.cbz"), []byte("v2"), t0)
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond) // t=30ms: attempt 1 -> RUNNING
+		}
+		if trig.callCount() != 1 {
+			t.Fatalf("callCount after RUNNING deduplication = %d, want 1", trig.callCount())
+		}
+
+		// Retry at t=50ms -> QUEUED -> admitted and cleared.
+		for range 2 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 2 {
+			t.Fatalf("callCount after retry = %d, want 2", trig.callCount())
+		}
+
+		// Further unchanged ticks do not re-trigger.
+		for range 4 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 2 {
+			t.Fatalf("callCount after QUEUED admission = %d, want 2", trig.callCount())
+		}
+	})
+
+	t.Run("cancels pending retry when library is removed", func(t *testing.T) {
+		dir := t.TempDir()
+		writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), t0)
+		root := makeWatcherTestRoot(t, "lib-removed", "root-removed", dir)
+
+		lister := &stubRootLister{roots: []domain.LibraryRoot{root}}
+		trig := &scriptedDetailedTrigger{
+			steps: []scriptTriggerStep{
+				{err: app.ErrConflict},
+				{outcome: jobs.TriggerOutcome{JobID: "should-not-run", Created: true, State: domain.JobStateQueued}},
+			},
+		}
+		clk := newFakeWatcherClock(t0)
+
+		w, err := NewWatcher(WatcherOptions{
+			Roots:   lister,
+			Trigger: trig,
+			Clock:   clk,
+			MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+				return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+			}),
+			PollInterval:   10 * time.Millisecond,
+			DebounceWindow: 20 * time.Millisecond,
+			RetryInterval:  30 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		if err := w.Start(t.Context()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer w.Stop()
+		clk.waitForParked(t, 1)
+
+		writeWatcherFile(t, filepath.Join(dir, "vol02.cbz"), []byte("v2"), t0)
+		for range 3 {
+			clk.advanceAndWait(t, 10*time.Millisecond) // t=30ms: attempt 1 -> ErrConflict, retry -> 60ms
+		}
+		if trig.callCount() != 1 {
+			t.Fatalf("callCount = %d, want 1", trig.callCount())
+		}
+
+		// Remove the library before retry fires.
+		lister.setRoots(nil)
+		for range 6 {
+			clk.advanceAndWait(t, 10*time.Millisecond)
+		}
+		if trig.callCount() != 1 {
+			t.Fatalf("callCount after library removal = %d, want 1 (pending retry cancelled)", trig.callCount())
+		}
+	})
+}
+
+func TestWatcher_RootMarkerAddRemoveAndValidity(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatalf("MkdirAll sub: %v", err)
+	}
+	root := makeWatcherTestRoot(t, "lib-marker", "root-marker", dir)
+
+	trig := &recordedTrigger{}
+	clk := newFakeWatcherClock(t0)
+
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots: []domain.LibraryRoot{root},
+		Trigger:     trig,
+		Clock:       clk,
+		MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+			return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+		}),
+		PollInterval:   10 * time.Millisecond,
+		DebounceWindow: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+	clk.waitForParked(t, 1)
+
+	// Empty root without marker emits no scans.
+	for range 3 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 0 {
+		t.Fatalf("empty root triggered %d scans, want 0", got)
+	}
+
+	// Subdirectory marker is ignored (root-level only).
+	writeWatcherFile(t, filepath.Join(dir, "sub", RootMarkerFilename), nil, t0)
+	for range 4 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 0 {
+		t.Fatalf("subdirectory marker triggered %d scans, want 0", got)
+	}
+
+	// Add root-level regular file .tobiten-root -> triggers 1 SCAN.
+	markerPath := filepath.Join(dir, RootMarkerFilename)
+	writeWatcherFile(t, markerPath, nil, t0)
+	for range 3 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("adding root marker triggered %d scans, want 1", got)
+	}
+
+	// Steady state with marker emits no further scans.
+	for range 3 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("steady root with marker triggered %d scans, want 1", got)
+	}
+
+	// Remove root-level marker -> triggers 1 SCAN.
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("Remove marker: %v", err)
+	}
+	for range 3 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("removing root marker triggered %d scans, want 2", got)
+	}
+
+	// Directory named .tobiten-root is not a valid marker -> triggers 0 scans.
+	if err := os.Mkdir(markerPath, 0o755); err != nil {
+		t.Fatalf("Mkdir marker: %v", err)
+	}
+	for range 4 {
+		clk.advanceAndWait(t, 10*time.Millisecond)
+	}
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("directory marker triggered %d scans, want 2 total", got)
+	}
+}
+
+func TestWatcher_StartDoesNotBlockOnMountIO(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), t0)
+	root := makeWatcherTestRoot(t, "lib-nonblock", "root-nonblock", dir)
+
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var readOnce sync.Once
+	var mu sync.Mutex
+	rootStatCalls := 0
+
+	trig := &recordedTrigger{}
+	clk := newFakeWatcherClock(t0)
+
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots: []domain.LibraryRoot{root},
+		Trigger:     trig,
+		Clock:       clk,
+		MountDetector: MountDetectorFunc(func([]byte) (mount.FilesystemInfo, error) {
+			return mount.FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
+		}),
+		PollInterval:   10 * time.Millisecond,
+		DebounceWindow: 20 * time.Millisecond,
+		Stat: func(rawPath []byte) (os.FileInfo, error) {
+			if bytes.Equal(rawPath, []byte(dir)) {
+				mu.Lock()
+				rootStatCalls++
+				mu.Unlock()
+				readOnce.Do(func() {
+					close(readEntered)
+					<-releaseRead
+				})
+			}
+			return os.Stat(string(rawPath))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	// Start must return immediately even while the initial root filesystem read is blocked.
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- w.Start(t.Context())
+	}()
+
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(releaseRead)
+		t.Fatal("Start blocked on mount I/O")
+	}
+	defer w.Stop()
+
+	// Wait until the background goroutine reaches the initial filesystem read, then release it.
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		close(releaseRead)
+		t.Fatal("background baseline did not start")
+	}
+	close(releaseRead)
+
+	// Wait for initial baseline pass to park on the first timer.
+	clk.waitForParked(t, 1)
+
+	mu.Lock()
+	callsAfterStart := rootStatCalls
+	mu.Unlock()
+	if callsAfterStart != 1 {
+		t.Fatalf("initial baseline walked root %d times, want 1", callsAfterStart)
+	}
+	if got := len(trig.snapshot()); got != 0 {
+		t.Fatalf("initial baseline triggered %d scans, want 0", got)
+	}
 }

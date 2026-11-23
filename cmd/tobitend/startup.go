@@ -170,15 +170,78 @@ var newDaemonRelocator = func(pool *pgxpool.Pool, _ *config.Config) (*roots.Relo
 	return roots.NewRelocator(postgres.NewTransactor(pool), roots.RelocatorOptions{})
 }
 
-var newDaemonWatcher = func(pool *pgxpool.Pool, _ *config.Config, ds *daemonServices) (*scanner.Watcher, error) {
+var newDaemonWatcher = func(pool *pgxpool.Pool, cfg *config.Config, ds *daemonServices) (*scanner.Watcher, error) {
 	if ds == nil || ds.jobs == nil {
 		return nil, errors.New("daemon job service is required for mount watcher")
 	}
+	pollInterval, err := parseScannerPollInterval(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return scanner.NewWatcher(scanner.WatcherOptions{
-		Roots:   postgres.NewLibraryRepository(pool),
-		Trigger: ds.jobs,
-		Logger:  slog.Default(),
+		Roots:        postgres.NewLibraryRepository(pool),
+		Trigger:      ds.jobs,
+		Jobs:         postgres.NewJobRepository(pool),
+		PollInterval: pollInterval,
+		Logger:       slog.Default(),
 	})
+}
+
+func parseScannerPollInterval(cfg *config.Config) (time.Duration, error) {
+	if cfg == nil {
+		return 0, nil
+	}
+	sys := cfg.SystemSettings()
+	keys := make([]string, 0, len(sys))
+	for key := range sys {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	var (
+		seen    bool
+		seenKey string
+		val     time.Duration
+	)
+	for _, key := range keys {
+		trimmedKey := strings.TrimSpace(key)
+		if !strings.EqualFold(trimmedKey, scanner.PollIntervalSettingKey) {
+			continue
+		}
+		trimmedVal := strings.TrimSpace(sys[key])
+		if trimmedVal == "" {
+			continue
+		}
+		d, err := parsePositiveDurationOrSeconds(trimmedVal)
+		if err != nil {
+			return 0, fmt.Errorf("%w: system_settings %q = %q (%v)", scanner.ErrInvalidPollInterval, key, sys[key], err)
+		}
+		if seen {
+			return 0, fmt.Errorf("%w: conflicting poll interval settings %q (%s) and %q (%s)",
+				scanner.ErrInvalidPollInterval, seenKey, val, key, d)
+		}
+		seen = true
+		seenKey = key
+		val = d
+	}
+	return val, nil
+}
+
+func parsePositiveDurationOrSeconds(raw string) (time.Duration, error) {
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs <= 0 {
+			return 0, errors.New("must be positive")
+		}
+		return time.Duration(secs) * time.Second, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	return d, nil
 }
 
 var startDaemonJobs = runDaemonJobs
