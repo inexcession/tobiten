@@ -252,9 +252,10 @@ func (s *ConfigService) AddRoot(
 	return created, nil
 }
 
-// RemoveRoot deletes an empty library root from its owning library. Roots that still own
-// any media asset (including missing or retired assets) fail with app.ErrConflict and
-// preserve all root and catalogue records (ADR-0019 §7).
+// RemoveRoot deletes an empty library root from its owning library when at least one
+// sibling root remains. Removing a library's final root (ADR-0019 §3) or a root that
+// still owns any media asset, including missing or retired ones (ADR-0019 §7), fails
+// with app.ErrConflict and preserves all root and catalogue records.
 func (s *ConfigService) RemoveRoot(
 	ctx context.Context,
 	principal *domain.Principal,
@@ -288,6 +289,14 @@ func (s *ConfigService) RemoveRoot(
 		}
 		if err := repo.LockLibrary(ctx, req.LibraryID); err != nil {
 			return mapLibraryStorageError(err)
+		}
+
+		roots, err := repo.ListLibraryRoots(ctx, req.LibraryID)
+		if err != nil {
+			return mapLibraryStorageError(err)
+		}
+		if len(roots) <= 1 {
+			return fmt.Errorf("%w: cannot remove the final root of library %q", app.ErrConflict, req.LibraryID)
 		}
 
 		if err := repo.DeleteLibraryRoot(ctx, req.RootID); err != nil {

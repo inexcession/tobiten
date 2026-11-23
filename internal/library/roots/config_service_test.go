@@ -1583,7 +1583,8 @@ func TestConfigService_RemoveRoot_GuardsAssetsAndDeletesEmpty(t *testing.T) {
 	}
 	dirKeep := filepath.Join(canonBase, "keep")
 	dirEmpty := filepath.Join(canonBase, "empty")
-	for _, d := range []string{dirKeep, dirEmpty} {
+	dirSibling := filepath.Join(canonBase, "sibling")
+	for _, d := range []string{dirKeep, dirEmpty, dirSibling} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("MkdirAll(%q): %v", d, err)
 		}
@@ -1631,7 +1632,7 @@ func TestConfigService_RemoveRoot_GuardsAssetsAndDeletesEmpty(t *testing.T) {
 		t.Fatalf("RemoveRoot(missing) = %v, want ErrNotFound", err)
 	}
 
-	// Empty root succeeds and leaves keepRoot intact.
+	// Empty root succeeds when a sibling remains.
 	if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
 		LibraryID: created.Library.ID,
 		RootID:    emptyRoot.ID,
@@ -1641,6 +1642,25 @@ func TestConfigService_RemoveRoot_GuardsAssetsAndDeletesEmpty(t *testing.T) {
 	libRepo := postgres.NewLibraryRepository(db.Pool)
 	if _, err := libRepo.GetLibraryRootByID(ctx, emptyRoot.ID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected emptyRoot deleted, got %v", err)
+	}
+
+	// Removing the sole empty root of a library fails with ErrConflict and preserves the root (ADR-0019 §3).
+	if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		RootID:    keepRoot.ID,
+	}); !errors.Is(err, app.ErrConflict) {
+		t.Fatalf("RemoveRoot(sole empty root) = %v, want ErrConflict", err)
+	}
+	if _, err := libRepo.GetLibraryRootByID(ctx, keepRoot.ID); err != nil {
+		t.Fatalf("sole root must be preserved after 409: %v", err)
+	}
+
+	// Add a sibling root before seeding assets so asset-conflict cases exercise the non-cascading FK guard.
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      []byte(dirSibling),
+	}); err != nil {
+		t.Fatalf("AddRoot(sibling): %v", err)
 	}
 
 	// Seed an available, missing, and retired asset on keepRoot; each state blocks removal with ErrConflict

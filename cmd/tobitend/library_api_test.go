@@ -1203,4 +1203,31 @@ func TestDaemonLibraryRootRemovalGuardRoute(t *testing.T) {
 	if finalRoots != beforeRoots-1 {
 		t.Fatalf("final roots = %d, want %d", finalRoots, beforeRoots-1)
 	}
+
+	// 6. Removing the sole empty root of a library returns 409 Conflict and preserves the root.
+	soleDir := filepath.Join(canonBase, "sole-empty-root")
+	if err := os.MkdirAll(soleDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(soleDir): %v", err)
+	}
+	createSoleCode, createSoleBody := doReq(http.MethodPost, "/api/v1/libraries", `{"name":"Sole Root Lib","root_path":"`+soleDir+`"}`, func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+	})
+	if createSoleCode != http.StatusCreated {
+		t.Fatalf("POST /libraries (Sole Root Lib) = %d (%s), want 201", createSoleCode, createSoleBody)
+	}
+	var soleLib app.Library
+	mustUnmarshal(t, createSoleBody, &soleLib)
+	if len(soleLib.Roots) != 1 {
+		t.Fatalf("expected 1 root on Sole Root Lib, got %+v", soleLib.Roots)
+	}
+	soleDelCode, soleDelBody := doReq(http.MethodDelete, "/comics/api/v1/libraries/"+soleLib.ID+"/roots/"+soleLib.Roots[0].ID, "", func(r *http.Request) {
+		r.AddCookie(sessCookie)
+		r.Header.Set("X-CSRF-Token", csrfToken)
+	})
+	if soleDelCode != http.StatusConflict {
+		t.Fatalf("DELETE sole empty root = %d (%s), want 409", soleDelCode, soleDelBody)
+	}
+	if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryRootByID(ctx, soleLib.Roots[0].ID); err != nil {
+		t.Fatalf("sole root must remain persisted after 409: %v", err)
+	}
 }
