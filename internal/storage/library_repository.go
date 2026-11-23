@@ -51,6 +51,10 @@ type LibraryRepository interface {
 
 	// Configuration serialization
 	LockConfiguration(ctx context.Context) error
+	// TryLockConfiguration performs the same READ COMMITTED isolation check as
+	// LockConfiguration and attempts a non-blocking try-lock on the global library
+	// configuration advisory lock, reporting whether the lock was acquired.
+	TryLockConfiguration(ctx context.Context) (bool, error)
 	LockLibrary(ctx context.Context, id string) error
 	LockLibraryForKeyShare(ctx context.Context, id string) error
 }

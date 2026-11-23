@@ -174,6 +174,7 @@ type Querier interface {
 	SaveJobCheckpoint(ctx context.Context, arg SaveJobCheckpointParams) (Job, error)
 	SetJobCancelRequested(ctx context.Context, arg SetJobCancelRequestedParams) (Job, error)
 	SetUserLabelPolicy(ctx context.Context, arg SetUserLabelPolicyParams) error
+	TryAcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) (bool, error)
 	UpdateCredentialLastUsed(ctx context.Context, arg UpdateCredentialLastUsedParams) (int64, error)
 	UpdateCredit(ctx context.Context, arg UpdateCreditParams) (Credit, error)
 	UpdateDomainEventSequence(ctx context.Context, lastSequence int64) error

@@ -554,6 +554,17 @@ func (q *Queries) LockLibraryForKeyShare(ctx context.Context, id string) (string
 	return id_2, err
 }
 
+const tryAcquireLibraryConfigLock = `-- name: TryAcquireLibraryConfigLock :one
+SELECT pg_try_advisory_xact_lock($1::bigint)::boolean
+`
+
+func (q *Queries) TryAcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) (bool, error) {
+	row := q.db.QueryRow(ctx, tryAcquireLibraryConfigLock, dollar_1)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const updateLibrary = `-- name: UpdateLibrary :one
 UPDATE libraries
 SET name = $2,

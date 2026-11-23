@@ -589,6 +589,76 @@ func TestRelocateRoot_VerificationAndOverlapFailures(t *testing.T) {
 		}, roots.ErrMissingAssetFile)
 	})
 
+	t.Run("verified file replaced while waiting on contended global configuration lock fails verification", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		dst := filepath.Join(newRoot, "Reloc/v01.cbz")
+		writeRelocateTestFile(t, dst, fix.availData)
+		altered := append([]byte(nil), fix.availData...)
+		altered[0] ^= 0xff
+
+		lockAcquired := make(chan struct{})
+		holderDone := make(chan error, 1)
+		holderCtx, holderCancel := context.WithCancel(ctx)
+		defer holderCancel()
+
+		runAndExpectFail(t, fix, newRoot, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				go func() {
+					holderDone <- transactor.WithReadCommittedTx(holderCtx, func(tx storage.Tx) error {
+						if err := tx.Libraries().LockConfiguration(holderCtx); err != nil {
+							return err
+						}
+						close(lockAcquired)
+
+						// Wait until Relocator's TryLockConfiguration observed contention and entered
+						// waitForConfigLockRelease (blocked on AcquireLibraryConfigLock).
+						deadline := time.Now().Add(8 * time.Second)
+						for {
+							var blocked int
+							if err := db.QueryRow(holderCtx, `
+								SELECT COUNT(*)
+								FROM pg_stat_activity
+								WHERE datname = current_database()
+								  AND pid <> pg_backend_pid()
+								  AND wait_event_type = 'Lock'
+								  AND query ILIKE '%pg_advisory_xact_lock%'
+							`).Scan(&blocked); err != nil {
+								return err
+							}
+							if blocked > 0 {
+								break
+							}
+							if time.Now().After(deadline) {
+								return errors.New("timed out waiting for relocator to block on config lock release")
+							}
+							time.Sleep(15 * time.Millisecond)
+						}
+
+						if err := os.WriteFile(dst, altered, 0o600); err != nil {
+							return err
+						}
+						if fix.avail.FileMtime != nil {
+							return os.Chtimes(dst, *fix.avail.FileMtime, *fix.avail.FileMtime)
+						}
+						return nil
+					})
+				}()
+				select {
+				case <-lockAcquired:
+					return nil
+				case err := <-holderDone:
+					return fmt.Errorf("config lock holder exited early: %w", err)
+				case <-holderCtx.Done():
+					return holderCtx.Err()
+				}
+			},
+		}, roots.ErrDigestMismatch)
+
+		if err := <-holderDone; err != nil {
+			t.Fatalf("config lock holder err = %v", err)
+		}
+	})
+
 	t.Run("previously absent optional file appearing after verification with wrong digest fails", func(t *testing.T) {
 		fix, newRoot, _ := setupCase(t)
 		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
@@ -985,7 +1055,7 @@ func (r *lostCommitAckLibRepo) UpdateLibraryRootPath(ctx context.Context, id str
 	return r.LibraryRepository.UpdateLibraryRootPath(ctx, id, path)
 }
 
-func TestRelocateRoot_LostCommitAckSettlesSucceededWithoutSecondActivation(t *testing.T) {
+func TestRelocateRoot_CommitAckAndInFlightOutcomeSettlement(t *testing.T) {
 	t.Parallel()
 	db, transactor, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -999,65 +1069,164 @@ func TestRelocateRoot_LostCommitAckSettlesSucceededWithoutSecondActivation(t *te
 	jobRepo := postgres.NewJobRepository(db.Pool)
 	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 
-	for _, tc := range []struct {
-		name               string
-		maxAttempts        int
-		cancelBeforeCommit bool
-	}{
-		{name: "with remaining retries settles as SUCCEEDED instead of retrying", maxAttempts: 3},
-		{name: "with single attempt settles as SUCCEEDED instead of failing", maxAttempts: 1},
-		{name: "with concurrent cancel_requested after commit settles as SUCCEEDED instead of cancelling", maxAttempts: 3, cancelBeforeCommit: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			caseDir := filepath.Join(canonBase, "lost-ack-"+domain.MustNewID())
-			oldRoot := filepath.Join(caseDir, "old")
-			newRoot := filepath.Join(caseDir, "new")
-			fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
-			writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+	t.Run("lost commit ACK with single attempt and concurrent cancel_requested settles SUCCEEDED", func(t *testing.T) {
+		caseDir := filepath.Join(canonBase, "lost-ack-"+domain.MustNewID())
+		oldRoot := filepath.Join(caseDir, "old")
+		newRoot := filepath.Join(caseDir, "new")
+		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
 
-			jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
-				MaxAttempts: tc.maxAttempts,
-			})
-			if err != nil {
-				t.Fatalf("TriggerRelocateRoot: %v", err)
-			}
-
-			faultTx := &lostCommitAckTransactor{inner: transactor}
-			faultTx.injectOnce.Store(true)
-			if tc.cancelBeforeCommit {
-				faultTx.afterCommit = func(hookCtx context.Context) error {
-					_, cErr := jobSvc.CancelJob(hookCtx, admin, jobID)
-					return cErr
-				}
-			}
-
-			rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
-			if err != nil {
-				t.Fatalf("NewRelocator: %v", err)
-			}
-			runner := newRootsRunner(t, jobRepo, rel)
-			if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
-				t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
-			}
-
-			// Claiming again must find no queued retry.
-			if claimedAgain, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || claimedAgain {
-				t.Fatalf("unexpected retry ClaimAndRunNext = (%v, %v)", claimedAgain, err)
-			}
-			if commits := faultTx.activationCommits.Load(); commits != 1 {
-				t.Fatalf("activationCommits = %d, want 1", commits)
-			}
-
-			got, err := jobRepo.GetJobByID(ctx, jobID)
-			if err != nil {
-				t.Fatalf("GetJobByID: %v", err)
-			}
-			if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
-				t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
-			}
-			assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
+			MaxAttempts: 1,
 		})
+		if err != nil {
+			t.Fatalf("TriggerRelocateRoot: %v", err)
+		}
+
+		faultTx := &lostCommitAckTransactor{inner: transactor}
+		faultTx.injectOnce.Store(true)
+		faultTx.afterCommit = func(hookCtx context.Context) error {
+			_, cErr := jobSvc.CancelJob(hookCtx, admin, jobID)
+			return cErr
+		}
+
+		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
+		if err != nil {
+			t.Fatalf("NewRelocator: %v", err)
+		}
+		runner := newRootsRunner(t, jobRepo, rel)
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+		}
+		if claimedAgain, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || claimedAgain {
+			t.Fatalf("unexpected retry ClaimAndRunNext = (%v, %v)", claimedAgain, err)
+		}
+		if commits := faultTx.activationCommits.Load(); commits != 1 {
+			t.Fatalf("activationCommits = %d, want 1", commits)
+		}
+
+		got, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
+			t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
+
+	runInFlightCase := func(t *testing.T, shouldCommit bool, maxAttempts int) (seededRelocateFixture, string, string, string, *jobs.Runner, *inFlightActivationTransactor) {
+		t.Helper()
+		caseDir := filepath.Join(canonBase, "inflight-"+domain.MustNewID())
+		oldRoot := filepath.Join(caseDir, "old")
+		newRoot := filepath.Join(caseDir, "new")
+		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+
+		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
+			MaxAttempts: maxAttempts,
+		})
+		if err != nil {
+			t.Fatalf("TriggerRelocateRoot: %v", err)
+		}
+
+		faultTx := &inFlightActivationTransactor{
+			inner:           transactor,
+			testCtx:         ctx,
+			shouldCommit:    shouldCommit,
+			inFlightReady:   make(chan struct{}),
+			releaseInFlight: make(chan struct{}),
+			bgDone:          make(chan error, 1),
+		}
+		faultTx.injectInFlight.Store(true)
+		defer faultTx.release()
+
+		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
+		if err != nil {
+			t.Fatalf("NewRelocator: %v", err)
+		}
+		runner := newRootsRunner(t, jobRepo, rel)
+
+		runDone := make(chan struct{})
+		var claimed bool
+		var runErr error
+		go func() {
+			defer close(runDone)
+			claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
+		}()
+
+		select {
+		case <-faultTx.inFlightReady:
+		case <-runDone:
+			t.Fatalf("ClaimAndRunNext exited before activation entered in-flight state: (%v, %v)", claimed, runErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for in-flight activation: %v", ctx.Err())
+		}
+
+		if err := waitForJobOutcomeLockWaiter(ctx, db, runDone); err != nil {
+			gotNow, _ := jobRepo.GetJobByID(ctx, jobID)
+			t.Fatalf("waitForJobOutcomeLockWaiter: %v (claimed=%v runErr=%v state=%+v)", err, claimed, runErr, gotNow)
+		}
+		faultTx.release()
+		bgErr := <-faultTx.bgDone
+		if shouldCommit && bgErr != nil {
+			t.Fatalf("background activation commit err = %v", bgErr)
+		}
+		if !shouldCommit && bgErr == nil {
+			t.Fatalf("expected rolled-back background activation error, got nil")
+		}
+		<-runDone
+
+		if runErr != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, runErr)
+		}
+		return fix, jobID, oldRoot, newRoot, runner, faultTx
 	}
+
+	t.Run("in-flight activation commits while outcome handler waits on lock and settles SUCCEEDED", func(t *testing.T) {
+		fix, jobID, _, newRoot, _, faultTx := runInFlightCase(t, true, 3)
+		if faultTx.attemptsStarted.Load() != 1 {
+			t.Fatalf("activation attemptsStarted = %d, want 1", faultTx.attemptsStarted.Load())
+		}
+		got, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
+			t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
+
+	t.Run("in-flight activation rolls back while outcome handler waits on lock then retries and succeeds", func(t *testing.T) {
+		fix, jobID, oldRoot, newRoot, runner, faultTx := runInFlightCase(t, false, 2)
+		mid, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID(after rollback): %v", err)
+		}
+		if mid.State != domain.JobStateQueued || mid.Attempts != 1 || mid.LastError == nil {
+			t.Fatalf("after rollback job = %+v, want QUEUED attempts=1 with error", mid)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(oldRoot))
+
+		if _, err := db.Exec(ctx, `UPDATE jobs SET run_after = NOW() WHERE id = $1`, jobID); err != nil {
+			t.Fatalf("reset run_after: %v", err)
+		}
+		if claimed2, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed2 {
+			t.Fatalf("ClaimAndRunNext(attempt 2) = (%v, %v)", claimed2, err)
+		}
+		final, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID(attempt 2): %v", err)
+		}
+		if final.State != domain.JobStateSucceeded || final.Attempts != 2 || final.LastError != nil {
+			t.Fatalf("final job = %+v, want SUCCEEDED attempts=2 last_error=nil", final)
+		}
+		if faultTx.attemptsStarted.Load() != 2 {
+			t.Fatalf("attemptsStarted = %d, want 2", faultTx.attemptsStarted.Load())
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
 }
 
 type inFlightActivationTransactor struct {
@@ -1233,207 +1402,6 @@ func waitForJobOutcomeLockWaiter(ctx context.Context, db *testdb.TestDB, done <-
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-}
-
-func TestRelocateRoot_InFlightCommitAtOutcomeHandling(t *testing.T) {
-	t.Parallel()
-	db, transactor, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	base := t.TempDir()
-	canonBase, err := paths.CanonicalPath(base)
-	if err != nil {
-		t.Fatalf("CanonicalPath: %v", err)
-	}
-	jobRepo := postgres.NewJobRepository(db.Pool)
-	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
-
-	t.Run("in-flight activation commits while outcome handler waits on lock and settles SUCCEEDED", func(t *testing.T) {
-		caseDir := filepath.Join(canonBase, "inflight-commit-"+domain.MustNewID())
-		oldRoot := filepath.Join(caseDir, "old")
-		newRoot := filepath.Join(caseDir, "new")
-		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
-		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
-
-		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
-			MaxAttempts: 3,
-		})
-		if err != nil {
-			t.Fatalf("TriggerRelocateRoot: %v", err)
-		}
-
-		faultTx := &inFlightActivationTransactor{
-			inner:           transactor,
-			testCtx:         ctx,
-			shouldCommit:    true,
-			inFlightReady:   make(chan struct{}),
-			releaseInFlight: make(chan struct{}),
-			bgDone:          make(chan error, 1),
-		}
-		faultTx.injectInFlight.Store(true)
-		defer faultTx.release()
-
-		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
-		if err != nil {
-			t.Fatalf("NewRelocator: %v", err)
-		}
-		runner := newRootsRunner(t, jobRepo, rel)
-
-		runDone := make(chan struct{})
-		var claimed bool
-		var runErr error
-		go func() {
-			defer close(runDone)
-			claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
-		}()
-
-		select {
-		case <-faultTx.inFlightReady:
-		case <-runDone:
-			t.Fatalf("ClaimAndRunNext exited before activation entered in-flight state: (%v, %v)", claimed, runErr)
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for in-flight activation: %v", ctx.Err())
-		}
-
-		if err := waitForJobOutcomeLockWaiter(ctx, db, runDone); err != nil {
-			gotNow, _ := jobRepo.GetJobByID(ctx, jobID)
-			var lastErrStr string
-			if gotNow != nil && gotNow.LastError != nil {
-				lastErrStr = *gotNow.LastError
-			}
-			var bgStatus string
-			select {
-			case be := <-faultTx.bgDone:
-				bgStatus = fmt.Sprintf("done(%v)", be)
-			default:
-				bgStatus = "still-blocked"
-			}
-			t.Fatalf("waitForJobOutcomeLockWaiter: %v (claimed=%v runErr=%v attemptsStarted=%d state=%s lastErr=%q bg=%s)",
-				err, claimed, runErr, faultTx.attemptsStarted.Load(), gotNow.State, lastErrStr, bgStatus)
-		}
-		faultTx.release()
-		if bgErr := <-faultTx.bgDone; bgErr != nil {
-			t.Fatalf("background activation commit err = %v", bgErr)
-		}
-		<-runDone
-
-		if runErr != nil || !claimed {
-			t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, runErr)
-		}
-		if faultTx.attemptsStarted.Load() != 1 {
-			t.Fatalf("activation attemptsStarted = %d, want 1", faultTx.attemptsStarted.Load())
-		}
-		got, err := jobRepo.GetJobByID(ctx, jobID)
-		if err != nil {
-			t.Fatalf("GetJobByID: %v", err)
-		}
-		if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
-			t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
-		}
-		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
-	})
-
-	t.Run("in-flight activation rolls back while outcome handler waits on lock then retries and succeeds", func(t *testing.T) {
-		caseDir := filepath.Join(canonBase, "inflight-rollback-"+domain.MustNewID())
-		oldRoot := filepath.Join(caseDir, "old")
-		newRoot := filepath.Join(caseDir, "new")
-		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
-		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
-
-		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
-			MaxAttempts: 2,
-		})
-		if err != nil {
-			t.Fatalf("TriggerRelocateRoot: %v", err)
-		}
-
-		faultTx := &inFlightActivationTransactor{
-			inner:           transactor,
-			testCtx:         ctx,
-			shouldCommit:    false,
-			inFlightReady:   make(chan struct{}),
-			releaseInFlight: make(chan struct{}),
-			bgDone:          make(chan error, 1),
-		}
-		faultTx.injectInFlight.Store(true)
-		defer faultTx.release()
-
-		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
-		if err != nil {
-			t.Fatalf("NewRelocator: %v", err)
-		}
-		runner := newRootsRunner(t, jobRepo, rel)
-
-		runDone := make(chan struct{})
-		var claimed bool
-		var runErr error
-		go func() {
-			defer close(runDone)
-			claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
-		}()
-
-		select {
-		case <-faultTx.inFlightReady:
-		case <-runDone:
-			t.Fatalf("ClaimAndRunNext exited before activation entered in-flight state: (%v, %v)", claimed, runErr)
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for in-flight activation: %v", ctx.Err())
-		}
-
-		if err := waitForJobOutcomeLockWaiter(ctx, db, runDone); err != nil {
-			gotNow, _ := jobRepo.GetJobByID(ctx, jobID)
-			var lastErrStr string
-			if gotNow != nil && gotNow.LastError != nil {
-				lastErrStr = *gotNow.LastError
-			}
-			var bgStatus string
-			select {
-			case be := <-faultTx.bgDone:
-				bgStatus = fmt.Sprintf("done(%v)", be)
-			default:
-				bgStatus = "still-blocked"
-			}
-			t.Fatalf("waitForJobOutcomeLockWaiter: %v (claimed=%v runErr=%v attemptsStarted=%d state=%s lastErr=%q bg=%s)",
-				err, claimed, runErr, faultTx.attemptsStarted.Load(), gotNow.State, lastErrStr, bgStatus)
-		}
-		faultTx.release()
-		if bgErr := <-faultTx.bgDone; bgErr == nil {
-			t.Fatalf("expected rolled-back background activation error, got nil")
-		}
-		<-runDone
-
-		if runErr != nil || !claimed {
-			t.Fatalf("ClaimAndRunNext(attempt 1) = (%v, %v), want (true, nil)", claimed, runErr)
-		}
-		mid, err := jobRepo.GetJobByID(ctx, jobID)
-		if err != nil {
-			t.Fatalf("GetJobByID(after rollback): %v", err)
-		}
-		if mid.State != domain.JobStateQueued || mid.Attempts != 1 || mid.LastError == nil {
-			t.Fatalf("after rollback job = %+v, want QUEUED attempts=1 with error", mid)
-		}
-		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(oldRoot))
-
-		// Attempt 2 runs cleanly and succeeds.
-		if _, err := db.Exec(ctx, `UPDATE jobs SET run_after = NOW() WHERE id = $1`, jobID); err != nil {
-			t.Fatalf("reset run_after: %v", err)
-		}
-		if claimed2, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed2 {
-			t.Fatalf("ClaimAndRunNext(attempt 2) = (%v, %v)", claimed2, err)
-		}
-		final, err := jobRepo.GetJobByID(ctx, jobID)
-		if err != nil {
-			t.Fatalf("GetJobByID(attempt 2): %v", err)
-		}
-		if final.State != domain.JobStateSucceeded || final.Attempts != 2 || final.LastError != nil {
-			t.Fatalf("final job = %+v, want SUCCEEDED attempts=2 last_error=nil", final)
-		}
-		if faultTx.attemptsStarted.Load() != 2 {
-			t.Fatalf("attemptsStarted = %d, want 2", faultTx.attemptsStarted.Load())
-		}
-		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
-	})
 }
 
 func TestRelocateRoot_VerificationAndRecheckDoNotBlockOtherLibraryConfig(t *testing.T) {

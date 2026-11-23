@@ -28,9 +28,15 @@ const ModuleName = "roots"
 // DefaultRelocateRootMaxAttempts is the default attempt budget for durable RELOCATE_ROOT jobs.
 const DefaultRelocateRootMaxAttempts = domain.DefaultJobMaxAttempts
 
-const maxRelocateVerifyPasses = 3
+const (
+	maxRelocateVerifyPasses       = 3
+	maxConfigLockContentionPasses = 8
+)
 
-var errVerificationDrift = errors.New("roots: target file set drifted after verification")
+var (
+	errVerificationDrift   = errors.New("roots: target file set drifted after verification")
+	errConfigLockContended = errors.New("roots: global configuration lock contended before activation")
+)
 
 var (
 	// ErrMissingAssetFile indicates a required non-missing asset file was absent at the relocation target.
@@ -156,18 +162,22 @@ func buildRelocateTriggerRequest(
 // reconciles to SUCCEEDED; pre-activation interruptions requeue/restart within budget.
 func RelocateRootReconciler() domain.JobReconciler {
 	return domain.JobReconcileFunc(func(_ context.Context, job domain.Job) (domain.JobReconcileOutcome, error) {
-		if len(bytes.TrimSpace(job.Checkpoint)) == 0 {
-			return domain.JobReconcileOutcome{Action: domain.JobReconcileRequeue}, nil
-		}
-		var cp RelocateRootCheckpoint
-		if err := json.Unmarshal(job.Checkpoint, &cp); err != nil {
-			return domain.JobReconcileOutcome{}, fmt.Errorf("decoding relocate root checkpoint: %w", err)
-		}
-		if cp.Activated && cp.Attempt == job.Attempts {
-			return domain.JobReconcileOutcome{Action: domain.JobReconcileSucceeded}, nil
-		}
-		return domain.JobReconcileOutcome{Action: domain.JobReconcileRequeue}, nil
+		return reconcileRelocateRootCheckpoint(job)
 	})
+}
+
+func reconcileRelocateRootCheckpoint(job domain.Job) (domain.JobReconcileOutcome, error) {
+	if len(bytes.TrimSpace(job.Checkpoint)) == 0 {
+		return domain.JobReconcileOutcome{Action: domain.JobReconcileRequeue}, nil
+	}
+	var cp RelocateRootCheckpoint
+	if err := json.Unmarshal(job.Checkpoint, &cp); err != nil {
+		return domain.JobReconcileOutcome{}, fmt.Errorf("decoding relocate root checkpoint: %w", err)
+	}
+	if cp.Activated && cp.Attempt == job.Attempts {
+		return domain.JobReconcileOutcome{Action: domain.JobReconcileSucceeded}, nil
+	}
+	return domain.JobReconcileOutcome{Action: domain.JobReconcileRequeue}, nil
 }
 
 // RelocatorOptions configures read-only target verification and atomic activation for RELOCATE_ROOT.
@@ -299,10 +309,11 @@ func (m *Module) RegisterJobs(r *jobs.Runner) error {
 		return errors.New("roots: relocator is required")
 	}
 	cfg := jobs.KindConfig{
-		Kind:               domain.JobKindRelocateRoot,
-		ResumePolicy:       domain.JobResumeRestart,
-		RequiresReconciler: true,
-		Handler:            jobs.HandlerFunc(m.handleRelocateRootJob),
+		Kind:                 domain.JobKindRelocateRoot,
+		ResumePolicy:         domain.JobResumeRestart,
+		RequiresReconciler:   true,
+		Handler:              jobs.HandlerFunc(m.handleRelocateRootJob),
+		CheckpointReconciler: reconcileRelocateRootCheckpoint,
 	}
 	if _, already := r.KindPolicy(domain.JobKindRelocateRoot); !already {
 		cfg.Reconciler = RelocateRootReconciler()
@@ -375,8 +386,12 @@ func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel fun
 		return err
 	}
 
-	for pass := range maxRelocateVerifyPasses {
-		err := r.executeVerifyAndActivatePass(ctx, job, payload, pass == 0, checkCancel)
+	driftPasses := 0
+	lockPasses := 0
+	firstPass := true
+	for {
+		err := r.executeVerifyAndActivatePass(ctx, job, payload, firstPass, checkCancel)
+		firstPass = false
 		if err == nil {
 			if r.onAfterActivate != nil {
 				if hookErr := r.onAfterActivate(ctx, job); hookErr != nil {
@@ -385,12 +400,24 @@ func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel fun
 			}
 			return nil
 		}
-		if errors.Is(err, errVerificationDrift) {
-			continue
+		switch {
+		case errors.Is(err, errVerificationDrift):
+			driftPasses++
+			if driftPasses >= maxRelocateVerifyPasses {
+				return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, ErrTargetIdentityChanged)
+			}
+		case errors.Is(err, errConfigLockContended):
+			lockPasses++
+			if lockPasses >= maxConfigLockContentionPasses {
+				return fmt.Errorf("%w: %w", app.ErrServiceBusy, err)
+			}
+			if waitErr := r.waitForConfigLockRelease(ctx); waitErr != nil {
+				return waitErr
+			}
+		default:
+			return err
 		}
-		return err
 	}
-	return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, ErrTargetIdentityChanged)
 }
 
 func (r *Relocator) executeVerifyAndActivatePass(
@@ -616,14 +643,28 @@ func (r *Relocator) activateRelocation(
 	})
 }
 
+func (r *Relocator) waitForConfigLockRelease(ctx context.Context) error {
+	return r.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		libRepo := tx.Libraries()
+		if libRepo == nil {
+			return errors.New("roots: library repository is required")
+		}
+		return libRepo.LockConfiguration(ctx)
+	})
+}
+
 func lockAndVerifyRelocateLibrary(
 	ctx context.Context,
 	libRepo storage.LibraryRepository,
 	payload RelocateRootPayload,
 	expectedOldPath []byte,
 ) error {
-	if err := libRepo.LockConfiguration(ctx); err != nil {
+	acquired, err := libRepo.TryLockConfiguration(ctx)
+	if err != nil {
 		return err
+	}
+	if !acquired {
+		return errConfigLockContended
 	}
 	if err := libRepo.LockLibrary(ctx, payload.LibraryID); err != nil {
 		return wrapPermanentNotFound(err)

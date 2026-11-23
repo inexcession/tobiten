@@ -404,13 +404,7 @@ func (r *LibraryRepository) DeleteLibraryRoot(ctx context.Context, id string) er
 	return nil
 }
 
-// LockConfiguration verifies that the active transaction runs under READ COMMITTED
-// isolation (so reads executed after acquiring the lock observe a fresh snapshot) and
-// acquires a transaction-scoped advisory lock that serializes library root and intake
-// path configuration checks and mutations. Pool-backed or non-transactional repositories
-// return storage.ErrTransactionRequired; stricter isolation levels fail closed with
-// storage.ErrTransactionIsolation.
-func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
+func (r *LibraryRepository) ensureConfigLockIsolation(ctx context.Context) error {
 	if r == nil || r.scope == nil {
 		return storage.ErrTransactionRequired
 	}
@@ -421,10 +415,36 @@ func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
 	if !strings.EqualFold(strings.TrimSpace(iso), "read committed") {
 		return fmt.Errorf("%w: got %q", storage.ErrTransactionIsolation, iso)
 	}
+	return nil
+}
+
+// LockConfiguration verifies that the active transaction runs under READ COMMITTED
+// isolation (so reads executed after acquiring the lock observe a fresh snapshot) and
+// acquires a transaction-scoped advisory lock that serializes library root and intake
+// path configuration checks and mutations. Pool-backed or non-transactional repositories
+// return storage.ErrTransactionRequired; stricter isolation levels fail closed with
+// storage.ErrTransactionIsolation.
+func (r *LibraryRepository) LockConfiguration(ctx context.Context) error {
+	if err := r.ensureConfigLockIsolation(ctx); err != nil {
+		return err
+	}
 	if err := r.q.AcquireLibraryConfigLock(ctx, libraryConfigLockID); err != nil {
 		return mapPgError(err)
 	}
 	return nil
+}
+
+// TryLockConfiguration checks READ COMMITTED isolation and attempts a non-blocking
+// advisory lock acquisition on the global configuration lock.
+func (r *LibraryRepository) TryLockConfiguration(ctx context.Context) (bool, error) {
+	if err := r.ensureConfigLockIsolation(ctx); err != nil {
+		return false, err
+	}
+	acquired, err := r.q.TryAcquireLibraryConfigLock(ctx, libraryConfigLockID)
+	if err != nil {
+		return false, mapPgError(err)
+	}
+	return acquired, nil
 }
 
 // LockLibrary acquires a row-level FOR UPDATE lock on library id inside an active

@@ -70,15 +70,21 @@ func (f HandlerFunc) Run(ctx context.Context, exec *Execution) error {
 	return f(ctx, exec)
 }
 
+// CheckpointReconciler inspects an already-locked job row (principally its
+// durable checkpoint) without performing external I/O or repository queries to
+// determine whether the attempt already committed its terminal outcome.
+type CheckpointReconciler func(job domain.Job) (ReconcileOutcome, error)
+
 // KindConfig registers a job kind's startup recovery policy, execution hooks, and optional pool size.
 type KindConfig struct {
-	Kind               domain.JobKind
-	ResumePolicy       domain.JobResumePolicy
-	Handler            Handler
-	Reconciler         Reconciler
-	RequiresReconciler bool
-	PoolSize           int
-	OnSucceeded        func(ctx context.Context, job domain.Job)
+	Kind                 domain.JobKind
+	ResumePolicy         domain.JobResumePolicy
+	Handler              Handler
+	Reconciler           Reconciler
+	CheckpointReconciler CheckpointReconciler
+	RequiresReconciler   bool
+	PoolSize             int
+	OnSucceeded          func(ctx context.Context, job domain.Job)
 }
 
 // KindRegistrar is an optional interface implemented by modules that register
@@ -420,6 +426,9 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	if existing.Reconciler != nil && cfg.Reconciler != nil {
 		return fmt.Errorf("%w: kind %q already has a reconciler", ErrDuplicateJobKind, cfg.Kind)
 	}
+	if existing.CheckpointReconciler != nil && cfg.CheckpointReconciler != nil {
+		return fmt.Errorf("%w: kind %q already has a checkpoint reconciler", ErrDuplicateJobKind, cfg.Kind)
+	}
 	if existing.PoolSize > 0 && cfg.PoolSize > 0 && existing.PoolSize != cfg.PoolSize {
 		return fmt.Errorf("%w: kind %q pool size %d conflicts with %d",
 			ErrDuplicateJobKind, cfg.Kind, cfg.PoolSize, existing.PoolSize)
@@ -433,6 +442,9 @@ func (r *Runner) RegisterKind(cfg KindConfig) error {
 	}
 	if existing.Reconciler == nil {
 		existing.Reconciler = cfg.Reconciler
+	}
+	if existing.CheckpointReconciler == nil {
+		existing.CheckpointReconciler = cfg.CheckpointReconciler
 	}
 	if existing.PoolSize == 0 {
 		existing.PoolSize = cfg.PoolSize
@@ -832,9 +844,9 @@ func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, jo
 		isResolved func(*domain.Job) bool
 	)
 
-	if runErr != nil && cfg.Reconciler != nil {
+	if runErr != nil && cfg.CheckpointReconciler != nil {
 		label, writeFn, isResolved = reconciledOutcomePersistence(
-			r.repo, cfg.Reconciler, job, runErr, now, &settled, &settledAsSucceeded,
+			r.repo, cfg.CheckpointReconciler, job, runErr, now, &settled, &settledAsSucceeded,
 		)
 	} else {
 		label, writeFn, isResolved = directOutcomePersistence(r.repo, job, runErr, now, &settled)
@@ -854,7 +866,7 @@ func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, jo
 
 func reconciledOutcomePersistence(
 	repo storage.JobRepository,
-	reconciler Reconciler,
+	reconciler CheckpointReconciler,
 	job *domain.Job,
 	runErr error,
 	now time.Time,
@@ -893,7 +905,7 @@ func reconciledOutcomePersistence(
 func settleLockedOutcomeTx(
 	ctx context.Context,
 	txRepo storage.JobRepository,
-	reconciler Reconciler,
+	reconciler CheckpointReconciler,
 	job *domain.Job,
 	runErr error,
 	now time.Time,
@@ -909,7 +921,7 @@ func settleLockedOutcomeTx(
 		return nil, false, fmt.Errorf("%w: job %q expected attempt %d, got %d", domain.ErrStaleJobAttempt, job.ID, job.Attempts, row.Attempts)
 	}
 
-	outcome, err := reconciler.Reconcile(ctx, *row)
+	outcome, err := reconciler(*row)
 	if err != nil {
 		return nil, false, err
 	}
