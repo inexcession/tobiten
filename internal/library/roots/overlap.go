@@ -15,6 +15,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/library/paths"
+	"github.com/inexcession/tobiten/internal/mount"
 	"github.com/inexcession/tobiten/internal/storage"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -116,12 +117,7 @@ func resolveAndInspectDirectory(raw []byte) ([]byte, *pathIdentityInfo, error) {
 	return canon, info, nil
 }
 
-const (
-	linuxExtSuperMagic   uint32 = 0xEF53
-	linuxTmpfsMagic      uint32 = 0x01021994
-	linuxBtrfsSuperMagic uint32 = 0x9123683E
-	linuxCasefoldFlag           = 0x40000000 // FS_CASEFOLD_FL
-)
+const linuxCasefoldFlag = 0x40000000 // FS_CASEFOLD_FL
 
 type lookupSemantics struct {
 	caseInsensitive        bool
@@ -131,7 +127,7 @@ type lookupSemantics struct {
 
 func linuxStatfsSemantics(magic uint32, extFlags int, extFlagsErr error) lookupSemantics {
 	switch magic {
-	case linuxExtSuperMagic:
+	case mount.LinuxExtSuperMagic:
 		if extFlagsErr != nil || (extFlags&linuxCasefoldFlag) != 0 {
 			return lookupSemantics{
 				caseInsensitive:        true,
@@ -140,7 +136,7 @@ func linuxStatfsSemantics(magic uint32, extFlags int, extFlagsErr error) lookupS
 			}
 		}
 		return lookupSemantics{caseInsensitive: false, normInsensitive: false, ignoreDefaultIgnorable: false}
-	case linuxTmpfsMagic, linuxBtrfsSuperMagic:
+	case mount.LinuxTmpfsMagic, mount.LinuxBtrfsSuperMagic:
 		return lookupSemantics{caseInsensitive: false, normInsensitive: false, ignoreDefaultIgnorable: false}
 	default:
 		// Network, FUSE, overlay, or foreign mounts can alias case, normalization,

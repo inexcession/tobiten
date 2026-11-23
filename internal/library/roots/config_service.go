@@ -15,18 +15,20 @@ import (
 
 // ConfigServiceOptions configures the concrete library configuration service.
 type ConfigServiceOptions struct {
-	DefaultMode domain.LibraryMode
-	Now         func() time.Time
-	Notifier    jobs.JobNotifier
+	DefaultMode    domain.LibraryMode
+	Now            func() time.Time
+	Notifier       jobs.JobNotifier
+	OnRootsChanged func()
 }
 
 // ConfigService implements app.LibraryConfigService with PostgreSQL advisory-lock
 // serialization and canonical root/intake overlap rejection.
 type ConfigService struct {
-	tx          storage.Transactor
-	defaultMode domain.LibraryMode
-	now         func() time.Time
-	notifier    jobs.JobNotifier
+	tx             storage.Transactor
+	defaultMode    domain.LibraryMode
+	now            func() time.Time
+	notifier       jobs.JobNotifier
+	onRootsChanged func()
 }
 
 var _ app.LibraryConfigService = (*ConfigService)(nil)
@@ -48,11 +50,18 @@ func NewConfigService(tx storage.Transactor, opts ConfigServiceOptions) (*Config
 		nowFn = time.Now
 	}
 	return &ConfigService{
-		tx:          tx,
-		defaultMode: defaultMode,
-		now:         nowFn,
-		notifier:    opts.Notifier,
+		tx:             tx,
+		defaultMode:    defaultMode,
+		now:            nowFn,
+		notifier:       opts.Notifier,
+		onRootsChanged: opts.OnRootsChanged,
 	}, nil
+}
+
+func (s *ConfigService) notifyRootsChanged() {
+	if s != nil && s.onRootsChanged != nil {
+		s.onRootsChanged()
+	}
 }
 
 // CreateLibrary validates mode/intake/root invariants, checks canonical overlap against
@@ -99,6 +108,7 @@ func (s *ConfigService) CreateLibrary(
 	if err != nil {
 		return nil, err
 	}
+	s.notifyRootsChanged()
 	return result, nil
 }
 
@@ -249,6 +259,7 @@ func (s *ConfigService) AddRoot(
 	if err != nil {
 		return nil, err
 	}
+	s.notifyRootsChanged()
 	return created, nil
 }
 
@@ -274,7 +285,7 @@ func (s *ConfigService) RemoveRoot(
 		return fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyLibraryRootID)
 	}
 
-	return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+	err := s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		repo := tx.Libraries()
 		if err := repo.LockConfiguration(ctx); err != nil {
 			return err
@@ -304,6 +315,11 @@ func (s *ConfigService) RemoveRoot(
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.notifyRootsChanged()
+	return nil
 }
 
 // SetManagedIntakePath updates a managed library's intake path after verifying it does

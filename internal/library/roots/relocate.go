@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -190,6 +191,7 @@ type RelocatorOptions struct {
 	OnBeforeVerify  func(ctx context.Context, job domain.Job) error
 	OnAfterVerify   func(ctx context.Context, job domain.Job) error
 	OnAfterActivate func(ctx context.Context, job domain.Job) error
+	OnRootsChanged  func()
 }
 
 type statReadAtCloser interface {
@@ -210,6 +212,7 @@ type Relocator struct {
 	onBeforeVerify  func(ctx context.Context, job domain.Job) error
 	onAfterVerify   func(ctx context.Context, job domain.Job) error
 	onAfterActivate func(ctx context.Context, job domain.Job) error
+	onRootsChanged  atomic.Pointer[func()]
 }
 
 // NewRelocator constructs a Relocator backed by tx.
@@ -248,7 +251,7 @@ func NewRelocator(tx storage.Transactor, opts RelocatorOptions) (*Relocator, err
 		openDirFn = checkRawDirReadable
 	}
 
-	return &Relocator{
+	rel := &Relocator{
 		tx:              tx,
 		now:             nowFn,
 		open:            openFn,
@@ -259,7 +262,23 @@ func NewRelocator(tx storage.Transactor, opts RelocatorOptions) (*Relocator, err
 		onBeforeVerify:  opts.OnBeforeVerify,
 		onAfterVerify:   opts.OnAfterVerify,
 		onAfterActivate: opts.OnAfterActivate,
-	}, nil
+	}
+	if opts.OnRootsChanged != nil {
+		rel.SetOnRootsChanged(opts.OnRootsChanged)
+	}
+	return rel, nil
+}
+
+// SetOnRootsChanged registers a callback invoked after a root path relocation commits.
+func (r *Relocator) SetOnRootsChanged(fn func()) {
+	if r == nil {
+		return
+	}
+	if fn == nil {
+		r.onRootsChanged.Store(nil)
+		return
+	}
+	r.onRootsChanged.Store(&fn)
 }
 
 // Module wires RELOCATE_ROOT job registration, recovery reconciliation, and execution
@@ -626,7 +645,7 @@ func (r *Relocator) activateRelocation(
 	payload RelocateRootPayload,
 	snap relocateSnapshot,
 ) error {
-	return r.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+	err := r.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 		libRepo := tx.Libraries()
 		jobRepo := tx.Jobs()
 		if libRepo == nil || jobRepo == nil {
@@ -641,6 +660,12 @@ func (r *Relocator) activateRelocation(
 		}
 		return r.commitRelocateActivation(ctx, libRepo, jobRepo, job, payload.RootID, reCanonTarget)
 	})
+	if err == nil {
+		if fnPtr := r.onRootsChanged.Load(); fnPtr != nil && *fnPtr != nil {
+			(*fnPtr)()
+		}
+	}
+	return err
 }
 
 func (r *Relocator) waitForConfigLockRelease(ctx context.Context) error {

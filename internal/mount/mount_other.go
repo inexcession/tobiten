@@ -1,8 +1,8 @@
 //go:build !darwin && !linux
 
-package embedded
+package mount
 
-func statfsInfo(path string) (FilesystemInfo, error) {
+func statfsInfo(_ string) (FilesystemInfo, error) {
 	return FilesystemInfo{
 		Type:      "unknown",
 		IsNetwork: false,

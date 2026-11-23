@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/inexcession/tobiten/internal/api"
@@ -169,15 +170,53 @@ var newDaemonRelocator = func(pool *pgxpool.Pool, _ *config.Config) (*roots.Relo
 	return roots.NewRelocator(postgres.NewTransactor(pool), roots.RelocatorOptions{})
 }
 
+var newDaemonWatcher = func(pool *pgxpool.Pool, _ *config.Config, ds *daemonServices) (*scanner.Watcher, error) {
+	if ds == nil || ds.jobs == nil {
+		return nil, errors.New("daemon job service is required for mount watcher")
+	}
+	return scanner.NewWatcher(scanner.WatcherOptions{
+		Roots:   postgres.NewLibraryRepository(pool),
+		Trigger: ds.jobs,
+		Logger:  slog.Default(),
+	})
+}
+
 var startDaemonJobs = runDaemonJobs
+
+var startDaemonWatchers = runDaemonWatchers
+
+var stopDaemonWatchers = func(w *daemonWatchers) {
+	w.stopAndWait()
+}
 
 var buildDaemonServices = newDaemonServices
 
 type daemonServices struct {
-	app         *app.Services
-	jobs        *jobs.Service
-	events      *events.StreamService
-	triggerScan func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error)
+	app          *app.Services
+	jobs         *jobs.Service
+	events       *events.StreamService
+	triggerScan  func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error)
+	rootsChanged atomic.Pointer[func()]
+}
+
+func (ds *daemonServices) setOnRootsChanged(fn func()) {
+	if ds == nil {
+		return
+	}
+	if fn == nil {
+		ds.rootsChanged.Store(nil)
+		return
+	}
+	ds.rootsChanged.Store(&fn)
+}
+
+func (ds *daemonServices) notifyRootsChanged() {
+	if ds == nil {
+		return
+	}
+	if fnPtr := ds.rootsChanged.Load(); fnPtr != nil && *fnPtr != nil {
+		(*fnPtr)()
+	}
 }
 
 type parsedPoolSetting struct {
@@ -317,6 +356,39 @@ type daemonWorkers struct {
 	delivery    *events.DeliveryCoordinator
 	dispatcher  *events.Dispatcher
 	progressHub *events.ProgressHub
+	relocator   *roots.Relocator
+}
+
+type daemonWatchers struct {
+	mount *scanner.Watcher
+}
+
+func (w *daemonWatchers) stopAndWait() {
+	if w != nil && w.mount != nil {
+		w.mount.Stop()
+	}
+}
+
+func runDaemonWatchers(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg *config.Config,
+	ds *daemonServices,
+) (*daemonWatchers, error) {
+	if cfg != nil && !cfg.IsModuleEnabled(scanner.ModuleName) {
+		return &daemonWatchers{}, nil
+	}
+	watcher, err := newDaemonWatcher(pool, cfg, ds)
+	if err != nil {
+		return nil, fmt.Errorf("initializing mount watcher: %w", err)
+	}
+	if watcher == nil {
+		return &daemonWatchers{}, nil
+	}
+	if err := watcher.Start(ctx); err != nil {
+		return nil, fmt.Errorf("starting mount watcher: %w", err)
+	}
+	return &daemonWatchers{mount: watcher}, nil
 }
 
 func (w *daemonWorkers) stopAndWait() {
@@ -469,6 +541,7 @@ func runDaemonJobs(
 		delivery:    delivery,
 		dispatcher:  dispatcher,
 		progressHub: progressHub,
+		relocator:   relocator,
 	}
 	return workers, nil
 }
@@ -524,17 +597,25 @@ func newDaemonServices(
 		}
 		defaultLibraryMode = parsedMode
 	}
-	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
-		DefaultMode: defaultLibraryMode,
-		Notifier:    jobService,
-	})
-	if err != nil {
-		return nil, err
-	}
 	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
 		Users:    userRepo,
 		Sessions: sessionRepo,
 	})
+	ds := &daemonServices{
+		jobs:   jobService,
+		events: eventService,
+		triggerScan: func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error) {
+			return scanner.TriggerScan(ctx, jobService, libraryID, opts)
+		},
+	}
+	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
+		DefaultMode:    defaultLibraryMode,
+		Notifier:       jobService,
+		OnRootsChanged: ds.notifyRootsChanged,
+	})
+	if err != nil {
+		return nil, err
+	}
 	services := app.NewAuthorizingServices(&app.Services{
 		Setup:         setup,
 		BasicAuth:     basicAuth,
@@ -546,14 +627,8 @@ func newDaemonServices(
 		Library:       libraryService,
 		LibraryConfig: libraryConfigService,
 	})
-	return &daemonServices{
-		app:    services,
-		jobs:   jobService,
-		events: eventService,
-		triggerScan: func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error) {
-			return scanner.TriggerScan(ctx, jobService, libraryID, opts)
-		},
-	}, nil
+	ds.app = services
+	return ds, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -610,6 +685,19 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	defer func() {
 		cancel(nil)
 		workers.stopAndWait()
+	}()
+	watchers, err := startDaemonWatchers(ctx, d.pool, cfg, ds)
+	if err != nil {
+		return err
+	}
+	if watchers != nil && watchers.mount != nil {
+		ds.setOnRootsChanged(watchers.mount.NotifySync)
+		if workers != nil && workers.relocator != nil {
+			workers.relocator.SetOnRootsChanged(watchers.mount.NotifySync)
+		}
+	}
+	defer func() {
+		stopDaemonWatchers(watchers)
 	}()
 	slog.Info("starting server daemon", slog.String("version", Version))
 	err = serve(ctx, cfg, slog.Default(), ds.app)

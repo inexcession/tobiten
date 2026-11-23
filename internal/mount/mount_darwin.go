@@ -1,6 +1,6 @@
 //go:build darwin
 
-package embedded
+package mount
 
 import (
 	"strings"

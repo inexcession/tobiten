@@ -12,6 +12,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/library/paths"
+	"github.com/inexcession/tobiten/internal/mount"
 )
 
 type treeEntrySnapshot struct {
@@ -371,12 +372,12 @@ func TestCheckPathOverlap_CaseAndNormalizationAliases(t *testing.T) {
 func TestComponentEqual_LookupSemantics(t *testing.T) {
 	t.Parallel()
 
-	sensitive := linuxStatfsSemantics(linuxExtSuperMagic, 0, nil)
+	sensitive := linuxStatfsSemantics(mount.LinuxExtSuperMagic, 0, nil)
 	caseOnly := lookupSemantics{caseInsensitive: true, normInsensitive: false, ignoreDefaultIgnorable: false}
 	normOnly := lookupSemantics{caseInsensitive: false, normInsensitive: true, ignoreDefaultIgnorable: false}
-	ext4Casefold := linuxStatfsSemantics(linuxExtSuperMagic, linuxCasefoldFlag, nil)
-	ext4IoctlErr := linuxStatfsSemantics(linuxExtSuperMagic, 0, errors.New("ioctl failed"))
-	unknownMount := linuxStatfsSemantics(0xFF534D42, 0, nil)
+	ext4Casefold := linuxStatfsSemantics(mount.LinuxExtSuperMagic, linuxCasefoldFlag, nil)
+	ext4IoctlErr := linuxStatfsSemantics(mount.LinuxExtSuperMagic, 0, errors.New("ioctl failed"))
+	unknownMount := linuxStatfsSemantics(mount.LinuxCIFSMagicNumber, 0, nil)
 
 	if sensitive.caseInsensitive || sensitive.normInsensitive || sensitive.ignoreDefaultIgnorable {
 		t.Fatalf("standard ext4 should be byte-exact, got %+v", sensitive)

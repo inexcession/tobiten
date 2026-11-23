@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/inexcession/tobiten/internal/mount"
 )
 
 // Sentinel errors for cluster version validation (ADR-0001 §4).
@@ -23,10 +25,7 @@ var (
 )
 
 // FilesystemInfo contains information about a filesystem mount.
-type FilesystemInfo struct {
-	Type      string
-	IsNetwork bool
-}
+type FilesystemInfo = mount.FilesystemInfo
 
 // ParseClusterVersion parses the PostgreSQL major version integer from the contents of a PG_VERSION file.
 func ParseClusterVersion(content string) (int, error) {
@@ -103,5 +102,5 @@ func findExistingAncestor(path string) string {
 
 // DetectFilesystem returns filesystem information for the specified path using statfs.
 func DetectFilesystem(path string) (FilesystemInfo, error) {
-	return statfsInfo(path)
+	return mount.DetectFilesystem(path)
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/inexcession/tobiten/internal/mount"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,7 +21,7 @@ func directoryLookupSemantics(dir string) lookupSemantics {
 	}
 
 	magic := uint32(st.Type)
-	if magic == linuxExtSuperMagic {
+	if magic == mount.LinuxExtSuperMagic {
 		f, err := os.Open(dir)
 		if err != nil {
 			return linuxStatfsSemantics(magic, 0, err)

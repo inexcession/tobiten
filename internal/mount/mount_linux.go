@@ -1,20 +1,10 @@
 //go:build linux
 
-package embedded
+package mount
 
 import (
 	"fmt"
 	"syscall"
-)
-
-const (
-	nfsSuperMagic   uint32 = 0x6969
-	smbSuperMagic   uint32 = 0x517B
-	cifsMagicNumber uint32 = 0xFF534D42
-	smb2MagicNumber uint32 = 0xFE534D42
-	codaSuperMagic  uint32 = 0x73757245
-	afsSuperMagic   uint32 = 0x5346414F
-	cephSuperMagic  uint32 = 0x00C36400
 )
 
 func statfsInfo(path string) (FilesystemInfo, error) {
@@ -25,29 +15,29 @@ func statfsInfo(path string) (FilesystemInfo, error) {
 
 	magic := uint32(stat.Type)
 	switch magic {
-	case nfsSuperMagic:
+	case LinuxNFSSuperMagic:
 		return FilesystemInfo{Type: "nfs", IsNetwork: true}, nil
-	case smbSuperMagic:
+	case LinuxSMBSuperMagic:
 		return FilesystemInfo{Type: "smb", IsNetwork: true}, nil
-	case cifsMagicNumber:
+	case LinuxCIFSMagicNumber:
 		return FilesystemInfo{Type: "cifs", IsNetwork: true}, nil
-	case smb2MagicNumber:
+	case LinuxSMB2MagicNumber:
 		return FilesystemInfo{Type: "smb2", IsNetwork: true}, nil
-	case afsSuperMagic:
+	case LinuxAFSSuperMagic:
 		return FilesystemInfo{Type: "afs", IsNetwork: true}, nil
-	case cephSuperMagic:
+	case LinuxCephSuperMagic:
 		return FilesystemInfo{Type: "ceph", IsNetwork: true}, nil
-	case codaSuperMagic:
+	case LinuxCodaSuperMagic:
 		return FilesystemInfo{Type: "coda", IsNetwork: true}, nil
-	case 0xEF53:
+	case LinuxExtSuperMagic:
 		return FilesystemInfo{Type: "ext4", IsNetwork: false}, nil
-	case 0x9123683E:
+	case LinuxBtrfsSuperMagic:
 		return FilesystemInfo{Type: "btrfs", IsNetwork: false}, nil
-	case 0x58465342:
+	case LinuxXFSSuperMagic:
 		return FilesystemInfo{Type: "xfs", IsNetwork: false}, nil
-	case 0x01021994:
+	case LinuxTmpfsMagic:
 		return FilesystemInfo{Type: "tmpfs", IsNetwork: false}, nil
-	case 0x2FC12FC1:
+	case LinuxZFSSuperMagic:
 		return FilesystemInfo{Type: "zfs", IsNetwork: false}, nil
 	default:
 		return FilesystemInfo{Type: fmt.Sprintf("0x%x", magic), IsNetwork: false}, nil
