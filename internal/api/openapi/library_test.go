@@ -338,14 +338,20 @@ func TestLibraryReadRoutes_QueryValidationJSONContractAndHEAD(t *testing.T) {
 }
 
 type recordingLibraryConfigService struct {
-	createCalls   int
-	addCalls      int
-	lastCreateReq app.CreateLibraryRequest
-	lastAddReq    app.AddLibraryRootRequest
-	defaultMode   domain.LibraryMode
-	conflictErr   bool
-	notFoundErr   bool
-	invalidErr    bool
+	createCalls     int
+	addCalls        int
+	removeCalls     int
+	relocateCalls   int
+	lastCreateReq   app.CreateLibraryRequest
+	lastAddReq      app.AddLibraryRootRequest
+	lastRemoveReq   app.RemoveLibraryRootRequest
+	lastRelocateReq app.RelocateRootRequest
+	relocateJobID   string
+	defaultMode     domain.LibraryMode
+	conflictErr     bool
+	notFoundErr     bool
+	invalidErr      bool
+	serviceBusyErr  bool
 }
 
 func (r *recordingLibraryConfigService) CreateLibrary(_ context.Context, _ *domain.Principal, req app.CreateLibraryRequest) (*app.CreateLibraryResult, error) {
@@ -424,12 +430,47 @@ func (r *recordingLibraryConfigService) AddRoot(_ context.Context, _ *domain.Pri
 	}, nil
 }
 
+func (r *recordingLibraryConfigService) RemoveRoot(_ context.Context, _ *domain.Principal, req app.RemoveLibraryRootRequest) error {
+	r.removeCalls++
+	r.lastRemoveReq = req
+	if r.serviceBusyErr {
+		return app.ErrServiceBusy
+	}
+	if r.conflictErr {
+		return app.ErrConflict
+	}
+	if r.notFoundErr {
+		return app.ErrNotFound
+	}
+	if r.invalidErr {
+		return app.ErrInvalidInput
+	}
+	return nil
+}
+
 func (r *recordingLibraryConfigService) SetManagedIntakePath(context.Context, *domain.Principal, app.SetManagedIntakePathRequest) (*domain.Library, error) {
 	return nil, app.ErrNotImplemented
 }
 
-func (r *recordingLibraryConfigService) RelocateRoot(context.Context, *domain.Principal, app.RelocateRootRequest) (string, error) {
-	return "", app.ErrNotImplemented
+func (r *recordingLibraryConfigService) RelocateRoot(_ context.Context, _ *domain.Principal, req app.RelocateRootRequest) (string, error) {
+	r.relocateCalls++
+	r.lastRelocateReq = req
+	if r.serviceBusyErr {
+		return "", app.ErrServiceBusy
+	}
+	if r.conflictErr {
+		return "", app.ErrConflict
+	}
+	if r.notFoundErr {
+		return "", app.ErrNotFound
+	}
+	if r.invalidErr {
+		return "", app.ErrInvalidInput
+	}
+	if r.relocateJobID != "" {
+		return r.relocateJobID, nil
+	}
+	return "job-relocate-" + req.RootID, nil
 }
 
 func TestLibraryProvisioningRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
@@ -945,4 +986,223 @@ func TestLibraryScanRoute_AuthValidationAndResponse(t *testing.T) {
 	if out.JobID != "job-scan-42" {
 		t.Fatalf("JobID = %q, want job-scan-42", out.JobID)
 	}
+}
+
+func TestLibraryRootManagementRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
+	recCfg := &recordingLibraryConfigService{
+		defaultMode:   domain.LibraryModeVirtual,
+		relocateJobID: "job-relocate-99",
+	}
+	mod := NewModule(app.NewAuthorizingServices(&app.Services{LibraryConfig: recCfg}))
+	modNil := NewModule(nil)
+
+	reader := libraryTestPrincipal(domain.PermissionLibraryRead)
+	admin := libraryTestPrincipal(domain.PermissionLibraryRead, domain.PermissionLibraryAdmin)
+
+	routes := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/api/v1/admin/roots/root-1/relocate", `{"path":"/mnt/new"}`},
+		{http.MethodDelete, "/api/v1/libraries/lib-1/roots/root-1", ""},
+	}
+
+	for _, rt := range routes {
+		// 1. Unauthenticated -> 401
+		reqUnauth := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		recUnauth := httptest.NewRecorder()
+		mod.router.ServeHTTP(recUnauth, reqUnauth)
+		if recUnauth.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated %s %s = %d, want 401", rt.method, rt.path, recUnauth.Code)
+		}
+
+		// 2. Unverified CSRF -> 403
+		reqCSRF := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		ctxCSRF := middleware.WithCSRFUnverified(domain.ContextWithPrincipal(reqCSRF.Context(), admin))
+		recCSRF := httptest.NewRecorder()
+		mod.router.ServeHTTP(recCSRF, reqCSRF.WithContext(ctxCSRF))
+		if recCSRF.Code != http.StatusForbidden {
+			t.Fatalf("unverified CSRF %s %s = %d, want 403", rt.method, rt.path, recCSRF.Code)
+		}
+
+		// 3. Missing library:admin -> 403 before payload/ID validation
+		reqNoPerm := httptest.NewRequest(rt.method, rt.path, strings.NewReader(`{invalid`))
+		reqNoPerm = reqNoPerm.WithContext(domain.ContextWithPrincipal(reqNoPerm.Context(), reader))
+		recNoPerm := httptest.NewRecorder()
+		mod.router.ServeHTTP(recNoPerm, reqNoPerm)
+		if recNoPerm.Code != http.StatusForbidden {
+			t.Fatalf("no library:admin %s %s = %d, want 403", rt.method, rt.path, recNoPerm.Code)
+		}
+
+		// 4. Nil service -> 503
+		reqUnavail := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		reqUnavail = reqUnavail.WithContext(domain.ContextWithPrincipal(reqUnavail.Context(), admin))
+		recUnavail := httptest.NewRecorder()
+		modNil.router.ServeHTTP(recUnavail, reqUnavail)
+		if recUnavail.Code != http.StatusServiceUnavailable {
+			t.Fatalf("nil service %s %s = %d, want 503", rt.method, rt.path, recUnavail.Code)
+		}
+	}
+
+	if recCfg.relocateCalls != 0 || recCfg.removeCalls != 0 {
+		t.Fatalf("denied requests reached service: relocate=%d remove=%d", recCfg.relocateCalls, recCfg.removeCalls)
+	}
+
+	// Wrong methods -> 405
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/admin/roots/root-1/relocate"},
+		{http.MethodDelete, "/api/v1/admin/roots/root-1/relocate"},
+		{http.MethodGet, "/api/v1/libraries/lib-1/roots/root-1"},
+		{http.MethodPost, "/api/v1/libraries/lib-1/roots/root-1"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+		rec := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s = %d, want 405", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	t.Run("POST /api/v1/admin/roots/{id}/relocate forwards path/path_hex and maps errors", func(t *testing.T) {
+		// Text path -> 202 Accepted with {"job_id":...}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/roots/root-42/relocate", strings.NewReader(`{"path":"/mnt/relocated"}`))
+		req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+		rec := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("POST /relocate = %d (%s), want 202", rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+		}
+		if recCfg.lastRelocateReq.RootID != "root-42" || string(recCfg.lastRelocateReq.Path) != "/mnt/relocated" {
+			t.Fatalf("unexpected RelocateRootRequest: %+v", recCfg.lastRelocateReq)
+		}
+		var out middleware.JobAcceptedResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode JobAcceptedResponse: %v", err)
+		}
+		if out.JobID != "job-relocate-99" {
+			t.Fatalf("JobID = %q, want job-relocate-99", out.JobID)
+		}
+
+		// Raw non-UTF-8 path_hex -> 202
+		reqHex := httptest.NewRequest(http.MethodPost, "/api/v1/admin/roots/root-42/relocate", strings.NewReader(`{"path_hex":"2f6d6e742fff"}`))
+		reqHex = reqHex.WithContext(domain.ContextWithPrincipal(reqHex.Context(), admin))
+		recHex := httptest.NewRecorder()
+		mod.router.ServeHTTP(recHex, reqHex)
+		if recHex.Code != http.StatusAccepted || !bytes.Equal(recCfg.lastRelocateReq.Path, []byte{0x2f, 0x6d, 0x6e, 0x74, 0x2f, 0xff}) {
+			t.Fatalf("POST /relocate (path_hex) = (%d, %x), want (202, 2f6d6e742fff)", recHex.Code, recCfg.lastRelocateReq.Path)
+		}
+
+		// Blank ID, bad JSON, unpaired surrogates, lossy UTF-8 -> 400 without service call
+		beforeCalls := recCfg.relocateCalls
+		for _, tc := range []struct {
+			path string
+			body []byte
+		}{
+			{"/api/v1/admin/roots/%20/relocate", []byte(`{"path":"/mnt/a"}`)},
+			{"/api/v1/admin/roots/root-1/relocate", []byte(`{}`)},
+			{"/api/v1/admin/roots/root-1/relocate", []byte(`{"path":"/mnt/bad-` + "\xff" + `"}`)},
+			{"/api/v1/admin/roots/root-1/relocate", []byte(`{"path":"/mnt/\ud800"}`)},
+		} {
+			badReq := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(tc.body))
+			badReq = badReq.WithContext(domain.ContextWithPrincipal(badReq.Context(), admin))
+			badRec := httptest.NewRecorder()
+			mod.router.ServeHTTP(badRec, badReq)
+			if badRec.Code != http.StatusBadRequest {
+				t.Fatalf("invalid POST %s body=%q = %d, want 400", tc.path, tc.body, badRec.Code)
+			}
+		}
+		if recCfg.relocateCalls != beforeCalls {
+			t.Fatalf("invalid POST /relocate invoked service (%d -> %d)", beforeCalls, recCfg.relocateCalls)
+		}
+
+		// Oversized body -> 413 without service call
+		prefix := `{"path":"/mnt/over"}`
+		pad := strings.Repeat(" ", maxLibraryJSONBodyBytes-len(prefix)+1)
+		reqOver := httptest.NewRequest(http.MethodPost, "/api/v1/admin/roots/root-1/relocate", strings.NewReader(prefix+pad))
+		reqOver = reqOver.WithContext(domain.ContextWithPrincipal(reqOver.Context(), admin))
+		recOver := httptest.NewRecorder()
+		mod.router.ServeHTTP(recOver, reqOver)
+		if recOver.Code != http.StatusRequestEntityTooLarge || recCfg.relocateCalls != beforeCalls {
+			t.Fatalf("oversized POST /relocate = (%d, calls=%d/%d), want 413 without service call", recOver.Code, recCfg.relocateCalls, beforeCalls)
+		}
+
+		// 404 and 409 error mapping
+		recCfg.notFoundErr = true
+		req404 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/roots/missing/relocate", strings.NewReader(`{"path":"/mnt/a"}`))
+		req404 = req404.WithContext(domain.ContextWithPrincipal(req404.Context(), admin))
+		rec404 := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec404, req404)
+		if rec404.Code != http.StatusNotFound {
+			t.Fatalf("missing root POST /relocate = %d, want 404", rec404.Code)
+		}
+		recCfg.notFoundErr = false
+
+		recCfg.conflictErr = true
+		req409 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/roots/root-1/relocate", strings.NewReader(`{"path":"/mnt/a"}`))
+		req409 = req409.WithContext(domain.ContextWithPrincipal(req409.Context(), admin))
+		rec409 := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec409, req409)
+		if rec409.Code != http.StatusConflict {
+			t.Fatalf("conflict POST /relocate = %d, want 409", rec409.Code)
+		}
+		recCfg.conflictErr = false
+	})
+
+	t.Run("DELETE /api/v1/libraries/{id}/roots/{root_id} succeeds with 204 and maps 400/404/409", func(t *testing.T) {
+		beforeCalls := recCfg.removeCalls
+		for _, p := range []string{"/api/v1/libraries/%20/roots/root-1", "/api/v1/libraries/lib-1/roots/%20"} {
+			badReq := httptest.NewRequest(http.MethodDelete, p, nil)
+			badReq = badReq.WithContext(domain.ContextWithPrincipal(badReq.Context(), admin))
+			badRec := httptest.NewRecorder()
+			mod.router.ServeHTTP(badRec, badReq)
+			if badRec.Code != http.StatusBadRequest {
+				t.Fatalf("DELETE %s = %d, want 400", p, badRec.Code)
+			}
+		}
+		if recCfg.removeCalls != beforeCalls {
+			t.Fatalf("blank param DELETE invoked service")
+		}
+
+		recCfg.notFoundErr = true
+		req404 := httptest.NewRequest(http.MethodDelete, "/api/v1/libraries/lib-1/roots/missing", nil)
+		req404 = req404.WithContext(domain.ContextWithPrincipal(req404.Context(), admin))
+		rec404 := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec404, req404)
+		if rec404.Code != http.StatusNotFound {
+			t.Fatalf("missing DELETE root = %d, want 404", rec404.Code)
+		}
+		recCfg.notFoundErr = false
+
+		recCfg.conflictErr = true
+		req409 := httptest.NewRequest(http.MethodDelete, "/api/v1/libraries/lib-1/roots/root-1", nil)
+		req409 = req409.WithContext(domain.ContextWithPrincipal(req409.Context(), admin))
+		rec409 := httptest.NewRecorder()
+		mod.router.ServeHTTP(rec409, req409)
+		if rec409.Code != http.StatusConflict {
+			t.Fatalf("in-use DELETE root = %d, want 409", rec409.Code)
+		}
+		recCfg.conflictErr = false
+
+		reqOK := httptest.NewRequest(http.MethodDelete, "/api/v1/libraries/lib-9/roots/root-7", nil)
+		reqOK = reqOK.WithContext(domain.ContextWithPrincipal(reqOK.Context(), admin))
+		recOK := httptest.NewRecorder()
+		mod.router.ServeHTTP(recOK, reqOK)
+		if recOK.Code != http.StatusNoContent || recOK.Body.Len() != 0 {
+			t.Fatalf("DELETE root = (%d, %q), want (204, empty)", recOK.Code, recOK.Body.String())
+		}
+		if recOK.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("DELETE Cache-Control = %q, want no-store", recOK.Header().Get("Cache-Control"))
+		}
+		if recCfg.lastRemoveReq != (app.RemoveLibraryRootRequest{LibraryID: "lib-9", RootID: "root-7"}) {
+			t.Fatalf("unexpected RemoveLibraryRootRequest: %+v", recCfg.lastRemoveReq)
+		}
+	})
 }

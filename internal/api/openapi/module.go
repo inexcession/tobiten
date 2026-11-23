@@ -65,10 +65,12 @@ func (m *Module) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/v1/volumes", m.handleListVolumes)
 	mux.HandleFunc("GET /api/v1/volumes/{id}", m.handleGetVolume)
 
-	// Native library provisioning and scan trigger routes (M1-T21.5, M1-T10.7, ADR-0017, ADR-0019).
+	// Native library provisioning, scan, and root management routes (M1-T21.5, M1-T10.7, M1-T22.5, ADR-0017, ADR-0019).
 	mux.HandleFunc("POST /api/v1/libraries", m.handleCreateLibrary)
 	mux.HandleFunc("POST /api/v1/libraries/{id}/roots", m.handleAddLibraryRoot)
+	mux.HandleFunc("DELETE /api/v1/libraries/{id}/roots/{root_id}", m.handleRemoveLibraryRoot)
 	mux.HandleFunc("POST /api/v1/libraries/{id}/scan", m.handleScanLibrary)
+	mux.HandleFunc("POST /api/v1/admin/roots/{id}/relocate", m.handleRelocateRoot)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqPath := r.URL.Path

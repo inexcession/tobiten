@@ -151,6 +151,15 @@ func (s *authorizingLibraryConfigService) AddRoot(ctx context.Context, principal
 	})
 }
 
+func (s *authorizingLibraryConfigService) RemoveRoot(ctx context.Context, principal *domain.Principal, req RemoveLibraryRootRequest) error {
+	return Authorize(principal, domain.PermissionLibraryAdmin, func() error {
+		if s.next == nil {
+			return ErrNotImplemented
+		}
+		return s.next.RemoveRoot(ctx, principal, req)
+	})
+}
+
 func (s *authorizingLibraryConfigService) SetManagedIntakePath(ctx context.Context, principal *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error) {
 	return AuthorizeValue(principal, domain.PermissionLibraryAdmin, func() (*domain.Library, error) {
 		if s.next == nil {

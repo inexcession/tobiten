@@ -362,7 +362,7 @@ type createLibraryHTTPRequest struct {
 	DefaultCoverPolicy    string          `json:"default_cover_policy"`
 }
 
-type addLibraryRootHTTPRequest struct {
+type libraryRootPathHTTPRequest struct {
 	Path    *strictJSONPath `json:"path"`
 	PathHex *string         `json:"path_hex"`
 }
@@ -400,14 +400,8 @@ func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
 		middleware.WriteAppError(w, r, err)
 		return
 	}
-	var body addLibraryRootHTTPRequest
-	if err := decodeLibraryJSONBody(w, r, &body); err != nil {
-		writeLibraryDecodeError(w, r, err)
-		return
-	}
-	pathBytes, err := parseJSONPathPair(body.Path.asStringPtr(), body.PathHex, "path", "path_hex", true)
-	if err != nil {
-		middleware.WriteAppError(w, r, err)
+	pathBytes, ok := parseRootPathBody(w, r)
+	if !ok {
 		return
 	}
 	root, err := svc.AddRoot(r.Context(), p, app.AddLibraryRootRequest{
@@ -419,6 +413,67 @@ func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, app.LibraryRootFromDomain(*root, p))
+}
+
+func (m *Module) handleRemoveLibraryRoot(w http.ResponseWriter, r *http.Request) {
+	p, svc, ok := m.prepareLibraryConfigRequest(w, r)
+	if !ok {
+		return
+	}
+	libID, err := requirePathParam(r, "id")
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	rootID, err := requirePathParam(r, "root_id")
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	if err := svc.RemoveRoot(r.Context(), p, app.RemoveLibraryRootRequest{
+		LibraryID: libID,
+		RootID:    rootID,
+	}); err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (m *Module) handleRelocateRoot(w http.ResponseWriter, r *http.Request) {
+	p, svc, ok := m.prepareLibraryConfigRequest(w, r)
+	if !ok {
+		return
+	}
+	rootID, err := requireIDParam(r)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	pathBytes, ok := parseRootPathBody(w, r)
+	if !ok {
+		return
+	}
+	middleware.HandleJobTrigger(w, r, func(ctx context.Context) (string, error) {
+		return svc.RelocateRoot(ctx, p, app.RelocateRootRequest{
+			RootID: rootID,
+			Path:   pathBytes,
+		})
+	})
+}
+
+func parseRootPathBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	var body libraryRootPathHTTPRequest
+	if err := decodeLibraryJSONBody(w, r, &body); err != nil {
+		writeLibraryDecodeError(w, r, err)
+		return nil, false
+	}
+	pathBytes, err := parseJSONPathPair(body.Path.asStringPtr(), body.PathHex, "path", "path_hex", true)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return nil, false
+	}
+	return pathBytes, true
 }
 
 func (m *Module) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
@@ -555,11 +610,15 @@ func writeLibraryJSON(w http.ResponseWriter, r *http.Request, v any) {
 }
 
 func requireIDParam(r *http.Request) (string, error) {
-	id := r.PathValue("id")
-	if strings.TrimSpace(id) == "" {
-		return "", fmt.Errorf("%w: id is required", app.ErrInvalidInput)
+	return requirePathParam(r, "id")
+}
+
+func requirePathParam(r *http.Request, name string) (string, error) {
+	val := r.PathValue(name)
+	if strings.TrimSpace(val) == "" {
+		return "", fmt.Errorf("%w: %s is required", app.ErrInvalidInput, name)
 	}
-	return id, nil
+	return val, nil
 }
 
 func parseQueryValues(r *http.Request) (url.Values, error) {

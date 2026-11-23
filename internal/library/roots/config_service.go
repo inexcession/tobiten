@@ -252,6 +252,51 @@ func (s *ConfigService) AddRoot(
 	return created, nil
 }
 
+// RemoveRoot deletes an empty library root from its owning library. Roots that still own
+// any media asset (including missing or retired assets) fail with app.ErrConflict and
+// preserve all root and catalogue records (ADR-0019 §7).
+func (s *ConfigService) RemoveRoot(
+	ctx context.Context,
+	principal *domain.Principal,
+	req app.RemoveLibraryRootRequest,
+) error {
+	if err := app.RequirePermission(principal, domain.PermissionLibraryAdmin); err != nil {
+		return err
+	}
+	if s == nil || s.tx == nil {
+		return fmt.Errorf("%w: library configuration service is unavailable", app.ErrServiceBusy)
+	}
+	if strings.TrimSpace(req.LibraryID) == "" {
+		return fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyLibraryID)
+	}
+	if strings.TrimSpace(req.RootID) == "" {
+		return fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyLibraryRootID)
+	}
+
+	return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		repo := tx.Libraries()
+		if err := repo.LockConfiguration(ctx); err != nil {
+			return err
+		}
+
+		root, err := repo.GetLibraryRootByID(ctx, req.RootID)
+		if err != nil {
+			return mapLibraryStorageError(err)
+		}
+		if root.LibraryID != req.LibraryID {
+			return fmt.Errorf("%w: library root %q does not belong to library %q", app.ErrNotFound, req.RootID, req.LibraryID)
+		}
+		if err := repo.LockLibrary(ctx, req.LibraryID); err != nil {
+			return mapLibraryStorageError(err)
+		}
+
+		if err := repo.DeleteLibraryRoot(ctx, req.RootID); err != nil {
+			return mapLibraryStorageError(err)
+		}
+		return nil
+	})
+}
+
 // SetManagedIntakePath updates a managed library's intake path after verifying it does
 // not overlap any existing root (including the target library's own roots) or any other
 // library's intake path.
@@ -435,7 +480,9 @@ func mapLibraryStorageError(err error) error {
 		return nil
 	case errors.Is(err, storage.ErrNotFound):
 		return fmt.Errorf("%w: %w", app.ErrNotFound, err)
-	case errors.Is(err, storage.ErrAlreadyExists):
+	case errors.Is(err, storage.ErrAlreadyExists),
+		errors.Is(err, storage.ErrLibraryRootInUse),
+		errors.Is(err, storage.ErrLibraryInUse):
 		return fmt.Errorf("%w: %w", app.ErrConflict, err)
 	case errors.Is(err, domain.ErrEmptyLibraryID),
 		errors.Is(err, domain.ErrEmptyLibraryRootID),

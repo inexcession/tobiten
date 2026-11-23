@@ -43,11 +43,18 @@ type RelocateRootRequest struct {
 	Path   []byte
 }
 
+// RemoveLibraryRootRequest defines parameters for removing a root directory from a library.
+type RemoveLibraryRootRequest struct {
+	LibraryID string
+	RootID    string
+}
+
 // LibraryConfigService defines administrative use-cases for configuring libraries, roots,
 // and managed intake paths.
 type LibraryConfigService interface {
 	CreateLibrary(ctx context.Context, principal *domain.Principal, req CreateLibraryRequest) (*CreateLibraryResult, error)
 	AddRoot(ctx context.Context, principal *domain.Principal, req AddLibraryRootRequest) (*domain.LibraryRoot, error)
+	RemoveRoot(ctx context.Context, principal *domain.Principal, req RemoveLibraryRootRequest) error
 	SetManagedIntakePath(ctx context.Context, principal *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error)
 	RelocateRoot(ctx context.Context, principal *domain.Principal, req RelocateRootRequest) (string, error)
 }

@@ -390,6 +390,8 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			"/comics/api/v1/libraries/lib-1/roots",
 			"/api/v1/libraries/lib-1/scan",
 			"/comics/api/v1/libraries/lib-1/scan",
+			"/api/v1/admin/roots/root-1/relocate",
+			"/comics/api/v1/admin/roots/root-1/relocate",
 		}
 		for _, path := range protectedPostPaths {
 			resp, err := client.Post(baseURL+path, "application/json", strings.NewReader(`{}`))
@@ -399,6 +401,25 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Errorf("POST %s status = %d, want 401", path, resp.StatusCode)
+			}
+		}
+
+		protectedDeletePaths := []string{
+			"/api/v1/libraries/lib-1/roots/root-1",
+			"/comics/api/v1/libraries/lib-1/roots/root-1",
+		}
+		for _, path := range protectedDeletePaths {
+			req, err := http.NewRequest(http.MethodDelete, baseURL+path, nil)
+			if err != nil {
+				t.Fatalf("NewRequest DELETE %s failed: %v", path, err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("DELETE %s failed: %v", path, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("DELETE %s status = %d, want 401", path, resp.StatusCode)
 			}
 		}
 	})

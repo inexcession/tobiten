@@ -1570,3 +1570,127 @@ func TestConfigService_MissingDirectoryAliases(t *testing.T) {
 
 	assertSnapshotIdentical(t, canonBase, before)
 }
+
+func TestConfigService_RemoveRoot_GuardsAssetsAndDeletesEmpty(t *testing.T) {
+	db, _, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath: %v", err)
+	}
+	dirKeep := filepath.Join(canonBase, "keep")
+	dirEmpty := filepath.Join(canonBase, "empty")
+	for _, d := range []string{dirKeep, dirEmpty} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", d, err)
+		}
+	}
+
+	created, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:  "Remove Guard Lib",
+		Roots: [][]byte{[]byte(dirKeep)},
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+	keepRoot := created.Roots[0]
+	emptyRoot, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		Path:      []byte(dirEmpty),
+	})
+	if err != nil {
+		t.Fatalf("AddRoot(empty): %v", err)
+	}
+
+	otherDir := filepath.Join(canonBase, "other")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", otherDir, err)
+	}
+	otherLib, err := svc.CreateLibrary(ctx, admin, app.CreateLibraryRequest{
+		Name:  "Other Lib",
+		Roots: [][]byte{[]byte(otherDir)},
+	})
+	if err != nil {
+		t.Fatalf("CreateLibrary(other): %v", err)
+	}
+
+	// Cross-library or unknown root returns ErrNotFound.
+	if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
+		LibraryID: otherLib.Library.ID,
+		RootID:    emptyRoot.ID,
+	}); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("RemoveRoot(cross-library) = %v, want ErrNotFound", err)
+	}
+	if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		RootID:    domain.MustNewID(),
+	}); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("RemoveRoot(missing) = %v, want ErrNotFound", err)
+	}
+
+	// Empty root succeeds and leaves keepRoot intact.
+	if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
+		LibraryID: created.Library.ID,
+		RootID:    emptyRoot.ID,
+	}); err != nil {
+		t.Fatalf("RemoveRoot(empty) = %v, want nil", err)
+	}
+	libRepo := postgres.NewLibraryRepository(db.Pool)
+	if _, err := libRepo.GetLibraryRootByID(ctx, emptyRoot.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected emptyRoot deleted, got %v", err)
+	}
+
+	// Seed an available, missing, and retired asset on keepRoot; each state blocks removal with ErrConflict
+	// and preserves all root and catalogue rows.
+	volID := domain.MustNewID()
+	if _, err := db.Exec(ctx, `INSERT INTO volumes (id, library_id) VALUES ($1, $2)`, volID, created.Library.ID); err != nil {
+		t.Fatalf("insert volume: %v", err)
+	}
+	assetID := domain.MustNewID()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO media_assets (id, volume_id, library_root_id, rel_path_bytes, rel_path_display, rel_path_match, file_size, format)
+		VALUES ($1, $2, $3, $4, 'Series/v01.cbz', 'series/v01.cbz', 42, 'CBZ')
+	`, assetID, volID, keepRoot.ID, []byte("Series/v01.cbz")); err != nil {
+		t.Fatalf("insert media_asset: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "available asset",
+			sql:  `UPDATE media_assets SET missing_since = NULL, retired_at = NULL WHERE id = $1`,
+		},
+		{
+			name: "missing asset",
+			sql:  `UPDATE media_assets SET missing_since = NOW(), retired_at = NULL WHERE id = $1`,
+		},
+		{
+			name: "retired asset",
+			sql:  `UPDATE media_assets SET missing_since = NOW() - INTERVAL '10 days', retired_at = NOW() WHERE id = $1`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.Exec(ctx, tc.sql, assetID); err != nil {
+				t.Fatalf("update asset state (%s): %v", tc.name, err)
+			}
+			if err := svc.RemoveRoot(ctx, admin, app.RemoveLibraryRootRequest{
+				LibraryID: created.Library.ID,
+				RootID:    keepRoot.ID,
+			}); !errors.Is(err, app.ErrConflict) {
+				t.Fatalf("RemoveRoot(%s) = %v, want ErrConflict", tc.name, err)
+			}
+			if _, err := libRepo.GetLibraryRootByID(ctx, keepRoot.ID); err != nil {
+				t.Fatalf("keepRoot must be preserved after 409 (%s): %v", tc.name, err)
+			}
+			var count int
+			if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM media_assets WHERE id = $1`, assetID).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("asset must be preserved after 409 (%s): count=%d err=%v", tc.name, count, err)
+			}
+		})
+	}
+}

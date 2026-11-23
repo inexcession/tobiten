@@ -1005,3 +1005,202 @@ func TestDaemonLibraryProvisioningDefaultModeFromEnv(t *testing.T) {
 		t.Fatalf("expected explicit VIRTUAL library, got %+v", virtualLib)
 	}
 }
+
+func TestDaemonLibraryRootRemovalGuardRoute(t *testing.T) {
+	db := testdb.New(t)
+	ts, userRepo := startLibraryTestServer(t, db, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	admin := createTestUserWithPassword(ctx, t, userRepo, "rmadmin", "admin-pass-123", domain.RoleAdminID)
+	reader := createTestUserWithPassword(ctx, t, userRepo, "rmreader", "reader-pass-123", domain.RoleReaderID)
+	restricted := createTestUserWithPassword(ctx, t, userRepo, "rmkid", "kid-pass-123", domain.RoleRestrictedReaderID)
+	_ = createTestUserWithPassword(ctx, t, userRepo, "rmcurator", "curator-pass-123", domain.RoleCuratorID)
+
+	readPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeRead})
+	libAdminPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeLibraryAdmin})
+
+	seedDaemonCatalogueFixture(ctx, t, db.Pool, reader.ID, restricted.ID)
+
+	// Seed a reading_progress row on vol-clean to prove 409 preserves all catalogue and user state.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
+		VALUES ($1, 'vol-clean', '{"type":"page","page":4}'::jsonb, 0.25, 'KOMGA', false)
+	`, reader.ID); err != nil {
+		t.Fatalf("seed reading_progress: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	doReq := func(method, path, body string, mutate func(*http.Request)) (int, string) {
+		t.Helper()
+		var bodyReader io.Reader
+		if body != "" {
+			bodyReader = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, bodyReader)
+		if err != nil {
+			t.Fatalf("NewRequest(%s %s): %v", method, path, err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if mutate != nil {
+			mutate(req)
+		}
+		return execReq(t, client, req)
+	}
+
+	// Add an empty root to lib-main via the M1B-D1 provisioning route.
+	baseDir := t.TempDir()
+	canonBase, err := paths.CanonicalPath(baseDir)
+	if err != nil {
+		t.Fatalf("CanonicalPath: %v", err)
+	}
+	emptyDir := filepath.Join(canonBase, "empty-root")
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	addCode, addBody := doReq(http.MethodPost, "/api/v1/libraries/lib-main/roots", `{"path":"`+emptyDir+`"}`, func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+	})
+	if addCode != http.StatusCreated {
+		t.Fatalf("POST /roots = %d (%s), want 201", addCode, addBody)
+	}
+	var emptyRoot app.LibraryRoot
+	mustUnmarshal(t, addBody, &emptyRoot)
+
+	// Log in admin for cookie CSRF verification.
+	loginCode, _, sessCookie, csrfToken := func() (int, string, *http.Cookie, string) {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login", strings.NewReader(`{"username":"rmadmin","password":"admin-pass-123"}`))
+		if err != nil {
+			t.Fatalf("NewRequest login: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("login failed: %v", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var ck *http.Cookie
+		for _, c := range resp.Cookies() {
+			if c.Name == app.NativeSessionCookieName {
+				ck = c
+			}
+		}
+		return resp.StatusCode, string(raw), ck, resp.Header.Get("X-CSRF-Token")
+	}()
+	if loginCode != http.StatusOK || sessCookie == nil || csrfToken == "" {
+		t.Fatalf("admin login failed: code=%d cookie=%v csrf=%q", loginCode, sessCookie, csrfToken)
+	}
+
+	// 1. Unauthenticated DELETE returns 401 on direct and subpath routes.
+	for _, p := range []string{
+		"/api/v1/libraries/lib-main/roots/" + emptyRoot.ID,
+		"/comics/api/v1/libraries/lib-main/roots/" + emptyRoot.ID,
+	} {
+		code, _ := doReq(http.MethodDelete, p, "", nil)
+		if code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated DELETE %s = %d, want 401", p, code)
+		}
+	}
+
+	// 2. Missing library:admin or missing CSRF returns 403 and preserves all roots.
+	_, beforeRoots := countLibraryAndRootRows(ctx, t, db)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*http.Request)
+	}{
+		{"reader basic", func(r *http.Request) { r.SetBasicAuth("rmreader", "reader-pass-123") }},
+		{"curator basic", func(r *http.Request) { r.SetBasicAuth("rmcurator", "curator-pass-123") }},
+		{"read PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+readPAT) }},
+		{"cookie without CSRF", func(r *http.Request) { r.AddCookie(sessCookie) }},
+	} {
+		code, body := doReq(http.MethodDelete, "/api/v1/libraries/lib-main/roots/"+emptyRoot.ID, "", tc.mutate)
+		if code != http.StatusForbidden {
+			t.Fatalf("%s DELETE emptyRoot = %d (%s), want 403", tc.name, code, body)
+		}
+	}
+	_, afterDeniedRoots := countLibraryAndRootRows(ctx, t, db)
+	if afterDeniedRoots != beforeRoots {
+		t.Fatalf("denied DELETE mutated roots: before=%d after=%d", beforeRoots, afterDeniedRoots)
+	}
+
+	// 3. Unknown root or mismatched library/root returns 404.
+	for _, p := range []string{
+		"/api/v1/libraries/lib-main/roots/does-not-exist",
+		"/api/v1/libraries/lib-alt/roots/r-main-1",
+	} {
+		code, _ := doReq(http.MethodDelete, p, "", func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if code != http.StatusNotFound {
+			t.Fatalf("DELETE %s = %d, want 404", p, code)
+		}
+	}
+
+	// 4. Removing a root while any asset belongs to it (available, missing, or retired) returns 409
+	//    and preserves the root, assets, volumes, series, and reading_progress.
+	for _, tc := range []struct {
+		name   string
+		rootID string
+		prep   string
+	}{
+		{
+			name:   "available assets",
+			rootID: "r-main-1",
+		},
+		{
+			name:   "missing asset",
+			rootID: "r-main-2",
+			prep:   `UPDATE media_assets SET missing_since = NOW(), retired_at = NULL WHERE id = 'a-raw'`,
+		},
+		{
+			name:   "retired asset",
+			rootID: "r-main-2",
+			prep:   `UPDATE media_assets SET missing_since = NOW() - INTERVAL '10 days', retired_at = NOW() WHERE id = 'a-raw'`,
+		},
+	} {
+		if tc.prep != "" {
+			if _, err := db.Exec(ctx, tc.prep); err != nil {
+				t.Fatalf("prep %s: %v", tc.name, err)
+			}
+		}
+		code, body := doReq(http.MethodDelete, "/api/v1/libraries/lib-main/roots/"+tc.rootID, "", func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+libAdminPAT)
+		})
+		if code != http.StatusConflict {
+			t.Fatalf("DELETE %s (%s) = %d (%s), want 409", tc.rootID, tc.name, code, body)
+		}
+	}
+
+	var assetCount, volCount, serCount, progCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM media_assets WHERE library_root_id IN ('r-main-1', 'r-main-2')`).Scan(&assetCount); err != nil || assetCount != 7 {
+		t.Fatalf("media_assets preserved = (%d, %v), want 7", assetCount, err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM volumes WHERE library_id = 'lib-main'`).Scan(&volCount); err != nil || volCount != 5 {
+		t.Fatalf("volumes preserved = (%d, %v), want 5", volCount, err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM series WHERE library_id = 'lib-main'`).Scan(&serCount); err != nil || serCount != 4 {
+		t.Fatalf("series preserved = (%d, %v), want 4", serCount, err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM reading_progress WHERE user_id = $1 AND volume_id = 'vol-clean'`, reader.ID).Scan(&progCount); err != nil || progCount != 1 {
+		t.Fatalf("reading_progress preserved = (%d, %v), want 1", progCount, err)
+	}
+
+	// 5. Removing an empty root via valid cookie + CSRF on subpath route succeeds with 204.
+	delCode, delBody := doReq(http.MethodDelete, "/comics/api/v1/libraries/lib-main/roots/"+emptyRoot.ID, "", func(r *http.Request) {
+		r.AddCookie(sessCookie)
+		r.Header.Set("X-CSRF-Token", csrfToken)
+	})
+	if delCode != http.StatusNoContent || delBody != "" {
+		t.Fatalf("DELETE emptyRoot = (%d, %q), want (204, empty)", delCode, delBody)
+	}
+	if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryRootByID(ctx, emptyRoot.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected emptyRoot deleted from DB, got %v", err)
+	}
+	_, finalRoots := countLibraryAndRootRows(ctx, t, db)
+	if finalRoots != beforeRoots-1 {
+		t.Fatalf("final roots = %d, want %d", finalRoots, beforeRoots-1)
+	}
+}
