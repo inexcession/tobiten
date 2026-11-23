@@ -388,6 +388,8 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			"/comics/api/v1/libraries",
 			"/api/v1/libraries/lib-1/roots",
 			"/comics/api/v1/libraries/lib-1/roots",
+			"/api/v1/libraries/lib-1/scan",
+			"/comics/api/v1/libraries/lib-1/scan",
 		}
 		for _, path := range protectedPostPaths {
 			resp, err := client.Post(baseURL+path, "application/json", strings.NewReader(`{}`))

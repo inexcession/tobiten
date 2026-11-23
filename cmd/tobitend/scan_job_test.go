@@ -7,10 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/api"
+	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
@@ -1965,5 +1970,599 @@ func TestRunDaemonScanJob_InterruptionsExhaustMaxAttemptsAndFreshTriggerComplete
 	}
 	if missingEvents != 0 {
 		t.Fatalf("asset.missing count = %d, want 0", missingEvents)
+	}
+}
+
+func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
+	originalNewScanner := newDaemonScanner
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonScanner = originalNewScanner
+		slog.SetDefault(originalLogger)
+	})
+
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	// Seed 3 libraries on disk:
+	// - lib1: 2 CBZs, used for active-scan dedupe + creator/jobs:read_all SSE + finish + post-finish re-trigger
+	// - lib2: 3 CBZs, used for HTTP cancel -> CANCELLED (gates on 02.cbz so 01.cbz emits progress first, 03.cbz stays unopened) + automatic scan
+	// - lib3: 1 CBZ, triggered by otherLibAdmin at the end to prove its SSE stream was live with 0 prior leaks
+	baseDir := t.TempDir()
+	root1 := filepath.Join(baseDir, "lib1")
+	root2 := filepath.Join(baseDir, "lib2")
+	root3 := filepath.Join(baseDir, "lib3")
+
+	lib1File1 := filepath.Join(root1, "Horizon/01.cbz")
+	lib1File2 := filepath.Join(root1, "Horizon/02.cbz")
+	lib2File1 := filepath.Join(root2, "CancelSaga/01.cbz")
+	lib2File2 := filepath.Join(root2, "CancelSaga/02.cbz")
+	lib2File3 := filepath.Join(root2, "CancelSaga/03.cbz")
+	lib3File1 := filepath.Join(root3, "Other/01.cbz")
+
+	writeTestFile(t, lib1File1, buildTestCBZ(t, "Horizon", "First", "1"))
+	writeTestFile(t, lib1File2, buildTestCBZ(t, "Horizon", "Second", "2"))
+	writeTestFile(t, lib2File1, buildTestCBZ(t, "CancelSaga", "One", "1"))
+	writeTestFile(t, lib2File2, buildTestCBZ(t, "CancelSaga", "Two", "2"))
+	writeTestFile(t, lib2File3, buildTestCBZ(t, "CancelSaga", "Three", "3"))
+	writeTestFile(t, lib3File1, buildTestCBZ(t, "Other", "One", "1"))
+
+	lib1, _ := seedTestLibrary(ctx, t, db.Pool, "E2E Scan Lib 1", root1)
+	lib2, _ := seedTestLibrary(ctx, t, db.Pool, "E2E Scan Lib 2", root2)
+	lib3, _ := seedTestLibrary(ctx, t, db.Pool, "E2E Scan Lib 3", root3)
+
+	// Gate hooks so we deterministically hold lib1's first scan RUNNING during dedupe/snapshot checks
+	// and hold lib2's first scan RUNNING on 02.cbz during cancel checks without racing fast disk I/O.
+	var gateLib1Once atomic.Bool
+	gateLib1Once.Store(true)
+	lib1Entered := make(chan struct{}, 1)
+	releaseLib1 := make(chan struct{})
+
+	var gateLib2Once atomic.Bool
+	gateLib2Once.Store(true)
+	lib2Entered := make(chan struct{}, 1)
+	releaseLib2 := make(chan struct{})
+	var lib2File3Opened atomic.Bool
+
+	newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
+		return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
+			Open: func(openCtx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				p := string(rawPath)
+				if p == lib1File1 && gateLib1Once.CompareAndSwap(true, false) {
+					select {
+					case lib1Entered <- struct{}{}:
+					default:
+					}
+					select {
+					case <-releaseLib1:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				}
+				if p == lib2File2 && gateLib2Once.CompareAndSwap(true, false) {
+					select {
+					case lib2Entered <- struct{}{}:
+					default:
+					}
+					select {
+					case <-releaseLib2:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				}
+				if p == lib2File3 {
+					lib2File3Opened.Store(true)
+				}
+				return os.Open(p)
+			},
+		})
+	}
+
+	cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron([]string{
+		"TOBITEN_STORAGE_MODE=postgres",
+		"TOBITEN_DATABASE_URL=" + db.URL,
+		"TOBITEN_ADMIN_USER=sysadmin",
+		"TOBITEN_ADMIN_PASS=admin-secret-123",
+		"TOBITEN_BASE_URL=http://localhost:8080/comics",
+		"TOBITEN_LOG_FORMAT=json",
+		"TOBITEN_SCANNER_WORKERS=1",
+	}))
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	dsPtr, _ := captureDaemonAssembly(t)
+	userRepo := postgres.NewUserRepository(db.Pool)
+
+	err = runDaemon(ctx, cfg, func(serveCtx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
+		ds := *dsPtr
+		reg := BuildRegistryWithServices(cfg, services)
+		srv, err := api.NewServer(api.ServerOptions{
+			Config:   cfg,
+			Logger:   logger,
+			Registry: reg,
+		})
+		if err != nil {
+			return err
+		}
+		srvCtx, cancelSrv := context.WithCancel(serveCtx)
+		srvDone := make(chan error, 1)
+		go func() {
+			srvDone <- srv.Run(srvCtx)
+		}()
+		defer func() {
+			cancelSrv()
+			if sErr := <-srvDone; sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+				t.Errorf("srv.Run: %v", sErr)
+			}
+		}()
+
+		baseURL := srv.URL()
+		httpClient := &http.Client{Timeout: 5 * time.Second}
+
+		// Custom roles:
+		// - roleLibAdminNoJobsAll: library:read + library:admin + jobs:cancel_own (NO jobs:read_all!)
+		// - roleJobsReadAllOnly: library:read + jobs:read_all (NO library:admin, NO jobs:cancel_all!)
+		const (
+			roleLibAdminNoJobsAllID = "019318a0-0000-7000-8000-000000000201"
+			roleJobsReadAllOnlyID   = "019318a0-0000-7000-8000-000000000202"
+		)
+		if _, err := db.Exec(serveCtx, `
+			INSERT INTO roles (id, name, built_in, requires_allow_labels) VALUES
+				($1, 'Library Admin No ReadAll', FALSE, FALSE),
+				($2, 'Jobs ReadAll Only', FALSE, FALSE)
+		`, roleLibAdminNoJobsAllID, roleJobsReadAllOnlyID); err != nil {
+			return err
+		}
+		if _, err := db.Exec(serveCtx, `
+			INSERT INTO role_permissions (role_id, permission) VALUES
+				($1, 'library:read'), ($1, 'library:admin'), ($1, 'jobs:cancel_own'),
+				($2, 'library:read'), ($2, 'jobs:read_all')
+		`, roleLibAdminNoJobsAllID, roleJobsReadAllOnlyID); err != nil {
+			return err
+		}
+
+		sysadmin, err := userRepo.GetUserByUsername(serveCtx, "sysadmin")
+		if err != nil {
+			return err
+		}
+		creator := createTestUserWithPassword(serveCtx, t, userRepo, "scan-creator", "creator-pass-123", roleLibAdminNoJobsAllID)
+		otherLibAdmin := createTestUserWithPassword(serveCtx, t, userRepo, "scan-other", "other-pass-123", roleLibAdminNoJobsAllID)
+		auditor := createTestUserWithPassword(serveCtx, t, userRepo, "scan-auditor", "auditor-pass-123", roleJobsReadAllOnlyID)
+		reader := createTestUserWithPassword(serveCtx, t, userRepo, "scan-reader", "reader-pass-123", domain.RoleReaderID)
+		curator := createTestUserWithPassword(serveCtx, t, userRepo, "scan-curator", "curator-pass-123", domain.RoleCuratorID)
+
+		sysReadPAT := createTestPAT(serveCtx, t, userRepo, sysadmin.ID, []domain.PATScope{domain.ScopeRead})
+		sysLibAdminPAT := createTestPAT(serveCtx, t, userRepo, sysadmin.ID, []domain.PATScope{domain.ScopeLibraryAdmin})
+		sysAdminPAT := createTestPAT(serveCtx, t, userRepo, sysadmin.ID, []domain.PATScope{domain.ScopeAdmin})
+
+		doReq := func(method, path string, mutate func(*http.Request)) (int, http.Header, string) {
+			req, reqErr := http.NewRequestWithContext(serveCtx, method, baseURL+path, nil)
+			if reqErr != nil {
+				t.Fatalf("NewRequest(%s %s): %v", method, path, reqErr)
+			}
+			if mutate != nil {
+				mutate(req)
+			}
+			resp, doErr := httpClient.Do(req)
+			if doErr != nil {
+				t.Fatalf("%s %s: %v", method, path, doErr)
+			}
+			defer resp.Body.Close()
+			raw, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				t.Fatalf("ReadAll(%s %s): %v", method, path, readErr)
+			}
+			return resp.StatusCode, resp.Header, string(raw)
+		}
+
+		// Cookie session login for creator to test CSRF enforcement and valid cookie-triggered scan.
+		loginReq, err := http.NewRequestWithContext(serveCtx, http.MethodPost, baseURL+"/api/v1/auth/login",
+			strings.NewReader(`{"username":"scan-creator","password":"creator-pass-123"}`))
+		if err != nil {
+			return err
+		}
+		loginReq.Header.Set("Content-Type", "application/json")
+		loginResp, err := httpClient.Do(loginReq)
+		if err != nil {
+			return err
+		}
+		_ = loginResp.Body.Close()
+		if loginResp.StatusCode != http.StatusOK {
+			return fmt.Errorf("creator login = %d, want 200", loginResp.StatusCode)
+		}
+		var creatorCookie *http.Cookie
+		for _, c := range loginResp.Cookies() {
+			if c.Name == app.NativeSessionCookieName {
+				creatorCookie = c
+			}
+		}
+		creatorCSRF := loginResp.Header.Get("X-CSRF-Token")
+		if creatorCookie == nil || creatorCSRF == "" {
+			return errors.New("missing session cookie or CSRF token")
+		}
+
+		// 1. Unauthenticated POST /scan returns 401 (direct + subpath).
+		for _, p := range []string{
+			"/api/v1/libraries/" + lib1.ID + "/scan",
+			"/comics/api/v1/libraries/" + lib1.ID + "/scan",
+		} {
+			code, hdr, _ := doReq(http.MethodPost, p, nil)
+			if code != http.StatusUnauthorized || !strings.HasPrefix(hdr.Get("WWW-Authenticate"), "Basic") {
+				return fmt.Errorf("unauthenticated POST %s = (%d, WWW-Authenticate=%q), want (401, Basic)", p, code, hdr.Get("WWW-Authenticate"))
+			}
+		}
+
+		// 2. Missing library:admin returns 403 and writes no job rows; cookie without CSRF returns 403.
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"reader basic", func(r *http.Request) { r.SetBasicAuth(reader.Username, "reader-pass-123") }},
+			{"curator basic", func(r *http.Request) { r.SetBasicAuth(curator.Username, "curator-pass-123") }},
+			{"auditor jobs:read_all basic", func(r *http.Request) { r.SetBasicAuth(auditor.Username, "auditor-pass-123") }},
+			{"sysadmin read PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+sysReadPAT) }},
+			{"cookie without CSRF", func(r *http.Request) { r.AddCookie(creatorCookie) }},
+		} {
+			code, _, body := doReq(http.MethodPost, "/api/v1/libraries/"+lib1.ID+"/scan", tc.mutate)
+			if code != http.StatusForbidden {
+				return fmt.Errorf("%s POST /scan = %d (%s), want 403", tc.name, code, body)
+			}
+		}
+
+		// 3. Unknown library returns 404 and writes no job row.
+		code404, _, _ := doReq(http.MethodPost, "/api/v1/libraries/unknown-library-id/scan", func(r *http.Request) {
+			r.SetBasicAuth(creator.Username, "creator-pass-123")
+		})
+		if code404 != http.StatusNotFound {
+			return fmt.Errorf("unknown library POST /scan = %d, want 404", code404)
+		}
+		var preJobs int
+		if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM jobs`).Scan(&preJobs); err != nil {
+			return err
+		}
+		if preJobs != 0 {
+			return fmt.Errorf("expected 0 jobs after denied/404 requests, got %d", preJobs)
+		}
+
+		// 4. Open live SSE streams before triggering scans:
+		//    - creatorStream (creator: no jobs:read_all)
+		//    - auditorStream (auditor: jobs:read_all)
+		//    - otherStream (otherLibAdmin: no jobs:read_all)
+		creatorStream := openSSEStream(t, baseURL+"/api/v1/events", creator.Username, "creator-pass-123", "")
+		auditorStream := openSSEStream(t, baseURL+"/comics/api/v1/events", auditor.Username, "auditor-pass-123", "")
+		otherStream := openSSEStream(t, baseURL+"/api/v1/events", otherLibAdmin.Username, "other-pass-123", "")
+		defer func() {
+			creatorStream.close()
+			auditorStream.close()
+			otherStream.close()
+		}()
+
+		// 5. Creator triggers lib1 scan -> 202 with job_id; repeated requests while RUNNING return the same job_id.
+		trigCode, trigHdr, trigBody := doReq(http.MethodPost, "/comics/api/v1/libraries/"+lib1.ID+"/scan", func(r *http.Request) {
+			r.SetBasicAuth(creator.Username, "creator-pass-123")
+		})
+		if trigCode != http.StatusAccepted {
+			return fmt.Errorf("creator POST /scan = %d (%s), want 202", trigCode, trigBody)
+		}
+		if trigHdr.Get("Cache-Control") != "no-store" {
+			return fmt.Errorf("POST /scan Cache-Control = %q, want no-store", trigHdr.Get("Cache-Control"))
+		}
+		var trigResp middleware.JobAcceptedResponse
+		mustUnmarshal(t, trigBody, &trigResp)
+		if trigResp.JobID == "" {
+			return errors.New("expected non-empty job_id from POST /scan")
+		}
+		jobID1 := trigResp.JobID
+
+		// Wait until worker is actively inside lib1File1.
+		select {
+		case <-lib1Entered:
+		case <-time.After(10 * time.Second):
+			return errors.New("timed out waiting for lib1 scan to enter RUNNING")
+		}
+
+		// Repeated triggers while active return the exact same job_id (for both creator and another library:admin principal).
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"creator repeat", func(r *http.Request) { r.SetBasicAuth(creator.Username, "creator-pass-123") }},
+			{"sysadmin library:admin PAT repeat", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+sysLibAdminPAT) }},
+		} {
+			dupCode, _, dupBody := doReq(http.MethodPost, "/api/v1/libraries/"+lib1.ID+"/scan", tc.mutate)
+			if dupCode != http.StatusAccepted {
+				return fmt.Errorf("%s POST /scan = %d (%s), want 202", tc.name, dupCode, dupBody)
+			}
+			var dupResp middleware.JobAcceptedResponse
+			mustUnmarshal(t, dupBody, &dupResp)
+			if dupResp.JobID != jobID1 {
+				return fmt.Errorf("%s returned job_id=%q, want %q", tc.name, dupResp.JobID, jobID1)
+			}
+		}
+
+		// GET /api/v1/jobs/{job_id}: creator and jobs:read_all see RUNNING snapshot; another user gets 404.
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"creator", func(r *http.Request) { r.SetBasicAuth(creator.Username, "creator-pass-123") }},
+			{"auditor", func(r *http.Request) { r.SetBasicAuth(auditor.Username, "auditor-pass-123") }},
+		} {
+			c, _, b := doReq(http.MethodGet, "/api/v1/jobs/"+jobID1, tc.mutate)
+			if c != http.StatusOK {
+				return fmt.Errorf("%s GET /jobs/%s = %d (%s), want 200", tc.name, jobID1, c, b)
+			}
+			var info app.JobInfo
+			mustUnmarshal(t, b, &info)
+			if info.ID != jobID1 || info.Kind != string(domain.JobKindScan) || info.State != string(domain.JobStateRunning) ||
+				info.CreatedBy == nil || *info.CreatedBy != creator.ID {
+				return fmt.Errorf("%s GET /jobs/%s snapshot = %+v", tc.name, jobID1, info)
+			}
+		}
+		if c, _, _ := doReq(http.MethodGet, "/api/v1/jobs/"+jobID1, func(r *http.Request) {
+			r.SetBasicAuth(otherLibAdmin.Username, "other-pass-123")
+		}); c != http.StatusNotFound {
+			return fmt.Errorf("non-creator GET /jobs/%s = %d, want 404", jobID1, c)
+		}
+
+		// Release lib1 scan to complete both files and verify SSE lifecycle + ephemeral job.progress on creator & auditor.
+		close(releaseLib1)
+
+		collectScanFrames := func(stream *sseClientStream, who, wantJobID, wantTerminal string) error {
+			var lifecycle []sseFrame
+			var sawProgress bool
+			for len(lifecycle) < 2 || !sawProgress {
+				f := stream.nextFrame(t)
+				if f.Event == domain.ProgressTickEventName {
+					if f.ID != "" {
+						return fmt.Errorf("%s progress frame carried SSE ID %q, want empty", who, f.ID)
+					}
+					var tick domain.JobProgressTick
+					mustUnmarshal(t, f.Data, &tick)
+					if tick.JobID != wantJobID || tick.ScannedCount < 1 || tick.CurrentPath == "" {
+						return fmt.Errorf("%s unexpected progress tick for %s: %+v", who, wantJobID, tick)
+					}
+					sawProgress = true
+					continue
+				}
+				var pub app.PublicEvent
+				mustUnmarshal(t, f.Data, &pub)
+				if pub.AggregateID != wantJobID {
+					return fmt.Errorf("%s received event for job %q (%s), want %q", who, pub.AggregateID, f.Event, wantJobID)
+				}
+				seq, convErr := strconv.ParseInt(f.ID, 10, 64)
+				if convErr != nil || seq != pub.Sequence || seq <= 0 {
+					return fmt.Errorf("%s invalid SSE id=%q vs seq=%d", who, f.ID, pub.Sequence)
+				}
+				lifecycle = append(lifecycle, f)
+			}
+			if lifecycle[0].Event != string(domain.EventJobStarted) || lifecycle[1].Event != wantTerminal {
+				return fmt.Errorf("%s events for %s = [%s %s], want [job.started %s]", who, wantJobID, lifecycle[0].Event, lifecycle[1].Event, wantTerminal)
+			}
+			s0, _ := strconv.ParseInt(lifecycle[0].ID, 10, 64)
+			s1, _ := strconv.ParseInt(lifecycle[1].ID, 10, 64)
+			if s0 >= s1 {
+				return fmt.Errorf("%s sequence order = [%d %d], want increasing", who, s0, s1)
+			}
+			return nil
+		}
+
+		if err := collectScanFrames(creatorStream, "creator", jobID1, string(domain.EventJobFinished)); err != nil {
+			return err
+		}
+		if err := collectScanFrames(auditorStream, "auditor", jobID1, string(domain.EventJobFinished)); err != nil {
+			return err
+		}
+
+		// GET /api/v1/jobs/{job_id} reflects persisted SUCCEEDED snapshot.
+		getSuccCode, _, getSuccBody := doReq(http.MethodGet, "/api/v1/jobs/"+jobID1, func(r *http.Request) {
+			r.SetBasicAuth(creator.Username, "creator-pass-123")
+		})
+		if getSuccCode != http.StatusOK {
+			return fmt.Errorf("GET finished job = %d (%s), want 200", getSuccCode, getSuccBody)
+		}
+		var succInfo app.JobInfo
+		mustUnmarshal(t, getSuccBody, &succInfo)
+		if succInfo.State != string(domain.JobStateSucceeded) || succInfo.FinishedAt == nil {
+			return fmt.Errorf("finished job snapshot = %+v, want SUCCEEDED with finished_at", succInfo)
+		}
+
+		// 6. Trigger lib2 scan via cookie + CSRF, wait for 01.cbz progress + 02.cbz gate, then cancel via POST /api/v1/jobs/{job_id}/cancel -> CANCELLED.
+		codeLib2, _, bodyLib2 := doReq(http.MethodPost, "/api/v1/libraries/"+lib2.ID+"/scan", func(r *http.Request) {
+			r.AddCookie(creatorCookie)
+			r.Header.Set("X-CSRF-Token", creatorCSRF)
+		})
+		if codeLib2 != http.StatusAccepted {
+			return fmt.Errorf("cookie POST /scan(lib2) = %d (%s), want 202", codeLib2, bodyLib2)
+		}
+		var respLib2 middleware.JobAcceptedResponse
+		mustUnmarshal(t, bodyLib2, &respLib2)
+		jobID2 := respLib2.JobID
+
+		select {
+		case <-lib2Entered:
+		case <-time.After(10 * time.Second):
+			return errors.New("timed out waiting for lib2 scan to enter 02.cbz")
+		}
+
+		// Ensure job.started and 01.cbz's job.progress are observed before cancelling so no progress tick
+		// trails into subsequent SSE checks.
+		waitStartedAndProgress := func(stream *sseClientStream, who string) error {
+			var sawStarted, sawProgress bool
+			for !sawStarted || !sawProgress {
+				f := stream.nextFrame(t)
+				if f.Event == domain.ProgressTickEventName {
+					if f.ID != "" {
+						return fmt.Errorf("%s lib2 progress carried SSE ID %q", who, f.ID)
+					}
+					var tick domain.JobProgressTick
+					mustUnmarshal(t, f.Data, &tick)
+					if tick.JobID != jobID2 {
+						return fmt.Errorf("%s lib2 progress job_id = %q, want %q", who, tick.JobID, jobID2)
+					}
+					sawProgress = true
+					continue
+				}
+				var pub app.PublicEvent
+				mustUnmarshal(t, f.Data, &pub)
+				if pub.AggregateID != jobID2 || f.Event != string(domain.EventJobStarted) {
+					return fmt.Errorf("%s unexpected pre-cancel event (%s, %q), want (job.started, %q)", who, f.Event, pub.AggregateID, jobID2)
+				}
+				sawStarted = true
+			}
+			return nil
+		}
+		if err := waitStartedAndProgress(creatorStream, "creator"); err != nil {
+			return err
+		}
+		if err := waitStartedAndProgress(auditorStream, "auditor"); err != nil {
+			return err
+		}
+
+		// Non-creator cannot cancel (404); auditor without jobs:cancel_all gets 403; creator cancels (200).
+		if c, _, _ := doReq(http.MethodPost, "/api/v1/jobs/"+jobID2+"/cancel", func(r *http.Request) {
+			r.SetBasicAuth(otherLibAdmin.Username, "other-pass-123")
+		}); c != http.StatusNotFound {
+			return fmt.Errorf("non-creator cancel = %d, want 404", c)
+		}
+		if c, _, _ := doReq(http.MethodPost, "/api/v1/jobs/"+jobID2+"/cancel", func(r *http.Request) {
+			r.SetBasicAuth(auditor.Username, "auditor-pass-123")
+		}); c != http.StatusForbidden {
+			return fmt.Errorf("auditor (no cancel_all) cancel = %d, want 403", c)
+		}
+		cancelCode, _, cancelBody := doReq(http.MethodPost, "/comics/api/v1/jobs/"+jobID2+"/cancel", func(r *http.Request) {
+			r.AddCookie(creatorCookie)
+			r.Header.Set("X-CSRF-Token", creatorCSRF)
+		})
+		if cancelCode != http.StatusOK {
+			return fmt.Errorf("creator cancel = %d (%s), want 200", cancelCode, cancelBody)
+		}
+		var cancelSnap app.JobInfo
+		mustUnmarshal(t, cancelBody, &cancelSnap)
+		if !cancelSnap.CancelRequested {
+			return fmt.Errorf("cancel snapshot = %+v, want cancel_requested=true", cancelSnap)
+		}
+
+		close(releaseLib2)
+
+		waitCancelledSSE := func(stream *sseClientStream, who string) error {
+			for {
+				f := stream.nextFrame(t)
+				if f.Event == domain.ProgressTickEventName {
+					if f.ID != "" {
+						return fmt.Errorf("%s cancel progress carried SSE ID %q", who, f.ID)
+					}
+					var tick domain.JobProgressTick
+					mustUnmarshal(t, f.Data, &tick)
+					if tick.JobID != jobID2 {
+						return fmt.Errorf("%s unexpected progress job_id=%q, want %q", who, tick.JobID, jobID2)
+					}
+					continue
+				}
+				var pub app.PublicEvent
+				mustUnmarshal(t, f.Data, &pub)
+				if pub.AggregateID != jobID2 || f.Event != string(domain.EventJobCancelled) {
+					return fmt.Errorf("%s expected (job.cancelled, %q), got (%s, %q)", who, jobID2, f.Event, pub.AggregateID)
+				}
+				return nil
+			}
+		}
+		if err := waitCancelledSSE(creatorStream, "creator"); err != nil {
+			return err
+		}
+		if err := waitCancelledSSE(auditorStream, "auditor"); err != nil {
+			return err
+		}
+		if lib2File3Opened.Load() {
+			return errors.New("cancelled scan unexpectedly opened third archive CancelSaga/03.cbz")
+		}
+		getCanCode, _, getCanBody := doReq(http.MethodGet, "/api/v1/jobs/"+jobID2, func(r *http.Request) {
+			r.SetBasicAuth(creator.Username, "creator-pass-123")
+		})
+		if getCanCode != http.StatusOK {
+			return fmt.Errorf("GET cancelled job = %d (%s), want 200", getCanCode, getCanBody)
+		}
+		var canInfo app.JobInfo
+		mustUnmarshal(t, getCanBody, &canInfo)
+		if canInfo.State != string(domain.JobStateCancelled) || !canInfo.CancelRequested {
+			return fmt.Errorf("cancelled job snapshot = %+v, want CANCELLED and cancel_requested=true", canInfo)
+		}
+
+		// 7. Automatic scan (created_by NULL) is visible only with jobs:read_all.
+		autoJobID, err := ds.triggerScan(serveCtx, lib2.ID, scanner.TriggerScanOptions{})
+		if err != nil {
+			return fmt.Errorf("trigger automatic scan: %w", err)
+		}
+		if err := collectScanFrames(auditorStream, "auditor(auto)", autoJobID, string(domain.EventJobFinished)); err != nil {
+			return err
+		}
+
+		// GET /api/v1/jobs/{autoJobID}: auditor and admin PAT get 200 with created_by=null; creator/other/reader get 404.
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"auditor", func(r *http.Request) { r.SetBasicAuth(auditor.Username, "auditor-pass-123") }},
+			{"sysadmin admin PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+sysAdminPAT) }},
+		} {
+			c, _, b := doReq(http.MethodGet, "/api/v1/jobs/"+autoJobID, tc.mutate)
+			if c != http.StatusOK {
+				return fmt.Errorf("%s GET automatic job = %d (%s), want 200", tc.name, c, b)
+			}
+			var autoInfo app.JobInfo
+			mustUnmarshal(t, b, &autoInfo)
+			if autoInfo.CreatedBy != nil {
+				return fmt.Errorf("automatic job CreatedBy = %v, want nil", *autoInfo.CreatedBy)
+			}
+		}
+		for _, tc := range []struct {
+			name   string
+			mutate func(*http.Request)
+		}{
+			{"creator(library:admin without jobs:read_all)", func(r *http.Request) { r.SetBasicAuth(creator.Username, "creator-pass-123") }},
+			{"otherLibAdmin", func(r *http.Request) { r.SetBasicAuth(otherLibAdmin.Username, "other-pass-123") }},
+			{"reader", func(r *http.Request) { r.SetBasicAuth(reader.Username, "reader-pass-123") }},
+			{"sysadmin library:admin PAT", func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+sysLibAdminPAT) }},
+		} {
+			c, _, _ := doReq(http.MethodGet, "/api/v1/jobs/"+autoJobID, tc.mutate)
+			if c != http.StatusNotFound {
+				return fmt.Errorf("%s GET automatic job = %d, want 404", tc.name, c)
+			}
+		}
+
+		// 8. Prove creator's SSE stream never received autoJobID and otherStream never received ANY of
+		//    jobID1, jobID2, or autoJobID by triggering one job each for creator and otherLibAdmin and
+		//    asserting their very next SSE lifecycle frames belong exclusively to those new jobs.
+		reTrigCode, _, reTrigBody := doReq(http.MethodPost, "/api/v1/libraries/"+lib1.ID+"/scan", func(r *http.Request) {
+			r.SetBasicAuth(creator.Username, "creator-pass-123")
+		})
+		if reTrigCode != http.StatusAccepted {
+			return fmt.Errorf("post-finish re-trigger = %d (%s), want 202", reTrigCode, reTrigBody)
+		}
+		var reTrigResp middleware.JobAcceptedResponse
+		mustUnmarshal(t, reTrigBody, &reTrigResp)
+		if reTrigResp.JobID == jobID1 {
+			return fmt.Errorf("re-trigger after SUCCEEDED reused %q", jobID1)
+		}
+		if err := collectScanFrames(creatorStream, "creator(re-trigger)", reTrigResp.JobID, string(domain.EventJobFinished)); err != nil {
+			return err
+		}
+
+		otherCode, _, otherBody := doReq(http.MethodPost, "/api/v1/libraries/"+lib3.ID+"/scan", func(r *http.Request) {
+			r.SetBasicAuth(otherLibAdmin.Username, "other-pass-123")
+		})
+		if otherCode != http.StatusAccepted {
+			return fmt.Errorf("otherLibAdmin POST /scan(lib3) = %d (%s), want 202", otherCode, otherBody)
+		}
+		var otherResp middleware.JobAcceptedResponse
+		mustUnmarshal(t, otherBody, &otherResp)
+		return collectScanFrames(otherStream, "otherLibAdmin(first)", otherResp.JobID, string(domain.EventJobFinished))
+	})
+	if err != nil {
+		t.Fatalf("runDaemon err = %v", err)
 	}
 }

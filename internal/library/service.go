@@ -11,22 +11,32 @@ import (
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/storage"
 )
 
 var _ app.LibraryService = (*Service)(nil)
 
-// Service implements app.LibraryService over PostgreSQL repositories inside repeatable-read snapshots.
-type Service struct {
-	readTx storage.ReadTransactor
+// ServiceOptions configures optional runtime dependencies on the library Service.
+type ServiceOptions struct {
+	ScanTrigger scanner.JobTrigger
 }
 
-// NewService constructs a read-only LibraryService backed by readTx.
-func NewService(readTx storage.ReadTransactor) (*Service, error) {
+// Service implements app.LibraryService over PostgreSQL repositories inside repeatable-read snapshots.
+type Service struct {
+	readTx      storage.ReadTransactor
+	scanTrigger scanner.JobTrigger
+}
+
+// NewService constructs a LibraryService backed by readTx and opts.
+func NewService(readTx storage.ReadTransactor, opts ServiceOptions) (*Service, error) {
 	if readTx == nil {
 		return nil, errors.New("library service read transactor cannot be nil")
 	}
-	return &Service{readTx: readTx}, nil
+	return &Service{
+		readTx:      readTx,
+		scanTrigger: opts.ScanTrigger,
+	}, nil
 }
 
 // ListLibraries returns a server-paginated list of libraries with root metadata redacted for non-admins.
@@ -313,9 +323,40 @@ func getCatalogueEntity[DomainT any, DTO any](
 	return out, nil
 }
 
-// ScanLibrary remains unimplemented on LibraryService until M1-T10.7 adds POST /api/v1/libraries/{id}/scan.
-func (s *Service) ScanLibrary(_ context.Context, _ *domain.Principal, _ string) (string, error) {
-	return "", app.ErrNotImplemented
+// ScanLibrary verifies library:admin permission and library existence, then enqueues a
+// deduplicated durable SCAN job created by principal.User.ID (ADR-0017 §§1–2).
+func (s *Service) ScanLibrary(ctx context.Context, principal *domain.Principal, libraryID string) (string, error) {
+	if err := validateReadPrincipal(principal); err != nil {
+		return "", err
+	}
+	if err := app.RequirePermission(principal, domain.PermissionLibraryAdmin); err != nil {
+		return "", err
+	}
+	if _, err := scanner.ScanDedupeKey(libraryID); err != nil {
+		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+	}
+	if s == nil || s.scanTrigger == nil {
+		return "", fmt.Errorf("%w: scan job trigger is unavailable", app.ErrServiceBusy)
+	}
+
+	err := s.withReadTx(ctx, func(tx storage.ReadTx) error {
+		libRepo, err := requireLibraryRepo(tx)
+		if err != nil {
+			return err
+		}
+		if _, err := libRepo.GetLibraryByID(ctx, libraryID); err != nil {
+			return mapServiceError(err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	createdBy := principal.User.ID
+	return scanner.TriggerScan(ctx, s.scanTrigger, libraryID, scanner.TriggerScanOptions{
+		CreatedBy: &createdBy,
+	})
 }
 
 func (s *Service) withReadTx(ctx context.Context, fn func(tx storage.ReadTx) error) error {

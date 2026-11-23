@@ -107,7 +107,7 @@ func TestDaemonLibraryAndCatalogueReadAPI(t *testing.T) {
 	rawDirHex := seedDaemonCatalogueFixture(ctx, t, db.Pool, reader.ID, restricted.ID)
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	t.Run("M1-AC5 closed allowlist and ScanLibrary remains unimplemented", func(t *testing.T) {
+	t.Run("M1-AC5 closed allowlist and unknown library scan returns 404", func(t *testing.T) {
 		for _, p := range []string{
 			"/api/v1/libraries",
 			"/comics/api/v1/libraries/lib-main",
@@ -127,9 +127,23 @@ func TestDaemonLibraryAndCatalogueReadAPI(t *testing.T) {
 			}
 		}
 
+		for _, p := range []string{
+			"/api/v1/libraries/lib-main/scan",
+			"/comics/api/v1/libraries/lib-main/scan",
+		} {
+			resp, err := client.Post(ts.URL+p, "application/json", nil)
+			if err != nil {
+				t.Fatalf("POST %s: %v", p, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated POST %s = %d, want 401", p, resp.StatusCode)
+			}
+		}
+
 		adminPrincipal := domain.NewPrincipal(admin, []domain.Role{{ID: domain.RoleAdminID, Permissions: []domain.Permission{domain.PermissionLibraryAdmin}}}, domain.CredentialKindPassword, "c1", nil)
-		if _, err := daemonSvcs.app.Library.ScanLibrary(ctx, adminPrincipal, "lib-main"); !errors.Is(err, app.ErrNotImplemented) {
-			t.Fatalf("ScanLibrary = %v, want ErrNotImplemented", err)
+		if _, err := daemonSvcs.app.Library.ScanLibrary(ctx, adminPrincipal, "missing-lib"); !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("ScanLibrary(missing-lib) = %v, want ErrNotFound", err)
 		}
 	})
 

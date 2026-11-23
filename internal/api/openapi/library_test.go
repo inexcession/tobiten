@@ -23,8 +23,12 @@ type recordingLibraryService struct {
 	lastGetLibID     string
 	lastGetSeriesID  string
 	lastGetVolumeID  string
+	lastScanLibID    string
+	scanCalls        int
+	scanJobID        string
 	notFound         bool
 	invalidInput     bool
+	serviceBusy      bool
 }
 
 func (r *recordingLibraryService) ListLibraries(_ context.Context, principal *domain.Principal, filter app.LibraryFilter) (*app.LibraryPage, error) {
@@ -133,8 +137,22 @@ func (r *recordingLibraryService) GetVolume(_ context.Context, _ *domain.Princip
 	return &app.Volume{ID: id, LibraryID: "lib-1", Kind: "VOLUME", SeriesID: nil}, nil
 }
 
-func (r *recordingLibraryService) ScanLibrary(context.Context, *domain.Principal, string) (string, error) {
-	return "", app.ErrNotImplemented
+func (r *recordingLibraryService) ScanLibrary(_ context.Context, _ *domain.Principal, libraryID string) (string, error) {
+	r.scanCalls++
+	r.lastScanLibID = libraryID
+	if r.serviceBusy {
+		return "", app.ErrServiceBusy
+	}
+	if r.notFound {
+		return "", app.ErrNotFound
+	}
+	if r.invalidInput {
+		return "", app.ErrInvalidInput
+	}
+	if r.scanJobID != "" {
+		return r.scanJobID, nil
+	}
+	return "job-scan-" + libraryID, nil
 }
 
 func libraryTestPrincipal(perms ...domain.Permission) *domain.Principal {
@@ -819,4 +837,108 @@ func TestLibraryProvisioningRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestLibraryScanRoute_AuthValidationAndResponse(t *testing.T) {
+	recSvc := &recordingLibraryService{scanJobID: "job-scan-42"}
+	mod := NewModule(app.NewAuthorizingServices(&app.Services{Library: recSvc}))
+	modNil := NewModule(nil)
+
+	reader := libraryTestPrincipal(domain.PermissionLibraryRead)
+	admin := libraryTestPrincipal(domain.PermissionLibraryRead, domain.PermissionLibraryAdmin)
+
+	// 1. Unauthenticated -> 401
+	reqUnauth := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-1/scan", nil)
+	recUnauth := httptest.NewRecorder()
+	mod.router.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST /scan = %d, want 401", recUnauth.Code)
+	}
+
+	// 2. Unverified CSRF -> 403
+	reqCSRF := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-1/scan", nil)
+	ctxCSRF := middleware.WithCSRFUnverified(domain.ContextWithPrincipal(reqCSRF.Context(), admin))
+	recCSRF := httptest.NewRecorder()
+	mod.router.ServeHTTP(recCSRF, reqCSRF.WithContext(ctxCSRF))
+	if recCSRF.Code != http.StatusForbidden {
+		t.Fatalf("unverified CSRF POST /scan = %d, want 403", recCSRF.Code)
+	}
+
+	// 3. Missing library:admin -> 403 before {id} validation or service call
+	for _, path := range []string{"/api/v1/libraries/lib-1/scan", "/api/v1/libraries/%20/scan"} {
+		before := recSvc.scanCalls
+		reqNoPerm := httptest.NewRequest(http.MethodPost, path, nil)
+		reqNoPerm = reqNoPerm.WithContext(domain.ContextWithPrincipal(reqNoPerm.Context(), reader))
+		recNoPerm := httptest.NewRecorder()
+		mod.router.ServeHTTP(recNoPerm, reqNoPerm)
+		if recNoPerm.Code != http.StatusForbidden {
+			t.Fatalf("no library:admin POST %s = %d, want 403", path, recNoPerm.Code)
+		}
+		if recSvc.scanCalls != before {
+			t.Fatalf("no library:admin POST %s invoked service", path)
+		}
+	}
+
+	// 4. Nil service -> 503
+	reqUnavail := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-1/scan", nil)
+	reqUnavail = reqUnavail.WithContext(domain.ContextWithPrincipal(reqUnavail.Context(), admin))
+	recUnavail := httptest.NewRecorder()
+	modNil.router.ServeHTTP(recUnavail, reqUnavail)
+	if recUnavail.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil service POST /scan = %d, want 503", recUnavail.Code)
+	}
+
+	// 5. Wrong methods -> 405
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		reqMethod := httptest.NewRequest(method, "/api/v1/libraries/lib-1/scan", nil)
+		reqMethod = reqMethod.WithContext(domain.ContextWithPrincipal(reqMethod.Context(), admin))
+		recMethod := httptest.NewRecorder()
+		mod.router.ServeHTTP(recMethod, reqMethod)
+		if recMethod.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /api/v1/libraries/lib-1/scan = %d, want 405", method, recMethod.Code)
+		}
+	}
+
+	// 6. Blank library ID -> 400 without calling service
+	beforeBlank := recSvc.scanCalls
+	reqBlank := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/%20/scan", nil)
+	reqBlank = reqBlank.WithContext(domain.ContextWithPrincipal(reqBlank.Context(), admin))
+	recBlank := httptest.NewRecorder()
+	mod.router.ServeHTTP(recBlank, reqBlank)
+	if recBlank.Code != http.StatusBadRequest || recSvc.scanCalls != beforeBlank {
+		t.Fatalf("blank ID POST /scan = (%d, calls=%d/%d), want 400 without service call", recBlank.Code, recSvc.scanCalls, beforeBlank)
+	}
+
+	// 7. Unknown library -> 404
+	recSvc.notFound = true
+	req404 := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/missing/scan", nil)
+	req404 = req404.WithContext(domain.ContextWithPrincipal(req404.Context(), admin))
+	rec404 := httptest.NewRecorder()
+	mod.router.ServeHTTP(rec404, req404)
+	if rec404.Code != http.StatusNotFound {
+		t.Fatalf("unknown library POST /scan = %d, want 404", rec404.Code)
+	}
+	recSvc.notFound = false
+
+	// 8. Valid library:admin trigger -> 202 Accepted with {"job_id":"job-scan-42"} and Cache-Control: no-store
+	reqOK := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-42/scan", nil)
+	reqOK = reqOK.WithContext(domain.ContextWithPrincipal(reqOK.Context(), admin))
+	recOK := httptest.NewRecorder()
+	mod.router.ServeHTTP(recOK, reqOK)
+	if recOK.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/v1/libraries/lib-42/scan = %d (%s), want 202", recOK.Code, recOK.Body.String())
+	}
+	if cc := recOK.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("POST /scan Cache-Control = %q, want no-store", cc)
+	}
+	if recSvc.lastScanLibID != "lib-42" {
+		t.Fatalf("lastScanLibID = %q, want lib-42", recSvc.lastScanLibID)
+	}
+	var out middleware.JobAcceptedResponse
+	if err := json.Unmarshal(recOK.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode JobAcceptedResponse: %v", err)
+	}
+	if out.JobID != "job-scan-42" {
+		t.Fatalf("JobID = %q, want job-scan-42", out.JobID)
+	}
 }

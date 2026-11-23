@@ -9,6 +9,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/library"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
@@ -47,7 +48,9 @@ func setupLibraryFixture(t *testing.T) *libraryFixture {
 	}
 
 	transactor := postgres.NewTransactor(tdb.Pool)
-	rawSvc, err := library.NewService(transactor)
+	jobRepo := postgres.NewJobRepository(tdb.Pool)
+	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+	rawSvc, err := library.NewService(transactor, library.ServiceOptions{ScanTrigger: jobSvc})
 	if err != nil {
 		t.Fatalf("library.NewService: %v", err)
 	}
@@ -343,8 +346,43 @@ func TestLibraryService_LibrariesAndAdminRedaction(t *testing.T) {
 	if _, err := f.svc.GetLibrary(ctx, f.reader, "missing-lib"); !errors.Is(err, app.ErrNotFound) {
 		t.Fatalf("GetLibrary(missing) = %v, want ErrNotFound", err)
 	}
-	if _, err := f.svc.ScanLibrary(ctx, f.admin, f.lib1ID); !errors.Is(err, app.ErrNotImplemented) {
-		t.Fatalf("ScanLibrary = %v, want ErrNotImplemented", err)
+
+	// ScanLibrary authorization, validation, 404, trigger, and deduplication.
+	if _, err := f.svc.ScanLibrary(ctx, nil, f.lib1ID); !errors.Is(err, app.ErrUnauthorized) {
+		t.Fatalf("ScanLibrary(nil) = %v, want ErrUnauthorized", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.reader, f.lib1ID); !errors.Is(err, app.ErrForbidden) {
+		t.Fatalf("ScanLibrary(reader) = %v, want ErrForbidden", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.admin, "   "); !errors.Is(err, app.ErrInvalidInput) {
+		t.Fatalf("ScanLibrary(blank) = %v, want ErrInvalidInput", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.admin, "missing-lib"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("ScanLibrary(missing-lib) = %v, want ErrNotFound", err)
+	}
+
+	rawNoTrigger, err := library.NewService(postgres.NewTransactor(f.tdb.Pool), library.ServiceOptions{})
+	if err != nil {
+		t.Fatalf("library.NewService(no trigger): %v", err)
+	}
+	if _, err := rawNoTrigger.ScanLibrary(ctx, f.admin, f.lib1ID); !errors.Is(err, app.ErrServiceBusy) {
+		t.Fatalf("ScanLibrary(nil trigger) = %v, want ErrServiceBusy", err)
+	}
+
+	jobID1, err := f.svc.ScanLibrary(ctx, f.admin, f.lib1ID)
+	if err != nil || jobID1 == "" {
+		t.Fatalf("ScanLibrary(admin, lib1) = (%q, %v)", jobID1, err)
+	}
+	jobID2, err := f.svc.ScanLibrary(ctx, f.admin, f.lib1ID)
+	if err != nil || jobID2 != jobID1 {
+		t.Fatalf("duplicate ScanLibrary = (%q, %v), want %q", jobID2, err, jobID1)
+	}
+	persistedJob, err := postgres.NewJobRepository(f.tdb.Pool).GetJobByID(ctx, jobID1)
+	if err != nil {
+		t.Fatalf("GetJobByID(%s): %v", jobID1, err)
+	}
+	if persistedJob.Kind != domain.JobKindScan || persistedJob.CreatedBy == nil || *persistedJob.CreatedBy != f.admin.User.ID {
+		t.Fatalf("persisted scan job = %+v, want kind=SCAN created_by=%q", persistedJob, f.admin.User.ID)
 	}
 }
 

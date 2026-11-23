@@ -499,8 +499,11 @@ func newDaemonServices(
 	}
 	eventRepo := postgres.NewEventRepository(pool)
 	jobRepo := postgres.NewJobRepository(pool)
+	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 	transactor := postgres.NewTransactor(pool)
-	libraryService, err := library.NewService(transactor)
+	libraryService, err := library.NewService(transactor, library.ServiceOptions{
+		ScanTrigger: jobService,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +521,6 @@ func newDaemonServices(
 	if err != nil {
 		return nil, err
 	}
-	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
 	eventService := events.NewStreamService(eventRepo, jobRepo, events.StreamOptions{
 		Users:    userRepo,
 		Sessions: sessionRepo,

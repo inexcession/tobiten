@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -250,7 +251,11 @@ func (m *Module) preparePrincipalPermission(w http.ResponseWriter, r *http.Reque
 }
 
 func (m *Module) prepareLibraryRequest(w http.ResponseWriter, r *http.Request) (*domain.Principal, app.LibraryService, bool) {
-	p, ok := m.preparePrincipalPermission(w, r, domain.PermissionLibraryRead)
+	return m.prepareLibraryServiceRequest(w, r, domain.PermissionLibraryRead)
+}
+
+func (m *Module) prepareLibraryServiceRequest(w http.ResponseWriter, r *http.Request, perm domain.Permission) (*domain.Principal, app.LibraryService, bool) {
+	p, ok := m.preparePrincipalPermission(w, r, perm)
 	if !ok {
 		return nil, nil, false
 	}
@@ -414,6 +419,21 @@ func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, app.LibraryRootFromDomain(*root, p))
+}
+
+func (m *Module) handleScanLibrary(w http.ResponseWriter, r *http.Request) {
+	p, svc, ok := m.prepareLibraryServiceRequest(w, r, domain.PermissionLibraryAdmin)
+	if !ok {
+		return
+	}
+	id, err := requireIDParam(r)
+	if err != nil {
+		middleware.WriteAppError(w, r, err)
+		return
+	}
+	middleware.HandleJobTrigger(w, r, func(ctx context.Context) (string, error) {
+		return svc.ScanLibrary(ctx, p, id)
+	})
 }
 
 func buildCreateLibraryRequest(body createLibraryHTTPRequest) (app.CreateLibraryRequest, error) {
