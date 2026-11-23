@@ -1542,3 +1542,94 @@ func TestRunner_SettlesCommittedReconcilerOutcomeWhenHandlerReturnsError(t *test
 		})
 	}
 }
+
+type staleUnlockedReadJobRepo struct {
+	storage.JobRepository
+	targetID      string
+	unlockedReads atomic.Int32
+	failCalls     atomic.Int32
+}
+
+func (s *staleUnlockedReadJobRepo) GetJobByID(ctx context.Context, id string) (*domain.Job, error) {
+	if id == s.targetID {
+		s.unlockedReads.Add(1)
+		got, err := s.JobRepository.GetJobByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		// Simulate an unlocked snapshot that has not observed the committed checkpoint yet.
+		stale := *got
+		stale.Checkpoint = json.RawMessage(`{}`)
+		return &stale, nil
+	}
+	return s.JobRepository.GetJobByID(ctx, id)
+}
+
+func (s *staleUnlockedReadJobRepo) FailOrRetry(ctx context.Context, id string, attempt int, errMsg string, retryAt time.Time, now time.Time) (*domain.Job, error) {
+	s.failCalls.Add(1)
+	return s.JobRepository.FailOrRetry(ctx, id, attempt, errMsg, retryAt, now)
+}
+
+func TestRunner_ResolvesCheckpointUnderOutcomeLockEvenIfUnlockedReadIsStale(t *testing.T) {
+	t.Parallel()
+	_, baseRepo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 23, 5, 0, 0, 0, time.UTC)
+	j := &domain.Job{
+		Kind:        domain.JobKindRelocateRoot,
+		DedupeKey:   new("relocate-locked-cp-" + domain.MustNewID()),
+		MaxAttempts: 3,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	if _, err := baseRepo.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	wrapped := &staleUnlockedReadJobRepo{JobRepository: baseRepo, targetID: j.ID}
+	runner := jobs.NewRunner(wrapped, jobs.RunnerOptions{Now: func() time.Time { return t0 }})
+	if err := runner.RegisterKind(jobs.KindConfig{
+		Kind:         domain.JobKindRelocateRoot,
+		ResumePolicy: domain.JobResumeRestart,
+		Handler: jobs.HandlerFunc(func(runCtx context.Context, exec *jobs.Execution) error {
+			if err := exec.SaveCheckpoint(runCtx, json.RawMessage(`{"committed":true}`)); err != nil {
+				return err
+			}
+			return errors.New("lost commit ack")
+		}),
+		Reconciler: jobs.ReconcileFunc(func(_ context.Context, got domain.Job) (jobs.ReconcileOutcome, error) {
+			var cp struct {
+				Committed bool `json:"committed"`
+			}
+			if len(got.Checkpoint) > 0 && json.Unmarshal(got.Checkpoint, &cp) == nil && cp.Committed {
+				return jobs.ReconcileOutcome{Action: jobs.ReconcileSucceeded}, nil
+			}
+			return jobs.ReconcileOutcome{Action: jobs.ReconcileRequeue}, nil
+		}),
+	}); err != nil {
+		t.Fatalf("RegisterKind: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if wrapped.failCalls.Load() != 0 {
+		t.Fatalf("FailOrRetry called %d times, want 0", wrapped.failCalls.Load())
+	}
+	if wrapped.unlockedReads.Load() != 0 {
+		t.Fatalf("unlocked GetJobByID called %d times during outcome settlement, want 0", wrapped.unlockedReads.Load())
+	}
+	got, err := baseRepo.GetJobByID(ctx, j.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
+		t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
+	}
+}

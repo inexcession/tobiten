@@ -824,94 +824,204 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, job *domain.Job, runErr error) error {
 	now := r.now().UTC()
 	settled := *job
-
-	var reconciledCheckpoint json.RawMessage
-	if runErr != nil && cfg.Reconciler != nil {
-		outcome, committed, err := r.reconcileCommittedSuccessBeforeFailure(ctx, cfg.Reconciler, job)
-		if err != nil {
-			return err
-		}
-		if committed {
-			runErr = nil
-			reconciledCheckpoint = outcome.Checkpoint
-		}
-	}
+	settledAsSucceeded := runErr == nil
 
 	var (
 		label      string
-		writeFn    func(context.Context) (*domain.Job, error)
+		writeFn    func(context.Context) error
 		isResolved func(*domain.Job) bool
 	)
 
-	switch {
-	case runErr == nil:
-		label = "marking succeeded"
-		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
-			if len(reconciledCheckpoint) > 0 {
-				return r.repo.RecoverSucceeded(writeCtx, job.ID, job.Attempts, reconciledCheckpoint, now)
-			}
-			return r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
-		}
-		isResolved = func(row *domain.Job) bool {
-			return (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
-		}
-	case errors.Is(runErr, ErrJobCancelled):
-		msg := runErr.Error()
-		label = "marking cancelled"
-		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
-			return r.repo.MarkCancelled(writeCtx, job.ID, job.Attempts, &msg, now)
-		}
-		isResolved = func(row *domain.Job) bool {
-			return (row.State == domain.JobStateCancelled && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
-		}
-	case errors.Is(runErr, ErrPermanentFailure):
-		label = "marking permanently failed"
-		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
-			return r.repo.MarkFailed(writeCtx, job.ID, job.Attempts, runErr.Error(), now)
-		}
-		isResolved = func(row *domain.Job) bool {
-			return ((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) || row.Attempts > job.Attempts
-		}
-	default:
-		label = "recording failure"
-		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
-			return r.repo.FailOrRetry(writeCtx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now)
-		}
-		isResolved = func(row *domain.Job) bool {
-			return (row.State == domain.JobStateQueued && row.Attempts == job.Attempts) ||
-				((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= job.Attempts) ||
-				row.Attempts > job.Attempts
-		}
+	if runErr != nil && cfg.Reconciler != nil {
+		label, writeFn, isResolved = reconciledOutcomePersistence(
+			r.repo, cfg.Reconciler, job, runErr, now, &settled, &settledAsSucceeded,
+		)
+	} else {
+		label, writeFn, isResolved = directOutcomePersistence(r.repo, job, runErr, now, &settled)
 	}
 
-	err := r.persistOutcomeWithRetry(
-		ctx,
-		job,
-		label,
-		func(writeCtx context.Context) error {
-			updated, err := writeFn(writeCtx)
-			if err == nil && updated != nil {
-				settled = *updated
-			}
-			return err
-		},
-		func(row *domain.Job) bool {
-			ok := isResolved(row)
-			if ok {
-				settled = *row
-			}
-			return ok
-		},
-	)
+	err := r.persistOutcomeWithRetry(ctx, job, label, writeFn, isResolved)
 	if err != nil {
 		return err
 	}
 
 	r.notifyTransition(settled)
-	if runErr == nil && cfg.OnSucceeded != nil {
+	if settledAsSucceeded && cfg.OnSucceeded != nil {
 		cfg.OnSucceeded(ctx, settled)
 	}
 	return nil
+}
+
+func reconciledOutcomePersistence(
+	repo storage.JobRepository,
+	reconciler Reconciler,
+	job *domain.Job,
+	runErr error,
+	now time.Time,
+	settled *domain.Job,
+	settledAsSucceeded *bool,
+) (string, func(context.Context) error, func(*domain.Job) bool) {
+	writeFn := func(writeCtx context.Context) error {
+		return repo.WithTx(writeCtx, func(txRepo storage.JobRepository) error {
+			updated, succeeded, err := settleLockedOutcomeTx(writeCtx, txRepo, reconciler, job, runErr, now)
+			if err != nil {
+				return err
+			}
+			if updated != nil {
+				*settled = *updated
+			}
+			*settledAsSucceeded = succeeded
+			return nil
+		})
+	}
+	isResolved := func(row *domain.Job) bool {
+		if row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts {
+			*settled = *row
+			*settledAsSucceeded = true
+			return true
+		}
+		if failureOutcomeResolved(row, job.Attempts, runErr) {
+			*settled = *row
+			*settledAsSucceeded = false
+			return true
+		}
+		return false
+	}
+	return "reconciling and recording outcome", writeFn, isResolved
+}
+
+func settleLockedOutcomeTx(
+	ctx context.Context,
+	txRepo storage.JobRepository,
+	reconciler Reconciler,
+	job *domain.Job,
+	runErr error,
+	now time.Time,
+) (*domain.Job, bool, error) {
+	row, err := txRepo.GetJobByIDForUpdate(ctx, job.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if row.State != domain.JobStateRunning {
+		return nil, false, fmt.Errorf("%w: job %q is in state %s (expected RUNNING)", domain.ErrInvalidJobTransition, job.ID, row.State)
+	}
+	if row.Attempts != job.Attempts {
+		return nil, false, fmt.Errorf("%w: job %q expected attempt %d, got %d", domain.ErrStaleJobAttempt, job.ID, job.Attempts, row.Attempts)
+	}
+
+	outcome, err := reconciler.Reconcile(ctx, *row)
+	if err != nil {
+		return nil, false, err
+	}
+	if outcome.Action == ReconcileSucceeded {
+		updated, markErr := persistReconciledSuccess(ctx, txRepo, job.ID, job.Attempts, outcome.Checkpoint, now)
+		return updated, true, markErr
+	}
+	updated, failErr := persistFailureOutcome(ctx, txRepo, job.ID, job.Attempts, runErr, now)
+	return updated, false, failErr
+}
+
+func directOutcomePersistence(
+	repo storage.JobRepository,
+	job *domain.Job,
+	runErr error,
+	now time.Time,
+	settled *domain.Job,
+) (string, func(context.Context) error, func(*domain.Job) bool) {
+	var label string
+	var call func(context.Context) (*domain.Job, error)
+	switch {
+	case runErr == nil:
+		label = "marking succeeded"
+		call = func(writeCtx context.Context) (*domain.Job, error) {
+			return repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
+		}
+	case errors.Is(runErr, ErrJobCancelled):
+		label = "marking cancelled"
+		call = func(writeCtx context.Context) (*domain.Job, error) {
+			msg := runErr.Error()
+			return repo.MarkCancelled(writeCtx, job.ID, job.Attempts, &msg, now)
+		}
+	case errors.Is(runErr, ErrPermanentFailure):
+		label = "marking permanently failed"
+		call = func(writeCtx context.Context) (*domain.Job, error) {
+			return repo.MarkFailed(writeCtx, job.ID, job.Attempts, runErr.Error(), now)
+		}
+	default:
+		label = "recording failure"
+		call = func(writeCtx context.Context) (*domain.Job, error) {
+			return repo.FailOrRetry(writeCtx, job.ID, job.Attempts, runErr.Error(), time.Time{}, now)
+		}
+	}
+
+	writeFn := func(writeCtx context.Context) error {
+		updated, err := call(writeCtx)
+		if err == nil && updated != nil {
+			*settled = *updated
+		}
+		return err
+	}
+	isResolved := func(row *domain.Job) bool {
+		var ok bool
+		if runErr == nil {
+			ok = (row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts) || row.Attempts > job.Attempts
+		} else {
+			ok = failureOutcomeResolved(row, job.Attempts, runErr)
+		}
+		if ok {
+			*settled = *row
+		}
+		return ok
+	}
+	return label, writeFn, isResolved
+}
+
+func persistReconciledSuccess(
+	ctx context.Context,
+	repo storage.JobRepository,
+	jobID string,
+	attempt int,
+	checkpoint json.RawMessage,
+	now time.Time,
+) (*domain.Job, error) {
+	if len(checkpoint) > 0 {
+		return repo.RecoverSucceeded(ctx, jobID, attempt, checkpoint, now)
+	}
+	return repo.MarkSucceeded(ctx, jobID, attempt, now)
+}
+
+func persistFailureOutcome(
+	ctx context.Context,
+	repo storage.JobRepository,
+	jobID string,
+	attempt int,
+	runErr error,
+	now time.Time,
+) (*domain.Job, error) {
+	switch {
+	case errors.Is(runErr, ErrJobCancelled):
+		msg := runErr.Error()
+		return repo.MarkCancelled(ctx, jobID, attempt, &msg, now)
+	case errors.Is(runErr, ErrPermanentFailure):
+		return repo.MarkFailed(ctx, jobID, attempt, runErr.Error(), now)
+	default:
+		return repo.FailOrRetry(ctx, jobID, attempt, runErr.Error(), time.Time{}, now)
+	}
+}
+
+func failureOutcomeResolved(row *domain.Job, attempt int, runErr error) bool {
+	if row.Attempts > attempt {
+		return true
+	}
+	switch {
+	case errors.Is(runErr, ErrJobCancelled):
+		return row.State == domain.JobStateCancelled && row.Attempts >= attempt
+	case errors.Is(runErr, ErrPermanentFailure):
+		return (row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= attempt
+	default:
+		return (row.State == domain.JobStateQueued && row.Attempts == attempt) ||
+			((row.State == domain.JobStateFailed || row.State == domain.JobStateCancelled) && row.Attempts >= attempt)
+	}
 }
 
 func (r *Runner) persistOutcomeWithRetry(
@@ -963,53 +1073,4 @@ func (r *Runner) persistOutcomeWithRetry(
 	}
 
 	return fmt.Errorf("%w: %s job %q (attempt %d): %w", ErrOutcomePersistenceFailed, label, job.ID, job.Attempts, lastErr)
-}
-
-func (r *Runner) reconcileCommittedSuccessBeforeFailure(
-	ctx context.Context,
-	reconciler Reconciler,
-	job *domain.Job,
-) (ReconcileOutcome, bool, error) {
-	var lastErr error
-	maxAttempts := 1 + len(defaultOutcomeRetryDelays)
-	for attemptIdx := range maxAttempts {
-		if err := ctx.Err(); err != nil {
-			return ReconcileOutcome{}, false, err
-		}
-
-		row, err := r.repo.GetJobByID(ctx, job.ID)
-		if err == nil {
-			if row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts {
-				return ReconcileOutcome{Action: ReconcileSucceeded}, true, nil
-			}
-			if row.State != domain.JobStateRunning || row.Attempts != job.Attempts {
-				return ReconcileOutcome{}, false, nil
-			}
-			outcome, recErr := reconciler.Reconcile(ctx, *row)
-			if recErr == nil {
-				return outcome, outcome.Action == ReconcileSucceeded, nil
-			}
-			lastErr = recErr
-		} else {
-			lastErr = err
-		}
-
-		if ctx.Err() != nil {
-			return ReconcileOutcome{}, false, ctx.Err()
-		}
-		if attemptIdx >= len(defaultOutcomeRetryDelays) {
-			break
-		}
-		timer := time.NewTimer(defaultOutcomeRetryDelays[attemptIdx])
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ReconcileOutcome{}, false, ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return ReconcileOutcome{}, false, fmt.Errorf(
-		"%w: reconciling committed outcome for job %q (attempt %d): %w",
-		ErrOutcomePersistenceFailed, job.ID, job.Attempts, lastErr,
-	)
 }

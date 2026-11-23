@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1057,4 +1058,507 @@ func TestRelocateRoot_LostCommitAckSettlesSucceededWithoutSecondActivation(t *te
 			assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
 		})
 	}
+}
+
+type inFlightActivationTransactor struct {
+	inner             storage.Transactor
+	testCtx           context.Context
+	injectInFlight    atomic.Bool
+	shouldCommit      bool
+	attemptsStarted   atomic.Int32
+	inFlightReady     chan struct{}
+	inFlightReadyOnce sync.Once
+	releaseInFlight   chan struct{}
+	releaseOnce       sync.Once
+	bgDone            chan error
+}
+
+func (f *inFlightActivationTransactor) release() {
+	f.releaseOnce.Do(func() {
+		close(f.releaseInFlight)
+	})
+}
+
+func (f *inFlightActivationTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return f.inner.WithTx(ctx, fn)
+}
+
+func (f *inFlightActivationTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	var sawActivation bool
+	var holdActivation bool
+	err := f.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return fn(&inFlightDetectTx{
+			Tx:            tx,
+			sawActivation: &sawActivation,
+			onCheckpoint: func() error {
+				if !sawActivation || !f.injectInFlight.CompareAndSwap(true, false) {
+					return nil
+				}
+				holdActivation = true
+				return errors.New("yielding local tx to run held in-flight tx")
+			},
+		})
+	})
+	if !holdActivation {
+		if sawActivation {
+			f.attemptsStarted.Add(1)
+		}
+		return err
+	}
+
+	// Run the real activation inside an independent background transaction that holds
+	// the jobs FOR UPDATE lock after UpdateLibraryRootPath + SaveCheckpoint until releaseInFlight.
+	f.attemptsStarted.Add(1)
+	go func() {
+		bgCtx := f.testCtx
+		if bgCtx == nil {
+			bgCtx = context.WithoutCancel(ctx)
+		}
+		bgErr := f.inner.WithReadCommittedTx(bgCtx, func(bgTx storage.Tx) error {
+			return fn(&inFlightBgTx{
+				Tx: bgTx,
+				afterSaveCheckpoint: func() error {
+					f.inFlightReadyOnce.Do(func() { close(f.inFlightReady) })
+					select {
+					case <-f.releaseInFlight:
+					case <-bgCtx.Done():
+						return bgCtx.Err()
+					}
+					if !f.shouldCommit {
+						return errors.New("simulated in-flight activation rollback")
+					}
+					return nil
+				},
+			})
+		})
+		f.bgDone <- bgErr
+	}()
+
+	select {
+	case <-f.inFlightReady:
+	case bgErr := <-f.bgDone:
+		return fmt.Errorf("in-flight background tx ended early: %w", bgErr)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return errors.New("simulated connection drop while activation commit in flight")
+}
+
+type inFlightDetectTx struct {
+	storage.Tx
+	sawActivation *bool
+	onCheckpoint  func() error
+}
+
+func (t *inFlightDetectTx) Libraries() storage.LibraryRepository {
+	return &lostCommitAckLibRepo{
+		LibraryRepository: t.Tx.Libraries(),
+		sawActivation:     t.sawActivation,
+	}
+}
+
+func (t *inFlightDetectTx) Jobs() storage.JobRepository {
+	return &inFlightDetectJobRepo{
+		JobRepository: t.Tx.Jobs(),
+		onCheckpoint:  t.onCheckpoint,
+	}
+}
+
+type inFlightDetectJobRepo struct {
+	storage.JobRepository
+	onCheckpoint func() error
+}
+
+func (r *inFlightDetectJobRepo) SaveCheckpoint(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error) {
+	if err := r.onCheckpoint(); err != nil {
+		return nil, err
+	}
+	return r.JobRepository.SaveCheckpoint(ctx, id, attempt, checkpoint, now)
+}
+
+type inFlightBgTx struct {
+	storage.Tx
+	afterSaveCheckpoint func() error
+}
+
+func (t *inFlightBgTx) Jobs() storage.JobRepository {
+	return &inFlightBgJobRepo{
+		JobRepository:       t.Tx.Jobs(),
+		afterSaveCheckpoint: t.afterSaveCheckpoint,
+	}
+}
+
+type inFlightBgJobRepo struct {
+	storage.JobRepository
+	afterSaveCheckpoint func() error
+}
+
+func (r *inFlightBgJobRepo) SaveCheckpoint(ctx context.Context, id string, attempt int, checkpoint json.RawMessage, now time.Time) (*domain.Job, error) {
+	res, err := r.JobRepository.SaveCheckpoint(ctx, id, attempt, checkpoint, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.afterSaveCheckpoint(); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func waitForJobOutcomeLockWaiter(ctx context.Context, db *testdb.TestDB, done <-chan struct{}) error {
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		var count int
+		if err := db.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+			  AND query ILIKE '%FROM jobs%FOR UPDATE%'
+		`).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return nil
+		}
+		select {
+		case <-done:
+			return errors.New("runner outcome handling exited without waiting for jobs row lock")
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for outcome handler to block on jobs FOR UPDATE lock")
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+func TestRelocateRoot_InFlightCommitAtOutcomeHandling(t *testing.T) {
+	t.Parallel()
+	db, transactor, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath: %v", err)
+	}
+	jobRepo := postgres.NewJobRepository(db.Pool)
+	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+	t.Run("in-flight activation commits while outcome handler waits on lock and settles SUCCEEDED", func(t *testing.T) {
+		caseDir := filepath.Join(canonBase, "inflight-commit-"+domain.MustNewID())
+		oldRoot := filepath.Join(caseDir, "old")
+		newRoot := filepath.Join(caseDir, "new")
+		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+
+		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
+			MaxAttempts: 3,
+		})
+		if err != nil {
+			t.Fatalf("TriggerRelocateRoot: %v", err)
+		}
+
+		faultTx := &inFlightActivationTransactor{
+			inner:           transactor,
+			testCtx:         ctx,
+			shouldCommit:    true,
+			inFlightReady:   make(chan struct{}),
+			releaseInFlight: make(chan struct{}),
+			bgDone:          make(chan error, 1),
+		}
+		faultTx.injectInFlight.Store(true)
+		defer faultTx.release()
+
+		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
+		if err != nil {
+			t.Fatalf("NewRelocator: %v", err)
+		}
+		runner := newRootsRunner(t, jobRepo, rel)
+
+		runDone := make(chan struct{})
+		var claimed bool
+		var runErr error
+		go func() {
+			defer close(runDone)
+			claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
+		}()
+
+		select {
+		case <-faultTx.inFlightReady:
+		case <-runDone:
+			t.Fatalf("ClaimAndRunNext exited before activation entered in-flight state: (%v, %v)", claimed, runErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for in-flight activation: %v", ctx.Err())
+		}
+
+		if err := waitForJobOutcomeLockWaiter(ctx, db, runDone); err != nil {
+			gotNow, _ := jobRepo.GetJobByID(ctx, jobID)
+			var lastErrStr string
+			if gotNow != nil && gotNow.LastError != nil {
+				lastErrStr = *gotNow.LastError
+			}
+			var bgStatus string
+			select {
+			case be := <-faultTx.bgDone:
+				bgStatus = fmt.Sprintf("done(%v)", be)
+			default:
+				bgStatus = "still-blocked"
+			}
+			t.Fatalf("waitForJobOutcomeLockWaiter: %v (claimed=%v runErr=%v attemptsStarted=%d state=%s lastErr=%q bg=%s)",
+				err, claimed, runErr, faultTx.attemptsStarted.Load(), gotNow.State, lastErrStr, bgStatus)
+		}
+		faultTx.release()
+		if bgErr := <-faultTx.bgDone; bgErr != nil {
+			t.Fatalf("background activation commit err = %v", bgErr)
+		}
+		<-runDone
+
+		if runErr != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, runErr)
+		}
+		if faultTx.attemptsStarted.Load() != 1 {
+			t.Fatalf("activation attemptsStarted = %d, want 1", faultTx.attemptsStarted.Load())
+		}
+		got, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID: %v", err)
+		}
+		if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
+			t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
+
+	t.Run("in-flight activation rolls back while outcome handler waits on lock then retries and succeeds", func(t *testing.T) {
+		caseDir := filepath.Join(canonBase, "inflight-rollback-"+domain.MustNewID())
+		oldRoot := filepath.Join(caseDir, "old")
+		newRoot := filepath.Join(caseDir, "new")
+		fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+
+		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
+			MaxAttempts: 2,
+		})
+		if err != nil {
+			t.Fatalf("TriggerRelocateRoot: %v", err)
+		}
+
+		faultTx := &inFlightActivationTransactor{
+			inner:           transactor,
+			testCtx:         ctx,
+			shouldCommit:    false,
+			inFlightReady:   make(chan struct{}),
+			releaseInFlight: make(chan struct{}),
+			bgDone:          make(chan error, 1),
+		}
+		faultTx.injectInFlight.Store(true)
+		defer faultTx.release()
+
+		rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
+		if err != nil {
+			t.Fatalf("NewRelocator: %v", err)
+		}
+		runner := newRootsRunner(t, jobRepo, rel)
+
+		runDone := make(chan struct{})
+		var claimed bool
+		var runErr error
+		go func() {
+			defer close(runDone)
+			claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
+		}()
+
+		select {
+		case <-faultTx.inFlightReady:
+		case <-runDone:
+			t.Fatalf("ClaimAndRunNext exited before activation entered in-flight state: (%v, %v)", claimed, runErr)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for in-flight activation: %v", ctx.Err())
+		}
+
+		if err := waitForJobOutcomeLockWaiter(ctx, db, runDone); err != nil {
+			gotNow, _ := jobRepo.GetJobByID(ctx, jobID)
+			var lastErrStr string
+			if gotNow != nil && gotNow.LastError != nil {
+				lastErrStr = *gotNow.LastError
+			}
+			var bgStatus string
+			select {
+			case be := <-faultTx.bgDone:
+				bgStatus = fmt.Sprintf("done(%v)", be)
+			default:
+				bgStatus = "still-blocked"
+			}
+			t.Fatalf("waitForJobOutcomeLockWaiter: %v (claimed=%v runErr=%v attemptsStarted=%d state=%s lastErr=%q bg=%s)",
+				err, claimed, runErr, faultTx.attemptsStarted.Load(), gotNow.State, lastErrStr, bgStatus)
+		}
+		faultTx.release()
+		if bgErr := <-faultTx.bgDone; bgErr == nil {
+			t.Fatalf("expected rolled-back background activation error, got nil")
+		}
+		<-runDone
+
+		if runErr != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext(attempt 1) = (%v, %v), want (true, nil)", claimed, runErr)
+		}
+		mid, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID(after rollback): %v", err)
+		}
+		if mid.State != domain.JobStateQueued || mid.Attempts != 1 || mid.LastError == nil {
+			t.Fatalf("after rollback job = %+v, want QUEUED attempts=1 with error", mid)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(oldRoot))
+
+		// Attempt 2 runs cleanly and succeeds.
+		if _, err := db.Exec(ctx, `UPDATE jobs SET run_after = NOW() WHERE id = $1`, jobID); err != nil {
+			t.Fatalf("reset run_after: %v", err)
+		}
+		if claimed2, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed2 {
+			t.Fatalf("ClaimAndRunNext(attempt 2) = (%v, %v)", claimed2, err)
+		}
+		final, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID(attempt 2): %v", err)
+		}
+		if final.State != domain.JobStateSucceeded || final.Attempts != 2 || final.LastError != nil {
+			t.Fatalf("final job = %+v, want SUCCEEDED attempts=2 last_error=nil", final)
+		}
+		if faultTx.attemptsStarted.Load() != 2 {
+			t.Fatalf("attemptsStarted = %d, want 2", faultTx.attemptsStarted.Load())
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
+}
+
+func TestRelocateRoot_VerificationAndRecheckDoNotBlockOtherLibraryConfig(t *testing.T) {
+	t.Parallel()
+	db, transactor, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath: %v", err)
+	}
+	oldA := filepath.Join(canonBase, "libA-old")
+	newA := filepath.Join(canonBase, "libA-new")
+	oldB := filepath.Join(canonBase, "libB-old")
+	extraB1 := filepath.Join(canonBase, "libB-extra-1")
+	extraB2 := filepath.Join(canonBase, "libB-extra-2")
+	for _, dir := range []string{extraB1, extraB2} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+	}
+
+	fixA := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldA, "")
+	fixB := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldB, "")
+	availNewA := filepath.Join(newA, "Reloc/v01.cbz")
+	writeRelocateTestFile(t, availNewA, fixA.availData)
+
+	jobRepo := postgres.NewJobRepository(db.Pool)
+	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+	jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fixA.lib.ID, fixA.root.ID, []byte(newA), roots.TriggerRelocateOptions{})
+	if err != nil {
+		t.Fatalf("TriggerRelocateRoot: %v", err)
+	}
+
+	inOpenVerify := make(chan struct{})
+	releaseOpenVerify := make(chan struct{})
+	var openOnce sync.Once
+
+	inAssetRecheck := make(chan struct{})
+	releaseAssetRecheck := make(chan struct{})
+	var recheckOnce sync.Once
+	var openCompleted atomic.Bool
+
+	rel, err := roots.NewRelocator(transactor, roots.RelocatorOptions{
+		Open: func(openCtx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+			if string(rawPath) == availNewA {
+				openOnce.Do(func() {
+					close(inOpenVerify)
+					select {
+					case <-releaseOpenVerify:
+					case <-openCtx.Done():
+					}
+					openCompleted.Store(true)
+				})
+			}
+			return os.Open(string(rawPath))
+		},
+		Stat: func(rawPath []byte) (os.FileInfo, error) {
+			// Pause only on per-asset recheck after Open verification has completed.
+			if openCompleted.Load() && string(rawPath) == availNewA {
+				recheckOnce.Do(func() {
+					close(inAssetRecheck)
+					select {
+					case <-releaseAssetRecheck:
+					case <-ctx.Done():
+					}
+				})
+			}
+			return os.Stat(string(rawPath))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRelocator: %v", err)
+	}
+	runner := newRootsRunner(t, jobRepo, rel)
+
+	runDone := make(chan struct{})
+	var claimed bool
+	var runErr error
+	go func() {
+		defer close(runDone)
+		claimed, runErr = runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot)
+	}()
+
+	// 1. Pause inside Open (fingerprint verification): unrelated libB config change must not block.
+	select {
+	case <-inOpenVerify:
+	case <-runDone:
+		t.Fatalf("relocator exited before Open pause: (%v, %v)", claimed, runErr)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for Open pause: %v", ctx.Err())
+	}
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: fixB.lib.ID,
+		Path:      []byte(extraB1),
+	}); err != nil {
+		t.Fatalf("unrelated libB AddRoot blocked/failed during verification: %v", err)
+	}
+	close(releaseOpenVerify)
+
+	// 2. Pause inside per-asset Stat recheck: unrelated libB config change must still not block.
+	select {
+	case <-inAssetRecheck:
+	case <-runDone:
+		t.Fatalf("relocator exited before per-asset Stat recheck pause: (%v, %v)", claimed, runErr)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for per-asset Stat recheck pause: %v", ctx.Err())
+	}
+	if _, err := svc.AddRoot(ctx, admin, app.AddLibraryRootRequest{
+		LibraryID: fixB.lib.ID,
+		Path:      []byte(extraB2),
+	}); err != nil {
+		t.Fatalf("unrelated libB AddRoot blocked/failed during per-asset recheck: %v", err)
+	}
+	close(releaseAssetRecheck)
+
+	<-runDone
+	if runErr != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, runErr)
+	}
+	got, err := jobRepo.GetJobByID(ctx, jobID)
+	if err != nil || got.State != domain.JobStateSucceeded {
+		t.Fatalf("relocate job = (%+v, %v), want SUCCEEDED", got, err)
+	}
+	assertRelocateFixturePreserved(ctx, t, db, fixA, []byte(newA))
 }

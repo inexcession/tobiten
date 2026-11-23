@@ -424,6 +424,9 @@ func (r *Relocator) executeVerifyAndActivatePass(
 			return err
 		}
 	}
+	if err := r.verifyObservationsBeforeActivation(ctx, snap.observations, checkCancel); err != nil {
+		return err
+	}
 	if err := observeRelocateCancel(ctx, checkCancel); err != nil {
 		return err
 	}
@@ -716,15 +719,16 @@ func (r *Relocator) recheckActivationTarget(
 	if !r.customStat && !os.SameFile(snap.targetDirInfo, curInfo) {
 		return nil, fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, ErrTargetIdentityChanged)
 	}
-	if err := r.verifyObservationsAtActivation(ctx, snap.observations); err != nil {
-		return nil, err
-	}
 	return reCanonTarget, nil
 }
 
-func (r *Relocator) verifyObservationsAtActivation(ctx context.Context, observations []relocateAssetObservation) error {
+func (r *Relocator) verifyObservationsBeforeActivation(
+	ctx context.Context,
+	observations []relocateAssetObservation,
+	checkCancel func(context.Context) error,
+) error {
 	for _, obs := range observations {
-		if err := ctx.Err(); err != nil {
+		if err := observeRelocateCancel(ctx, checkCancel); err != nil {
 			return err
 		}
 		if err := r.checkObservationStillValid(obs); err != nil {
