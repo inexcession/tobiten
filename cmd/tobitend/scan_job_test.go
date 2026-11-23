@@ -5,10 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -2080,12 +2082,18 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 	err = runDaemon(ctx, cfg, func(serveCtx context.Context, cfg *config.Config, logger *slog.Logger, services *app.Services) error {
 		ds := *dsPtr
 		reg := BuildRegistryWithServices(cfg, services)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
 		srv, err := api.NewServer(api.ServerOptions{
 			Config:   cfg,
 			Logger:   logger,
+			Listener: ln,
 			Registry: reg,
 		})
 		if err != nil {
+			_ = ln.Close()
 			return err
 		}
 		srvCtx, cancelSrv := context.WithCancel(serveCtx)
@@ -2240,6 +2248,9 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 			auditorStream.close()
 			otherStream.close()
 		}()
+		creatorTracker := newStreamScanSSETracker(t, "creator", creatorStream)
+		auditorTracker := newStreamScanSSETracker(t, "auditor", auditorStream)
+		otherTracker := newStreamScanSSETracker(t, "otherLibAdmin", otherStream)
 
 		// 5. Creator triggers lib1 scan -> 202 with job_id; repeated requests while RUNNING return the same job_id.
 		trigCode, trigHdr, trigBody := doReq(http.MethodPost, "/comics/api/v1/libraries/"+lib1.ID+"/scan", func(r *http.Request) {
@@ -2312,49 +2323,10 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 		// Release lib1 scan to complete both files and verify SSE lifecycle + ephemeral job.progress on creator & auditor.
 		close(releaseLib1)
 
-		collectScanFrames := func(stream *sseClientStream, who, wantJobID, wantTerminal string) error {
-			var lifecycle []sseFrame
-			var sawProgress bool
-			for len(lifecycle) < 2 || !sawProgress {
-				f := stream.nextFrame(t)
-				if f.Event == domain.ProgressTickEventName {
-					if f.ID != "" {
-						return fmt.Errorf("%s progress frame carried SSE ID %q, want empty", who, f.ID)
-					}
-					var tick domain.JobProgressTick
-					mustUnmarshal(t, f.Data, &tick)
-					if tick.JobID != wantJobID || tick.ScannedCount < 1 || tick.CurrentPath == "" {
-						return fmt.Errorf("%s unexpected progress tick for %s: %+v", who, wantJobID, tick)
-					}
-					sawProgress = true
-					continue
-				}
-				var pub app.PublicEvent
-				mustUnmarshal(t, f.Data, &pub)
-				if pub.AggregateID != wantJobID {
-					return fmt.Errorf("%s received event for job %q (%s), want %q", who, pub.AggregateID, f.Event, wantJobID)
-				}
-				seq, convErr := strconv.ParseInt(f.ID, 10, 64)
-				if convErr != nil || seq != pub.Sequence || seq <= 0 {
-					return fmt.Errorf("%s invalid SSE id=%q vs seq=%d", who, f.ID, pub.Sequence)
-				}
-				lifecycle = append(lifecycle, f)
-			}
-			if lifecycle[0].Event != string(domain.EventJobStarted) || lifecycle[1].Event != wantTerminal {
-				return fmt.Errorf("%s events for %s = [%s %s], want [job.started %s]", who, wantJobID, lifecycle[0].Event, lifecycle[1].Event, wantTerminal)
-			}
-			s0, _ := strconv.ParseInt(lifecycle[0].ID, 10, 64)
-			s1, _ := strconv.ParseInt(lifecycle[1].ID, 10, 64)
-			if s0 >= s1 {
-				return fmt.Errorf("%s sequence order = [%d %d], want increasing", who, s0, s1)
-			}
-			return nil
-		}
-
-		if err := collectScanFrames(creatorStream, "creator", jobID1, string(domain.EventJobFinished)); err != nil {
+		if err := creatorTracker.collectFinishedWithProgress(jobID1); err != nil {
 			return err
 		}
-		if err := collectScanFrames(auditorStream, "auditor", jobID1, string(domain.EventJobFinished)); err != nil {
+		if err := auditorTracker.collectFinishedWithProgress(jobID1); err != nil {
 			return err
 		}
 
@@ -2389,37 +2361,10 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 			return errors.New("timed out waiting for lib2 scan to enter 02.cbz")
 		}
 
-		// Ensure job.started and 01.cbz's job.progress are observed before cancelling so no progress tick
-		// trails into subsequent SSE checks.
-		waitStartedAndProgress := func(stream *sseClientStream, who string) error {
-			var sawStarted, sawProgress bool
-			for !sawStarted || !sawProgress {
-				f := stream.nextFrame(t)
-				if f.Event == domain.ProgressTickEventName {
-					if f.ID != "" {
-						return fmt.Errorf("%s lib2 progress carried SSE ID %q", who, f.ID)
-					}
-					var tick domain.JobProgressTick
-					mustUnmarshal(t, f.Data, &tick)
-					if tick.JobID != jobID2 {
-						return fmt.Errorf("%s lib2 progress job_id = %q, want %q", who, tick.JobID, jobID2)
-					}
-					sawProgress = true
-					continue
-				}
-				var pub app.PublicEvent
-				mustUnmarshal(t, f.Data, &pub)
-				if pub.AggregateID != jobID2 || f.Event != string(domain.EventJobStarted) {
-					return fmt.Errorf("%s unexpected pre-cancel event (%s, %q), want (job.started, %q)", who, f.Event, pub.AggregateID, jobID2)
-				}
-				sawStarted = true
-			}
-			return nil
-		}
-		if err := waitStartedAndProgress(creatorStream, "creator"); err != nil {
+		if err := creatorTracker.waitStartedAndProgress(jobID2); err != nil {
 			return err
 		}
-		if err := waitStartedAndProgress(auditorStream, "auditor"); err != nil {
+		if err := auditorTracker.waitStartedAndProgress(jobID2); err != nil {
 			return err
 		}
 
@@ -2449,32 +2394,10 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 
 		close(releaseLib2)
 
-		waitCancelledSSE := func(stream *sseClientStream, who string) error {
-			for {
-				f := stream.nextFrame(t)
-				if f.Event == domain.ProgressTickEventName {
-					if f.ID != "" {
-						return fmt.Errorf("%s cancel progress carried SSE ID %q", who, f.ID)
-					}
-					var tick domain.JobProgressTick
-					mustUnmarshal(t, f.Data, &tick)
-					if tick.JobID != jobID2 {
-						return fmt.Errorf("%s unexpected progress job_id=%q, want %q", who, tick.JobID, jobID2)
-					}
-					continue
-				}
-				var pub app.PublicEvent
-				mustUnmarshal(t, f.Data, &pub)
-				if pub.AggregateID != jobID2 || f.Event != string(domain.EventJobCancelled) {
-					return fmt.Errorf("%s expected (job.cancelled, %q), got (%s, %q)", who, jobID2, f.Event, pub.AggregateID)
-				}
-				return nil
-			}
-		}
-		if err := waitCancelledSSE(creatorStream, "creator"); err != nil {
+		if err := creatorTracker.waitTerminal(jobID2, string(domain.EventJobCancelled)); err != nil {
 			return err
 		}
-		if err := waitCancelledSSE(auditorStream, "auditor"); err != nil {
+		if err := auditorTracker.waitTerminal(jobID2, string(domain.EventJobCancelled)); err != nil {
 			return err
 		}
 		if lib2File3Opened.Load() {
@@ -2497,7 +2420,7 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("trigger automatic scan: %w", err)
 		}
-		if err := collectScanFrames(auditorStream, "auditor(auto)", autoJobID, string(domain.EventJobFinished)); err != nil {
+		if err := auditorTracker.collectFinishedWithProgress(autoJobID); err != nil {
 			return err
 		}
 
@@ -2536,7 +2459,8 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 
 		// 8. Prove creator's SSE stream never received autoJobID and otherStream never received ANY of
 		//    jobID1, jobID2, or autoJobID by triggering one job each for creator and otherLibAdmin and
-		//    asserting their very next SSE lifecycle frames belong exclusively to those new jobs.
+		//    asserting their next lifecycle frames belong exclusively to those new jobs (while tolerating
+		//    only delayed progress ticks from earlier authorized jobs on the same stream).
 		reTrigCode, _, reTrigBody := doReq(http.MethodPost, "/api/v1/libraries/"+lib1.ID+"/scan", func(r *http.Request) {
 			r.SetBasicAuth(creator.Username, "creator-pass-123")
 		})
@@ -2548,7 +2472,7 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 		if reTrigResp.JobID == jobID1 {
 			return fmt.Errorf("re-trigger after SUCCEEDED reused %q", jobID1)
 		}
-		if err := collectScanFrames(creatorStream, "creator(re-trigger)", reTrigResp.JobID, string(domain.EventJobFinished)); err != nil {
+		if err := creatorTracker.collectFinishedWithProgress(reTrigResp.JobID); err != nil {
 			return err
 		}
 
@@ -2560,9 +2484,269 @@ func TestDaemonScanTriggerJobsAndSSEEndToEnd(t *testing.T) {
 		}
 		var otherResp middleware.JobAcceptedResponse
 		mustUnmarshal(t, otherBody, &otherResp)
-		return collectScanFrames(otherStream, "otherLibAdmin(first)", otherResp.JobID, string(domain.EventJobFinished))
+		return otherTracker.collectFinishedWithProgress(otherResp.JobID)
 	})
 	if err != nil {
 		t.Fatalf("runDaemon err = %v", err)
 	}
+}
+
+type scanSSETracker struct {
+	who             string
+	nextFrame       func() (sseFrame, error)
+	priorAuthorized map[string]bool
+	lastSeq         int64
+}
+
+func newStreamScanSSETracker(t *testing.T, who string, stream *sseClientStream) *scanSSETracker {
+	t.Helper()
+	return &scanSSETracker{
+		who:             who,
+		priorAuthorized: make(map[string]bool),
+		nextFrame: func() (sseFrame, error) {
+			return stream.nextFrame(t), nil
+		},
+	}
+}
+
+func newSliceScanSSETracker(frames []sseFrame) *scanSSETracker {
+	idx := 0
+	return &scanSSETracker{
+		who:             "test",
+		priorAuthorized: make(map[string]bool),
+		nextFrame: func() (sseFrame, error) {
+			if idx >= len(frames) {
+				return sseFrame{}, errors.New("unexpected end of SSE frames")
+			}
+			f := frames[idx]
+			idx++
+			return f, nil
+		},
+	}
+}
+
+func (tr *scanSSETracker) handleProgressFrame(f sseFrame, wantJobID string) (bool, error) {
+	if f.ID != "" {
+		return false, fmt.Errorf("%s progress frame carried SSE ID %q, want empty", tr.who, f.ID)
+	}
+	var tick domain.JobProgressTick
+	if err := json.Unmarshal([]byte(f.Data), &tick); err != nil {
+		return false, fmt.Errorf("%s invalid progress JSON %q: %w", tr.who, f.Data, err)
+	}
+	if tick.ScannedCount < 1 || tick.CurrentPath == "" {
+		return false, fmt.Errorf("%s incomplete progress tick: %+v", tr.who, tick)
+	}
+	if tick.JobID == wantJobID {
+		return true, nil
+	}
+	if tr.priorAuthorized[tick.JobID] {
+		return false, nil
+	}
+	return false, fmt.Errorf("%s received unauthorized progress tick for job %q (want %q)", tr.who, tick.JobID, wantJobID)
+}
+
+func (tr *scanSSETracker) parseLifecycleFrame(f sseFrame, wantJobID string) error {
+	var pub app.PublicEvent
+	if err := json.Unmarshal([]byte(f.Data), &pub); err != nil {
+		return fmt.Errorf("%s invalid event JSON %q: %w", tr.who, f.Data, err)
+	}
+	if pub.AggregateID != wantJobID {
+		return fmt.Errorf("%s received lifecycle event for job %q (%s), want %q", tr.who, pub.AggregateID, f.Event, wantJobID)
+	}
+	seq, err := strconv.ParseInt(f.ID, 10, 64)
+	if err != nil || seq != pub.Sequence || seq <= 0 {
+		return fmt.Errorf("%s invalid SSE id=%q vs seq=%d", tr.who, f.ID, pub.Sequence)
+	}
+	if tr.lastSeq > 0 && seq <= tr.lastSeq {
+		return fmt.Errorf("%s non-increasing SSE sequence %d after %d", tr.who, seq, tr.lastSeq)
+	}
+	tr.lastSeq = seq
+	return nil
+}
+
+func (tr *scanSSETracker) collectFinishedWithProgress(wantJobID string) error {
+	var lifecycle []sseFrame
+	var sawProgress bool
+	for len(lifecycle) < 2 || !sawProgress {
+		f, err := tr.nextFrame()
+		if err != nil {
+			return err
+		}
+		if f.Event == domain.ProgressTickEventName {
+			matched, pErr := tr.handleProgressFrame(f, wantJobID)
+			if pErr != nil {
+				return pErr
+			}
+			if matched {
+				sawProgress = true
+			}
+			continue
+		}
+		if lErr := tr.parseLifecycleFrame(f, wantJobID); lErr != nil {
+			return lErr
+		}
+		lifecycle = append(lifecycle, f)
+		if len(lifecycle) > 2 {
+			return fmt.Errorf("%s received extra lifecycle event %s for %q", tr.who, f.Event, wantJobID)
+		}
+	}
+	if lifecycle[0].Event != string(domain.EventJobStarted) || lifecycle[1].Event != string(domain.EventJobFinished) {
+		return fmt.Errorf("%s events for %s = [%s %s], want [job.started job.finished]", tr.who, wantJobID, lifecycle[0].Event, lifecycle[1].Event)
+	}
+	tr.priorAuthorized[wantJobID] = true
+	return nil
+}
+
+func (tr *scanSSETracker) waitStartedAndProgress(wantJobID string) error {
+	var sawStarted, sawProgress bool
+	for !sawStarted || !sawProgress {
+		f, err := tr.nextFrame()
+		if err != nil {
+			return err
+		}
+		if f.Event == domain.ProgressTickEventName {
+			matched, pErr := tr.handleProgressFrame(f, wantJobID)
+			if pErr != nil {
+				return pErr
+			}
+			if matched {
+				sawProgress = true
+			}
+			continue
+		}
+		if lErr := tr.parseLifecycleFrame(f, wantJobID); lErr != nil {
+			return lErr
+		}
+		if sawStarted || f.Event != string(domain.EventJobStarted) {
+			return fmt.Errorf("%s unexpected pre-cancel event (%s, %q), want single job.started", tr.who, f.Event, wantJobID)
+		}
+		sawStarted = true
+	}
+	return nil
+}
+
+func (tr *scanSSETracker) waitTerminal(wantJobID, wantTerminal string) error {
+	for {
+		f, err := tr.nextFrame()
+		if err != nil {
+			return err
+		}
+		if f.Event == domain.ProgressTickEventName {
+			if _, pErr := tr.handleProgressFrame(f, wantJobID); pErr != nil {
+				return pErr
+			}
+			continue
+		}
+		if lErr := tr.parseLifecycleFrame(f, wantJobID); lErr != nil {
+			return lErr
+		}
+		if f.Event != wantTerminal {
+			return fmt.Errorf("%s expected %s for %q, got %s", tr.who, wantTerminal, wantJobID, f.Event)
+		}
+		tr.priorAuthorized[wantJobID] = true
+		return nil
+	}
+}
+
+func TestScanSSECollector_ToleratesDelayedAuthorizedProgressAndRejectsHiddenOrOutOfOrder(t *testing.T) {
+	t.Parallel()
+
+	lifecycleFrame := func(seq int64, kind domain.EventKind, jobID string) sseFrame {
+		return sseFrame{
+			ID:    strconv.FormatInt(seq, 10),
+			Event: string(kind),
+			Data:  fmt.Sprintf(`{"sequence":%d,"kind":%q,"aggregate_id":%q}`, seq, kind, jobID),
+		}
+	}
+	progressFrame := func(id, jobID string, count int64, path string) sseFrame {
+		return sseFrame{
+			ID:    id,
+			Event: domain.ProgressTickEventName,
+			Data:  fmt.Sprintf(`{"job_id":%q,"kind":"SCAN","scanned_count":%d,"current_path":%q}`, jobID, count, path),
+		}
+	}
+
+	t.Run("tolerates delayed ticks from earlier authorized job across subsequent phases", func(t *testing.T) {
+		frames := []sseFrame{
+			// job-1 finishes after first progress tick, leaving a second buffered tick behind job.finished.
+			lifecycleFrame(1, domain.EventJobStarted, "job-1"),
+			progressFrame("", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(2, domain.EventJobFinished, "job-1"),
+			// Delayed buffered tick from job-1 arrives before job-2 starts, then another between job-2 start and progress.
+			progressFrame("", "job-1", 2, "Series/02.cbz"),
+			lifecycleFrame(3, domain.EventJobStarted, "job-2"),
+			progressFrame("", "job-1", 2, "Series/02.cbz"),
+			progressFrame("", "job-2", 1, "Next/01.cbz"),
+			lifecycleFrame(4, domain.EventJobFinished, "job-2"),
+		}
+		tr := newSliceScanSSETracker(frames)
+		if err := tr.collectFinishedWithProgress("job-1"); err != nil {
+			t.Fatalf("phase 1 failed: %v", err)
+		}
+		if err := tr.collectFinishedWithProgress("job-2"); err != nil {
+			t.Fatalf("phase 2 failed on delayed authorized progress: %v", err)
+		}
+	})
+
+	t.Run("rejects progress tick for hidden or unauthorized job", func(t *testing.T) {
+		frames := []sseFrame{
+			lifecycleFrame(1, domain.EventJobStarted, "job-1"),
+			progressFrame("", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(2, domain.EventJobFinished, "job-1"),
+			// Unauthorized automatic job tick arrives before job-2.
+			progressFrame("", "job-auto", 1, "Hidden/01.cbz"),
+			lifecycleFrame(3, domain.EventJobStarted, "job-2"),
+			progressFrame("", "job-2", 1, "Next/01.cbz"),
+			lifecycleFrame(4, domain.EventJobFinished, "job-2"),
+		}
+		tr := newSliceScanSSETracker(frames)
+		if err := tr.collectFinishedWithProgress("job-1"); err != nil {
+			t.Fatalf("phase 1 failed: %v", err)
+		}
+		if err := tr.collectFinishedWithProgress("job-2"); err == nil || !strings.Contains(err.Error(), "unauthorized progress tick") {
+			t.Fatalf("expected unauthorized progress error for job-auto, got %v", err)
+		}
+	})
+
+	t.Run("rejects progress frame with SSE ID, unexpected lifecycle job, and out-of-order lifecycle", func(t *testing.T) {
+		badProgressID := newSliceScanSSETracker([]sseFrame{
+			lifecycleFrame(1, domain.EventJobStarted, "job-1"),
+			progressFrame("99", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(2, domain.EventJobFinished, "job-1"),
+		})
+		if err := badProgressID.collectFinishedWithProgress("job-1"); err == nil || !strings.Contains(err.Error(), "carried SSE ID") {
+			t.Fatalf("expected SSE ID rejection on progress frame, got %v", err)
+		}
+
+		hiddenLifecycle := newSliceScanSSETracker([]sseFrame{
+			lifecycleFrame(1, domain.EventJobStarted, "job-1"),
+			progressFrame("", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(2, domain.EventJobFinished, "job-1"),
+			lifecycleFrame(3, domain.EventJobStarted, "job-auto"),
+		})
+		if err := hiddenLifecycle.collectFinishedWithProgress("job-1"); err != nil {
+			t.Fatalf("phase 1 failed: %v", err)
+		}
+		if err := hiddenLifecycle.collectFinishedWithProgress("job-2"); err == nil || !strings.Contains(err.Error(), "lifecycle event for job \"job-auto\"") {
+			t.Fatalf("expected unexpected lifecycle job error, got %v", err)
+		}
+
+		outOfOrder := newSliceScanSSETracker([]sseFrame{
+			lifecycleFrame(1, domain.EventJobFinished, "job-1"),
+			progressFrame("", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(2, domain.EventJobStarted, "job-1"),
+		})
+		if err := outOfOrder.collectFinishedWithProgress("job-1"); err == nil || !strings.Contains(err.Error(), "want [job.started job.finished]") {
+			t.Fatalf("expected out-of-order lifecycle error, got %v", err)
+		}
+
+		nonIncreasingSeq := newSliceScanSSETracker([]sseFrame{
+			lifecycleFrame(5, domain.EventJobStarted, "job-1"),
+			progressFrame("", "job-1", 1, "Series/01.cbz"),
+			lifecycleFrame(5, domain.EventJobFinished, "job-1"),
+		})
+		if err := nonIncreasingSeq.collectFinishedWithProgress("job-1"); err == nil || !strings.Contains(err.Error(), "non-increasing SSE sequence") {
+			t.Fatalf("expected non-increasing SSE sequence error, got %v", err)
+		}
+	})
 }
