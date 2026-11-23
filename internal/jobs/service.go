@@ -21,12 +21,14 @@ type JobNotifier interface {
 
 // TriggerRequest specifies parameters for enqueueing a durable background job (ADR-0017 §1–§2).
 type TriggerRequest struct {
-	Kind        domain.JobKind
-	Payload     json.RawMessage
-	DedupeKey   *string
-	MaxAttempts int
-	CreatedBy   *string
-	RunAfter    time.Time
+	Kind               domain.JobKind
+	Payload            json.RawMessage
+	DedupeKey          *string
+	LockKey            string
+	ConflictDedupeKeys []string
+	MaxAttempts        int
+	CreatedBy          *string
+	RunAfter           time.Time
 }
 
 // TriggerJob validates req, enqueues a durable QUEUED job (returning the existing active
@@ -47,6 +49,11 @@ func TriggerJob(
 	}
 	if req.DedupeKey != nil && strings.TrimSpace(*req.DedupeKey) == "" {
 		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
+	}
+	for _, key := range req.ConflictDedupeKeys {
+		if strings.TrimSpace(key) == "" {
+			return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyDedupeKey)
+		}
 	}
 	if req.CreatedBy != nil && strings.TrimSpace(*req.CreatedBy) == "" {
 		return "", fmt.Errorf("%w: created_by cannot be empty when present", app.ErrInvalidInput)
@@ -74,9 +81,19 @@ func TriggerJob(
 		CreatedAt:   ts,
 	}
 
-	created, err := repo.Enqueue(ctx, &job)
+	var (
+		created bool
+		err     error
+	)
+	if req.LockKey != "" || len(req.ConflictDedupeKeys) > 0 {
+		created, err = repo.EnqueueExclusive(ctx, &job, req.LockKey, req.ConflictDedupeKeys)
+	} else {
+		created, err = repo.Enqueue(ctx, &job)
+	}
 	if err != nil {
 		switch {
+		case errors.Is(err, domain.ErrJobConflict):
+			return "", fmt.Errorf("%w: %w", app.ErrConflict, err)
 		case errors.Is(err, domain.ErrEmptyJobKind),
 			errors.Is(err, domain.ErrInvalidJobJSON),
 			errors.Is(err, domain.ErrEmptyDedupeKey),
@@ -138,6 +155,16 @@ func (s *Service) SetNotifier(notifier JobNotifier) {
 	s.mu.Lock()
 	s.notifier = notifier
 	s.mu.Unlock()
+}
+
+// Notify forwards a worker-pool wakeup signal to the attached notifier, if any.
+func (s *Service) Notify(kind domain.JobKind) {
+	if s == nil {
+		return
+	}
+	if notifier := s.currentNotifier(); notifier != nil {
+		notifier.Notify(kind)
+	}
 }
 
 // SetOnTransition attaches or updates the post-commit lifecycle transition callback.

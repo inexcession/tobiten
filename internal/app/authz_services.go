@@ -160,6 +160,15 @@ func (s *authorizingLibraryConfigService) SetManagedIntakePath(ctx context.Conte
 	})
 }
 
+func (s *authorizingLibraryConfigService) RelocateRoot(ctx context.Context, principal *domain.Principal, req RelocateRootRequest) (string, error) {
+	return AuthorizeValue(principal, domain.PermissionLibraryAdmin, func() (string, error) {
+		if s.next == nil {
+			return "", ErrNotImplemented
+		}
+		return s.next.RelocateRoot(ctx, principal, req)
+	})
+}
+
 type authorizingReadingService struct {
 	next ReadingService
 }

@@ -12,6 +12,7 @@ import (
 )
 
 type Querier interface {
+	AcquireJobAdmissionLock(ctx context.Context, lockKey string) error
 	AcquireLibraryConfigLock(ctx context.Context, dollar_1 int64) error
 	AcquireSeriesVariantLock(ctx context.Context, variantKey string) error
 	AppendDomainEvent(ctx context.Context, arg AppendDomainEventParams) (DomainEvent, error)
@@ -51,6 +52,7 @@ type Querier interface {
 	DemotePrimarySeriesMembership(ctx context.Context, volumeID string) error
 	EnqueueJob(ctx context.Context, arg EnqueueJobParams) (Job, error)
 	EnsureUserBuiltInLabel(ctx context.Context, arg EnsureUserBuiltInLabelParams) error
+	FindActiveJobByDedupeKeys(ctx context.Context, dedupeKeys []string) (Job, error)
 	FindMediaAssetsWithDigestsByDigestInLibrary(ctx context.Context, arg FindMediaAssetsWithDigestsByDigestInLibraryParams) ([]FindMediaAssetsWithDigestsByDigestInLibraryRow, error)
 	FindOrInsertEntityByImportKey(ctx context.Context, arg FindOrInsertEntityByImportKeyParams) (Entity, error)
 	FindOrInsertPersonByImportKey(ctx context.Context, arg FindOrInsertPersonByImportKeyParams) (Person, error)
@@ -180,6 +182,7 @@ type Querier interface {
 	UpdateEventSubscriberState(ctx context.Context, arg UpdateEventSubscriberStateParams) (EventSubscriber, error)
 	UpdateLibrary(ctx context.Context, arg UpdateLibraryParams) (Library, error)
 	UpdateLibraryRoot(ctx context.Context, arg UpdateLibraryRootParams) (LibraryRoot, error)
+	UpdateLibraryRootPath(ctx context.Context, arg UpdateLibraryRootPathParams) (LibraryRoot, error)
 	UpdateLibraryRootStatus(ctx context.Context, arg UpdateLibraryRootStatusParams) (int64, error)
 	UpdateMediaAsset(ctx context.Context, arg UpdateMediaAssetParams) (MediaAsset, error)
 	UpdateMediaAssetContent(ctx context.Context, arg UpdateMediaAssetContentParams) (MediaAsset, error)

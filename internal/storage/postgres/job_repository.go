@@ -270,6 +270,144 @@ func (r *JobRepository) Enqueue(ctx context.Context, job *domain.Job) (bool, err
 	return false, errors.New("exhausted enqueue retries resolving active dedupe conflict")
 }
 
+// EnqueueExclusive atomically checks conflictDedupeKeys under an optional transaction-scoped
+// advisory lock for lockKey inside a READ COMMITTED transaction, then enqueues job.
+func (r *JobRepository) EnqueueExclusive(
+	ctx context.Context,
+	job *domain.Job,
+	lockKey string,
+	conflictDedupeKeys []string,
+) (bool, error) {
+	if r == nil {
+		return false, errors.New("job repository is required")
+	}
+	candidate, err := prepareJobForEnqueue(job)
+	if err != nil {
+		return false, err
+	}
+	if candidate.Kind == domain.JobKindEventDelivery {
+		return false, errors.New("EVENT_DELIVERY does not support EnqueueExclusive")
+	}
+
+	cleanConflicts, selfConflict, err := normalizeConflictDedupeKeys(conflictDedupeKeys, candidate.DedupeKey)
+	if err != nil {
+		return false, err
+	}
+
+	params := EnqueueJobParams{
+		ID:          candidate.ID,
+		Kind:        string(candidate.Kind),
+		Payload:     []byte(candidate.Payload),
+		Checkpoint:  []byte(candidate.Checkpoint),
+		MaxAttempts: int32(candidate.MaxAttempts),
+		CreatedBy:   candidate.CreatedBy,
+		DedupeKey:   candidate.DedupeKey,
+		RunAfter:    candidate.RunAfter,
+		CreatedAt:   candidate.CreatedAt,
+		UpdatedAt:   candidate.UpdatedAt,
+	}
+
+	var (
+		persisted domain.Job
+		created   bool
+	)
+	runFn := func(q *Queries) error {
+		if lockKey != "" {
+			if err := q.AcquireJobAdmissionLock(ctx, lockKey); err != nil {
+				return mapPgError(err)
+			}
+		}
+		var txErr error
+		persisted, created, txErr = enqueueWithConflictsInTx(ctx, q, params, cleanConflicts, selfConflict)
+		return txErr
+	}
+
+	if r.InTx() {
+		err = r.WithTx(ctx, func(txRepo storage.JobRepository) error {
+			pgRepo := txRepo.(*JobRepository)
+			if isoErr := ensureReadCommittedIsolation(ctx, pgRepo.q); isoErr != nil {
+				return isoErr
+			}
+			return runFn(pgRepo.q)
+		})
+	} else {
+		err = runReadCommittedTx(ctx, r.tx, "job exclusive enqueue", func(_ pgx.Tx, q *Queries) error {
+			return runFn(q)
+		})
+	}
+	if err != nil {
+		return false, err
+	}
+	*job = persisted
+	return created, nil
+}
+
+func normalizeConflictDedupeKeys(keys []string, selfKey *string) ([]string, bool, error) {
+	if len(keys) == 0 {
+		return nil, false, nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	clean := make([]string, 0, len(keys))
+	selfConflict := false
+	for _, k := range keys {
+		if strings.TrimSpace(k) == "" {
+			return nil, false, domain.ErrEmptyDedupeKey
+		}
+		if selfKey != nil && k == *selfKey {
+			selfConflict = true
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		clean = append(clean, k)
+	}
+	return clean, selfConflict, nil
+}
+
+func enqueueWithConflictsInTx(
+	ctx context.Context,
+	q *Queries,
+	params EnqueueJobParams,
+	conflictDedupeKeys []string,
+	selfConflict bool,
+) (domain.Job, bool, error) {
+	for range maxDedupeEnqueueAttempts {
+		if len(conflictDedupeKeys) > 0 {
+			conflictRow, err := q.FindActiveJobByDedupeKeys(ctx, conflictDedupeKeys)
+			if err == nil {
+				return domain.Job{}, false, fmt.Errorf("%w: active job %q (%s)",
+					domain.ErrJobConflict, conflictRow.ID, conflictRow.Kind)
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return domain.Job{}, false, fmt.Errorf("checking conflicting active jobs: %w", err)
+			}
+		}
+
+		row, err := q.EnqueueJob(ctx, params)
+		if err == nil {
+			return JobToDomain(row), true, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.Job{}, false, mapJobWriteError(err)
+		}
+
+		if selfConflict {
+			return domain.Job{}, false, fmt.Errorf("%w: active job with dedupe_key %q",
+				domain.ErrJobConflict, *params.DedupeKey)
+		}
+
+		existing, err := q.GetActiveJobByDedupeKey(ctx, params.DedupeKey)
+		if err == nil {
+			return JobToDomain(existing), false, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.Job{}, false, fmt.Errorf("looking up active job for dedupe_key: %w", err)
+		}
+	}
+	return domain.Job{}, false, errors.New("exhausted exclusive enqueue retries resolving active dedupe conflict")
+}
+
 func (r *JobRepository) enqueueEventDeliverySerialized(
 	ctx context.Context,
 	job *domain.Job,

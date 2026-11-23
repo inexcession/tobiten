@@ -34,6 +34,22 @@ WHERE dedupe_key = $1
   AND state IN ('QUEUED', 'RUNNING')
 LIMIT 1;
 
+-- name: AcquireJobAdmissionLock :exec
+SELECT pg_advisory_xact_lock(
+    1414747725,
+    hashtext(sqlc.arg(lock_key)::text)
+);
+
+-- name: FindActiveJobByDedupeKeys :one
+SELECT id, kind, state, payload, checkpoint, attempts, max_attempts,
+       cancel_requested, last_error, created_by, dedupe_key,
+       run_after, created_at, started_at, updated_at, finished_at
+FROM jobs
+WHERE dedupe_key = ANY(sqlc.arg(dedupe_keys)::text[])
+  AND state IN ('QUEUED', 'RUNNING')
+ORDER BY created_at ASC, id ASC
+LIMIT 1;
+
 -- name: GetJobByID :one
 SELECT id, kind, state, payload, checkpoint, attempts, max_attempts,
        cancel_requested, last_error, created_by, dedupe_key,

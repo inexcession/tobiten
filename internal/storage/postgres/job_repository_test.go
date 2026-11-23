@@ -15,7 +15,12 @@ import (
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
+	"github.com/jackc/pgx/v5"
 )
+
+func pgxTxRepeatableRead() pgx.TxOptions {
+	return pgx.TxOptions{IsoLevel: pgx.RepeatableRead}
+}
 
 func setupJobTestDB(t *testing.T) (*testdb.TestDB, *postgres.JobRepository, *postgres.UserRepository) {
 	t.Helper()
@@ -1577,5 +1582,163 @@ func TestJobRepository_LifecycleOutboxEventsCommittedRolledBackAndRetried(t *tes
 	}
 	if evs := listJobLifecycleEventsForJob(ctx, t, db, delivJob.ID); len(evs) != 0 {
 		t.Fatalf("expected 0 lifecycle events for EVENT_DELIVERY job, got %d", len(evs))
+	}
+}
+
+func TestJobRepository_EnqueueExclusiveAndIsolation(t *testing.T) {
+	t.Parallel()
+	db, repo, _ := setupJobTestDB(t)
+	transactor := postgres.NewTransactor(db.Pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	scanKey := "SCAN:lib-excl"
+	relocKey := "RELOCATE_ROOT:lib-excl"
+	lockKey := "library:lib-excl"
+
+	// 1. Persisted SCAN blocks RELOCATE_ROOT across QUEUED, RUNNING, and retry backoff.
+	scanJob := &domain.Job{
+		Kind:        domain.JobKindScan,
+		DedupeKey:   &scanKey,
+		MaxAttempts: 2,
+		CreatedAt:   t0,
+		RunAfter:    t0,
+	}
+	created, err := repo.Enqueue(ctx, scanJob)
+	if err != nil || !created {
+		t.Fatalf("Enqueue scanJob = (%v, %v)", created, err)
+	}
+
+	if _, err := repo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &relocKey,
+	}, lockKey, []string{scanKey, relocKey}); !errors.Is(err, domain.ErrJobConflict) {
+		t.Fatalf("EnqueueExclusive(RELOCATE_ROOT while SCAN QUEUED) = %v, want ErrJobConflict", err)
+	}
+
+	// Claim SCAN -> RUNNING; RELOCATE_ROOT still blocked, repeat SCAN deduplicates.
+	claimedScan, err := repo.ClaimNext(ctx, domain.JobKindScan, t0)
+	if err != nil {
+		t.Fatalf("ClaimNext SCAN: %v", err)
+	}
+	if _, err := repo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &relocKey,
+	}, lockKey, []string{scanKey, relocKey}); !errors.Is(err, domain.ErrJobConflict) {
+		t.Fatalf("EnqueueExclusive(RELOCATE_ROOT while SCAN RUNNING) = %v, want ErrJobConflict", err)
+	}
+	repeatScan := &domain.Job{Kind: domain.JobKindScan, DedupeKey: &scanKey}
+	if created, err := repo.EnqueueExclusive(ctx, repeatScan, lockKey, []string{relocKey}); err != nil || created || repeatScan.ID != scanJob.ID {
+		t.Fatalf("repeat SCAN = (%v, %v, %q), want (false, nil, %q)", created, err, repeatScan.ID, scanJob.ID)
+	}
+
+	// Put SCAN into retry backoff (QUEUED with future RunAfter); RELOCATE_ROOT still blocked.
+	if _, err := repo.FailOrRetry(ctx, claimedScan.ID, claimedScan.Attempts, "transient", t0.Add(time.Minute), t0.Add(time.Second)); err != nil {
+		t.Fatalf("FailOrRetry SCAN: %v", err)
+	}
+	if _, err := repo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &relocKey,
+	}, lockKey, []string{scanKey, relocKey}); !errors.Is(err, domain.ErrJobConflict) {
+		t.Fatalf("EnqueueExclusive(RELOCATE_ROOT while SCAN in backoff) = %v, want ErrJobConflict", err)
+	}
+
+	// Finish SCAN -> reservation released; RELOCATE_ROOT succeeds.
+	claimedScan2, err := repo.ClaimNext(ctx, domain.JobKindScan, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimNext SCAN retry: %v", err)
+	}
+	if _, err := repo.MarkSucceeded(ctx, claimedScan2.ID, claimedScan2.Attempts, t0.Add(2*time.Minute)); err != nil {
+		t.Fatalf("MarkSucceeded SCAN: %v", err)
+	}
+
+	relocJob := &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &relocKey,
+		CreatedAt: t0.Add(3 * time.Minute),
+		RunAfter:  t0.Add(3 * time.Minute),
+	}
+	if created, err := repo.EnqueueExclusive(ctx, relocJob, lockKey, []string{scanKey, relocKey}); err != nil || !created {
+		t.Fatalf("EnqueueExclusive(RELOCATE_ROOT after SCAN terminal) = (%v, %v)", created, err)
+	}
+
+	// Active RELOCATE_ROOT blocks both SCAN and a second RELOCATE_ROOT.
+	if _, err := repo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindScan,
+		DedupeKey: &scanKey,
+	}, lockKey, []string{relocKey}); !errors.Is(err, domain.ErrJobConflict) {
+		t.Fatalf("EnqueueExclusive(SCAN while RELOCATE_ROOT active) = %v, want ErrJobConflict", err)
+	}
+	if _, err := repo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &relocKey,
+	}, lockKey, []string{scanKey, relocKey}); !errors.Is(err, domain.ErrJobConflict) {
+		t.Fatalf("EnqueueExclusive(second RELOCATE_ROOT) = %v, want ErrJobConflict", err)
+	}
+
+	// 2. Stricter isolation caller transaction fails closed with ErrTransactionIsolation.
+	if err := transactor.WithRepeatableReadTx(ctx, func(_ storage.ReadTx) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("WithRepeatableReadTx smoke check: %v", err)
+	}
+	txRR, err := db.Pool.BeginTx(ctx, pgxTxRepeatableRead())
+	if err != nil {
+		t.Fatalf("BeginTx REPEATABLE READ: %v", err)
+	}
+	defer func() { _ = txRR.Rollback(ctx) }()
+	rrRepo := postgres.NewJobRepository(txRR)
+	otherKey := "RELOCATE_ROOT:lib-rr"
+	if _, err := rrRepo.EnqueueExclusive(ctx, &domain.Job{
+		Kind:      domain.JobKindRelocateRoot,
+		DedupeKey: &otherKey,
+	}, "library:lib-rr", []string{"SCAN:lib-rr", otherKey}); !errors.Is(err, storage.ErrTransactionIsolation) {
+		t.Fatalf("EnqueueExclusive inside REPEATABLE READ = %v, want ErrTransactionIsolation", err)
+	}
+	_ = txRR.Rollback(ctx)
+
+	// 3. Concurrent barrier race on an independent library: exactly 1 succeeds, 1 gets ErrJobConflict.
+	raceScanKey := "SCAN:lib-race"
+	raceRelocKey := "RELOCATE_ROOT:lib-race"
+	raceLockKey := "library:lib-race"
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			if idx == 0 {
+				_, errs[idx] = repo.EnqueueExclusive(ctx, &domain.Job{
+					Kind:      domain.JobKindScan,
+					DedupeKey: &raceScanKey,
+				}, raceLockKey, []string{raceRelocKey})
+			} else {
+				_, errs[idx] = repo.EnqueueExclusive(ctx, &domain.Job{
+					Kind:      domain.JobKindRelocateRoot,
+					DedupeKey: &raceRelocKey,
+				}, raceLockKey, []string{raceScanKey, raceRelocKey})
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var okCount, conflictCount int
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			okCount++
+		case errors.Is(e, domain.ErrJobConflict):
+			conflictCount++
+		default:
+			t.Fatalf("unexpected concurrent EnqueueExclusive error: %v", e)
+		}
+	}
+	if okCount != 1 || conflictCount != 1 {
+		t.Fatalf("concurrent race outcomes = (ok=%d, conflict=%d), errs=%v", okCount, conflictCount, errs)
 	}
 }

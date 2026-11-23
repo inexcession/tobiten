@@ -428,6 +428,10 @@ func (r *recordingLibraryConfigService) SetManagedIntakePath(context.Context, *d
 	return nil, app.ErrNotImplemented
 }
 
+func (r *recordingLibraryConfigService) RelocateRoot(context.Context, *domain.Principal, app.RelocateRootRequest) (string, error) {
+	return "", app.ErrNotImplemented
+}
+
 func TestLibraryProvisioningRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
 	recCfg := &recordingLibraryConfigService{defaultMode: domain.LibraryModeVirtual}
 	mod := NewModule(app.NewAuthorizingServices(&app.Services{LibraryConfig: recCfg}))

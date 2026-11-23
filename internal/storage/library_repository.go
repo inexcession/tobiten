@@ -42,6 +42,9 @@ type LibraryRepository interface {
 	ListLibraryRootsForNoKeyUpdate(ctx context.Context, libraryID string) ([]domain.LibraryRoot, error)
 	ListAllLibraryRoots(ctx context.Context) ([]domain.LibraryRoot, error)
 	UpdateLibraryRoot(ctx context.Context, root *domain.LibraryRoot) error
+	// UpdateLibraryRootPath updates only the stored absolute path and derived display/match
+	// forms on an existing root row, preserving its state and check metadata (ADR-0019 §7).
+	UpdateLibraryRootPath(ctx context.Context, id string, path domain.PathIdentity) (*domain.LibraryRoot, error)
 	// UpdateLibraryRootStatus returns ErrNotFound if the root's identity changed since it was checked.
 	UpdateLibraryRootStatus(ctx context.Context, root domain.LibraryRoot, state domain.LibraryRootState, checkedAt time.Time, lastError *string) error
 	DeleteLibraryRoot(ctx context.Context, id string) error

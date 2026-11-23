@@ -1596,3 +1596,57 @@ func TestLibraryRepository_LockLibraryForKeyShareAndRootsForNoKeyUpdate(t *testi
 		t.Fatalf("rootUpd failed after release: %v", rootUpdErr)
 	}
 }
+
+func TestLibraryRepository_UpdateLibraryRootPath(t *testing.T) {
+	t.Parallel()
+	_, transactor := setupLibraryTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	checkedAt := time.Date(2026, 11, 23, 9, 30, 0, 0, time.UTC)
+	lastErr := "previous check note"
+	var rootID string
+
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		repo := tx.Libraries()
+		lib := &domain.Library{Name: "Path Update Lib", Mode: domain.LibraryModeVirtual}
+		if err := repo.CreateLibrary(ctx, lib); err != nil {
+			return err
+		}
+		root := &domain.LibraryRoot{
+			LibraryID:     lib.ID,
+			Path:          mustRootPath(t, []byte("/mnt/old-root")),
+			State:         domain.LibraryRootStateOffline,
+			LastCheckedAt: &checkedAt,
+			LastError:     &lastErr,
+		}
+		if err := repo.CreateLibraryRoot(ctx, root); err != nil {
+			return err
+		}
+		rootID = root.ID
+
+		newPath := mustRootPath(t, []byte{'/', 'm', 'n', 't', '/', 'n', 'e', 'w', '-', 0xff})
+		updated, err := repo.UpdateLibraryRootPath(ctx, rootID, newPath)
+		if err != nil {
+			return err
+		}
+		assertPathIdentityEqual(t, "updated.Path", updated.Path, newPath)
+		if updated.ID != rootID || updated.LibraryID != lib.ID || updated.State != domain.LibraryRootStateOffline {
+			t.Fatalf("unexpected updated root metadata: %+v", updated)
+		}
+		if updated.LastCheckedAt == nil || !updated.LastCheckedAt.Equal(checkedAt) {
+			t.Fatalf("LastCheckedAt changed: got %v, want %v", updated.LastCheckedAt, checkedAt)
+		}
+		if updated.LastError == nil || *updated.LastError != lastErr {
+			t.Fatalf("LastError changed: got %v, want %q", updated.LastError, lastErr)
+		}
+
+		if _, err := repo.UpdateLibraryRootPath(ctx, domain.MustNewID(), mustRootPath(t, []byte("/mnt/absent"))); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("UpdateLibraryRootPath(missing) = %v, want ErrNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("TestLibraryRepository_UpdateLibraryRootPath: %v", err)
+	}
+}

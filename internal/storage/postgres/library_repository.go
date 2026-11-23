@@ -332,6 +332,29 @@ func (r *LibraryRepository) UpdateLibraryRoot(ctx context.Context, root *domain.
 	return nil
 }
 
+// UpdateLibraryRootPath updates only the stored absolute path and derived display/match
+// forms on an existing root row, preserving its state and check metadata (ADR-0019 §7).
+func (r *LibraryRepository) UpdateLibraryRootPath(ctx context.Context, id string, path domain.PathIdentity) (*domain.LibraryRoot, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, domain.ErrEmptyLibraryRootID
+	}
+	if err := domain.ValidateRootPathIdentity(path); err != nil {
+		return nil, err
+	}
+
+	row, err := r.q.UpdateLibraryRootPath(ctx, UpdateLibraryRootPathParams{
+		ID:          id,
+		PathBytes:   slices.Clone(path.Bytes),
+		PathDisplay: path.Display,
+		PathMatch:   path.Match,
+	})
+	if err != nil {
+		return nil, mapRootWriteError(err)
+	}
+	updated := toDomainLibraryRoot(row)
+	return &updated, nil
+}
+
 // UpdateLibraryRootStatus records availability for the checked root identity.
 func (r *LibraryRepository) UpdateLibraryRootStatus(
 	ctx context.Context,

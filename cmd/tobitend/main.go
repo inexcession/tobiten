@@ -14,6 +14,7 @@ import (
 	"github.com/inexcession/tobiten/internal/api/openapi"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
@@ -59,6 +60,7 @@ func setupLogging(cfg *config.Config) error {
 type RegistryDeps struct {
 	Scanner        *scanner.Scanner
 	ScannerWorkers int
+	Relocator      *roots.Relocator
 }
 
 // BuildRegistry constructs the composition root module registry for tobitend.
@@ -106,6 +108,14 @@ func BuildRegistryWithDeps(cfg *config.Config, services *app.Services, deps Regi
 		})
 		if err != nil {
 			slog.Error("failed to initialize scanner module", logging.Err(err))
+		} else {
+			_ = reg.Register(mod)
+		}
+	}
+	if deps.Relocator != nil {
+		mod, err := roots.NewModule(deps.Relocator)
+		if err != nil {
+			slog.Error("failed to initialize roots module", logging.Err(err))
 		} else {
 			_ = reg.Register(mod)
 		}

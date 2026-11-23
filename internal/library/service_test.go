@@ -384,6 +384,40 @@ func TestLibraryService_LibrariesAndAdminRedaction(t *testing.T) {
 	if persistedJob.Kind != domain.JobKindScan || persistedJob.CreatedBy == nil || *persistedJob.CreatedBy != f.admin.User.ID {
 		t.Fatalf("persisted scan job = %+v, want kind=SCAN created_by=%q", persistedJob, f.admin.User.ID)
 	}
+
+	// Active RELOCATE_ROOT on lib2 blocks ScanLibrary with app.ErrConflict across QUEUED, RUNNING, and backoff.
+	relocKey, _ := domain.RelocateRootJobDedupeKey(f.lib2ID)
+	relocJob := &domain.Job{
+		Kind:        domain.JobKindRelocateRoot,
+		DedupeKey:   &relocKey,
+		MaxAttempts: 2,
+	}
+	jobRepo := postgres.NewJobRepository(f.tdb.Pool)
+	if _, err := jobRepo.Enqueue(ctx, relocJob); err != nil {
+		t.Fatalf("Enqueue RELOCATE_ROOT: %v", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.admin, f.lib2ID); !errors.Is(err, app.ErrConflict) {
+		t.Fatalf("ScanLibrary while RELOCATE_ROOT QUEUED = %v, want ErrConflict", err)
+	}
+	claimedReloc, err := jobRepo.ClaimNext(ctx, domain.JobKindRelocateRoot, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ClaimNext RELOCATE_ROOT: %v", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.admin, f.lib2ID); !errors.Is(err, app.ErrConflict) {
+		t.Fatalf("ScanLibrary while RELOCATE_ROOT RUNNING = %v, want ErrConflict", err)
+	}
+	if _, err := jobRepo.FailOrRetry(ctx, claimedReloc.ID, claimedReloc.Attempts, "retry", time.Now().UTC().Add(time.Hour), time.Now().UTC()); err != nil {
+		t.Fatalf("FailOrRetry RELOCATE_ROOT: %v", err)
+	}
+	if _, err := f.svc.ScanLibrary(ctx, f.admin, f.lib2ID); !errors.Is(err, app.ErrConflict) {
+		t.Fatalf("ScanLibrary while RELOCATE_ROOT in backoff = %v, want ErrConflict", err)
+	}
+	if _, err := jobRepo.RequestCancel(ctx, claimedReloc.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("RequestCancel RELOCATE_ROOT: %v", err)
+	}
+	if scanID, err := f.svc.ScanLibrary(ctx, f.admin, f.lib2ID); err != nil || scanID == "" {
+		t.Fatalf("ScanLibrary after RELOCATE_ROOT terminal = (%q, %v), want new job ID", scanID, err)
+	}
 }
 
 func TestLibraryService_SeriesVolumesAndFolderBrowse(t *testing.T) {

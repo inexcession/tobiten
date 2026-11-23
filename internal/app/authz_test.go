@@ -876,6 +876,11 @@ func (s *spyLibraryConfigService) SetManagedIntakePath(_ context.Context, _ *dom
 	return &domain.Library{ID: req.LibraryID, Mode: domain.LibraryModeManaged}, nil
 }
 
+func (s *spyLibraryConfigService) RelocateRoot(_ context.Context, _ *domain.Principal, req RelocateRootRequest) (string, error) {
+	s.calls++
+	return "job-relocate-" + req.RootID, nil
+}
+
 func TestAuthorizingLibraryConfigService_RequiresLibraryAdmin(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -895,6 +900,9 @@ func TestAuthorizingLibraryConfigService_RequiresLibraryAdmin(t *testing.T) {
 	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, nil, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("SetManagedIntakePath(nil) = %v, want ErrUnauthorized", err)
 	}
+	if _, err := svcs.LibraryConfig.RelocateRoot(ctx, nil, RelocateRootRequest{RootID: "root-1", Path: []byte("/mnt/new")}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("RelocateRoot(nil) = %v, want ErrUnauthorized", err)
+	}
 
 	curator := domain.NewPrincipal(testUser("u-curator"), []domain.Role{builtInRoleByID(t, domain.RoleCuratorID)}, domain.CredentialKindPassword, "cred-c", nil)
 	if _, err := svcs.LibraryConfig.CreateLibrary(ctx, curator, CreateLibraryRequest{Name: "Manga"}); !errors.Is(err, ErrForbidden) {
@@ -905,6 +913,9 @@ func TestAuthorizingLibraryConfigService_RequiresLibraryAdmin(t *testing.T) {
 	}
 	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, curator, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("SetManagedIntakePath(curator) = %v, want ErrForbidden", err)
+	}
+	if _, err := svcs.LibraryConfig.RelocateRoot(ctx, curator, RelocateRootRequest{RootID: "root-1", Path: []byte("/mnt/new")}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("RelocateRoot(curator) = %v, want ErrForbidden", err)
 	}
 	if spy.calls != 0 {
 		t.Fatalf("unauthorized/forbidden calls reached delegate %d times, want 0", spy.calls)
@@ -920,8 +931,11 @@ func TestAuthorizingLibraryConfigService_RequiresLibraryAdmin(t *testing.T) {
 	if _, err := svcs.LibraryConfig.SetManagedIntakePath(ctx, admin, SetManagedIntakePathRequest{LibraryID: "lib-1", IntakePath: []byte("/mnt/in")}); err != nil {
 		t.Fatalf("SetManagedIntakePath(admin) = %v, want nil", err)
 	}
-	if spy.calls != 3 {
-		t.Fatalf("authorized LibraryConfig delegate calls = %d, want 3", spy.calls)
+	if _, err := svcs.LibraryConfig.RelocateRoot(ctx, admin, RelocateRootRequest{RootID: "root-1", Path: []byte("/mnt/new")}); err != nil {
+		t.Fatalf("RelocateRoot(admin) = %v, want nil", err)
+	}
+	if spy.calls != 4 {
+		t.Fatalf("authorized LibraryConfig delegate calls = %d, want 4", spy.calls)
 	}
 
 	nilCfg := NewAuthorizingLibraryConfigService(nil)

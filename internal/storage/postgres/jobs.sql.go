@@ -12,6 +12,18 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireJobAdmissionLock = `-- name: AcquireJobAdmissionLock :exec
+SELECT pg_advisory_xact_lock(
+    1414747725,
+    hashtext($1::text)
+)
+`
+
+func (q *Queries) AcquireJobAdmissionLock(ctx context.Context, lockKey string) error {
+	_, err := q.db.Exec(ctx, acquireJobAdmissionLock, lockKey)
+	return err
+}
+
 const cancelQueuedJob = `-- name: CancelQueuedJob :one
 UPDATE jobs
 SET state = 'CANCELLED',
@@ -150,6 +162,41 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (Job, er
 		arg.CreatedAt,
 		arg.UpdatedAt,
 	)
+	var i Job
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.State,
+		&i.Payload,
+		&i.Checkpoint,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.CancelRequested,
+		&i.LastError,
+		&i.CreatedBy,
+		&i.DedupeKey,
+		&i.RunAfter,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
+const findActiveJobByDedupeKeys = `-- name: FindActiveJobByDedupeKeys :one
+SELECT id, kind, state, payload, checkpoint, attempts, max_attempts,
+       cancel_requested, last_error, created_by, dedupe_key,
+       run_after, created_at, started_at, updated_at, finished_at
+FROM jobs
+WHERE dedupe_key = ANY($1::text[])
+  AND state IN ('QUEUED', 'RUNNING')
+ORDER BY created_at ASC, id ASC
+LIMIT 1
+`
+
+func (q *Queries) FindActiveJobByDedupeKeys(ctx context.Context, dedupeKeys []string) (Job, error) {
+	row := q.db.QueryRow(ctx, findActiveJobByDedupeKeys, dedupeKeys)
 	var i Job
 	err := row.Scan(
 		&i.ID,

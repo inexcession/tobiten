@@ -9,6 +9,7 @@ import (
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/storage"
 )
 
@@ -16,6 +17,7 @@ import (
 type ConfigServiceOptions struct {
 	DefaultMode domain.LibraryMode
 	Now         func() time.Time
+	Notifier    jobs.JobNotifier
 }
 
 // ConfigService implements app.LibraryConfigService with PostgreSQL advisory-lock
@@ -24,6 +26,7 @@ type ConfigService struct {
 	tx          storage.Transactor
 	defaultMode domain.LibraryMode
 	now         func() time.Time
+	notifier    jobs.JobNotifier
 }
 
 var _ app.LibraryConfigService = (*ConfigService)(nil)
@@ -48,6 +51,7 @@ func NewConfigService(tx storage.Transactor, opts ConfigServiceOptions) (*Config
 		tx:          tx,
 		defaultMode: defaultMode,
 		now:         nowFn,
+		notifier:    opts.Notifier,
 	}, nil
 }
 
@@ -310,6 +314,86 @@ func (s *ConfigService) SetManagedIntakePath(
 	return updated, nil
 }
 
+// RelocateRoot validates the target directory against canonical root/intake overlap rules
+// (excluding the target root itself) and atomically checks for conflicting active SCAN or
+// RELOCATE_ROOT jobs on the owning library before enqueueing a durable RELOCATE_ROOT job
+// (ADR-0017 §§1–2, ADR-0019 §7, M1B-D7).
+func (s *ConfigService) RelocateRoot(
+	ctx context.Context,
+	principal *domain.Principal,
+	req app.RelocateRootRequest,
+) (string, error) {
+	if err := app.RequirePermission(principal, domain.PermissionLibraryAdmin); err != nil {
+		return "", err
+	}
+	if s == nil || s.tx == nil {
+		return "", fmt.Errorf("%w: library configuration service is unavailable", app.ErrServiceBusy)
+	}
+	if strings.TrimSpace(req.RootID) == "" {
+		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyLibraryRootID)
+	}
+	if _, err := ResolveDirectoryPath(req.Path); err != nil {
+		return "", err
+	}
+
+	var createdBy *string
+	if principal != nil && strings.TrimSpace(principal.User.ID) != "" {
+		uid := principal.User.ID
+		createdBy = &uid
+	}
+
+	var jobID string
+	err := s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		libRepo := tx.Libraries()
+		jobRepo := tx.Jobs()
+		if libRepo == nil || jobRepo == nil {
+			return fmt.Errorf("%w: library configuration repositories are unavailable", app.ErrServiceBusy)
+		}
+		if err := libRepo.LockConfiguration(ctx); err != nil {
+			return err
+		}
+
+		root, err := libRepo.GetLibraryRootByID(ctx, req.RootID)
+		if err != nil {
+			return mapLibraryStorageError(err)
+		}
+		if err := libRepo.LockLibrary(ctx, root.LibraryID); err != nil {
+			return mapLibraryStorageError(err)
+		}
+
+		existing, err := CollectExistingPaths(ctx, libRepo, CollectOptions{
+			ExcludeRootID: root.ID,
+		})
+		if err != nil {
+			return err
+		}
+		canonTarget, err := CheckPathOverlap(req.Path, existing)
+		if err != nil {
+			return err
+		}
+		if _, err := domain.NewRootPathIdentity(canonTarget); err != nil {
+			return fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+		}
+
+		reqJob, err := buildRelocateTriggerRequest(root.LibraryID, root.ID, canonTarget, TriggerRelocateOptions{
+			CreatedBy: createdBy,
+		})
+		if err != nil {
+			return err
+		}
+		jobID, err = jobs.TriggerJob(ctx, jobRepo, nil, reqJob, s.now())
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if s.notifier != nil {
+		s.notifier.Notify(domain.JobKindRelocateRoot)
+	}
+	return jobID, nil
+}
+
 func (s *ConfigService) resolveCreateMode(mode domain.LibraryMode, intakePath []byte) (domain.LibraryMode, error) {
 	if mode == "" {
 		mode = s.defaultMode
@@ -354,6 +438,7 @@ func mapLibraryStorageError(err error) error {
 	case errors.Is(err, storage.ErrAlreadyExists):
 		return fmt.Errorf("%w: %w", app.ErrConflict, err)
 	case errors.Is(err, domain.ErrEmptyLibraryID),
+		errors.Is(err, domain.ErrEmptyLibraryRootID),
 		errors.Is(err, domain.ErrEmptyLibraryName),
 		errors.Is(err, domain.ErrInvalidLibraryMode),
 		errors.Is(err, domain.ErrVirtualLibraryWithIntake),

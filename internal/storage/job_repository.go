@@ -33,6 +33,14 @@ type JobRepository interface {
 	// transaction-bound handles with ErrRootRepositoryRequired so scheduling cannot use a stale snapshot.
 	Enqueue(ctx context.Context, job *domain.Job) (created bool, err error)
 
+	// EnqueueExclusive atomically checks for conflicting active jobs and enqueues job
+	// inside a READ COMMITTED transaction (or savepoint when already inside one, failing
+	// closed with ErrTransactionIsolation if the outer transaction is not READ COMMITTED).
+	// When lockKey is non-empty, it acquires a transaction-scoped advisory lock for lockKey
+	// before checking conflictDedupeKeys. If any key in conflictDedupeKeys has an active
+	// (QUEUED or RUNNING) job, it returns domain.ErrJobConflict without inserting.
+	EnqueueExclusive(ctx context.Context, job *domain.Job, lockKey string, conflictDedupeKeys []string) (created bool, err error)
+
 	// GetJobByID retrieves a job by its ID. Returns ErrNotFound if no such job exists.
 	GetJobByID(ctx context.Context, id string) (*domain.Job, error)
 

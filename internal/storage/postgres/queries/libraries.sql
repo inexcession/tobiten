@@ -161,6 +161,14 @@ WHERE id = $1
   AND library_id = $5
   AND path_bytes = $6;
 
+-- name: UpdateLibraryRootPath :one
+UPDATE library_roots
+SET path_bytes = $2,
+    path_display = $3,
+    path_match = $4
+WHERE id = $1
+RETURNING id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error;
+
 -- name: DeleteLibraryRoot :execrows
 DELETE FROM library_roots
 WHERE id = $1;

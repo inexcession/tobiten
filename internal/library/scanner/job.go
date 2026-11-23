@@ -27,10 +27,7 @@ type ScanJobPayload struct {
 
 // ScanDedupeKey returns the active-job deduplication key for scanning libraryID (ADR-0017 §1).
 func ScanDedupeKey(libraryID string) (string, error) {
-	if strings.TrimSpace(libraryID) == "" || strings.TrimSpace(libraryID) != libraryID {
-		return "", domain.ErrEmptyLibraryID
-	}
-	return string(domain.JobKindScan) + ":" + libraryID, nil
+	return domain.ScanJobDedupeKey(libraryID)
 }
 
 // JobTrigger enqueues durable background jobs (implemented by *jobs.Service).
@@ -50,12 +47,21 @@ type TriggerScanOptions struct {
 	RunAfter    time.Time
 }
 
-// TriggerScan enqueues a deduplicated durable SCAN job for libraryID via trigger (ADR-0017 §§1–2).
+// TriggerScan enqueues a deduplicated durable SCAN job for libraryID via trigger (ADR-0017 §§1–2),
+// rejecting with app.ErrConflict if a RELOCATE_ROOT job is active for libraryID (M1B-D7).
 func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts TriggerScanOptions) (string, error) {
 	if trigger == nil {
 		return "", fmt.Errorf("%w: job trigger is unavailable", app.ErrServiceBusy)
 	}
 	dedupeKey, err := ScanDedupeKey(libraryID)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+	}
+	relocateKey, err := domain.RelocateRootJobDedupeKey(libraryID)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
+	}
+	lockKey, err := domain.LibraryJobLockKey(libraryID)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", app.ErrInvalidInput, err)
 	}
@@ -68,12 +74,14 @@ func TriggerScan(ctx context.Context, trigger JobTrigger, libraryID string, opts
 		maxAttempts = DefaultScanMaxAttempts
 	}
 	return trigger.Trigger(ctx, jobs.TriggerRequest{
-		Kind:        domain.JobKindScan,
-		Payload:     payload,
-		DedupeKey:   &dedupeKey,
-		MaxAttempts: maxAttempts,
-		CreatedBy:   opts.CreatedBy,
-		RunAfter:    opts.RunAfter,
+		Kind:               domain.JobKindScan,
+		Payload:            payload,
+		DedupeKey:          &dedupeKey,
+		LockKey:            lockKey,
+		ConflictDedupeKeys: []string{relocateKey},
+		MaxAttempts:        maxAttempts,
+		CreatedBy:          opts.CreatedBy,
+		RunAfter:           opts.RunAfter,
 	})
 }
 

@@ -44,6 +44,7 @@ var (
 	ErrInvalidDeliveryOutcome        = errors.New("invalid event delivery outcome")
 	ErrInvalidEventDeliveryDedupeKey = errors.New("EVENT_DELIVERY job must use canonical subscriber dedupe_key")
 	ErrEventDeliveryBlocked          = errors.New("event subscriber delivery blocked by terminal failure")
+	ErrJobConflict                   = errors.New("conflicting active job exists")
 	ErrInvalidProgressTick           = errors.New("invalid job progress tick")
 )
 
@@ -55,6 +56,7 @@ type JobKind string
 
 const (
 	JobKindScan          JobKind = "SCAN"
+	JobKindRelocateRoot  JobKind = "RELOCATE_ROOT"
 	JobKindIntake        JobKind = "INTAKE"
 	JobKindRepack        JobKind = "REPACK"
 	JobKindWriteBack     JobKind = "WRITE_BACK"
@@ -62,6 +64,32 @@ const (
 	JobKindPurge         JobKind = "PURGE"
 	JobKindEventDelivery JobKind = "EVENT_DELIVERY"
 )
+
+// ScanJobDedupeKey returns the active-job deduplication key for scanning libraryID (ADR-0017 §1).
+func ScanJobDedupeKey(libraryID string) (string, error) {
+	if strings.TrimSpace(libraryID) == "" || strings.TrimSpace(libraryID) != libraryID {
+		return "", ErrEmptyLibraryID
+	}
+	return string(JobKindScan) + ":" + libraryID, nil
+}
+
+// RelocateRootJobDedupeKey returns the active-job deduplication key for relocating a root
+// of libraryID (ADR-0017 §1, M1B-D7).
+func RelocateRootJobDedupeKey(libraryID string) (string, error) {
+	if strings.TrimSpace(libraryID) == "" || strings.TrimSpace(libraryID) != libraryID {
+		return "", ErrEmptyLibraryID
+	}
+	return string(JobKindRelocateRoot) + ":" + libraryID, nil
+}
+
+// LibraryJobLockKey returns the per-library job admission lock key serializing SCAN and
+// RELOCATE_ROOT active checks and enqueues (ADR-0017 §1, M1B-D7).
+func LibraryJobLockKey(libraryID string) (string, error) {
+	if strings.TrimSpace(libraryID) == "" || strings.TrimSpace(libraryID) != libraryID {
+		return "", ErrEmptyLibraryID
+	}
+	return "library:" + libraryID, nil
+}
 
 // IsInternal reports whether this job kind is an internal delivery job that must suppress
 // its own lifecycle outbox events to avoid recursive delivery (ADR-0018 S3).

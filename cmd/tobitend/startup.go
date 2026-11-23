@@ -165,6 +165,10 @@ var newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scan
 	return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{})
 }
 
+var newDaemonRelocator = func(pool *pgxpool.Pool, _ *config.Config) (*roots.Relocator, error) {
+	return roots.NewRelocator(postgres.NewTransactor(pool), roots.RelocatorOptions{})
+}
+
 var startDaemonJobs = runDaemonJobs
 
 var buildDaemonServices = newDaemonServices
@@ -404,10 +408,15 @@ func runDaemonJobs(
 	if err != nil {
 		return nil, fmt.Errorf("initializing library scanner: %w", err)
 	}
+	relocator, err := newDaemonRelocator(pool, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("initializing root relocator: %w", err)
+	}
 
 	reg := buildDaemonRegistry(cfg, services, RegistryDeps{
 		Scanner:        sc,
 		ScannerWorkers: scannerWorkers,
+		Relocator:      relocator,
 	})
 	runner, delivery, dispatcher, progressHub, err := buildDaemonJobComponents(cancel, pool, parsed.defaultPoolSize)
 	if err != nil {
@@ -517,6 +526,7 @@ func newDaemonServices(
 	}
 	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
 		DefaultMode: defaultLibraryMode,
+		Notifier:    jobService,
 	})
 	if err != nil {
 		return nil, err

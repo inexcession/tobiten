@@ -19,7 +19,9 @@ import (
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
+	"github.com/inexcession/tobiten/internal/module"
 )
 
 func TestVersionString(t *testing.T) {
@@ -562,6 +564,35 @@ func TestBuildRegistry(t *testing.T) {
 		}
 		if len(disabledReg.JobKinds()) != 0 {
 			t.Fatalf("disabled scanner JobKinds() = %+v, want empty", disabledReg.JobKinds())
+		}
+	})
+
+	t.Run("wires roots module with RELOCATE_ROOT job kind when relocator supplied", func(t *testing.T) {
+		rel := &roots.Relocator{}
+		reg := BuildRegistryWithDeps(nil, nil, RegistryDeps{Relocator: rel})
+		if reg.Module(roots.ModuleName) == nil {
+			t.Fatal("expected 'roots' module to be registered")
+		}
+		if !reg.IsEnabled(roots.ModuleName) {
+			t.Fatal("expected 'roots' module to be enabled")
+		}
+		kinds := reg.JobKinds()
+		if len(kinds) != 1 || kinds[0].Name() != string(domain.JobKindRelocateRoot) ||
+			kinds[0].ResumePolicy() != domain.JobResumeRestart {
+			t.Fatalf("JobKinds() = %+v, want [RELOCATE_ROOT/RESTART]", kinds)
+		}
+		if rec, ok := kinds[0].(module.ReconcilableJobKind); !ok || rec.Reconciler() == nil {
+			t.Fatalf("JobKinds()[0] = %T does not expose non-nil Reconciler", kinds[0])
+		}
+
+		disabledReg := BuildRegistryWithDeps(&config.Config{
+			DisabledModules: []string{roots.ModuleName},
+		}, nil, RegistryDeps{Relocator: rel})
+		if disabledReg.IsEnabled(roots.ModuleName) {
+			t.Fatal("expected 'roots' module to be disabled by config")
+		}
+		if len(disabledReg.JobKinds()) != 0 {
+			t.Fatalf("disabled roots JobKinds() = %+v, want empty", disabledReg.JobKinds())
 		}
 	})
 }

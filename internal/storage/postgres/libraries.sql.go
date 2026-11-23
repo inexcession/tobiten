@@ -662,6 +662,43 @@ func (q *Queries) UpdateLibraryRoot(ctx context.Context, arg UpdateLibraryRootPa
 	return i, err
 }
 
+const updateLibraryRootPath = `-- name: UpdateLibraryRootPath :one
+UPDATE library_roots
+SET path_bytes = $2,
+    path_display = $3,
+    path_match = $4
+WHERE id = $1
+RETURNING id, library_id, path_bytes, path_display, path_match, state, last_checked_at, last_error
+`
+
+type UpdateLibraryRootPathParams struct {
+	ID          string
+	PathBytes   []byte
+	PathDisplay string
+	PathMatch   string
+}
+
+func (q *Queries) UpdateLibraryRootPath(ctx context.Context, arg UpdateLibraryRootPathParams) (LibraryRoot, error) {
+	row := q.db.QueryRow(ctx, updateLibraryRootPath,
+		arg.ID,
+		arg.PathBytes,
+		arg.PathDisplay,
+		arg.PathMatch,
+	)
+	var i LibraryRoot
+	err := row.Scan(
+		&i.ID,
+		&i.LibraryID,
+		&i.PathBytes,
+		&i.PathDisplay,
+		&i.PathMatch,
+		&i.State,
+		&i.LastCheckedAt,
+		&i.LastError,
+	)
+	return i, err
+}
+
 const updateLibraryRootStatus = `-- name: UpdateLibraryRootStatus :execrows
 UPDATE library_roots
 SET state = $2,

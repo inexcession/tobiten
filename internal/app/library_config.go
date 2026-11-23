@@ -37,10 +37,17 @@ type SetManagedIntakePathRequest struct {
 	IntakePath []byte
 }
 
+// RelocateRootRequest defines parameters for relocating an existing library root to a new path.
+type RelocateRootRequest struct {
+	RootID string
+	Path   []byte
+}
+
 // LibraryConfigService defines administrative use-cases for configuring libraries, roots,
 // and managed intake paths.
 type LibraryConfigService interface {
 	CreateLibrary(ctx context.Context, principal *domain.Principal, req CreateLibraryRequest) (*CreateLibraryResult, error)
 	AddRoot(ctx context.Context, principal *domain.Principal, req AddLibraryRootRequest) (*domain.LibraryRoot, error)
 	SetManagedIntakePath(ctx context.Context, principal *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error)
+	RelocateRoot(ctx context.Context, principal *domain.Principal, req RelocateRootRequest) (string, error)
 }
