@@ -1490,6 +1490,9 @@ type reconcileHookTransactor struct {
 	// beforeSecondReadCommitted fires right before the first post-walk
 	// WithReadCommittedTx call (after PreCheckLibrary's call #1).
 	beforeSecondReadCommitted func() error
+	// beforeThirdReadCommitted fires right before the second post-walk
+	// WithReadCommittedTx call.
+	beforeThirdReadCommitted func() error
 	// onLockVolume calls hook right before GetVolumeByIDForUpdate on the
 	// reconciliation transaction.
 	onLockVolume func() error
@@ -1505,6 +1508,11 @@ func (r *reconcileHookTransactor) WithReadCommittedTx(ctx context.Context, fn fu
 	callNum := r.readCommittedCall.Add(1)
 	if callNum == 2 && r.beforeSecondReadCommitted != nil {
 		if err := r.beforeSecondReadCommitted(); err != nil {
+			return err
+		}
+	}
+	if callNum == 3 && r.beforeThirdReadCommitted != nil {
+		if err := r.beforeThirdReadCommitted(); err != nil {
 			return err
 		}
 	}
@@ -1806,6 +1814,14 @@ func TestReconcile_RootSnapshotInvalidatedBeforeWrite(t *testing.T) {
 				close(moveInTx)
 				select {
 				case <-releaseMove:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+			beforeThirdReadCommitted: func() error {
+				select {
+				case <-addDone:
 					return nil
 				case <-ctx.Done():
 					return ctx.Err()

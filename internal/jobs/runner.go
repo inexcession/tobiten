@@ -824,6 +824,19 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, job *domain.Job, runErr error) error {
 	now := r.now().UTC()
 	settled := *job
+
+	var reconciledCheckpoint json.RawMessage
+	if runErr != nil && cfg.Reconciler != nil {
+		outcome, committed, err := r.reconcileCommittedSuccessBeforeFailure(ctx, cfg.Reconciler, job)
+		if err != nil {
+			return err
+		}
+		if committed {
+			runErr = nil
+			reconciledCheckpoint = outcome.Checkpoint
+		}
+	}
+
 	var (
 		label      string
 		writeFn    func(context.Context) (*domain.Job, error)
@@ -834,6 +847,9 @@ func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, jo
 	case runErr == nil:
 		label = "marking succeeded"
 		writeFn = func(writeCtx context.Context) (*domain.Job, error) {
+			if len(reconciledCheckpoint) > 0 {
+				return r.repo.RecoverSucceeded(writeCtx, job.ID, job.Attempts, reconciledCheckpoint, now)
+			}
 			return r.repo.MarkSucceeded(writeCtx, job.ID, job.Attempts, now)
 		}
 		isResolved = func(row *domain.Job) bool {
@@ -947,4 +963,53 @@ func (r *Runner) persistOutcomeWithRetry(
 	}
 
 	return fmt.Errorf("%w: %s job %q (attempt %d): %w", ErrOutcomePersistenceFailed, label, job.ID, job.Attempts, lastErr)
+}
+
+func (r *Runner) reconcileCommittedSuccessBeforeFailure(
+	ctx context.Context,
+	reconciler Reconciler,
+	job *domain.Job,
+) (ReconcileOutcome, bool, error) {
+	var lastErr error
+	maxAttempts := 1 + len(defaultOutcomeRetryDelays)
+	for attemptIdx := range maxAttempts {
+		if err := ctx.Err(); err != nil {
+			return ReconcileOutcome{}, false, err
+		}
+
+		row, err := r.repo.GetJobByID(ctx, job.ID)
+		if err == nil {
+			if row.State == domain.JobStateSucceeded && row.Attempts == job.Attempts {
+				return ReconcileOutcome{Action: ReconcileSucceeded}, true, nil
+			}
+			if row.State != domain.JobStateRunning || row.Attempts != job.Attempts {
+				return ReconcileOutcome{}, false, nil
+			}
+			outcome, recErr := reconciler.Reconcile(ctx, *row)
+			if recErr == nil {
+				return outcome, outcome.Action == ReconcileSucceeded, nil
+			}
+			lastErr = recErr
+		} else {
+			lastErr = err
+		}
+
+		if ctx.Err() != nil {
+			return ReconcileOutcome{}, false, ctx.Err()
+		}
+		if attemptIdx >= len(defaultOutcomeRetryDelays) {
+			break
+		}
+		timer := time.NewTimer(defaultOutcomeRetryDelays[attemptIdx])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ReconcileOutcome{}, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return ReconcileOutcome{}, false, fmt.Errorf(
+		"%w: reconciling committed outcome for job %q (attempt %d): %w",
+		ErrOutcomePersistenceFailed, job.ID, job.Attempts, lastErr,
+	)
 }

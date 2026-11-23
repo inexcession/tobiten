@@ -536,6 +536,98 @@ func TestRelocateRoot_VerificationAndOverlapFailures(t *testing.T) {
 			},
 		}, roots.ErrPathOverlap)
 	})
+
+	t.Run("verified file replaced in place with matching size and mtime after verification fails", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		dst := filepath.Join(newRoot, "Reloc/v01.cbz")
+		writeRelocateTestFile(t, dst, fix.availData)
+		if fix.avail.FileMtime != nil {
+			if err := os.Chtimes(dst, *fix.avail.FileMtime, *fix.avail.FileMtime); err != nil {
+				t.Fatalf("Chtimes: %v", err)
+			}
+		}
+		altered := append([]byte(nil), fix.availData...)
+		altered[0] ^= 0xff
+		runAndExpectFail(t, fix, newRoot, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				if err := os.WriteFile(dst, altered, 0o600); err != nil {
+					return err
+				}
+				if fix.avail.FileMtime != nil {
+					return os.Chtimes(dst, *fix.avail.FileMtime, *fix.avail.FileMtime)
+				}
+				return nil
+			},
+		}, roots.ErrDigestMismatch)
+	})
+
+	t.Run("verified file replaced by atomic rename after verification fails", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		dst := filepath.Join(newRoot, "Reloc/v01.cbz")
+		writeRelocateTestFile(t, dst, fix.availData)
+		altered := buildTestCBZBytes(t, "Reloc", "Tampered", "1", "tampered-body-diff")
+		runAndExpectFail(t, fix, newRoot, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				tmp := dst + ".tmp"
+				if err := os.WriteFile(tmp, altered, 0o600); err != nil {
+					return err
+				}
+				return os.Rename(tmp, dst)
+			},
+		}, roots.ErrDigestMismatch)
+	})
+
+	t.Run("verified required file removed after verification fails", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		dst := filepath.Join(newRoot, "Reloc/v01.cbz")
+		writeRelocateTestFile(t, dst, fix.availData)
+		runAndExpectFail(t, fix, newRoot, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				return os.Remove(dst)
+			},
+		}, roots.ErrMissingAssetFile)
+	})
+
+	t.Run("previously absent optional file appearing after verification with wrong digest fails", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+		missDst := filepath.Join(newRoot, "Reloc/v02-missing.cbz")
+		runAndExpectFail(t, fix, newRoot, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				return os.WriteFile(missDst, []byte("appeared-with-bad-bytes"), 0o600)
+			},
+		}, roots.ErrDigestMismatch)
+	})
+
+	t.Run("previously absent optional file appearing after verification with valid digest re-verifies and activates", func(t *testing.T) {
+		fix, newRoot, _ := setupCase(t)
+		writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+		missDst := filepath.Join(newRoot, "Reloc/v02-missing.cbz")
+
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+		jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{})
+		if err != nil {
+			t.Fatalf("TriggerRelocateRoot: %v", err)
+		}
+		rel, err := roots.NewRelocator(transactor, roots.RelocatorOptions{
+			OnAfterVerify: func(_ context.Context, _ domain.Job) error {
+				return os.WriteFile(missDst, fix.missData, 0o600)
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewRelocator: %v", err)
+		}
+		runner := newRootsRunner(t, jobRepo, rel)
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+		}
+		got, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil || got.State != domain.JobStateSucceeded {
+			t.Fatalf("job = (%+v, %v), want SUCCEEDED", got, err)
+		}
+		assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+	})
 }
 
 func TestRelocateRoot_CancellationAndCrashRecoveryBothSides(t *testing.T) {
@@ -829,5 +921,140 @@ func TestRelocateRoot_SameLibraryExclusionAndIndependentLibraries(t *testing.T) 
 	s2, err := scanner.TriggerScan(ctx, jobSvc, fixA.lib.ID, scanner.TriggerScanOptions{})
 	if err != nil || s2 != s1 {
 		t.Fatalf("repeat TriggerScan = (%q, %v), want %q", s2, err, s1)
+	}
+}
+
+type lostCommitAckTransactor struct {
+	inner             storage.Transactor
+	activationCommits atomic.Int32
+	injectOnce        atomic.Bool
+	afterCommit       func(ctx context.Context) error
+}
+
+func (l *lostCommitAckTransactor) WithTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	return l.inner.WithTx(ctx, fn)
+}
+
+func (l *lostCommitAckTransactor) WithReadCommittedTx(ctx context.Context, fn func(tx storage.Tx) error) error {
+	var sawActivation bool
+	err := l.inner.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return fn(&lostCommitAckTx{
+			Tx:            tx,
+			parent:        l,
+			sawActivation: &sawActivation,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if sawActivation {
+		l.activationCommits.Add(1)
+		if l.afterCommit != nil {
+			if hookErr := l.afterCommit(ctx); hookErr != nil {
+				return hookErr
+			}
+		}
+		if l.injectOnce.CompareAndSwap(true, false) {
+			return errors.New("simulated lost commit acknowledgment")
+		}
+	}
+	return nil
+}
+
+type lostCommitAckTx struct {
+	storage.Tx
+	parent        *lostCommitAckTransactor
+	sawActivation *bool
+}
+
+func (t *lostCommitAckTx) Libraries() storage.LibraryRepository {
+	return &lostCommitAckLibRepo{
+		LibraryRepository: t.Tx.Libraries(),
+		sawActivation:     t.sawActivation,
+	}
+}
+
+type lostCommitAckLibRepo struct {
+	storage.LibraryRepository
+	sawActivation *bool
+}
+
+func (r *lostCommitAckLibRepo) UpdateLibraryRootPath(ctx context.Context, id string, path domain.PathIdentity) (*domain.LibraryRoot, error) {
+	*r.sawActivation = true
+	return r.LibraryRepository.UpdateLibraryRootPath(ctx, id, path)
+}
+
+func TestRelocateRoot_LostCommitAckSettlesSucceededWithoutSecondActivation(t *testing.T) {
+	t.Parallel()
+	db, transactor, svc, admin := setupConfigServiceTestDB(t, roots.ConfigServiceOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	canonBase, err := paths.CanonicalPath(base)
+	if err != nil {
+		t.Fatalf("CanonicalPath: %v", err)
+	}
+	jobRepo := postgres.NewJobRepository(db.Pool)
+	jobSvc := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+	for _, tc := range []struct {
+		name               string
+		maxAttempts        int
+		cancelBeforeCommit bool
+	}{
+		{name: "with remaining retries settles as SUCCEEDED instead of retrying", maxAttempts: 3},
+		{name: "with single attempt settles as SUCCEEDED instead of failing", maxAttempts: 1},
+		{name: "with concurrent cancel_requested after commit settles as SUCCEEDED instead of cancelling", maxAttempts: 3, cancelBeforeCommit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caseDir := filepath.Join(canonBase, "lost-ack-"+domain.MustNewID())
+			oldRoot := filepath.Join(caseDir, "old")
+			newRoot := filepath.Join(caseDir, "new")
+			fix := seedRelocateFixture(ctx, t, db, transactor, svc, admin, domain.LibraryModeVirtual, oldRoot, "")
+			writeRelocateTestFile(t, filepath.Join(newRoot, "Reloc/v01.cbz"), fix.availData)
+
+			jobID, err := roots.TriggerRelocateRoot(ctx, jobSvc, fix.lib.ID, fix.root.ID, []byte(newRoot), roots.TriggerRelocateOptions{
+				MaxAttempts: tc.maxAttempts,
+			})
+			if err != nil {
+				t.Fatalf("TriggerRelocateRoot: %v", err)
+			}
+
+			faultTx := &lostCommitAckTransactor{inner: transactor}
+			faultTx.injectOnce.Store(true)
+			if tc.cancelBeforeCommit {
+				faultTx.afterCommit = func(hookCtx context.Context) error {
+					_, cErr := jobSvc.CancelJob(hookCtx, admin, jobID)
+					return cErr
+				}
+			}
+
+			rel, err := roots.NewRelocator(faultTx, roots.RelocatorOptions{})
+			if err != nil {
+				t.Fatalf("NewRelocator: %v", err)
+			}
+			runner := newRootsRunner(t, jobRepo, rel)
+			if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
+				t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+			}
+
+			// Claiming again must find no queued retry.
+			if claimedAgain, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || claimedAgain {
+				t.Fatalf("unexpected retry ClaimAndRunNext = (%v, %v)", claimedAgain, err)
+			}
+			if commits := faultTx.activationCommits.Load(); commits != 1 {
+				t.Fatalf("activationCommits = %d, want 1", commits)
+			}
+
+			got, err := jobRepo.GetJobByID(ctx, jobID)
+			if err != nil {
+				t.Fatalf("GetJobByID: %v", err)
+			}
+			if got.State != domain.JobStateSucceeded || got.Attempts != 1 || got.LastError != nil {
+				t.Fatalf("job = %+v, want SUCCEEDED attempts=1 last_error=nil", got)
+			}
+			assertRelocateFixturePreserved(ctx, t, db, fix, []byte(newRoot))
+		})
 	}
 }

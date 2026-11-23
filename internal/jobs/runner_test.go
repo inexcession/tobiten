@@ -1406,3 +1406,139 @@ func TestRunner_PlainHandlerErrorRetriesWithBackoffAndAppendsSingleJobFailed(t *
 		t.Fatalf("post-failure Enqueue = (created=%v, err=%v, id=%s), want new job", created, err, retryJob.ID)
 	}
 }
+
+func TestRunner_SettlesCommittedReconcilerOutcomeWhenHandlerReturnsError(t *testing.T) {
+	t.Parallel()
+	_, repo := setupRunnerTestDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t0 := time.Date(2026, 11, 23, 4, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name              string
+		maxAttempts       int
+		requestCancel     bool
+		returnedErr       error
+		expectedReconcile jobs.ReconcileAction
+		wantState         domain.JobState
+	}{
+		{
+			name:              "ordinary error settles as SUCCEEDED when durable checkpoint committed",
+			maxAttempts:       3,
+			returnedErr:       errors.New("lost commit acknowledgment"),
+			expectedReconcile: jobs.ReconcileSucceeded,
+			wantState:         domain.JobStateSucceeded,
+		},
+		{
+			name:              "single attempt with cancel_requested settles as SUCCEEDED when durable checkpoint committed",
+			maxAttempts:       1,
+			requestCancel:     true,
+			returnedErr:       jobs.ErrJobCancelled,
+			expectedReconcile: jobs.ReconcileSucceeded,
+			wantState:         domain.JobStateSucceeded,
+		},
+		{
+			name:              "permanent failure settles as SUCCEEDED when durable checkpoint committed",
+			maxAttempts:       3,
+			returnedErr:       jobs.ErrPermanentFailure,
+			expectedReconcile: jobs.ReconcileSucceeded,
+			wantState:         domain.JobStateSucceeded,
+		},
+		{
+			name:              "ordinary error still retries when reconciler returns ReconcileRequeue",
+			maxAttempts:       3,
+			returnedErr:       errors.New("transient pre-commit error"),
+			expectedReconcile: jobs.ReconcileRequeue,
+			wantState:         domain.JobStateQueued,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := &domain.Job{
+				Kind:        domain.JobKindRelocateRoot,
+				DedupeKey:   new("relocate-runner-" + domain.MustNewID()),
+				MaxAttempts: tc.maxAttempts,
+				CreatedAt:   t0,
+				RunAfter:    t0,
+			}
+			if _, err := repo.Enqueue(ctx, j); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+
+			var transitions []domain.JobState
+			var onSucceededCount int
+			var handlerCalls int
+
+			runner := jobs.NewRunner(repo, jobs.RunnerOptions{
+				Now: func() time.Time { return t0 },
+				OnTransition: func(job domain.Job) {
+					if job.ID == j.ID {
+						transitions = append(transitions, job.State)
+					}
+				},
+			})
+			if err := runner.RegisterKind(jobs.KindConfig{
+				Kind:         domain.JobKindRelocateRoot,
+				ResumePolicy: domain.JobResumeRestart,
+				Handler: jobs.HandlerFunc(func(runCtx context.Context, exec *jobs.Execution) error {
+					handlerCalls++
+					if err := exec.SaveCheckpoint(runCtx, json.RawMessage(`{"committed":true}`)); err != nil {
+						return err
+					}
+					if tc.requestCancel {
+						if _, err := repo.RequestCancel(runCtx, j.ID, t0); err != nil {
+							return err
+						}
+					}
+					return tc.returnedErr
+				}),
+				Reconciler: jobs.ReconcileFunc(func(_ context.Context, got domain.Job) (jobs.ReconcileOutcome, error) {
+					var cp struct {
+						Committed bool `json:"committed"`
+					}
+					if len(got.Checkpoint) > 0 && json.Unmarshal(got.Checkpoint, &cp) == nil && cp.Committed {
+						return jobs.ReconcileOutcome{Action: tc.expectedReconcile}, nil
+					}
+					return jobs.ReconcileOutcome{Action: jobs.ReconcileRequeue}, nil
+				}),
+				OnSucceeded: func(_ context.Context, _ domain.Job) {
+					onSucceededCount++
+				},
+			}); err != nil {
+				t.Fatalf("RegisterKind: %v", err)
+			}
+			if _, err := runner.Recover(ctx); err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+
+			if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindRelocateRoot); err != nil || !claimed {
+				t.Fatalf("ClaimAndRunNext = (%v, %v), want (true, nil)", claimed, err)
+			}
+			got, err := repo.GetJobByID(ctx, j.ID)
+			if err != nil {
+				t.Fatalf("GetJobByID: %v", err)
+			}
+			if got.State != tc.wantState || got.Attempts != 1 || handlerCalls != 1 {
+				t.Fatalf("got state=%s attempts=%d handlerCalls=%d, want state=%s attempts=1 handlerCalls=1",
+					got.State, got.Attempts, handlerCalls, tc.wantState)
+			}
+			if tc.wantState == domain.JobStateSucceeded {
+				if onSucceededCount != 1 || got.LastError != nil {
+					t.Fatalf("onSucceededCount=%d lastErr=%v, want 1 and nil", onSucceededCount, got.LastError)
+				}
+				if !slices.Equal(transitions, []domain.JobState{domain.JobStateRunning, domain.JobStateSucceeded}) {
+					t.Fatalf("transitions = %v, want [RUNNING SUCCEEDED]", transitions)
+				}
+			}
+			if tc.wantState == domain.JobStateQueued {
+				if onSucceededCount != 0 || got.LastError == nil || *got.LastError != tc.returnedErr.Error() {
+					t.Fatalf("onSucceededCount=%d lastErr=%v, want 0 and %q", onSucceededCount, got.LastError, tc.returnedErr.Error())
+				}
+				if !slices.Equal(transitions, []domain.JobState{domain.JobStateRunning}) {
+					t.Fatalf("transitions = %v, want [RUNNING]", transitions)
+				}
+			}
+		})
+	}
+}

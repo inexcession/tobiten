@@ -2,7 +2,12 @@
 
 package roots
 
-import "golang.org/x/sys/unix"
+import (
+	"os"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 // darwinPCCaseSensitive is _PC_CASE_SENSITIVE from <sys/unistd.h> on Darwin.
 const darwinPCCaseSensitive = 11
@@ -24,4 +29,16 @@ func directoryLookupSemantics(dir string) lookupSemantics {
 		normInsensitive:        true,
 		ignoreDefaultIgnorable: true,
 	}
+}
+
+func sameFileIdentityAndChangeTime(a, b os.FileInfo) bool {
+	if !os.SameFile(a, b) {
+		return false
+	}
+	sa, okA := a.Sys().(*syscall.Stat_t)
+	sb, okB := b.Sys().(*syscall.Stat_t)
+	if !okA || !okB {
+		return true
+	}
+	return sa.Dev == sb.Dev && sa.Ino == sb.Ino && sa.Ctimespec == sb.Ctimespec
 }

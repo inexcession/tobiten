@@ -28,6 +28,10 @@ const ModuleName = "roots"
 // DefaultRelocateRootMaxAttempts is the default attempt budget for durable RELOCATE_ROOT jobs.
 const DefaultRelocateRootMaxAttempts = domain.DefaultJobMaxAttempts
 
+const maxRelocateVerifyPasses = 3
+
+var errVerificationDrift = errors.New("roots: target file set drifted after verification")
+
 var (
 	// ErrMissingAssetFile indicates a required non-missing asset file was absent at the relocation target.
 	ErrMissingAssetFile = errors.New("roots: required media asset file missing at relocation target")
@@ -339,16 +343,26 @@ func (m *Module) handleRelocateRootJob(ctx context.Context, exec *jobs.Execution
 	})
 }
 
+type relocateAssetObservation struct {
+	absPath []byte
+	present bool
+	info    os.FileInfo
+	size    int64
+	modTime time.Time
+}
+
 type relocateSnapshot struct {
 	root          domain.LibraryRoot
 	assets        []domain.MediaAsset
 	canonTarget   []byte
 	targetDirInfo os.FileInfo
+	observations  []relocateAssetObservation
 }
 
 // Execute verifies target asset fingerprints read-only outside the activation
-// transaction, rechecks canonical overlap and cancellation, and atomically commits
-// the new root path together with the attempt's activation checkpoint.
+// transaction, rechecks canonical overlap and cancellation, binds activation to
+// the verified target files, and atomically commits the new root path together
+// with the attempt's activation checkpoint.
 func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel func(context.Context) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -360,6 +374,32 @@ func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel fun
 	if err != nil {
 		return err
 	}
+
+	for pass := range maxRelocateVerifyPasses {
+		err := r.executeVerifyAndActivatePass(ctx, job, payload, pass == 0, checkCancel)
+		if err == nil {
+			if r.onAfterActivate != nil {
+				if hookErr := r.onAfterActivate(ctx, job); hookErr != nil {
+					return hookErr
+				}
+			}
+			return nil
+		}
+		if errors.Is(err, errVerificationDrift) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, ErrTargetIdentityChanged)
+}
+
+func (r *Relocator) executeVerifyAndActivatePass(
+	ctx context.Context,
+	job domain.Job,
+	payload RelocateRootPayload,
+	runHooks bool,
+	checkCancel func(context.Context) error,
+) error {
 	if err := observeRelocateCancel(ctx, checkCancel); err != nil {
 		return err
 	}
@@ -368,15 +408,18 @@ func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel fun
 	if err != nil {
 		return err
 	}
-	if r.onBeforeVerify != nil {
+	if runHooks && r.onBeforeVerify != nil {
 		if err := r.onBeforeVerify(ctx, job); err != nil {
 			return err
 		}
 	}
-	if err := r.verifyAllAssets(ctx, snap, checkCancel); err != nil {
+	observations, err := r.verifyAllAssets(ctx, snap, checkCancel)
+	if err != nil {
 		return err
 	}
-	if r.onAfterVerify != nil {
+	snap.observations = observations
+
+	if runHooks && r.onAfterVerify != nil {
 		if err := r.onAfterVerify(ctx, job); err != nil {
 			return err
 		}
@@ -384,16 +427,7 @@ func (r *Relocator) Execute(ctx context.Context, job domain.Job, checkCancel fun
 	if err := observeRelocateCancel(ctx, checkCancel); err != nil {
 		return err
 	}
-
-	if err := r.activateRelocation(ctx, job, payload, snap); err != nil {
-		return err
-	}
-	if r.onAfterActivate != nil {
-		if err := r.onAfterActivate(ctx, job); err != nil {
-			return err
-		}
-	}
-	return nil
+	return r.activateRelocation(ctx, job, payload, snap)
 }
 
 func (r *Relocator) prepareVerificationSnapshot(ctx context.Context, payload RelocateRootPayload) (relocateSnapshot, error) {
@@ -455,54 +489,66 @@ func (r *Relocator) verifyAllAssets(
 	ctx context.Context,
 	snap relocateSnapshot,
 	checkCancel func(context.Context) error,
-) error {
+) ([]relocateAssetObservation, error) {
+	observations := make([]relocateAssetObservation, 0, len(snap.assets))
 	for _, asset := range snap.assets {
 		if err := observeRelocateCancel(ctx, checkCancel); err != nil {
-			return err
+			return nil, err
 		}
 		absPath := joinAbsoluteBytes(snap.canonTarget, asset.RelPathBytes)
-		if err := r.verifyOneAsset(ctx, asset, absPath); err != nil {
-			return err
+		obs, err := r.verifyOneAsset(ctx, asset, absPath)
+		if err != nil {
+			return nil, err
 		}
+		observations = append(observations, obs)
 	}
-	return nil
+	return observations, nil
 }
 
-func (r *Relocator) verifyOneAsset(ctx context.Context, asset domain.MediaAsset, absPath []byte) error {
+func (r *Relocator) verifyOneAsset(ctx context.Context, asset domain.MediaAsset, absPath []byte) (relocateAssetObservation, error) {
 	expected, hasFingerprint := asset.CurrentDigest(domain.DigestKindXXH364Partial)
 	required := asset.IsAvailable()
 
 	f, err := r.open(ctx, absPath)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-			return ctxErr
+			return relocateAssetObservation{}, ctxErr
 		}
-		return r.classifyOpenFailure(absPath, required, err)
+		if classErr := r.classifyOpenFailure(absPath, required, err); classErr != nil {
+			return relocateAssetObservation{}, classErr
+		}
+		return relocateAssetObservation{absPath: absPath, present: false}, nil
 	}
 	defer func() {
 		_ = f.Close()
 	}()
 
-	size, err := r.resolveOpenedRegularFileSize(absPath, f)
+	info, err := r.resolveOpenedRegularFileInfo(absPath, f)
 	if err != nil {
-		return fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, err)
+		return relocateAssetObservation{}, fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, err)
 	}
 	if !hasFingerprint {
-		return fmt.Errorf("%w: asset %s (%s)", jobs.ErrPermanentFailure, ErrMissingVerificationDigest, asset.RelPathDisplay)
+		return relocateAssetObservation{}, fmt.Errorf("%w: asset %s (%s)", jobs.ErrPermanentFailure, ErrMissingVerificationDigest, asset.RelPathDisplay)
 	}
 
-	actual, err := scanner.PartialFingerprint(f, size)
+	actual, err := scanner.PartialFingerprint(f, info.Size())
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return relocateAssetObservation{}, ctxErr
 		}
-		return fmt.Errorf("%w: %w: %w", jobs.ErrPermanentFailure, ErrUnreadableAssetFile, err)
+		return relocateAssetObservation{}, fmt.Errorf("%w: %w: %w", jobs.ErrPermanentFailure, ErrUnreadableAssetFile, err)
 	}
 	if actual != expected.Value {
-		return fmt.Errorf("%w: %w for asset %s (want %s, got %s)",
+		return relocateAssetObservation{}, fmt.Errorf("%w: %w for asset %s (want %s, got %s)",
 			jobs.ErrPermanentFailure, ErrDigestMismatch, asset.RelPathDisplay, expected.Value, actual)
 	}
-	return nil
+	return relocateAssetObservation{
+		absPath: absPath,
+		present: true,
+		info:    info,
+		size:    info.Size(),
+		modTime: info.ModTime(),
+	}, nil
 }
 
 func (r *Relocator) classifyOpenFailure(absPath []byte, required bool, openErr error) error {
@@ -523,25 +569,25 @@ func (r *Relocator) classifyOpenFailure(absPath []byte, required bool, openErr e
 	return fmt.Errorf("%w: %w: %w", jobs.ErrPermanentFailure, ErrUnreadableAssetFile, openErr)
 }
 
-func (r *Relocator) resolveOpenedRegularFileSize(absPath []byte, f scanner.ReadAtCloser) (int64, error) {
+func (r *Relocator) resolveOpenedRegularFileInfo(absPath []byte, f scanner.ReadAtCloser) (os.FileInfo, error) {
 	if statable, ok := f.(statReadAtCloser); ok {
 		info, err := statable.Stat()
 		if err != nil {
-			return 0, fmt.Errorf("%w: %w", ErrUnreadableAssetFile, err)
+			return nil, fmt.Errorf("%w: %w", ErrUnreadableAssetFile, err)
 		}
 		if !info.Mode().IsRegular() {
-			return 0, fmt.Errorf("%w: %s is not a regular file", ErrUnreadableAssetFile, absPath)
+			return nil, fmt.Errorf("%w: %s is not a regular file", ErrUnreadableAssetFile, absPath)
 		}
-		return info.Size(), nil
+		return info, nil
 	}
 	info, err := r.stat(absPath)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrUnreadableAssetFile, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnreadableAssetFile, err)
 	}
 	if !info.Mode().IsRegular() {
-		return 0, fmt.Errorf("%w: %s is not a regular file", ErrUnreadableAssetFile, absPath)
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrUnreadableAssetFile, absPath)
 	}
-	return info.Size(), nil
+	return info, nil
 }
 
 func (r *Relocator) activateRelocation(
@@ -670,7 +716,44 @@ func (r *Relocator) recheckActivationTarget(
 	if !r.customStat && !os.SameFile(snap.targetDirInfo, curInfo) {
 		return nil, fmt.Errorf("%w: %w", jobs.ErrPermanentFailure, ErrTargetIdentityChanged)
 	}
+	if err := r.verifyObservationsAtActivation(ctx, snap.observations); err != nil {
+		return nil, err
+	}
 	return reCanonTarget, nil
+}
+
+func (r *Relocator) verifyObservationsAtActivation(ctx context.Context, observations []relocateAssetObservation) error {
+	for _, obs := range observations {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.checkObservationStillValid(obs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Relocator) checkObservationStillValid(obs relocateAssetObservation) error {
+	if !obs.present {
+		_, lerr := r.lstat(obs.absPath)
+		if isAbsentPathError(lerr) {
+			return nil
+		}
+		return errVerificationDrift
+	}
+
+	curInfo, err := r.stat(obs.absPath)
+	if err != nil || !curInfo.Mode().IsRegular() {
+		return errVerificationDrift
+	}
+	if curInfo.Size() != obs.size || !curInfo.ModTime().Equal(obs.modTime) {
+		return errVerificationDrift
+	}
+	if !r.customStat && !sameFileIdentityAndChangeTime(obs.info, curInfo) {
+		return errVerificationDrift
+	}
+	return nil
 }
 
 func (r *Relocator) checkTargetDirectory(target []byte) (os.FileInfo, error) {
