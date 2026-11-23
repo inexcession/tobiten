@@ -1,8 +1,10 @@
 package openapi
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/inexcession/tobiten/internal/api/middleware"
 	"github.com/inexcession/tobiten/internal/app"
@@ -272,22 +275,91 @@ func (m *Module) prepareLibraryConfigRequest(w http.ResponseWriter, r *http.Requ
 	return p, svc, true
 }
 
+type strictJSONPath string
+
+func (p *strictJSONPath) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return nil
+	}
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return fmt.Errorf("%w: path must be a JSON string", app.ErrInvalidInput)
+	}
+	if err := validateJSONStringEscapes(data[1 : len(data)-1]); err != nil {
+		return err
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("%w: invalid path string: %v", app.ErrInvalidInput, err)
+	}
+	*p = strictJSONPath(s)
+	return nil
+}
+
+func (p *strictJSONPath) asStringPtr() *string {
+	if p == nil {
+		return nil
+	}
+	s := string(*p)
+	return &s
+}
+
+func validateJSONStringEscapes(inner []byte) error {
+	for i := 0; i < len(inner); {
+		if inner[i] != '\\' {
+			i++
+			continue
+		}
+		if i+1 >= len(inner) {
+			return fmt.Errorf("%w: invalid json string escape", app.ErrInvalidInput)
+		}
+		if inner[i+1] != 'u' {
+			i += 2
+			continue
+		}
+		if i+6 > len(inner) {
+			return fmt.Errorf("%w: truncated unicode escape", app.ErrInvalidInput)
+		}
+		u1, err := strconv.ParseUint(string(inner[i+2:i+6]), 16, 16)
+		if err != nil {
+			return fmt.Errorf("%w: invalid unicode escape", app.ErrInvalidInput)
+		}
+		i += 6
+		if u1 >= 0xDC00 && u1 <= 0xDFFF {
+			return fmt.Errorf("%w: unpaired UTF-16 low surrogate in path", app.ErrInvalidInput)
+		}
+		if u1 >= 0xD800 && u1 <= 0xDBFF {
+			if i+6 > len(inner) || inner[i] != '\\' || inner[i+1] != 'u' {
+				return fmt.Errorf("%w: unpaired UTF-16 high surrogate in path", app.ErrInvalidInput)
+			}
+			u2, err := strconv.ParseUint(string(inner[i+2:i+6]), 16, 16)
+			if err != nil {
+				return fmt.Errorf("%w: invalid unicode escape", app.ErrInvalidInput)
+			}
+			if u2 < 0xDC00 || u2 > 0xDFFF {
+				return fmt.Errorf("%w: unpaired UTF-16 high surrogate in path", app.ErrInvalidInput)
+			}
+			i += 6
+		}
+	}
+	return nil
+}
+
 type createLibraryHTTPRequest struct {
-	Name                  string   `json:"name"`
-	Mode                  string   `json:"mode"`
-	RootPath              *string  `json:"root_path"`
-	RootPathHex           *string  `json:"root_path_hex"`
-	IntakePath            *string  `json:"intake_path"`
-	IntakePathHex         *string  `json:"intake_path_hex"`
-	AutoMetadataWriteback bool     `json:"auto_metadata_writeback"`
-	ResolverChain         []string `json:"resolver_chain"`
-	MetadataPrecedence    string   `json:"metadata_precedence"`
-	DefaultCoverPolicy    string   `json:"default_cover_policy"`
+	Name                  string          `json:"name"`
+	Mode                  string          `json:"mode"`
+	RootPath              *strictJSONPath `json:"root_path"`
+	RootPathHex           *string         `json:"root_path_hex"`
+	IntakePath            *strictJSONPath `json:"intake_path"`
+	IntakePathHex         *string         `json:"intake_path_hex"`
+	AutoMetadataWriteback bool            `json:"auto_metadata_writeback"`
+	ResolverChain         []string        `json:"resolver_chain"`
+	MetadataPrecedence    string          `json:"metadata_precedence"`
+	DefaultCoverPolicy    string          `json:"default_cover_policy"`
 }
 
 type addLibraryRootHTTPRequest struct {
-	Path    *string `json:"path"`
-	PathHex *string `json:"path_hex"`
+	Path    *strictJSONPath `json:"path"`
+	PathHex *string         `json:"path_hex"`
 }
 
 func (m *Module) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
@@ -296,8 +368,8 @@ func (m *Module) handleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body createLibraryHTTPRequest
-	if err := decodeLibraryJSONBody(r, &body); err != nil {
-		middleware.WriteAppError(w, r, err)
+	if err := decodeLibraryJSONBody(w, r, &body); err != nil {
+		writeLibraryDecodeError(w, r, err)
 		return
 	}
 	req, err := buildCreateLibraryRequest(body)
@@ -324,11 +396,11 @@ func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body addLibraryRootHTTPRequest
-	if err := decodeLibraryJSONBody(r, &body); err != nil {
-		middleware.WriteAppError(w, r, err)
+	if err := decodeLibraryJSONBody(w, r, &body); err != nil {
+		writeLibraryDecodeError(w, r, err)
 		return
 	}
-	pathBytes, err := parseJSONPathPair(body.Path, body.PathHex, "path", "path_hex", true)
+	pathBytes, err := parseJSONPathPair(body.Path.asStringPtr(), body.PathHex, "path", "path_hex", true)
 	if err != nil {
 		middleware.WriteAppError(w, r, err)
 		return
@@ -345,11 +417,11 @@ func (m *Module) handleAddLibraryRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildCreateLibraryRequest(body createLibraryHTTPRequest) (app.CreateLibraryRequest, error) {
-	rootBytes, err := parseJSONPathPair(body.RootPath, body.RootPathHex, "root_path", "root_path_hex", true)
+	rootBytes, err := parseJSONPathPair(body.RootPath.asStringPtr(), body.RootPathHex, "root_path", "root_path_hex", true)
 	if err != nil {
 		return app.CreateLibraryRequest{}, err
 	}
-	intakeBytes, err := parseJSONPathPair(body.IntakePath, body.IntakePathHex, "intake_path", "intake_path_hex", false)
+	intakeBytes, err := parseJSONPathPair(body.IntakePath.asStringPtr(), body.IntakePathHex, "intake_path", "intake_path_hex", false)
 	if err != nil {
 		return app.CreateLibraryRequest{}, err
 	}
@@ -392,8 +464,23 @@ func buildCreateLibraryRequest(body createLibraryHTTPRequest) (app.CreateLibrary
 	}, nil
 }
 
-func decodeLibraryJSONBody(r *http.Request, dst any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxLibraryJSONBodyBytes))
+func decodeLibraryJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	body := r.Body
+	if body == nil {
+		body = http.NoBody
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, body, maxLibraryJSONBodyBytes))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return err
+		}
+		return fmt.Errorf("%w: reading request body: %v", app.ErrInvalidInput, err)
+	}
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("%w: request body must be valid UTF-8", app.ErrInvalidInput)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("%w: invalid json body: %v", app.ErrInvalidInput, err)
 	}
@@ -402,6 +489,15 @@ func decodeLibraryJSONBody(r *http.Request, dst any) error {
 		return fmt.Errorf("%w: trailing data after json body", app.ErrInvalidInput)
 	}
 	return nil
+}
+
+func writeLibraryDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	middleware.WriteAppError(w, r, err)
 }
 
 func parseJSONPathPair(raw, rawHex *string, field, hexField string, required bool) ([]byte, error) {

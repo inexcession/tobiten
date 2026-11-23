@@ -320,6 +320,8 @@ func TestLibraryReadRoutes_QueryValidationJSONContractAndHEAD(t *testing.T) {
 }
 
 type recordingLibraryConfigService struct {
+	createCalls   int
+	addCalls      int
 	lastCreateReq app.CreateLibraryRequest
 	lastAddReq    app.AddLibraryRootRequest
 	defaultMode   domain.LibraryMode
@@ -329,6 +331,7 @@ type recordingLibraryConfigService struct {
 }
 
 func (r *recordingLibraryConfigService) CreateLibrary(_ context.Context, _ *domain.Principal, req app.CreateLibraryRequest) (*app.CreateLibraryResult, error) {
+	r.createCalls++
 	r.lastCreateReq = req
 	if r.conflictErr {
 		return nil, app.ErrConflict
@@ -384,6 +387,7 @@ func (r *recordingLibraryConfigService) CreateLibrary(_ context.Context, _ *doma
 }
 
 func (r *recordingLibraryConfigService) AddRoot(_ context.Context, _ *domain.Principal, req app.AddLibraryRootRequest) (*domain.LibraryRoot, error) {
+	r.addCalls++
 	r.lastAddReq = req
 	if r.conflictErr {
 		return nil, app.ErrConflict
@@ -629,5 +633,190 @@ func TestLibraryProvisioningRoutes_AuthCSRFValidationAndMapping(t *testing.T) {
 			t.Fatalf("missing library AddRoot = %d, want 404", rec404.Code)
 		}
 		recCfg.notFoundErr = false
+	})
+
+	t.Run("rejects lossy UTF-8 and unpaired surrogates in text paths while preserving literal U+FFFD and hex", func(t *testing.T) {
+		invalidPayloads := []struct {
+			name string
+			path string
+			body []byte
+		}{
+			{
+				name: "CreateLibrary raw invalid UTF-8 root_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","root_path":"/mnt/bad-` + "\xff" + `-dir"}`),
+			},
+			{
+				name: "CreateLibrary raw invalid UTF-8 intake_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","mode":"MANAGED","root_path":"/mnt/r","intake_path":"/mnt/in-` + "\xff" + `"}`),
+			},
+			{
+				name: "AddRoot raw invalid UTF-8 path",
+				path: "/api/v1/libraries/lib-1/roots",
+				body: []byte(`{"path":"/mnt/bad-` + "\xff" + `-dir"}`),
+			},
+			{
+				name: "CreateLibrary unpaired high surrogate root_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","root_path":"/mnt/\ud800"}`),
+			},
+			{
+				name: "CreateLibrary unpaired low surrogate root_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","root_path":"/mnt/\udc00"}`),
+			},
+			{
+				name: "CreateLibrary high surrogate followed by non-low surrogate root_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","root_path":"/mnt/\ud800\u0041"}`),
+			},
+			{
+				name: "CreateLibrary unpaired surrogate intake_path",
+				path: "/api/v1/libraries",
+				body: []byte(`{"name":"Lib","mode":"MANAGED","root_path":"/mnt/r","intake_path":"/mnt/\ud83d"}`),
+			},
+			{
+				name: "AddRoot unpaired high surrogate path",
+				path: "/api/v1/libraries/lib-1/roots",
+				body: []byte(`{"path":"/mnt/\ud800"}`),
+			},
+			{
+				name: "AddRoot unpaired low surrogate path",
+				path: "/api/v1/libraries/lib-1/roots",
+				body: []byte(`{"path":"/mnt/\udfff"}`),
+			},
+		}
+
+		for _, tc := range invalidPayloads {
+			t.Run(tc.name, func(t *testing.T) {
+				beforeCreate, beforeAdd := recCfg.createCalls, recCfg.addCalls
+				req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(tc.body))
+				req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+				rec := httptest.NewRecorder()
+				mod.router.ServeHTTP(rec, req)
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("%s status = %d (%s), want 400", tc.name, rec.Code, rec.Body.String())
+				}
+				if recCfg.createCalls != beforeCreate || recCfg.addCalls != beforeAdd {
+					t.Fatalf("%s invoked config service despite invalid text path", tc.name)
+				}
+			})
+		}
+
+		// Valid literal U+FFFD (raw UTF-8 \xef\xbf\xbd and \ufffd escape) and valid surrogate pairs succeed verbatim.
+		for _, tc := range []struct {
+			name     string
+			body     string
+			wantRoot string
+			wantIn   string
+		}{
+			{
+				name:     "raw UTF-8 U+FFFD and escaped U+FFFD",
+				body:     `{"name":"FFFD Lib","mode":"MANAGED","root_path":"/mnt/literal-` + "\ufffd" + `","intake_path":"/mnt/escaped-\ufffd"}`,
+				wantRoot: "/mnt/literal-\ufffd",
+				wantIn:   "/mnt/escaped-\ufffd",
+			},
+			{
+				name:     "valid surrogate pair and escaped backslash before ud800",
+				body:     `{"name":"Pair Lib","mode":"MANAGED","root_path":"/mnt/\ud83d\ude00","intake_path":"/mnt/\\ud800"}`,
+				wantRoot: "/mnt/\U0001f600",
+				wantIn:   `/mnt/\ud800`,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/libraries", strings.NewReader(tc.body))
+				req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+				rec := httptest.NewRecorder()
+				mod.router.ServeHTTP(rec, req)
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("%s CreateLibrary = %d (%s), want 201", tc.name, rec.Code, rec.Body.String())
+				}
+				if string(recCfg.lastCreateReq.Roots[0]) != tc.wantRoot || string(recCfg.lastCreateReq.IntakePath) != tc.wantIn {
+					t.Fatalf("%s got root=%q intake=%q, want root=%q intake=%q",
+						tc.name, recCfg.lastCreateReq.Roots[0], recCfg.lastCreateReq.IntakePath, tc.wantRoot, tc.wantIn)
+				}
+
+				addBody := `{"path":"/mnt/add-` + "\ufffd" + `-\ud83d\ude00"}`
+				addReq := httptest.NewRequest(http.MethodPost, "/api/v1/libraries/lib-1/roots", strings.NewReader(addBody))
+				addReq = addReq.WithContext(domain.ContextWithPrincipal(addReq.Context(), admin))
+				addRec := httptest.NewRecorder()
+				mod.router.ServeHTTP(addRec, addReq)
+				if addRec.Code != http.StatusCreated {
+					t.Fatalf("%s AddRoot = %d (%s), want 201", tc.name, addRec.Code, addRec.Body.String())
+				}
+				if string(recCfg.lastAddReq.Path) != "/mnt/add-\ufffd-\U0001f600" {
+					t.Fatalf("%s AddRoot path = %q", tc.name, recCfg.lastAddReq.Path)
+				}
+			})
+		}
+	})
+
+	t.Run("enforces exact 1 MiB body limit and rejects trailing data beyond cap", func(t *testing.T) {
+		// 1. Valid JSON object padded with whitespace to exact maxLibraryJSONBodyBytes succeeds.
+		for _, tc := range []struct {
+			name   string
+			path   string
+			prefix string
+		}{
+			{"CreateLibrary at exact cap", "/api/v1/libraries", `{"name":"AtLimit","root_path":"/mnt/limit"}`},
+			{"AddRoot at exact cap", "/api/v1/libraries/lib-1/roots", `{"path":"/mnt/limit"}`},
+		} {
+			pad := strings.Repeat(" ", maxLibraryJSONBodyBytes-len(tc.prefix))
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.prefix+pad))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("%s status = %d (%s), want 201", tc.name, rec.Code, rec.Body.String())
+			}
+		}
+
+		// 2. Valid JSON object followed by whitespace up to cap + second JSON value beyond cap -> 413 without service call.
+		for _, tc := range []struct {
+			name   string
+			path   string
+			prefix string
+			suffix string
+		}{
+			{"CreateLibrary padded overflow with trailing value", "/api/v1/libraries", `{"name":"Over","root_path":"/mnt/over"}`, `{}`},
+			{"AddRoot padded overflow with trailing value", "/api/v1/libraries/lib-1/roots", `{"path":"/mnt/over"}`, `{}`},
+			{"CreateLibrary 1 byte over cap", "/api/v1/libraries", `{"name":"Over1","root_path":"/mnt/over1"}`, " "},
+			{"AddRoot 1 byte over cap", "/api/v1/libraries/lib-1/roots", `{"path":"/mnt/over1"}`, " "},
+		} {
+			pad := strings.Repeat(" ", maxLibraryJSONBodyBytes-len(tc.prefix))
+			beforeCreate, beforeAdd := recCfg.createCalls, recCfg.addCalls
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.prefix+pad+tc.suffix))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("%s status = %d (%s), want 413", tc.name, rec.Code, rec.Body.String())
+			}
+			if recCfg.createCalls != beforeCreate || recCfg.addCalls != beforeAdd {
+				t.Fatalf("%s invoked config service on oversized body", tc.name)
+			}
+		}
+
+		// 3. Ordinary trailing data under cap -> 400 without service call.
+		for _, tc := range []struct {
+			path string
+			body string
+		}{
+			{"/api/v1/libraries", `{"name":"Trail","root_path":"/mnt/a"} {"extra":true}`},
+			{"/api/v1/libraries/lib-1/roots", `{"path":"/mnt/a"} {"extra":true}`},
+		} {
+			beforeCreate, beforeAdd := recCfg.createCalls, recCfg.addCalls
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req = req.WithContext(domain.ContextWithPrincipal(req.Context(), admin))
+			rec := httptest.NewRecorder()
+			mod.router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("trailing data POST %s = %d, want 400", tc.path, rec.Code)
+			}
+			if recCfg.createCalls != beforeCreate || recCfg.addCalls != beforeAdd {
+				t.Fatalf("trailing data POST %s invoked config service", tc.path)
+			}
+		}
 	})
 }

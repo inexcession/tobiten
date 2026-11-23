@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -13,12 +12,11 @@ import (
 // NewStubServices constructs a full Services set backed by stub implementations.
 func NewStubServices() *Services {
 	return &Services{
-		Events:        NewStubEventService(),
-		Library:       NewStubLibraryService(),
-		LibraryConfig: NewStubLibraryConfigService(),
-		Reading:       NewStubReadingService(),
-		Curation:      NewStubCurationService(),
-		Admin:         NewStubAdminService(),
+		Events:   NewStubEventService(),
+		Library:  NewStubLibraryService(),
+		Reading:  NewStubReadingService(),
+		Curation: NewStubCurationService(),
+		Admin:    NewStubAdminService(),
 	}
 }
 
@@ -181,126 +179,6 @@ func (s *StubLibraryService) GetVolume(_ context.Context, _ *domain.Principal, i
 
 func (s *StubLibraryService) ScanLibrary(_ context.Context, _ *domain.Principal, libraryID string) (string, error) {
 	return "job-scan-" + libraryID, nil
-}
-
-// StubLibraryConfigService implements LibraryConfigService for testing and bootstrap composition.
-type StubLibraryConfigService struct {
-	mu          sync.RWMutex
-	DefaultMode domain.LibraryMode
-	Libraries   map[string]domain.Library
-	Roots       map[string][]domain.LibraryRoot
-}
-
-// NewStubLibraryConfigService creates a new StubLibraryConfigService.
-func NewStubLibraryConfigService() *StubLibraryConfigService {
-	return &StubLibraryConfigService{
-		DefaultMode: domain.LibraryModeVirtual,
-		Libraries:   make(map[string]domain.Library),
-		Roots:       make(map[string][]domain.LibraryRoot),
-	}
-}
-
-func (s *StubLibraryConfigService) CreateLibrary(_ context.Context, _ *domain.Principal, req CreateLibraryRequest) (*CreateLibraryResult, error) {
-	if strings.TrimSpace(req.Name) == "" {
-		return nil, ErrInvalidInput
-	}
-	mode := req.Mode
-	if mode == "" {
-		mode = s.DefaultMode
-	}
-	if !mode.IsValid() {
-		return nil, ErrInvalidInput
-	}
-	var intake *domain.PathIdentity
-	if mode == domain.LibraryModeManaged {
-		if len(req.IntakePath) == 0 {
-			return nil, ErrInvalidInput
-		}
-		id, err := domain.NewRootPathIdentity(req.IntakePath)
-		if err != nil {
-			return nil, ErrInvalidInput
-		}
-		intake = &id
-	} else if len(req.IntakePath) > 0 {
-		return nil, ErrInvalidInput
-	}
-	lib := domain.Library{
-		ID:                    "lib-stub-created",
-		Name:                  req.Name,
-		Mode:                  mode,
-		IntakePath:            intake,
-		AutoMetadataWriteback: req.AutoMetadataWriteback,
-		ResolverChain:         domain.DefaultResolverChain(),
-		MetadataPrecedence:    domain.MetadataPrecedenceEmbeddedOverOnline,
-		DefaultCoverPolicy:    domain.CoverPolicyFirst,
-		CreatedAt:             time.Now().UTC(),
-	}
-	if len(req.ResolverChain) > 0 {
-		lib.ResolverChain = req.ResolverChain
-	}
-	if req.MetadataPrecedence != "" {
-		lib.MetadataPrecedence = req.MetadataPrecedence
-	}
-	if req.DefaultCoverPolicy != "" {
-		lib.DefaultCoverPolicy = req.DefaultCoverPolicy
-	}
-	roots := make([]domain.LibraryRoot, 0, len(req.Roots))
-	for _, rawRoot := range req.Roots {
-		pathID, err := domain.NewRootPathIdentity(rawRoot)
-		if err != nil {
-			return nil, ErrInvalidInput
-		}
-		roots = append(roots, domain.LibraryRoot{
-			ID:        "root-stub-created",
-			LibraryID: lib.ID,
-			Path:      pathID,
-			State:     domain.LibraryRootStateOnline,
-		})
-	}
-	s.mu.Lock()
-	s.Libraries[lib.ID] = lib
-	s.Roots[lib.ID] = roots
-	s.mu.Unlock()
-	return &CreateLibraryResult{Library: lib, Roots: roots}, nil
-}
-
-func (s *StubLibraryConfigService) AddRoot(_ context.Context, _ *domain.Principal, req AddLibraryRootRequest) (*domain.LibraryRoot, error) {
-	if strings.TrimSpace(req.LibraryID) == "" {
-		return nil, ErrInvalidInput
-	}
-	pathID, err := domain.NewRootPathIdentity(req.Path)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
-	root := domain.LibraryRoot{
-		ID:        "root-stub-added",
-		LibraryID: req.LibraryID,
-		Path:      pathID,
-		State:     domain.LibraryRootStateOnline,
-	}
-	s.mu.Lock()
-	s.Roots[req.LibraryID] = append(s.Roots[req.LibraryID], root)
-	s.mu.Unlock()
-	return &root, nil
-}
-
-func (s *StubLibraryConfigService) SetManagedIntakePath(_ context.Context, _ *domain.Principal, req SetManagedIntakePathRequest) (*domain.Library, error) {
-	if strings.TrimSpace(req.LibraryID) == "" {
-		return nil, ErrInvalidInput
-	}
-	pathID, err := domain.NewRootPathIdentity(req.IntakePath)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lib, ok := s.Libraries[req.LibraryID]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	lib.IntakePath = &pathID
-	s.Libraries[req.LibraryID] = lib
-	return &lib, nil
 }
 
 // StubReadingService implements ReadingService for testing.
