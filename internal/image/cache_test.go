@@ -873,6 +873,73 @@ func TestCoverCache_ConcurrentAccess(t *testing.T) {
 	}
 }
 
+func TestCoverCache_TraversalOnlyExternalAncestor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses 0111 directory permissions")
+	}
+
+	ctx := context.Background()
+	layouts := []struct {
+		name           string
+		preprovisioned bool
+	}{
+		{name: "pre_provisioned_covers_root", preprovisioned: true},
+		{name: "lazily_created_covers_root_under_writable_child", preprovisioned: false},
+	}
+
+	for _, tc := range layouts {
+		t.Run(tc.name, func(t *testing.T) {
+			extDir := filepath.Join(t.TempDir(), "ext")
+			var coversDir string
+			if tc.preprovisioned {
+				coversDir = filepath.Join(extDir, "covers")
+				if err := os.MkdirAll(coversDir, 0o755); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+			} else {
+				writable := filepath.Join(extDir, "writable")
+				if err := os.MkdirAll(writable, 0o755); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				coversDir = filepath.Join(writable, "covers")
+			}
+
+			if err := os.Chmod(extDir, 0o111); err != nil {
+				t.Fatalf("Chmod(0111): %v", err)
+			}
+			t.Cleanup(func() {
+				_ = os.Chmod(extDir, 0o755)
+			})
+
+			cache, err := tobitenimage.NewCoverCache(coversDir)
+			if err != nil {
+				t.Fatalf("NewCoverCache: %v", err)
+			}
+
+			key := tobitenimage.ArchiveCoverKey("1122334455667788", 0, tobitenimage.DefaultCoverOptions())
+			payload := []byte("cover-under-0111-ancestor")
+			if _, err := cache.Put(ctx, key, payload); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			got, err := cache.Get(ctx, key)
+			if err != nil || !bytes.Equal(got.Data, payload) {
+				t.Fatalf("Get = (%v, %v), want %q", got, err, payload)
+			}
+
+			newDigest := "99aabbccddeeff00"
+			if moved, err := cache.Rekey(ctx, key.Source(), tobitenimage.ArchiveSource(newDigest)); err != nil || moved != 1 {
+				t.Fatalf("Rekey = (%d, %v), want (1, nil)", moved, err)
+			}
+			if _, err := cache.Get(ctx, tobitenimage.ArchiveCoverKey(newDigest, 0, tobitenimage.DefaultCoverOptions())); err != nil {
+				t.Fatalf("Get after Rekey: %v", err)
+			}
+			if removed, err := cache.Invalidate(ctx, tobitenimage.ArchiveSource(newDigest)); err != nil || removed != 1 {
+				t.Fatalf("Invalidate = (%d, %v), want (1, nil)", removed, err)
+			}
+		})
+	}
+}
+
 func fingerprintFile(t *testing.T, path string) string {
 	t.Helper()
 	f, err := os.Open(path)

@@ -643,7 +643,7 @@ func (c *CoverCache) ensureRootDir() error {
 
 	if !c.rootEnsured {
 		if parent := filepath.Dir(cur); parent != cur {
-			if err := c.ops.syncDir(parent); err != nil {
+			if err := c.ops.syncDir(parent); err != nil && !errors.Is(err, os.ErrPermission) {
 				return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, err)
 			}
 		}

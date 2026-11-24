@@ -881,6 +881,35 @@ func TestCoverCache_DirectorySyncFailuresFinishOnRetry(t *testing.T) {
 			t.Fatalf("Get(newKey) = (%v, %v), want unsynced-dest", gotNew, err)
 		}
 	})
+
+	t.Run("cache_created_directory_propagates_permission_error", func(t *testing.T) {
+		base := t.TempDir()
+		writable := filepath.Join(base, "writable")
+		if err := os.MkdirAll(writable, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		coversDir := filepath.Join(writable, "covers")
+
+		cache, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+		origSyncDir := cache.ops.syncDir
+		cache.ops.syncDir = func(dir string) error {
+			if dir == writable {
+				return os.ErrPermission
+			}
+			return origSyncDir(dir)
+		}
+
+		key := ArchiveCoverKey("abcdef0123456789", 0, DefaultCoverOptions())
+		if _, err := cache.Put(ctx, key, []byte("perm-fail")); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("Put err = %v, want os.ErrPermission", err)
+		}
+		if _, err := os.Stat(coversDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("coversDir survived rollback after parent permission failure: %v", err)
+		}
+	})
 }
 
 func mustNormalize(t *testing.T, k CoverKey) CoverKey {
