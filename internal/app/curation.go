@@ -50,3 +50,23 @@ type CurationService interface {
 	RestoreTrash(ctx context.Context, principal *domain.Principal, itemID string) error
 	PurgeTrash(ctx context.Context, principal *domain.Principal, req PurgeTrashRequest) (string, error)
 }
+
+type coverTargetKindCtxKey struct{}
+
+// ContextWithCoverTargetKind scopes CurationService.GetCover to a specific target kind
+// (domain.ItemTypeVolume or domain.ItemTypeSeries).
+func ContextWithCoverTargetKind(ctx context.Context, kind domain.ItemType) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, coverTargetKindCtxKey{}, kind)
+}
+
+// CoverTargetKindFromContext extracts the requested cover target kind from ctx, if set.
+func CoverTargetKindFromContext(ctx context.Context) (domain.ItemType, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	kind, ok := ctx.Value(coverTargetKindCtxKey{}).(domain.ItemType)
+	return kind, ok && kind != ""
+}

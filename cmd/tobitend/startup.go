@@ -741,6 +741,7 @@ func newDaemonServices(
 		Events:        eventService,
 		Library:       libraryService,
 		LibraryConfig: libraryConfigService,
+		Curation:      coverService,
 	})
 	ds.app = services
 	return ds, nil

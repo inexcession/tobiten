@@ -61,10 +61,12 @@ const (
 		SELECT a.id, a.volume_id, r.library_id, a.library_root_id,
 		       r.path_bytes, r.path_display, r.state,
 		       a.rel_path_bytes, a.rel_path_display,
-		       a.file_size, a.format, a.page_count, a.cover_page_index, a.suppressed_pages,
+		       a.file_size, a.format, COALESCE(d.kind, ''), COALESCE(d.value, ''),
+		       a.page_count, a.cover_page_index, a.suppressed_pages,
 		       a.missing_since, a.retired_at
 		FROM media_assets a
-		JOIN library_roots r ON r.id = a.library_root_id`
+		JOIN library_roots r ON r.id = a.library_root_id
+		LEFT JOIN asset_digests d ON d.asset_id = a.id AND d.kind = 'XXH3_64_PARTIAL' AND d.is_current = TRUE`
 
 	selectReadingProgressColumns = `
 		SELECT rp.user_id, rp.volume_id, rp.locator, rp.total_progression,
@@ -75,11 +77,12 @@ const (
 		SELECT a.id, a.volume_id, r.library_id, a.library_root_id,
 		       r.path_bytes, r.path_display, r.state,
 		       a.rel_path_bytes, a.rel_path_display, a.rel_path_match,
-		       a.file_size, a.file_mtime, a.format, a.page_count,
-		       a.cover_page_index, a.suppressed_pages, a.diagnostics,
+		       a.file_size, a.file_mtime, a.format, COALESCE(d.kind, ''), COALESCE(d.value, ''),
+		       a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics,
 		       a.missing_since, a.retired_at, a.created_at, a.updated_at
 		FROM media_assets a
-		JOIN library_roots r ON r.id = a.library_root_id`
+		JOIN library_roots r ON r.id = a.library_root_id
+		LEFT JOIN asset_digests d ON d.asset_id = a.id AND d.kind = 'XXH3_64_PARTIAL' AND d.is_current = TRUE`
 
 	selectSeriesMembershipColumns = `
 		SELECT sm.volume_id, sm.series_id, sm.is_primary, sm.kind, sm.position,
@@ -1505,6 +1508,8 @@ func scanAuthorizedAssetFileRow(row pgx.Row) (*storage.AuthorizedAssetFile, erro
 	var (
 		f              storage.AuthorizedAssetFile
 		format         string
+		digestKind     string
+		digest         string
 		pageCount      int32
 		coverPageIndex int32
 		suppressed     []int32
@@ -1521,6 +1526,8 @@ func scanAuthorizedAssetFileRow(row pgx.Row) (*storage.AuthorizedAssetFile, erro
 		&f.RelPathDisplay,
 		&f.FileSize,
 		&format,
+		&digestKind,
+		&digest,
 		&pageCount,
 		&coverPageIndex,
 		&suppressed,
@@ -1531,6 +1538,8 @@ func scanAuthorizedAssetFileRow(row pgx.Row) (*storage.AuthorizedAssetFile, erro
 		return nil, mapPgError(err)
 	}
 	f.Format = domain.MediaFormat(format)
+	f.DigestKind = domain.DigestKind(digestKind)
+	f.Digest = digest
 	f.PageCount = int(pageCount)
 	f.CoverPageIndex = int(coverPageIndex)
 	f.SuppressedPages = int32SliceToInt(suppressed)
@@ -1542,6 +1551,8 @@ func scanAuthorizedAssetCandidateRow(row pgx.Row) (domain.MediaAsset, storage.Au
 		a                domain.MediaAsset
 		f                storage.AuthorizedAssetFile
 		format           string
+		digestKind       string
+		digest           string
 		pageCount        int32
 		coverPageIndex   int32
 		suppressed       []int32
@@ -1561,6 +1572,8 @@ func scanAuthorizedAssetCandidateRow(row pgx.Row) (domain.MediaAsset, storage.Au
 		&a.FileSize,
 		&a.FileMtime,
 		&format,
+		&digestKind,
+		&digest,
 		&pageCount,
 		&coverPageIndex,
 		&suppressed,
@@ -1581,6 +1594,14 @@ func scanAuthorizedAssetCandidateRow(row pgx.Row) (domain.MediaAsset, storage.Au
 	if err != nil {
 		return domain.MediaAsset{}, storage.AuthorizedAssetFile{}, fmt.Errorf("decoding asset diagnostics: %w", err)
 	}
+	if digestKind != "" && digest != "" {
+		a.Digests = []domain.AssetDigest{{
+			AssetID:   a.ID,
+			Kind:      domain.DigestKind(digestKind),
+			Value:     digest,
+			IsCurrent: true,
+		}}
+	}
 
 	f.AssetID = a.ID
 	f.VolumeID = a.VolumeID
@@ -1589,6 +1610,8 @@ func scanAuthorizedAssetCandidateRow(row pgx.Row) (domain.MediaAsset, storage.Au
 	f.RelPathDisplay = a.RelPathDisplay
 	f.FileSize = a.FileSize
 	f.Format = a.Format
+	f.DigestKind = domain.DigestKind(digestKind)
+	f.Digest = digest
 	f.PageCount = a.PageCount
 	f.CoverPageIndex = a.CoverPageIndex
 	f.SuppressedPages = a.SuppressedPages

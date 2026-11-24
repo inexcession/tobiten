@@ -62,8 +62,10 @@ func (m *Module) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/v1/libraries/{id}/folders", m.handleBrowseLibraryFolder)
 	mux.HandleFunc("GET /api/v1/series", m.handleListSeries)
 	mux.HandleFunc("GET /api/v1/series/{id}", m.handleGetSeries)
+	mux.HandleFunc("GET /api/v1/series/{id}/thumbnail", m.handleGetSeriesThumbnail)
 	mux.HandleFunc("GET /api/v1/volumes", m.handleListVolumes)
 	mux.HandleFunc("GET /api/v1/volumes/{id}", m.handleGetVolume)
+	mux.HandleFunc("GET /api/v1/volumes/{id}/thumbnail", m.handleGetVolumeThumbnail)
 
 	// Native library provisioning, scan, and root management routes (M1-T21.5, M1-T10.7, M1-T22.5, ADR-0017, ADR-0019).
 	mux.HandleFunc("POST /api/v1/libraries", m.handleCreateLibrary)

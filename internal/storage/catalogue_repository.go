@@ -128,6 +128,8 @@ type AuthorizedAssetFile struct {
 	RelPathDisplay  string
 	FileSize        int64
 	Format          domain.MediaFormat
+	DigestKind      domain.DigestKind
+	Digest          string
 	PageCount       int
 	CoverPageIndex  int
 	SuppressedPages []int

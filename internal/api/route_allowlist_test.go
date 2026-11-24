@@ -367,10 +367,14 @@ func TestM1AC5_DirectAndConfiguredSubpathAliases(t *testing.T) {
 			"/comics/api/v1/series",
 			"/api/v1/series/ser-1",
 			"/comics/api/v1/series/ser-1",
+			"/api/v1/series/ser-1/thumbnail",
+			"/comics/api/v1/series/ser-1/thumbnail",
 			"/api/v1/volumes",
 			"/comics/api/v1/volumes",
 			"/api/v1/volumes/vol-1",
 			"/comics/api/v1/volumes/vol-1",
+			"/api/v1/volumes/vol-1/thumbnail",
+			"/comics/api/v1/volumes/vol-1/thumbnail",
 		}
 		for _, path := range protectedGetPaths {
 			resp, err := client.Get(baseURL + path)

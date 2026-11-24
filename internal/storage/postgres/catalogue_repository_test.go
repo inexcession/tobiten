@@ -780,6 +780,13 @@ func enforceCountAssetsByVolume(t *testing.T, ec *catalogueEnforcementCtx) {
 }
 
 func enforceGetAuthorizedAssetFile(t *testing.T, ec *catalogueEnforcementCtx) {
+	// Seed a current partial digest on aKidsClean to verify AuthorizedAssetFile exposes it.
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `
+		INSERT INTO asset_digests (asset_id, kind, value, is_current, reason)
+		VALUES ($1, 'XXH3_64_PARTIAL', '0123456789abcdef', true, 'SCAN')
+		ON CONFLICT (asset_id, kind, value) DO UPDATE SET is_current = true`, ec.cat.aKidsClean); err != nil {
+		t.Fatalf("seed asset_digests for aKidsClean: %v", err)
+	}
 	file, err := ec.repo.GetAuthorizedAssetFile(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.aKidsClean)
 	if err != nil {
 		t.Fatalf("timmy GetAuthorizedAssetFile(aKidsClean) err: %v", err)
@@ -790,7 +797,9 @@ func enforceGetAuthorizedAssetFile(t *testing.T, ec *catalogueEnforcementCtx) {
 		file.LibraryRootID != ec.cat.rootID ||
 		!bytes.Equal(file.RootPathBytes, []byte("/manga")) ||
 		!bytes.Equal(file.RelPathBytes, []byte("kids-clean.cbz")) ||
-		file.Format != domain.MediaFormatCBZ {
+		file.Format != domain.MediaFormatCBZ ||
+		file.DigestKind != domain.DigestKindXXH364Partial ||
+		file.Digest != "0123456789abcdef" {
 		t.Fatalf("unexpected AuthorizedAssetFile: %+v", file)
 	}
 

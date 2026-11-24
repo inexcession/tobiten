@@ -6,12 +6,16 @@ package curation
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -169,6 +173,7 @@ func CoverAssetSourceFromDomain(asset domain.MediaAsset, root domain.LibraryRoot
 // cover generation worker pool (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverServiceOptions struct {
 	Tx               storage.Transactor
+	ReadTx           storage.ReadTransactor
 	Cache            *image.CoverCache
 	Pipelines        *image.Registry
 	Formats          *container.FormatRegistry
@@ -203,11 +208,14 @@ type archiveCoverSpec struct {
 	rendition     image.RenderOptions
 }
 
+var _ app.CurationService = (*CoverService)(nil)
+
 // CoverService serves cached cover renditions and runs cache-miss generation
 // on a daemon-owned bounded in-process worker pool deduplicated by full CoverKey
 // (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverService struct {
 	tx               storage.Transactor
+	readTx           storage.ReadTransactor
 	cache            *image.CoverCache
 	pipelines        *image.Registry
 	formats          *container.FormatRegistry
@@ -276,8 +284,14 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 		openFn = defaultOpenRawArchive
 	}
 
+	readTx := opts.ReadTx
+	if readTx == nil {
+		readTx, _ = opts.Tx.(storage.ReadTransactor)
+	}
+
 	svc := &CoverService{
 		tx:               opts.Tx,
+		readTx:           readTx,
 		cache:            opts.Cache,
 		pipelines:        opts.Pipelines,
 		formats:          formats,
@@ -897,4 +911,250 @@ func verifyOpenedArchive(
 		return archiveObservation{}, err
 	}
 	return expected, nil
+}
+
+type coverCandidate struct {
+	volumeID string
+	source   CoverAssetSource
+}
+
+// GetCover resolves targetID under principal's SERVER-label policies and serves
+// its rendered JPEG cover and strong ETag through the daemon-owned cover pool
+// (ADR-0006 §5, ADR-0010 §2, ADR-0015 §4).
+func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal, targetID string) (*app.CoverRendition, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, ErrCoverPoolNotRunning)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if principal == nil || strings.TrimSpace(principal.User.ID) == "" {
+		return nil, app.ErrUnauthorized
+	}
+	if strings.TrimSpace(targetID) == "" {
+		return nil, fmt.Errorf("%w: target id is required", app.ErrInvalidInput)
+	}
+	targetKind, hasTargetKind := app.CoverTargetKindFromContext(ctx)
+	if hasTargetKind && targetKind != domain.ItemTypeVolume && targetKind != domain.ItemTypeSeries {
+		return nil, fmt.Errorf("%w: unsupported cover target kind %q", app.ErrInvalidInput, targetKind)
+	}
+
+	resolvedKind, candidates, err := s.resolveCoverCandidates(ctx, principal, targetID, targetKind, hasTargetKind)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		sawOffline  bool
+		lastUnavail error
+	)
+	for _, cand := range candidates {
+		entry, genErr := s.GetOrGenerateCover(ctx, cand.source)
+		if genErr == nil {
+			return &app.CoverRendition{
+				TargetID:    targetID,
+				ContentType: entry.ContentType,
+				Data:        entry.Data,
+				ETag:        computeCoverETag(resolvedKind, targetID, cand.volumeID, cand.source.AssetID, entry),
+			}, nil
+		}
+		if errors.Is(genErr, ErrCoverPoolNotRunning) || errors.Is(genErr, ErrCoverPoolClosed) || errors.Is(genErr, ErrCoverWaitTimeout) {
+			return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, genErr)
+		}
+		if errors.Is(genErr, ErrCoverUnavailable) {
+			var unavail *CoverUnavailableError
+			if errors.As(genErr, &unavail) && unavail.Reason == "root_offline" {
+				sawOffline = true
+			}
+			lastUnavail = genErr
+			continue
+		}
+		return nil, genErr
+	}
+
+	if sawOffline {
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
+	}
+	if lastUnavail != nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
+	}
+	return nil, app.ErrNotFound
+}
+
+func (s *CoverService) resolveCoverCandidates(
+	ctx context.Context,
+	principal *domain.Principal,
+	targetID string,
+	targetKind domain.ItemType,
+	hasTargetKind bool,
+) (domain.ItemType, []coverCandidate, error) {
+	if s.readTx == nil {
+		return "", nil, ErrMissingTransactor
+	}
+
+	var (
+		resolvedKind domain.ItemType
+		candidates   []coverCandidate
+	)
+	scope := storage.CatalogueReadScope{
+		Principal:      principal,
+		IncludeTrashed: false,
+	}
+
+	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
+		catRepo := tx.Catalogue()
+		if catRepo == nil {
+			return errors.New("curation: read transaction missing catalogue repository")
+		}
+
+		if !hasTargetKind || targetKind == domain.ItemTypeVolume {
+			file, err := catRepo.SelectPreferredAssetFileForVolume(ctx, scope, targetID)
+			if err == nil {
+				resolvedKind = domain.ItemTypeVolume
+				candidates = []coverCandidate{{
+					volumeID: targetID,
+					source:   coverAssetSourceFromAuthorizedFile(file),
+				}}
+				return nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				return err
+			}
+			if hasTargetKind && targetKind == domain.ItemTypeVolume {
+				return app.ErrNotFound
+			}
+		}
+
+		seriesCandidates, err := resolveSeriesCoverCandidates(ctx, catRepo, scope, targetID)
+		if err != nil {
+			return err
+		}
+		resolvedKind = domain.ItemTypeSeries
+		candidates = seriesCandidates
+		return nil
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return resolvedKind, candidates, nil
+}
+
+// resolveSeriesCoverCandidates implements FIRST series cover selection (M1B)
+// with fallback across visible, available, non-trashed candidate volumes.
+func resolveSeriesCoverCandidates(
+	ctx context.Context,
+	catRepo storage.CatalogueRepository,
+	scope storage.CatalogueReadScope,
+	seriesID string,
+) ([]coverCandidate, error) {
+	if _, err := catRepo.GetSeriesByID(ctx, scope, seriesID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, app.ErrNotFound
+		}
+		return nil, err
+	}
+
+	vols, err := catRepo.ListVolumes(ctx, scope, storage.VolumeReadFilter{SeriesID: seriesID})
+	if err != nil {
+		return nil, err
+	}
+
+	var candidates []coverCandidate
+	for _, vol := range vols {
+		if len(vol.Assets) == 0 {
+			continue
+		}
+		file, err := catRepo.SelectPreferredAssetFileForVolume(ctx, scope, vol.ID)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, coverCandidate{
+			volumeID: vol.ID,
+			source:   coverAssetSourceFromAuthorizedFile(file),
+		})
+	}
+	if len(candidates) == 0 {
+		return nil, app.ErrNotFound
+	}
+	return candidates, nil
+}
+
+func coverAssetSourceFromAuthorizedFile(file *storage.AuthorizedAssetFile) CoverAssetSource {
+	if file == nil {
+		return CoverAssetSource{}
+	}
+	return CoverAssetSource{
+		AssetID:         file.AssetID,
+		LibraryRootID:   file.LibraryRootID,
+		RootPathBytes:   slices.Clone(file.RootPathBytes),
+		RootState:       domain.LibraryRootState(file.RootState),
+		RelPathBytes:    slices.Clone(file.RelPathBytes),
+		FileSize:        file.FileSize,
+		Format:          file.Format,
+		DigestKind:      file.DigestKind,
+		Digest:          file.Digest,
+		PageCount:       file.PageCount,
+		CoverPageIndex:  file.CoverPageIndex,
+		SuppressedPages: slices.Clone(file.SuppressedPages),
+		MissingSince:    file.MissingSince,
+		RetiredAt:       file.RetiredAt,
+	}
+}
+
+func computeCoverETag(targetKind domain.ItemType, targetID, volumeID, assetID string, entry image.CoverEntry) string {
+	h := sha256.New()
+	writeETagField(h, string(targetKind))
+	writeETagField(h, targetID)
+	writeETagField(h, volumeID)
+	writeETagField(h, assetID)
+	writeETagField(h, string(entry.Key.SourceKind))
+	writeETagField(h, entry.Key.Digest)
+	writeETagField(h, strconv.Itoa(entry.Key.PageIndex))
+	writeETagField(h, string(entry.Key.Rendition.OutputFormat))
+	writeETagField(h, strconv.Itoa(entry.Key.Rendition.MaxWidth))
+	writeETagField(h, strconv.Itoa(entry.Key.Rendition.MaxHeight))
+	writeETagField(h, strconv.Itoa(entry.Key.Rendition.Quality))
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(entry.Data)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(entry.Data)
+	return fmt.Sprintf(`"%x"`, h.Sum(nil))
+}
+
+func writeETagField(h hash.Hash, val string) {
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(val)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write([]byte(val))
+}
+
+// HidePage is scheduled for M2 (ADR-0010 §3).
+func (s *CoverService) HidePage(context.Context, *domain.Principal, app.HidePageRequest) error {
+	return app.ErrNotImplemented
+}
+
+// StageTrash is scheduled for M2 (ADR-0010 §4).
+func (s *CoverService) StageTrash(context.Context, *domain.Principal, app.StageTrashRequest) error {
+	return app.ErrNotImplemented
+}
+
+// ListTrash is scheduled for M2 (ADR-0010 §4).
+func (s *CoverService) ListTrash(context.Context, *domain.Principal) ([]app.TrashItem, error) {
+	return nil, app.ErrNotImplemented
+}
+
+// RestoreTrash is scheduled for M2 (ADR-0010 §4).
+func (s *CoverService) RestoreTrash(context.Context, *domain.Principal, string) error {
+	return app.ErrNotImplemented
+}
+
+// PurgeTrash is scheduled for M2 (ADR-0010 §4).
+func (s *CoverService) PurgeTrash(context.Context, *domain.Principal, app.PurgeTrashRequest) (string, error) {
+	return "", app.ErrNotImplemented
 }

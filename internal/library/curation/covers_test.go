@@ -1274,3 +1274,378 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	}
 	assertDominantColor(t, entry.Data, 220, 30, 30)
 }
+
+func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
+	t.Parallel()
+
+	rootDir := filepath.Join(t.TempDir(), "library")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	red := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 40, B: 220, A: 255})
+	yellow := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 210, B: 30, A: 255})
+
+	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-1-nsfw.cbz")), cbzEntry{name: "001.png", data: blue})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-1-clean.cbz")), cbzEntry{name: "001.png", data: red})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-2-clean.cbz")), cbzEntry{name: "001.png", data: green})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "kids-1.cbz")), cbzEntry{name: "001.png", data: yellow})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "offline-only.cbz")), cbzEntry{name: "001.png", data: red})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	ctx := t.Context()
+
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	offlineRootDir := filepath.Join(t.TempDir(), "offline-root")
+	offlineRootID, err := domain.NewID()
+	if err != nil {
+		t.Fatalf("NewID offline root: %v", err)
+	}
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		return st.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+			ID:        offlineRootID,
+			LibraryID: lib.ID,
+			Path:      domain.NewPathIdentity([]byte(offlineRootDir)),
+			State:     domain.LibraryRootStateOffline,
+		})
+	}); err != nil {
+		t.Fatalf("create offline root: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byName := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byName[a.RelPathDisplay] = a
+	}
+
+	var (
+		adminUser, readerUser, kidUser, blankKidUser domain.User
+		adminRole, readerRole, restrictedRole        domain.Role
+	)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		users := st.Users()
+		var ok bool
+		if adminRole, ok = domain.BuiltInRoleByName(domain.RoleAdminName); !ok {
+			return errors.New("missing Admin role")
+		}
+		if readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName); !ok {
+			return errors.New("missing Reader role")
+		}
+		if restrictedRole, ok = domain.BuiltInRoleByName(domain.RoleRestrictedReaderName); !ok {
+			return errors.New("missing Restricted reader role")
+		}
+
+		for _, u := range []struct {
+			dst  *domain.User
+			id   string
+			name string
+			role string
+		}{
+			{&adminUser, "u-cov-admin", "covadmin", adminRole.ID},
+			{&readerUser, "u-cov-reader", "covreader", readerRole.ID},
+			{&kidUser, "u-cov-kid", "covkid", restrictedRole.ID},
+			{&blankKidUser, "u-cov-blank", "covblank", restrictedRole.ID},
+		} {
+			*u.dst = domain.User{ID: u.id, Username: u.name, CreatedAt: now, UpdatedAt: now}
+			if err := users.CreateUser(ctx, u.dst); err != nil {
+				return err
+			}
+			if err := users.AssignUserRole(ctx, u.id, u.role); err != nil {
+				return err
+			}
+		}
+
+		cw := st.CatalogueWrites()
+		for _, s := range []domain.Series{
+			{ID: "ser-cov-alpha", LibraryID: lib.ID, Title: "Alpha", TitleSort: "alpha", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-fallback", LibraryID: lib.ID, Title: "Fallback", TitleSort: "fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-kids", LibraryID: lib.ID, Title: "Kids", TitleSort: "kids", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-trashed", LibraryID: lib.ID, Title: "Trashed", TitleSort: "trashed", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+		} {
+			ser := s
+			if err := cw.CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+		}
+
+		prefNSFW := byName["alpha-1-nsfw.cbz"].ID
+		for _, v := range []domain.Volume{
+			{ID: "vol-cov-multi", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PreferredAssetID: &prefNSFW, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-only-restricted", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-nofile", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 0, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-offline", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-clean2", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-kids", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-trashed", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+		} {
+			vol := v
+			if err := cw.CreateVolume(ctx, &vol); err != nil {
+				return err
+			}
+		}
+
+		sm := st.SeriesMemberships()
+		p1, p2, p3, p4 := 1.0, 2.0, 3.0, 4.0
+		for _, m := range []struct {
+			volID string
+			list  []domain.SeriesMembership
+		}{
+			{"vol-cov-only-restricted", []domain.SeriesMembership{{VolumeID: "vol-cov-only-restricted", SeriesID: "ser-cov-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-clean2", []domain.SeriesMembership{{VolumeID: "vol-cov-clean2", SeriesID: "ser-cov-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-nofile", []domain.SeriesMembership{{VolumeID: "vol-cov-nofile", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-offline", []domain.SeriesMembership{{VolumeID: "vol-cov-offline", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-trashed", []domain.SeriesMembership{{VolumeID: "vol-cov-trashed", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p3, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-multi", []domain.SeriesMembership{{VolumeID: "vol-cov-multi", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p4, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-kids", []domain.SeriesMembership{{VolumeID: "vol-cov-kids", SeriesID: "ser-cov-kids", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+		} {
+			if err := sm.SetVolumeMemberships(ctx, m.volID, m.list); err != nil {
+				return err
+			}
+		}
+
+		moveAsset := func(assetName, volID string, rootIDOverride string) error {
+			a, err := cw.GetAssetByIDForUpdate(ctx, byName[assetName].ID)
+			if err != nil {
+				return err
+			}
+			a.VolumeID = volID
+			if rootIDOverride != "" {
+				a.LibraryRootID = rootIDOverride
+			}
+			return cw.UpdateAsset(ctx, a)
+		}
+		if err := moveAsset("alpha-1-nsfw.cbz", "vol-cov-multi", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("alpha-1-clean.cbz", "vol-cov-multi", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("alpha-2-clean.cbz", "vol-cov-clean2", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("kids-1.cbz", "vol-cov-kids", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("offline-only.cbz", "vol-cov-offline", offlineRootID); err != nil {
+			return err
+		}
+
+		// Create a dedicated restricted-only asset for vol-cov-only-restricted.
+		nsfwAsset := byName["alpha-1-nsfw.cbz"]
+		nsfwDigest, _ := nsfwAsset.CurrentDigest(domain.DigestKindXXH364Partial)
+		copyPath := filepath.Join(rootDir, "only-restr-copy.cbz")
+		origBytes, err := os.ReadFile(filepath.Join(rootDir, "alpha-1-nsfw.cbz"))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(copyPath, origBytes, 0o644); err != nil {
+			return err
+		}
+		restrAsset := domain.MediaAsset{
+			ID:             "a-cov-only-restr",
+			VolumeID:       "vol-cov-only-restricted",
+			LibraryRootID:  root.ID,
+			RelPathBytes:   []byte("only-restr-copy.cbz"),
+			RelPathDisplay: "only-restr-copy.cbz",
+			RelPathMatch:   "only-restr-copy.cbz",
+			FileSize:       nsfwAsset.FileSize,
+			Format:         domain.MediaFormatCBZ,
+			PageCount:      1,
+			CoverPageIndex: 0,
+			Digests: []domain.AssetDigest{{
+				AssetID:   "a-cov-only-restr",
+				Kind:      domain.DigestKindXXH364Partial,
+				Value:     nsfwDigest.Value,
+				IsCurrent: true,
+				Reason:    domain.DigestReasonScan,
+			}},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := cw.CreateAsset(ctx, &restrAsset); err != nil {
+			return err
+		}
+
+		// Seed a trashed series asset (vol in trashed series / trashed volume).
+		trashedPath := filepath.Join(rootDir, "trashed-vol.cbz")
+		if err := os.WriteFile(trashedPath, origBytes, 0o644); err != nil {
+			return err
+		}
+		trashedAsset := domain.MediaAsset{
+			ID:             "a-cov-trashed-vol",
+			VolumeID:       "vol-cov-trashed",
+			LibraryRootID:  root.ID,
+			RelPathBytes:   []byte("trashed-vol.cbz"),
+			RelPathDisplay: "trashed-vol.cbz",
+			RelPathMatch:   "trashed-vol.cbz",
+			FileSize:       int64(len(origBytes)),
+			Format:         domain.MediaFormatCBZ,
+			PageCount:      1,
+			CoverPageIndex: 0,
+			Digests: []domain.AssetDigest{{
+				AssetID:   "a-cov-trashed-vol",
+				Kind:      domain.DigestKindXXH364Partial,
+				Value:     nsfwDigest.Value,
+				IsCurrent: true,
+				Reason:    domain.DigestReasonScan,
+			}},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := cw.CreateAsset(ctx, &trashedAsset); err != nil {
+			return err
+		}
+
+		labels := st.Labels()
+		if err := labels.EnsureBuiltInServerLabels(ctx); err != nil {
+			return err
+		}
+		for _, lbl := range []domain.Label{
+			{ID: "lbl-cov-nsfw", Name: "NSFW", Scope: domain.LabelScopeServer},
+			{ID: "lbl-cov-kids", Name: "Kids", Scope: domain.LabelScopeServer},
+		} {
+			l := lbl
+			if err := labels.CreateLabel(ctx, &l); err != nil {
+				return err
+			}
+		}
+		if err := labels.SetUserLabelPolicy(ctx, &domain.UserLabelPolicy{UserID: readerUser.ID, LabelID: "lbl-cov-nsfw", Effect: domain.PolicyEffectRestrict}); err != nil {
+			return err
+		}
+		if err := labels.SetUserLabelPolicy(ctx, &domain.UserLabelPolicy{UserID: kidUser.ID, LabelID: "lbl-cov-kids", Effect: domain.PolicyEffectAllow}); err != nil {
+			return err
+		}
+		for _, il := range []domain.ItemLabel{
+			{LabelID: "lbl-cov-nsfw", ItemType: domain.ItemTypeAsset, ItemID: byName["alpha-1-nsfw.cbz"].ID},
+			{LabelID: "lbl-cov-nsfw", ItemType: domain.ItemTypeAsset, ItemID: "a-cov-only-restr"},
+			{LabelID: "lbl-cov-kids", ItemType: domain.ItemTypeSeries, ItemID: "ser-cov-kids"},
+			{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeSeries, ItemID: "ser-cov-trashed"},
+			{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeVolume, ItemID: "vol-cov-trashed"},
+		} {
+			item := il
+			if err := labels.AssignItemLabel(ctx, &item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cover test fixture: %v", err)
+	}
+
+	_, reg := newSpyImagePipeline(t, nil)
+	svc, _ := newTestCoverService(t, tx, reg, 2*time.Second)
+
+	adminPrincipal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-adm", nil)
+	readerPrincipal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-rdr", nil)
+	kidPrincipal := domain.NewPrincipal(kidUser, []domain.Role{restrictedRole}, domain.CredentialKindPassword, "c-kid", nil)
+	blankPrincipal := domain.NewPrincipal(blankKidUser, []domain.Role{restrictedRole}, domain.CredentialKindPassword, "c-blk", nil)
+
+	// 1. Cross-principal volume asset selection: Admin gets NSFW blue; Reader gets Clean red and a different ETag.
+	admVolCover, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeVolume), adminPrincipal, "vol-cov-multi")
+	if err != nil {
+		t.Fatalf("admin GetCover(vol-cov-multi): %v", err)
+	}
+	assertDominantColor(t, admVolCover.Data, 30, 40, 220)
+
+	rdrVolCover, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeVolume), readerPrincipal, "vol-cov-multi")
+	if err != nil {
+		t.Fatalf("reader GetCover(vol-cov-multi): %v", err)
+	}
+	assertDominantColor(t, rdrVolCover.Data, 220, 30, 30)
+	if admVolCover.ETag == rdrVolCover.ETag || admVolCover.ETag == "" || strings.HasPrefix(admVolCover.ETag, "W/") {
+		t.Fatalf("expected distinct strong ETags for admin (%q) vs reader (%q)", admVolCover.ETag, rdrVolCover.ETag)
+	}
+
+	// 2. Target-kind isolation: series ID on volume kind and volume ID on series kind return ErrNotFound.
+	if _, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeVolume), adminPrincipal, "ser-cov-alpha"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("series ID with volume target kind = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), adminPrincipal, "vol-cov-multi"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("volume ID with series target kind = %v, want ErrNotFound", err)
+	}
+
+	// 3. Series FIRST selection & cross-principal fallback on ser-cov-alpha:
+	//    Admin gets vol-cov-only-restricted (blue); Reader falls back to vol-cov-clean2 (green).
+	admSerAlpha, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), adminPrincipal, "ser-cov-alpha")
+	if err != nil {
+		t.Fatalf("admin GetCover(ser-cov-alpha): %v", err)
+	}
+	assertDominantColor(t, admSerAlpha.Data, 30, 40, 220)
+
+	rdrSerAlpha, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-alpha")
+	if err != nil {
+		t.Fatalf("reader GetCover(ser-cov-alpha): %v", err)
+	}
+	assertDominantColor(t, rdrSerAlpha.Data, 30, 210, 30)
+	if admSerAlpha.ETag == rdrSerAlpha.ETag {
+		t.Fatalf("expected distinct ETags on ser-cov-alpha: both %q", admSerAlpha.ETag)
+	}
+
+	// 4. Series FIRST fallback across empty, offline-root, and trashed volumes on ser-cov-fallback:
+	//    pos 1 (vol-cov-nofile) -> pos 2 (vol-cov-offline) -> pos 3 (vol-cov-trashed) -> pos 4 (vol-cov-multi).
+	//    Admin gets vol-cov-multi's NSFW blue; Reader gets vol-cov-multi's clean red!
+	admFallback, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), adminPrincipal, "ser-cov-fallback")
+	if err != nil {
+		t.Fatalf("admin GetCover(ser-cov-fallback): %v", err)
+	}
+	assertDominantColor(t, admFallback.Data, 30, 40, 220)
+
+	rdrFallback, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-fallback")
+	if err != nil {
+		t.Fatalf("reader GetCover(ser-cov-fallback): %v", err)
+	}
+	assertDominantColor(t, rdrFallback.Data, 220, 30, 30)
+
+	// 5. Trashed targets return ErrNotFound even for Admin; Restricted reader sees ALLOW series only, blank kid fails closed.
+	for _, tc := range []struct {
+		name      string
+		principal *domain.Principal
+		kind      domain.ItemType
+		targetID  string
+		wantErr   error
+	}{
+		{"nil principal", nil, domain.ItemTypeVolume, "vol-cov-multi", app.ErrUnauthorized},
+		{"admin trashed volume", adminPrincipal, domain.ItemTypeVolume, "vol-cov-trashed", app.ErrNotFound},
+		{"admin trashed series", adminPrincipal, domain.ItemTypeSeries, "ser-cov-trashed", app.ErrNotFound},
+		{"admin nofile volume", adminPrincipal, domain.ItemTypeVolume, "vol-cov-nofile", app.ErrNotFound},
+		{"admin offline volume", adminPrincipal, domain.ItemTypeVolume, "vol-cov-offline", app.ErrServiceBusy},
+		{"reader only-restricted volume", readerPrincipal, domain.ItemTypeVolume, "vol-cov-only-restricted", app.ErrNotFound},
+		{"kid unallowed series", kidPrincipal, domain.ItemTypeSeries, "ser-cov-alpha", app.ErrNotFound},
+		{"kid unallowed volume", kidPrincipal, domain.ItemTypeVolume, "vol-cov-multi", app.ErrNotFound},
+		{"blank kid zero ALLOW", blankPrincipal, domain.ItemTypeSeries, "ser-cov-kids", app.ErrNotFound},
+	} {
+		_, gErr := svc.GetCover(app.ContextWithCoverTargetKind(ctx, tc.kind), tc.principal, tc.targetID)
+		if !errors.Is(gErr, tc.wantErr) {
+			t.Fatalf("%s: GetCover = %v, want %v", tc.name, gErr, tc.wantErr)
+		}
+	}
+
+	kidSerCover, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), kidPrincipal, "ser-cov-kids")
+	if err != nil {
+		t.Fatalf("kid GetCover(ser-cov-kids): %v", err)
+	}
+	assertDominantColor(t, kidSerCover.Data, 220, 210, 30)
+
+	// 6. Worker timeout on candidate 1 returns ErrServiceBusy rather than falling back to candidate 2.
+	_, slowReg := newSpyImagePipeline(t, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	slowSvc, _ := newTestCoverService(t, tx, slowReg, 40*time.Millisecond, func(o *curation.CoverServiceOptions) {
+		o.Workers = 1
+	})
+	if _, err := slowSvc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-alpha"); !errors.Is(err, app.ErrServiceBusy) {
+		t.Fatalf("slow worker series GetCover = %v, want ErrServiceBusy", err)
+	}
+}

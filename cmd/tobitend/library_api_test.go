@@ -1,10 +1,16 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log/slog"
 	"net"
@@ -22,6 +28,7 @@ import (
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/library/paths"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
@@ -1229,5 +1236,467 @@ func TestDaemonLibraryRootRemovalGuardRoute(t *testing.T) {
 	}
 	if _, err := postgres.NewLibraryRepository(db.Pool).GetLibraryRootByID(ctx, soleLib.Roots[0].ID); err != nil {
 		t.Fatalf("sole root must remain persisted after 409: %v", err)
+	}
+}
+
+func TestDaemonThumbnailRoutes(t *testing.T) {
+	db := testdb.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
+		t.Fatalf("migrations.RunFS: %v", err)
+	}
+
+	coversDir := filepath.Join(t.TempDir(), "covers")
+	rootDir := filepath.Join(t.TempDir(), "library")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir rootDir: %v", err)
+	}
+
+	makeCBZ := func(filename string, c color.RGBA) {
+		var pngBuf bytes.Buffer
+		img := image.NewRGBA(image.Rect(0, 0, 80, 120))
+		for y := range 120 {
+			for x := range 80 {
+				img.SetRGBA(x, y, c)
+			}
+		}
+		if err := png.Encode(&pngBuf, img); err != nil {
+			t.Fatalf("png.Encode: %v", err)
+		}
+		var zipBuf bytes.Buffer
+		zw := zip.NewWriter(&zipBuf)
+		w, err := zw.Create("001.png")
+		if err != nil {
+			t.Fatalf("zip.Create: %v", err)
+		}
+		if _, err := w.Write(pngBuf.Bytes()); err != nil {
+			t.Fatalf("zip.Write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("zip.Close: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rootDir, filename), zipBuf.Bytes(), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", filename, err)
+		}
+	}
+
+	makeCBZ("alpha-1-nsfw.cbz", color.RGBA{R: 30, G: 40, B: 220, A: 255})  // blue
+	makeCBZ("alpha-1-clean.cbz", color.RGBA{R: 220, G: 30, B: 30, A: 255}) // red
+	makeCBZ("alpha-2-clean.cbz", color.RGBA{R: 30, G: 210, B: 30, A: 255}) // green
+	makeCBZ("kids-1.cbz", color.RGBA{R: 220, G: 210, B: 30, A: 255})       // yellow
+	makeCBZ("trashed.cbz", color.RGBA{R: 180, G: 40, B: 180, A: 255})
+
+	cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron([]string{
+		"TOBITEN_STORAGE_MODE=postgres",
+		"TOBITEN_DATABASE_URL=" + db.URL,
+		"TOBITEN_BASE_URL=http://localhost:8080/comics",
+		"TOBITEN_COVERS_DIR=" + coversDir,
+		"TOBITEN_LOG_FORMAT=json",
+	}))
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	userRepo := postgres.NewUserRepository(db.Pool)
+	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	setup, err := bootstrap.NewSetup(ctx, userRepo, discardLogger, "http://localhost:8080/comics/api/v1/auth/setup")
+	if err != nil {
+		t.Fatalf("bootstrap.NewSetup: %v", err)
+	}
+	defer setup.Close()
+
+	daemonSvcs, err := newDaemonServices(db.Pool, cfg, setup, userRepo)
+	if err != nil {
+		t.Fatalf("newDaemonServices: %v", err)
+	}
+	if daemonSvcs.app == nil || daemonSvcs.app.Curation == nil {
+		t.Fatal("expected newDaemonServices to wire CurationService through NewAuthorizingServices")
+	}
+	if err := daemonSvcs.startBackground(ctx); err != nil {
+		t.Fatalf("startBackground: %v", err)
+	}
+	defer daemonSvcs.stopBackground()
+
+	reg := BuildRegistryWithServices(cfg, daemonSvcs.app)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv, err := api.NewServer(api.ServerOptions{
+		Config:   cfg,
+		Logger:   discardLogger,
+		Listener: ln,
+		Registry: reg,
+	})
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("api.NewServer: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	admin := createTestUserWithPassword(ctx, t, userRepo, "thumbadmin", "admin-pass-123", domain.RoleAdminID)
+	reader := createTestUserWithPassword(ctx, t, userRepo, "thumbreader", "reader-pass-123", domain.RoleReaderID)
+	kid := createTestUserWithPassword(ctx, t, userRepo, "thumbkid", "kid-pass-123", domain.RoleRestrictedReaderID)
+	_ = createTestUserWithPassword(ctx, t, userRepo, "thumbblank", "blank-pass-123", domain.RoleRestrictedReaderID)
+	noReadUser := createTestUserWithPassword(ctx, t, userRepo, "thumbnoread", "noread-pass-123", "")
+	if _, err := db.Exec(ctx, `INSERT INTO roles (id, name, built_in, requires_allow_labels) VALUES ('role-thumb-noread', 'NoRead', false, false)`); err != nil {
+		t.Fatalf("insert role-thumb-noread: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO role_permissions (role_id, permission) VALUES ('role-thumb-noread', $1)`, string(domain.PermissionJobsReadAll)); err != nil {
+		t.Fatalf("insert role_permissions: %v", err)
+	}
+	if err := userRepo.AssignUserRole(ctx, noReadUser.ID, "role-thumb-noread"); err != nil {
+		t.Fatalf("AssignUserRole: %v", err)
+	}
+
+	adminReadPAT := createTestPAT(ctx, t, userRepo, admin.ID, []domain.PATScope{domain.ScopeRead})
+
+	tx := postgres.NewTransactor(db.Pool)
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		if err := st.Libraries().CreateLibrary(ctx, &domain.Library{
+			ID:            "lib-thumb",
+			Name:          "Thumb Lib",
+			Mode:          domain.LibraryModeVirtual,
+			ResolverChain: domain.DefaultResolverChain(),
+		}); err != nil {
+			return err
+		}
+		return st.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+			ID:        "root-thumb",
+			LibraryID: "lib-thumb",
+			Path:      domain.NewPathIdentity([]byte(rootDir)),
+			State:     domain.LibraryRootStateOnline,
+		})
+	}); err != nil {
+		t.Fatalf("create library/root: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, "lib-thumb", scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	byName := make(map[string]domain.MediaAsset)
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		list, listErr := st.CatalogueWrites().ListAssetsByRoot(ctx, "root-thumb")
+		if listErr != nil {
+			return listErr
+		}
+		for _, a := range list {
+			byName[a.RelPathDisplay] = a
+		}
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		cw := st.CatalogueWrites()
+		for _, s := range []domain.Series{
+			{ID: "ser-thumb-alpha", LibraryID: "lib-thumb", Title: "Alpha", TitleSort: "alpha", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-kids", LibraryID: "lib-thumb", Title: "Kids", TitleSort: "kids", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-trashed", LibraryID: "lib-thumb", Title: "Trashed", TitleSort: "trashed", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+		} {
+			ser := s
+			if err := cw.CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+		}
+
+		prefNSFW := byName["alpha-1-nsfw.cbz"].ID
+		for _, v := range []domain.Volume{
+			{ID: "vol-thumb-multi", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PreferredAssetID: &prefNSFW, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-restr", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-clean2", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-kids", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-trashed", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+		} {
+			vol := v
+			if err := cw.CreateVolume(ctx, &vol); err != nil {
+				return err
+			}
+		}
+
+		sm := st.SeriesMemberships()
+		p1, p2 := 1.0, 2.0
+		for _, m := range []struct {
+			volID string
+			list  []domain.SeriesMembership
+		}{
+			{"vol-thumb-restr", []domain.SeriesMembership{{VolumeID: "vol-thumb-restr", SeriesID: "ser-thumb-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-thumb-clean2", []domain.SeriesMembership{{VolumeID: "vol-thumb-clean2", SeriesID: "ser-thumb-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
+			{"vol-thumb-kids", []domain.SeriesMembership{{VolumeID: "vol-thumb-kids", SeriesID: "ser-thumb-kids", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-thumb-trashed", []domain.SeriesMembership{{VolumeID: "vol-thumb-trashed", SeriesID: "ser-thumb-trashed", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+		} {
+			if err := sm.SetVolumeMemberships(ctx, m.volID, m.list); err != nil {
+				return err
+			}
+		}
+
+		moveAsset := func(name, volID string) error {
+			a, getErr := cw.GetAssetByIDForUpdate(ctx, byName[name].ID)
+			if getErr != nil {
+				return getErr
+			}
+			a.VolumeID = volID
+			return cw.UpdateAsset(ctx, a)
+		}
+		if err := moveAsset("alpha-1-nsfw.cbz", "vol-thumb-multi"); err != nil {
+			return err
+		}
+		if err := moveAsset("alpha-1-clean.cbz", "vol-thumb-multi"); err != nil {
+			return err
+		}
+		if err := moveAsset("alpha-2-clean.cbz", "vol-thumb-clean2"); err != nil {
+			return err
+		}
+		if err := moveAsset("kids-1.cbz", "vol-thumb-kids"); err != nil {
+			return err
+		}
+		if err := moveAsset("trashed.cbz", "vol-thumb-trashed"); err != nil {
+			return err
+		}
+
+		// Re-point vol-thumb-restr to a copy of alpha-1-nsfw.cbz so its sole asset is restricted.
+		nsfwAsset := byName["alpha-1-nsfw.cbz"]
+		nsfwDigest, _ := nsfwAsset.CurrentDigest(domain.DigestKindXXH364Partial)
+		origBytes, readErr := os.ReadFile(filepath.Join(rootDir, "alpha-1-nsfw.cbz"))
+		if readErr != nil {
+			return readErr
+		}
+		copyName := "alpha-1-restr-only.cbz"
+		if writeErr := os.WriteFile(filepath.Join(rootDir, copyName), origBytes, 0o644); writeErr != nil {
+			return writeErr
+		}
+		restrOnly := domain.MediaAsset{
+			ID:             "a-thumb-restr-only",
+			VolumeID:       "vol-thumb-restr",
+			LibraryRootID:  "root-thumb",
+			RelPathBytes:   []byte(copyName),
+			RelPathDisplay: copyName,
+			RelPathMatch:   copyName,
+			FileSize:       int64(len(origBytes)),
+			Format:         domain.MediaFormatCBZ,
+			PageCount:      1,
+			CoverPageIndex: 0,
+			Digests: []domain.AssetDigest{{
+				AssetID:   "a-thumb-restr-only",
+				Kind:      domain.DigestKindXXH364Partial,
+				Value:     nsfwDigest.Value,
+				IsCurrent: true,
+				Reason:    domain.DigestReasonScan,
+			}},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := cw.CreateAsset(ctx, &restrOnly); err != nil {
+			return err
+		}
+
+		labels := st.Labels()
+		if err := labels.EnsureBuiltInServerLabels(ctx); err != nil {
+			return err
+		}
+		for _, l := range []domain.Label{
+			{ID: "lbl-thumb-nsfw", Name: "NSFW", Scope: domain.LabelScopeServer},
+			{ID: "lbl-thumb-kids", Name: "Kids", Scope: domain.LabelScopeServer},
+		} {
+			lbl := l
+			if err := labels.CreateLabel(ctx, &lbl); err != nil {
+				return err
+			}
+		}
+		if err := labels.SetUserLabelPolicy(ctx, &domain.UserLabelPolicy{UserID: reader.ID, LabelID: "lbl-thumb-nsfw", Effect: domain.PolicyEffectRestrict}); err != nil {
+			return err
+		}
+		if err := labels.SetUserLabelPolicy(ctx, &domain.UserLabelPolicy{UserID: kid.ID, LabelID: "lbl-thumb-kids", Effect: domain.PolicyEffectAllow}); err != nil {
+			return err
+		}
+		for _, il := range []domain.ItemLabel{
+			{LabelID: "lbl-thumb-nsfw", ItemType: domain.ItemTypeAsset, ItemID: byName["alpha-1-nsfw.cbz"].ID},
+			{LabelID: "lbl-thumb-nsfw", ItemType: domain.ItemTypeAsset, ItemID: "a-thumb-restr-only"},
+			{LabelID: "lbl-thumb-kids", ItemType: domain.ItemTypeSeries, ItemID: "ser-thumb-kids"},
+			{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeVolume, ItemID: "vol-thumb-trashed"},
+			{LabelID: domain.LabelMarkedForDeletionID, ItemType: domain.ItemTypeSeries, ItemID: "ser-thumb-trashed"},
+		} {
+			item := il
+			if err := labels.AssignItemLabel(ctx, &item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed thumbnail HTTP fixture: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	doThumbReq := func(method, path, user, pass, bearer, ifNoneMatch string) (*http.Response, []byte) {
+		t.Helper()
+		req, reqErr := http.NewRequest(method, ts.URL+path, nil)
+		if reqErr != nil {
+			t.Fatalf("NewRequest(%s %s): %v", method, path, reqErr)
+		}
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			t.Fatalf("%s %s: %v", method, path, doErr)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read body %s %s: %v", method, path, readErr)
+		}
+		return resp, body
+	}
+
+	assertJPEGColor := func(t *testing.T, data []byte, wantR, wantG, wantB uint8) {
+		t.Helper()
+		decoded, decErr := jpeg.Decode(bytes.NewReader(data))
+		if decErr != nil {
+			t.Fatalf("jpeg.Decode: %v", decErr)
+		}
+		b := decoded.Bounds()
+		r32, g32, b32, _ := decoded.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+		gotR, gotG, gotB := uint8(r32>>8), uint8(g32>>8), uint8(b32>>8)
+		diff := func(a, b uint8) int {
+			if a > b {
+				return int(a - b)
+			}
+			return int(b - a)
+		}
+		if diff(gotR, wantR) > 35 || diff(gotG, wantG) > 35 || diff(gotB, wantB) > 35 {
+			t.Fatalf("decoded JPEG RGB=(%d,%d,%d), want ~(%d,%d,%d)", gotR, gotG, gotB, wantR, wantG, wantB)
+		}
+	}
+
+	// 1. AuthN/AuthZ before serving or evaluating If-None-Match.
+	for _, path := range []string{
+		"/api/v1/volumes/vol-thumb-multi/thumbnail",
+		"/comics/api/v1/series/ser-thumb-alpha/thumbnail",
+	} {
+		resp401, _ := doThumbReq(http.MethodGet, path, "", "", "", "*")
+		if resp401.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated %s = %d, want 401", path, resp401.StatusCode)
+		}
+		resp403, _ := doThumbReq(http.MethodGet, path, "thumbnoread", "noread-pass-123", "", "*")
+		if resp403.StatusCode != http.StatusForbidden {
+			t.Fatalf("no library:read %s = %d, want 403", path, resp403.StatusCode)
+		}
+	}
+
+	// 2. Volume thumbnail: cross-principal selection, strong ETag, Cache-Control: private, no-cache, HEAD, and 304 revalidation.
+	admVolResp, admVolBody := doThumbReq(http.MethodGet, "/api/v1/volumes/vol-thumb-multi/thumbnail", "", "", adminReadPAT, "")
+	if admVolResp.StatusCode != http.StatusOK {
+		t.Fatalf("admin GET vol-thumb-multi = %d (%s)", admVolResp.StatusCode, string(admVolBody))
+	}
+	if admVolResp.Header.Get("Content-Type") != "image/jpeg" || admVolResp.Header.Get("Cache-Control") != "private, no-cache" {
+		t.Fatalf("admin vol headers: CT=%q CC=%q", admVolResp.Header.Get("Content-Type"), admVolResp.Header.Get("Cache-Control"))
+	}
+	admVolETag := admVolResp.Header.Get("ETag")
+	if !strings.HasPrefix(admVolETag, `"`) || !strings.HasSuffix(admVolETag, `"`) || strings.HasPrefix(admVolETag, "W/") {
+		t.Fatalf("expected strong quoted ETag, got %q", admVolETag)
+	}
+	assertJPEGColor(t, admVolBody, 30, 40, 220) // NSFW blue
+
+	rdrVolResp, rdrVolBody := doThumbReq(http.MethodGet, "/comics/api/v1/volumes/vol-thumb-multi/thumbnail", "thumbreader", "reader-pass-123", "", admVolETag)
+	if rdrVolResp.StatusCode != http.StatusOK {
+		t.Fatalf("reader GET vol-thumb-multi with admin ETag = %d, want 200", rdrVolResp.StatusCode)
+	}
+	rdrVolETag := rdrVolResp.Header.Get("ETag")
+	if rdrVolETag == "" || rdrVolETag == admVolETag || strings.HasPrefix(rdrVolETag, "W/") {
+		t.Fatalf("expected distinct strong reader ETag, got %q vs admin %q", rdrVolETag, admVolETag)
+	}
+	assertJPEGColor(t, rdrVolBody, 220, 30, 30) // Clean red
+
+	// Matching If-None-Match for reader -> 304 with private, no-cache and strong ETag.
+	rdr304Resp, rdr304Body := doThumbReq(http.MethodGet, "/api/v1/volumes/vol-thumb-multi/thumbnail", "thumbreader", "reader-pass-123", "", rdrVolETag)
+	if rdr304Resp.StatusCode != http.StatusNotModified || len(rdr304Body) != 0 {
+		t.Fatalf("reader 304 check = (%d, len=%d), want (304, 0)", rdr304Resp.StatusCode, len(rdr304Body))
+	}
+	if rdr304Resp.Header.Get("Cache-Control") != "private, no-cache" || rdr304Resp.Header.Get("ETag") != rdrVolETag {
+		t.Fatalf("reader 304 headers: CC=%q ETag=%q", rdr304Resp.Header.Get("Cache-Control"), rdr304Resp.Header.Get("ETag"))
+	}
+
+	// HEAD request -> 200 with JPEG content-type, ETag, and empty body.
+	headResp, headBody := doThumbReq(http.MethodHead, "/api/v1/volumes/vol-thumb-multi/thumbnail", "thumbreader", "reader-pass-123", "", "")
+	if headResp.StatusCode != http.StatusOK || len(headBody) != 0 || headResp.Header.Get("ETag") != rdrVolETag {
+		t.Fatalf("HEAD vol-thumb-multi = (%d, len=%d, ETag=%q)", headResp.StatusCode, len(headBody), headResp.Header.Get("ETag"))
+	}
+
+	// 3. Series thumbnail FIRST selection & fallback: Admin gets blue vol 1; Reader falls back to green vol 2.
+	admSerResp, admSerBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-alpha/thumbnail", "thumbadmin", "admin-pass-123", "", "")
+	if admSerResp.StatusCode != http.StatusOK {
+		t.Fatalf("admin GET ser-thumb-alpha = %d", admSerResp.StatusCode)
+	}
+	assertJPEGColor(t, admSerBody, 30, 40, 220)
+	admSerETag := admSerResp.Header.Get("ETag")
+
+	rdrSerResp, rdrSerBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-alpha/thumbnail", "thumbreader", "reader-pass-123", "", admSerETag)
+	if rdrSerResp.StatusCode != http.StatusOK {
+		t.Fatalf("reader GET ser-thumb-alpha with admin ETag = %d, want 200", rdrSerResp.StatusCode)
+	}
+	assertJPEGColor(t, rdrSerBody, 30, 210, 30)
+	rdrSerETag := rdrSerResp.Header.Get("ETag")
+	if rdrSerETag == "" || rdrSerETag == admSerETag {
+		t.Fatalf("expected distinct series ETags: reader=%q admin=%q", rdrSerETag, admSerETag)
+	}
+	rdrSer304, _ := doThumbReq(http.MethodGet, "/comics/api/v1/series/ser-thumb-alpha/thumbnail", "thumbreader", "reader-pass-123", "", rdrSerETag)
+	if rdrSer304.StatusCode != http.StatusNotModified {
+		t.Fatalf("reader series 304 = %d, want 304", rdrSer304.StatusCode)
+	}
+
+	// Restricted reader ALLOW kids sees ser-thumb-kids (yellow), gets 404 on unallowed series/volumes even with valid ETag.
+	kidResp, kidBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-kids/thumbnail", "thumbkid", "kid-pass-123", "", "")
+	if kidResp.StatusCode != http.StatusOK {
+		t.Fatalf("kid GET ser-thumb-kids = %d", kidResp.StatusCode)
+	}
+	assertJPEGColor(t, kidBody, 220, 210, 30)
+
+	// 4. 404 for restricted, trashed, unknown, and wrong-kind targets even when If-None-Match is set.
+	for _, tc := range []struct {
+		name        string
+		path        string
+		user        string
+		pass        string
+		ifNoneMatch string
+	}{
+		{"unknown volume", "/api/v1/volumes/vol-missing/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"unknown series", "/api/v1/series/ser-missing/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"series id on volume route", "/api/v1/volumes/ser-thumb-alpha/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"volume id on series route", "/api/v1/series/vol-thumb-multi/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"admin trashed volume", "/api/v1/volumes/vol-thumb-trashed/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"admin trashed series", "/api/v1/series/ser-thumb-trashed/thumbnail", "thumbadmin", "admin-pass-123", "*"},
+		{"reader only-restricted volume", "/api/v1/volumes/vol-thumb-restr/thumbnail", "thumbreader", "reader-pass-123", admSerETag},
+		{"kid unallowed series with admin ETag", "/api/v1/series/ser-thumb-alpha/thumbnail", "thumbkid", "kid-pass-123", admSerETag},
+		{"kid unallowed volume with reader ETag", "/api/v1/volumes/vol-thumb-multi/thumbnail", "thumbkid", "kid-pass-123", rdrVolETag},
+		{"blank kid zero ALLOW", "/api/v1/series/ser-thumb-kids/thumbnail", "thumbblank", "blank-pass-123", "*"},
+	} {
+		resp, _ := doThumbReq(http.MethodGet, tc.path, tc.user, tc.pass, "", tc.ifNoneMatch)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: GET %s = %d, want 404", tc.name, tc.path, resp.StatusCode)
+		}
+		if resp.Header.Get("ETag") != "" {
+			t.Fatalf("%s: 404 leaked ETag %q", tc.name, resp.Header.Get("ETag"))
+		}
+	}
+
+	// 5. After trashing vol-thumb-clean2, revalidating with the previously valid ETag must return 404 (not 304).
+	if _, err := db.Exec(ctx, `INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'VOLUME', 'vol-thumb-clean2')`, domain.LabelMarkedForDeletionID); err != nil {
+		t.Fatalf("trash vol-thumb-clean2: %v", err)
+	}
+	afterTrashResp, _ := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-alpha/thumbnail", "thumbreader", "reader-pass-123", "", rdrSerETag)
+	if afterTrashResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("after trashing sole visible volume, series revalidation = %d, want 404", afterTrashResp.StatusCode)
 	}
 }
