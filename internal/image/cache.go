@@ -643,8 +643,13 @@ func (c *CoverCache) ensureRootDir() error {
 
 	if !c.rootEnsured {
 		if parent := filepath.Dir(cur); parent != cur {
-			if err := c.ops.syncDir(parent); err != nil && !errors.Is(err, os.ErrPermission) {
-				return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, err)
+			if err := c.ops.syncDir(parent); err != nil {
+				// Only tolerate ErrPermission when parent is an external
+				// directory the cache cannot modify (e.g. a 0111 mount
+				// ancestor); writable parents (e.g. 0300) must sync.
+				if !errors.Is(err, os.ErrPermission) || canModifyDir(parent) {
+					return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, err)
+				}
 			}
 		}
 	}

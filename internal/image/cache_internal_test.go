@@ -317,6 +317,82 @@ func TestCoverCache_SimulatedCrashLeavesNoPartialEntryAndCleansTemp(t *testing.T
 			}
 		})
 	}
+
+	t.Run("crash_after_covers_root_mkdir_with_writable_unreadable_parent", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0300 directory permissions")
+		}
+		base := t.TempDir()
+		parent := filepath.Join(base, "writable-unreadable")
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.Chmod(parent, 0o300); err != nil {
+			t.Fatalf("Chmod(0300): %v", err)
+		}
+		t.Cleanup(func() {
+			_ = os.Chmod(parent, 0o755)
+		})
+
+		coversDir := filepath.Join(parent, "covers")
+		cache, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+
+		// Simulate abrupt interruption after Mkdir(covers) before syncDir(parent) runs.
+		origSyncDir := cache.ops.syncDir
+		cache.ops.syncDir = func(dir string) error {
+			if dir == parent {
+				panic(simulatedCrashPanic{stage: "root_mkdir_unreadable_parent_sync"})
+			}
+			return origSyncDir(dir)
+		}
+
+		key := ArchiveCoverKey("1122334455667788", 0, DefaultCoverOptions())
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("expected simulated crash panic at 0300 parent sync")
+				}
+				if _, ok := r.(simulatedCrashPanic); !ok {
+					panic(r)
+				}
+			}()
+			_, _ = cache.Put(ctx, key, []byte("interrupted-0300-cover"))
+		}()
+
+		// Reopen with the same 0300 parent: Put MUST fail because parent is modifiable
+		// by the cache and its directory link still requires syncing.
+		reopened, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("reopen NewCoverCache: %v", err)
+		}
+		if _, err := reopened.Put(ctx, key, []byte("interrupted-0300-cover")); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("reopened Put with 0300 parent err = %v, want os.ErrPermission", err)
+		}
+		if _, err := reopened.Get(ctx, key); !errors.Is(err, ErrCacheMiss) {
+			t.Fatalf("Get after refused reopened Put = %v, want ErrCacheMiss", err)
+		}
+
+		// Once parent is readable (0755), reopened Put syncs parent and succeeds.
+		if err := os.Chmod(parent, 0o755); err != nil {
+			t.Fatalf("Chmod(0755): %v", err)
+		}
+		var synced []string
+		reopenOrigSync := reopened.ops.syncDir
+		reopened.ops.syncDir = func(dir string) error {
+			synced = append(synced, dir)
+			return reopenOrigSync(dir)
+		}
+		if _, err := reopened.Put(ctx, key, []byte("interrupted-0300-cover")); err != nil {
+			t.Fatalf("recovered Put after Chmod(0755): %v", err)
+		}
+		if !slices.Contains(synced, parent) {
+			t.Fatalf("recovered Put did not sync parent %q; synced=%v", parent, synced)
+		}
+	})
 }
 
 func TestCoverCache_PutErrorRemovesOwnTempFile(t *testing.T) {

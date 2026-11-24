@@ -938,6 +938,53 @@ func TestCoverCache_TraversalOnlyExternalAncestor(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("writable_unreadable_parent_0300_requires_sync", func(t *testing.T) {
+		parent := filepath.Join(t.TempDir(), "writable-unreadable")
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.Chmod(parent, 0o300); err != nil {
+			t.Fatalf("Chmod(0300): %v", err)
+		}
+		t.Cleanup(func() {
+			_ = os.Chmod(parent, 0o755)
+		})
+
+		coversDir := filepath.Join(parent, "covers")
+		cache, err := tobitenimage.NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+
+		key := tobitenimage.ArchiveCoverKey("1122334455667788", 0, tobitenimage.DefaultCoverOptions())
+		if _, err := cache.Put(ctx, key, []byte("cover")); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("Put under 0300 parent err = %v, want os.ErrPermission", err)
+		}
+		if _, err := os.Stat(coversDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("coversDir survived rollback under 0300 parent: %v", err)
+		}
+
+		// Even when coversDir already exists under the 0300 parent (such as after
+		// an interrupted creation), reopened Put must not bypass the parent sync.
+		if err := os.Mkdir(coversDir, 0o755); err != nil {
+			t.Fatalf("Mkdir(coversDir): %v", err)
+		}
+		reopened, err := tobitenimage.NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("reopen NewCoverCache: %v", err)
+		}
+		if _, err := reopened.Put(ctx, key, []byte("cover")); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("reopened Put with existing coversDir under 0300 parent err = %v, want os.ErrPermission", err)
+		}
+
+		if err := os.Chmod(parent, 0o755); err != nil {
+			t.Fatalf("Chmod(0755): %v", err)
+		}
+		if _, err := reopened.Put(ctx, key, []byte("cover")); err != nil {
+			t.Fatalf("Put after Chmod(0755): %v", err)
+		}
+	})
 }
 
 func fingerprintFile(t *testing.T, path string) string {
