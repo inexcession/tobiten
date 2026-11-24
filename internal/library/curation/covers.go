@@ -769,7 +769,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
 			return image.CoverEntry{}, chErr
 		}
-		return image.CoverEntry{}, fmt.Errorf("curation: open archive %s: %w", spec.assetID, err)
+		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open archive %s: %w", spec.assetID, err))
 	}
 	defer func() {
 		_ = cr.Close()
@@ -789,7 +789,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
 			return image.CoverEntry{}, chErr
 		}
-		return image.CoverEntry{}, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err)
+		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
 	}
 	defer func() {
 		_ = rc.Close()
@@ -807,7 +807,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 				return image.CoverEntry{}, chErr
 			}
 		}
-		return image.CoverEntry{}, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err)
+		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
 	}
 
 	if _, err := verifyOpenedArchive(genCtx, f, spec, &obs0); err != nil {
@@ -913,9 +913,37 @@ func verifyOpenedArchive(
 	return expected, nil
 }
 
-type coverCandidate struct {
-	volumeID string
-	source   CoverAssetSource
+const seriesCoverBatchSize = 8
+
+func classifySourceCoverError(assetID string, err error) error {
+	switch {
+	case errors.Is(err, container.ErrCorrupt),
+		errors.Is(err, container.ErrUnknownFormat),
+		errors.Is(err, container.ErrEncrypted),
+		errors.Is(err, container.ErrUnsupported),
+		errors.Is(err, container.ErrEntryNotFound):
+		return &CoverUnavailableError{AssetID: assetID, Reason: "corrupt_or_unsupported_archive", Err: err}
+	case errors.Is(err, image.ErrCorrupt),
+		errors.Is(err, image.ErrUnsupportedFormat),
+		errors.Is(err, image.ErrPixelLimitExceeded),
+		errors.Is(err, image.ErrPreflightLimitExceeded):
+		return &CoverUnavailableError{AssetID: assetID, Reason: "corrupt_or_unsupported_image", Err: err}
+	default:
+		return err
+	}
+}
+
+func isCandidateUnavailableError(err error) bool {
+	return errors.Is(err, ErrCoverUnavailable) ||
+		errors.Is(err, container.ErrCorrupt) ||
+		errors.Is(err, container.ErrUnknownFormat) ||
+		errors.Is(err, container.ErrEncrypted) ||
+		errors.Is(err, container.ErrUnsupported) ||
+		errors.Is(err, container.ErrEntryNotFound) ||
+		errors.Is(err, image.ErrCorrupt) ||
+		errors.Is(err, image.ErrUnsupportedFormat) ||
+		errors.Is(err, image.ErrPixelLimitExceeded) ||
+		errors.Is(err, image.ErrPreflightLimitExceeded)
 }
 
 // GetCover resolves targetID under principal's SERVER-label policies and serves
@@ -941,30 +969,143 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 	if hasTargetKind && targetKind != domain.ItemTypeVolume && targetKind != domain.ItemTypeSeries {
 		return nil, fmt.Errorf("%w: unsupported cover target kind %q", app.ErrInvalidInput, targetKind)
 	}
-
-	resolvedKind, candidates, err := s.resolveCoverCandidates(ctx, principal, targetID, targetKind, hasTargetKind)
-	if err != nil {
-		return nil, err
+	if s.readTx == nil {
+		return nil, ErrMissingTransactor
 	}
 
-	var (
-		sawOffline  bool
-		lastUnavail error
-	)
-	for _, cand := range candidates {
-		entry, genErr := s.GetOrGenerateCover(ctx, cand.source)
+	scope := storage.CatalogueReadScope{
+		Principal:      principal,
+		IncludeTrashed: false,
+	}
+
+	if !hasTargetKind || targetKind == domain.ItemTypeVolume {
+		rendition, handled, err := s.getVolumeCover(ctx, scope, targetID)
+		if handled {
+			return rendition, err
+		}
+		if hasTargetKind && targetKind == domain.ItemTypeVolume {
+			return nil, app.ErrNotFound
+		}
+	}
+
+	return s.getSeriesCover(ctx, scope, targetID)
+}
+
+func (s *CoverService) getVolumeCover(
+	ctx context.Context,
+	scope storage.CatalogueReadScope,
+	volumeID string,
+) (*app.CoverRendition, bool, error) {
+	var files []storage.AuthorizedAssetFile
+	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
+		catRepo := tx.Catalogue()
+		if catRepo == nil {
+			return errors.New("curation: read transaction missing catalogue repository")
+		}
+		var listErr error
+		files, listErr = catRepo.ListAuthorizedVolumeAssetFiles(ctx, scope, volumeID)
+		return listErr
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	if len(files) == 0 {
+		return nil, false, nil
+	}
+
+	rendition, sawOffline, lastUnavail, err := s.tryVolumeAssetCandidates(ctx, domain.ItemTypeVolume, volumeID, volumeID, files)
+	if err != nil {
+		return nil, true, err
+	}
+	if rendition != nil {
+		return rendition, true, nil
+	}
+	if sawOffline {
+		return nil, true, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
+	}
+	if lastUnavail != nil {
+		return nil, true, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
+	}
+	return nil, true, app.ErrNotFound
+}
+
+func (s *CoverService) getSeriesCover(
+	ctx context.Context,
+	scope storage.CatalogueReadScope,
+	seriesID string,
+) (*app.CoverRendition, error) {
+	var lastUnavail error
+	for offset := 0; ; {
+		var batch []storage.SeriesCoverCandidate
+		err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
+			catRepo := tx.Catalogue()
+			if catRepo == nil {
+				return errors.New("curation: read transaction missing catalogue repository")
+			}
+			var listErr error
+			batch, listErr = catRepo.ListSeriesCoverCandidates(ctx, scope, seriesID, seriesCoverBatchSize, offset)
+			return listErr
+		})
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, app.ErrNotFound
+			}
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		for _, volCand := range batch {
+			rendition, _, unavailErr, tryErr := s.tryVolumeAssetCandidates(ctx, domain.ItemTypeSeries, seriesID, volCand.VolumeID, volCand.Files)
+			if tryErr != nil {
+				return nil, tryErr
+			}
+			if rendition != nil {
+				return rendition, nil
+			}
+			if unavailErr != nil {
+				lastUnavail = unavailErr
+			}
+		}
+
+		if len(batch) < seriesCoverBatchSize {
+			break
+		}
+		offset += len(batch)
+	}
+
+	if lastUnavail != nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
+	}
+	return nil, app.ErrNotFound
+}
+
+func (s *CoverService) tryVolumeAssetCandidates(
+	ctx context.Context,
+	targetKind domain.ItemType,
+	targetID string,
+	volumeID string,
+	files []storage.AuthorizedAssetFile,
+) (rendition *app.CoverRendition, sawOffline bool, lastUnavail error, err error) {
+	for i := range files {
+		src := coverAssetSourceFromAuthorizedFile(&files[i])
+		entry, genErr := s.GetOrGenerateCover(ctx, src)
 		if genErr == nil {
 			return &app.CoverRendition{
 				TargetID:    targetID,
 				ContentType: entry.ContentType,
 				Data:        entry.Data,
-				ETag:        computeCoverETag(resolvedKind, targetID, cand.volumeID, cand.source.AssetID, entry),
-			}, nil
+				ETag:        computeCoverETag(targetKind, targetID, volumeID, src.AssetID, entry),
+			}, false, nil, nil
 		}
 		if errors.Is(genErr, ErrCoverPoolNotRunning) || errors.Is(genErr, ErrCoverPoolClosed) || errors.Is(genErr, ErrCoverWaitTimeout) {
-			return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, genErr)
+			return nil, false, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, genErr)
 		}
-		if errors.Is(genErr, ErrCoverUnavailable) {
+		if isCandidateUnavailableError(genErr) {
 			var unavail *CoverUnavailableError
 			if errors.As(genErr, &unavail) && unavail.Reason == "root_offline" {
 				sawOffline = true
@@ -972,117 +1113,9 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 			lastUnavail = genErr
 			continue
 		}
-		return nil, genErr
+		return nil, false, nil, genErr
 	}
-
-	if sawOffline {
-		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
-	}
-	if lastUnavail != nil {
-		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
-	}
-	return nil, app.ErrNotFound
-}
-
-func (s *CoverService) resolveCoverCandidates(
-	ctx context.Context,
-	principal *domain.Principal,
-	targetID string,
-	targetKind domain.ItemType,
-	hasTargetKind bool,
-) (domain.ItemType, []coverCandidate, error) {
-	if s.readTx == nil {
-		return "", nil, ErrMissingTransactor
-	}
-
-	var (
-		resolvedKind domain.ItemType
-		candidates   []coverCandidate
-	)
-	scope := storage.CatalogueReadScope{
-		Principal:      principal,
-		IncludeTrashed: false,
-	}
-
-	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
-		catRepo := tx.Catalogue()
-		if catRepo == nil {
-			return errors.New("curation: read transaction missing catalogue repository")
-		}
-
-		if !hasTargetKind || targetKind == domain.ItemTypeVolume {
-			file, err := catRepo.SelectPreferredAssetFileForVolume(ctx, scope, targetID)
-			if err == nil {
-				resolvedKind = domain.ItemTypeVolume
-				candidates = []coverCandidate{{
-					volumeID: targetID,
-					source:   coverAssetSourceFromAuthorizedFile(file),
-				}}
-				return nil
-			}
-			if !errors.Is(err, storage.ErrNotFound) {
-				return err
-			}
-			if hasTargetKind && targetKind == domain.ItemTypeVolume {
-				return app.ErrNotFound
-			}
-		}
-
-		seriesCandidates, err := resolveSeriesCoverCandidates(ctx, catRepo, scope, targetID)
-		if err != nil {
-			return err
-		}
-		resolvedKind = domain.ItemTypeSeries
-		candidates = seriesCandidates
-		return nil
-	})
-	if err != nil {
-		return "", nil, err
-	}
-	return resolvedKind, candidates, nil
-}
-
-// resolveSeriesCoverCandidates implements FIRST series cover selection (M1B)
-// with fallback across visible, available, non-trashed candidate volumes.
-func resolveSeriesCoverCandidates(
-	ctx context.Context,
-	catRepo storage.CatalogueRepository,
-	scope storage.CatalogueReadScope,
-	seriesID string,
-) ([]coverCandidate, error) {
-	if _, err := catRepo.GetSeriesByID(ctx, scope, seriesID); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, app.ErrNotFound
-		}
-		return nil, err
-	}
-
-	vols, err := catRepo.ListVolumes(ctx, scope, storage.VolumeReadFilter{SeriesID: seriesID})
-	if err != nil {
-		return nil, err
-	}
-
-	var candidates []coverCandidate
-	for _, vol := range vols {
-		if len(vol.Assets) == 0 {
-			continue
-		}
-		file, err := catRepo.SelectPreferredAssetFileForVolume(ctx, scope, vol.ID)
-		if errors.Is(err, storage.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		candidates = append(candidates, coverCandidate{
-			volumeID: vol.ID,
-			source:   coverAssetSourceFromAuthorizedFile(file),
-		})
-	}
-	if len(candidates) == 0 {
-		return nil, app.ErrNotFound
-	}
-	return candidates, nil
+	return nil, sawOffline, lastUnavail, nil
 }
 
 func coverAssetSourceFromAuthorizedFile(file *storage.AuthorizedAssetFile) CoverAssetSource {

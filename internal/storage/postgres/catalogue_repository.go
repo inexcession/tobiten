@@ -468,6 +468,15 @@ func (r *CatalogueRepository) GetSeriesByID(ctx context.Context, scope storage.C
 	}, scanSeriesRow)
 }
 
+func (r *CatalogueRepository) getSeriesWithPredicate(ctx context.Context, pred *LabelPredicate, id string) (*domain.Series, error) {
+	return queryOne(ctx, &r.guard, pred, guardedQuerySpec{
+		selectFrom: selectSeriesColumns,
+		whereParts: []string{"s.id = $1"},
+		args:       []any{id},
+		predicates: []predicateClause{{alias: "s", fragmentFn: (*LabelPredicate).SeriesFragment}},
+	}, scanSeriesRow)
+}
+
 // ListSeries returns series visible under the principal's label predicate matching filter.
 func (r *CatalogueRepository) ListSeries(ctx context.Context, scope storage.CatalogueReadScope, filter storage.SeriesReadFilter) ([]domain.Series, error) {
 	pred, err := r.loadPredicate(ctx, scope)
@@ -834,6 +843,241 @@ func (r *CatalogueRepository) SelectPreferredAssetFileForVolume(ctx context.Cont
 	}
 	file := filesByID[chosen.ID]
 	return &file, nil
+}
+
+// ListAuthorizedVolumeAssetFiles resolves all visible, available, non-trashed asset file
+// projections for volumeID ranked in preference order (preferred_asset_id -> user locator ->
+// oldest created_at, id). Trashed items are always excluded even when scope.IncludeTrashed is true.
+func (r *CatalogueRepository) ListAuthorizedVolumeAssetFiles(ctx context.Context, scope storage.CatalogueReadScope, volumeID string) ([]storage.AuthorizedAssetFile, error) {
+	readableScope := scope
+	readableScope.IncludeTrashed = false
+	pred, err := r.loadPredicate(ctx, readableScope)
+	if err != nil {
+		return nil, err
+	}
+	vol, err := r.getVolumeWithPredicate(ctx, pred, volumeID)
+	if err != nil {
+		return nil, err
+	}
+	filesByVol, err := r.listAuthorizedAssetCandidatesByVolumeIDsWithPredicate(ctx, pred, []string{volumeID})
+	if err != nil {
+		return nil, err
+	}
+	orderedFiles := filesByVol[volumeID]
+	if len(orderedFiles) == 0 {
+		return nil, storage.ErrNotFound
+	}
+	locatorByVol, err := r.listLocatorAssetIDsByVolumeIDsWithPredicate(ctx, pred, principalUserID(scope), []string{volumeID})
+	if err != nil {
+		return nil, err
+	}
+	return rankAuthorizedVolumeAssetFiles(vol.PreferredAssetID, locatorByVol[volumeID], orderedFiles), nil
+}
+
+// ListSeriesCoverCandidates returns up to limit visible, non-trashed volumes of seriesID
+// in FIRST order (sm.position, v.number, v.id) starting at offset, paired with each volume's
+// preference-ranked visible, available, non-trashed asset files. Returns storage.ErrNotFound
+// when seriesID itself is missing, restricted, or trashed.
+func (r *CatalogueRepository) ListSeriesCoverCandidates(
+	ctx context.Context,
+	scope storage.CatalogueReadScope,
+	seriesID string,
+	limit, offset int,
+) ([]storage.SeriesCoverCandidate, error) {
+	readableScope := scope
+	readableScope.IncludeTrashed = false
+	pred, err := r.loadPredicate(ctx, readableScope)
+	if err != nil {
+		return nil, err
+	}
+	normLimit, err := normalizeCataloguePageFilter(limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.getSeriesWithPredicate(ctx, pred, seriesID); err != nil {
+		return nil, err
+	}
+
+	vols, err := r.listSeriesCoverVolumesPageWithPredicate(ctx, pred, seriesID, normLimit, offset)
+	if err != nil || len(vols) == 0 {
+		return nil, err
+	}
+
+	volumeIDs := make([]string, len(vols))
+	for i := range vols {
+		volumeIDs[i] = vols[i].id
+	}
+	filesByVol, err := r.listAuthorizedAssetCandidatesByVolumeIDsWithPredicate(ctx, pred, volumeIDs)
+	if err != nil {
+		return nil, err
+	}
+	locatorByVol, err := r.listLocatorAssetIDsByVolumeIDsWithPredicate(ctx, pred, principalUserID(scope), volumeIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]storage.SeriesCoverCandidate, 0, len(vols))
+	for _, v := range vols {
+		ranked := rankAuthorizedVolumeAssetFiles(v.preferredAssetID, locatorByVol[v.id], filesByVol[v.id])
+		if len(ranked) == 0 {
+			continue
+		}
+		out = append(out, storage.SeriesCoverCandidate{
+			VolumeID: v.id,
+			Files:    ranked,
+		})
+	}
+	return out, nil
+}
+
+type seriesCoverVolumeRow struct {
+	id               string
+	preferredAssetID *string
+}
+
+func (r *CatalogueRepository) listSeriesCoverVolumesPageWithPredicate(
+	ctx context.Context,
+	pred *LabelPredicate,
+	seriesID string,
+	limit, offset int,
+) ([]seriesCoverVolumeRow, error) {
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: `
+			SELECT v.id, v.preferred_asset_id
+			FROM volumes v
+			JOIN series_memberships sm_f ON sm_f.volume_id = v.id
+			JOIN series s_f ON s_f.id = sm_f.series_id
+			JOIN media_assets a_c ON a_c.volume_id = v.id`,
+		whereParts: []string{"sm_f.series_id = $1", "a_c.missing_since IS NULL", "a_c.retired_at IS NULL"},
+		args:       []any{seriesID},
+		predicates: []predicateClause{
+			{alias: "v", fragmentFn: (*LabelPredicate).VolumeFragment},
+			{alias: "s_f", fragmentFn: (*LabelPredicate).SeriesFragment},
+			{alias: "a_c", fragmentFn: (*LabelPredicate).AssetFragment},
+		},
+		groupBy: " GROUP BY v.id, v.preferred_asset_id, sm_f.position, v.number",
+		orderBy: " ORDER BY sm_f.position ASC NULLS LAST, v.number ASC NULLS LAST, v.id ASC",
+		limit:   limit,
+		offset:  offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []seriesCoverVolumeRow
+	for rows.Next() {
+		var row seriesCoverVolumeRow
+		if err := rows.Scan(&row.id, &row.preferredAssetID); err != nil {
+			return nil, mapPgError(err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
+}
+
+func (r *CatalogueRepository) listAuthorizedAssetCandidatesByVolumeIDsWithPredicate(
+	ctx context.Context,
+	pred *LabelPredicate,
+	volumeIDs []string,
+) (map[string][]storage.AuthorizedAssetFile, error) {
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: selectAuthorizedAssetCandidatesColumns,
+		whereParts: []string{"a.volume_id = ANY($1::text[])", "a.missing_since IS NULL", "a.retired_at IS NULL"},
+		args:       []any{volumeIDs},
+		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
+		orderBy:    " ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC",
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	byVol := make(map[string][]storage.AuthorizedAssetFile, len(volumeIDs))
+	for rows.Next() {
+		_, file, err := scanAuthorizedAssetCandidateRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		byVol[file.VolumeID] = append(byVol[file.VolumeID], file)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return byVol, nil
+}
+
+func (r *CatalogueRepository) listLocatorAssetIDsByVolumeIDsWithPredicate(
+	ctx context.Context,
+	pred *LabelPredicate,
+	userID string,
+	volumeIDs []string,
+) (map[string]string, error) {
+	if userID == "" || len(volumeIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: "SELECT rp.volume_id, COALESCE(rp.locator->>'asset_id', '') FROM reading_progress rp",
+		whereParts: []string{"rp.user_id = $1", "rp.volume_id = ANY($2::text[])"},
+		args:       []any{userID, volumeIDs},
+		predicates: []predicateClause{{alias: "rp", fragmentFn: (*LabelPredicate).ReadingProgressFragment}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]string, len(volumeIDs))
+	for rows.Next() {
+		var volID, assetID string
+		if err := rows.Scan(&volID, &assetID); err != nil {
+			return nil, mapPgError(err)
+		}
+		if assetID != "" {
+			out[volID] = assetID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
+}
+
+func rankAuthorizedVolumeAssetFiles(
+	preferredAssetID *string,
+	locatorAssetID string,
+	orderedFiles []storage.AuthorizedAssetFile,
+) []storage.AuthorizedAssetFile {
+	if len(orderedFiles) == 0 {
+		return nil
+	}
+	ranked := make([]storage.AuthorizedAssetFile, 0, len(orderedFiles))
+	added := make(map[string]bool, len(orderedFiles))
+	addByID := func(id string) {
+		if id == "" || added[id] {
+			return
+		}
+		for i := range orderedFiles {
+			if orderedFiles[i].AssetID == id {
+				ranked = append(ranked, orderedFiles[i])
+				added[id] = true
+				return
+			}
+		}
+	}
+	if preferredAssetID != nil {
+		addByID(*preferredAssetID)
+	}
+	addByID(locatorAssetID)
+	for i := range orderedFiles {
+		if !added[orderedFiles[i].AssetID] {
+			ranked = append(ranked, orderedFiles[i])
+		}
+	}
+	return ranked
 }
 
 func (r *CatalogueRepository) listAuthorizedAssetCandidatesWithPredicate(

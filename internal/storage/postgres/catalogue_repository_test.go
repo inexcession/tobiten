@@ -127,6 +127,20 @@ var catalogueReadEnforcementSpecs = map[string]catalogueReadEnforcementSpec{
 			return err
 		},
 	},
+	"ListAuthorizedVolumeAssetFiles": {
+		runEnforcement: enforceListAuthorizedVolumeAssetFiles,
+		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
+			_, err := repo.ListAuthorizedVolumeAssetFiles(ctx, scope, "v-any")
+			return err
+		},
+	},
+	"ListSeriesCoverCandidates": {
+		runEnforcement: enforceListSeriesCoverCandidates,
+		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
+			_, err := repo.ListSeriesCoverCandidates(ctx, scope, "s-any", 8, 0)
+			return err
+		},
+	},
 	"GetReadingProgress": {
 		runEnforcement: enforceGetReadingProgress,
 		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
@@ -939,6 +953,106 @@ func enforceSelectPreferredAssetFileForVolume(t *testing.T, ec *catalogueEnforce
 	})
 	_, err = ec.repo.SelectPreferredAssetFileForVolume(ec.ctx, storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vInKids)
 	assertNotFound(t, "timmy when only permitted variant is missing", err)
+}
+
+func enforceListAuthorizedVolumeAssetFiles(t *testing.T, ec *catalogueEnforcementCtx) {
+	if _, err := ec.cat.tdb.Exec(ec.ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, ec.cat.aKidsNSFW, ec.cat.vInKids); err != nil {
+		t.Fatalf("set preferred_asset_id: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = ec.cat.tdb.Exec(context.Background(), `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, ec.cat.vInKids)
+	})
+
+	// Admin receives both non-trashed available variants ranked with preferred_asset_id first.
+	adminFiles, err := ec.repo.ListAuthorizedVolumeAssetFiles(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vInKids)
+	if err != nil {
+		t.Fatalf("admin ListAuthorizedVolumeAssetFiles(vInKids): %v", err)
+	}
+	if len(adminFiles) != 2 || adminFiles[0].AssetID != ec.cat.aKidsNSFW || adminFiles[1].AssetID != ec.cat.aKidsClean {
+		t.Fatalf("admin ListAuthorizedVolumeAssetFiles = %+v, want [aKidsNSFW, aKidsClean]", adminFiles)
+	}
+
+	// Reader receives only the permitted clean variant.
+	readerFiles, err := ec.repo.ListAuthorizedVolumeAssetFiles(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.vInKids)
+	if err != nil {
+		t.Fatalf("reader ListAuthorizedVolumeAssetFiles(vInKids): %v", err)
+	}
+	if len(readerFiles) != 1 || readerFiles[0].AssetID != ec.cat.aKidsClean {
+		t.Fatalf("reader ListAuthorizedVolumeAssetFiles = %+v, want [aKidsClean]", readerFiles)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		scope storage.CatalogueReadScope
+		volID string
+	}{
+		{"nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, ec.cat.vInKids},
+		{"multiRole zero policies", storage.CatalogueReadScope{Principal: ec.multiRole}, ec.cat.vInKids},
+		{"reader on restricted vInKidsVolRestricted", storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.vInKidsVolRestricted},
+		{"timmy on vAllowedVolInClean", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vAllowedVolInClean},
+		{"timmy on vZeroAssetsInKids", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.vZeroAssetsInKids},
+		{"admin IncludeTrashed=true excludes trashed volume", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.vTrashedInKids},
+	} {
+		_, err := ec.repo.ListAuthorizedVolumeAssetFiles(ec.ctx, tc.scope, tc.volID)
+		assertNotFound(t, tc.name, err)
+	}
+}
+
+func enforceListSeriesCoverCandidates(t *testing.T, ec *catalogueEnforcementCtx) {
+	// Admin sees visible non-trashed volumes of sKids that have available non-trashed assets, bounded by limit/offset.
+	allAdmin, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.sKids, 20, 0)
+	if err != nil {
+		t.Fatalf("admin ListSeriesCoverCandidates(sKids): %v", err)
+	}
+	if len(allAdmin) == 0 {
+		t.Fatal("expected at least 1 candidate for admin on sKids")
+	}
+	for _, c := range allAdmin {
+		if c.VolumeID == ec.cat.vZeroAssetsInKids || c.VolumeID == ec.cat.vTrashedInKids {
+			t.Fatalf("ListSeriesCoverCandidates leaked empty or trashed volume %s", c.VolumeID)
+		}
+		if len(c.Files) == 0 {
+			t.Fatalf("candidate %s had zero files", c.VolumeID)
+		}
+	}
+
+	// Limit=1 returns only the first candidate; offset=1 advances to the second when present.
+	page1, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.sKids, 1, 0)
+	if err != nil || len(page1) != 1 || page1[0].VolumeID != allAdmin[0].VolumeID {
+		t.Fatalf("page1(limit=1) = (%+v, %v), want [%s]", page1, err, allAdmin[0].VolumeID)
+	}
+
+	// Reader excludes vInKidsVolRestricted and vAltPathRestrictedSec and aKidsNSFW.
+	readerCands, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.sKids, 20, 0)
+	if err != nil {
+		t.Fatalf("reader ListSeriesCoverCandidates(sKids): %v", err)
+	}
+	for _, c := range readerCands {
+		if c.VolumeID == ec.cat.vInKidsVolRestricted || c.VolumeID == ec.cat.vAltPathRestrictedSec {
+			t.Fatalf("reader ListSeriesCoverCandidates leaked restricted volume %s", c.VolumeID)
+		}
+		for _, f := range c.Files {
+			if f.AssetID == ec.cat.aKidsNSFW {
+				t.Fatalf("reader ListSeriesCoverCandidates leaked restricted asset %s", f.AssetID)
+			}
+		}
+	}
+
+	// Restricted/trashed/unallowed/nil series return ErrNotFound even with IncludeTrashed=true.
+	for _, tc := range []struct {
+		name     string
+		scope    storage.CatalogueReadScope
+		seriesID string
+	}{
+		{"nil principal", storage.CatalogueReadScope{IncludeTrashed: true}, ec.cat.sKids},
+		{"multiRole zero policies", storage.CatalogueReadScope{Principal: ec.multiRole}, ec.cat.sKids},
+		{"reader on sNSFW", storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.sNSFW},
+		{"timmy on sClean", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.sClean},
+		{"admin IncludeTrashed=true on sTrashed", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.sTrashed},
+	} {
+		_, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, tc.scope, tc.seriesID, 8, 0)
+		assertNotFound(t, tc.name, err)
+	}
 }
 
 func enforceGetReadingProgress(t *testing.T, ec *catalogueEnforcementCtx) {

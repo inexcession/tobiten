@@ -137,6 +137,13 @@ type AuthorizedAssetFile struct {
 	RetiredAt       *time.Time
 }
 
+// SeriesCoverCandidate pairs one visible, non-trashed series member volume with its
+// preference-ranked, visible, available, non-trashed asset files (ADR-0006 §5, ADR-0010 §2).
+type SeriesCoverCandidate struct {
+	VolumeID string
+	Files    []AuthorizedAssetFile
+}
+
 // CatalogueRepository defines label-enforced read and count operations across series,
 // volumes, media assets, authorized file projections, and per-user reading progress (ADR-0006 §5).
 // Every method must apply the repository LabelPredicate and fail closed on missing principals
@@ -172,6 +179,8 @@ type CatalogueRepository interface {
 
 	GetAuthorizedAssetFile(ctx context.Context, scope CatalogueReadScope, assetID string) (*AuthorizedAssetFile, error)
 	SelectPreferredAssetFileForVolume(ctx context.Context, scope CatalogueReadScope, volumeID string) (*AuthorizedAssetFile, error)
+	ListAuthorizedVolumeAssetFiles(ctx context.Context, scope CatalogueReadScope, volumeID string) ([]AuthorizedAssetFile, error)
+	ListSeriesCoverCandidates(ctx context.Context, scope CatalogueReadScope, seriesID string, limit, offset int) ([]SeriesCoverCandidate, error)
 
 	GetReadingProgress(ctx context.Context, scope CatalogueReadScope, volumeID string) (*domain.ReadingProgress, error)
 	ListReadingProgress(ctx context.Context, scope CatalogueReadScope, filter ReadingProgressReadFilter) ([]domain.ReadingProgress, error)

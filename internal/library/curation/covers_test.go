@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -20,6 +21,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/container"
@@ -1287,12 +1292,16 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
 	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 40, B: 220, A: 255})
 	yellow := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 210, B: 30, A: 255})
+	purple := makeSolidPNG(t, 80, 120, color.RGBA{R: 180, G: 40, B: 200, A: 255})
 
 	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-1-nsfw.cbz")), cbzEntry{name: "001.png", data: blue})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-1-clean.cbz")), cbzEntry{name: "001.png", data: red})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "alpha-2-clean.cbz")), cbzEntry{name: "001.png", data: green})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "kids-1.cbz")), cbzEntry{name: "001.png", data: yellow})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "offline-only.cbz")), cbzEntry{name: "001.png", data: red})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "offline-pref.cbz")), cbzEntry{name: "001.png", data: blue})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "offline-fallback-online.cbz")), cbzEntry{name: "001.png", data: purple})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "corrupt-cover.cbz")), cbzEntry{name: "001.png", data: []byte("corrupt-not-a-valid-png")})
 
 	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
 	ctx := t.Context()
@@ -1372,6 +1381,9 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 			{ID: "ser-cov-fallback", LibraryID: lib.ID, Title: "Fallback", TitleSort: "fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-cov-kids", LibraryID: lib.ID, Title: "Kids", TitleSort: "kids", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-cov-trashed", LibraryID: lib.ID, Title: "Trashed", TitleSort: "trashed", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-offline-first", LibraryID: lib.ID, Title: "Offline First", TitleSort: "offline first", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-corrupt-fallback", LibraryID: lib.ID, Title: "Corrupt Fallback", TitleSort: "corrupt fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-cov-corrupt-only", LibraryID: lib.ID, Title: "Corrupt Only", TitleSort: "corrupt only", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 		} {
 			ser := s
 			if err := cw.CreateSeries(ctx, &ser); err != nil {
@@ -1380,11 +1392,14 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 		}
 
 		prefNSFW := byName["alpha-1-nsfw.cbz"].ID
+		prefOffline := byName["offline-pref.cbz"].ID
 		for _, v := range []domain.Volume{
 			{ID: "vol-cov-multi", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PreferredAssetID: &prefNSFW, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-only-restricted", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-nofile", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 0, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-offline", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-offline-with-online", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PreferredAssetID: &prefOffline, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-cov-corrupt", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-clean2", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-kids", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-cov-trashed", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
@@ -1402,7 +1417,16 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 			list  []domain.SeriesMembership
 		}{
 			{"vol-cov-only-restricted", []domain.SeriesMembership{{VolumeID: "vol-cov-only-restricted", SeriesID: "ser-cov-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
-			{"vol-cov-clean2", []domain.SeriesMembership{{VolumeID: "vol-cov-clean2", SeriesID: "ser-cov-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-clean2", []domain.SeriesMembership{
+				{VolumeID: "vol-cov-clean2", SeriesID: "ser-cov-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-cov-clean2", SeriesID: "ser-cov-offline-first", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-cov-clean2", SeriesID: "ser-cov-corrupt-fallback", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+			}},
+			{"vol-cov-offline-with-online", []domain.SeriesMembership{{VolumeID: "vol-cov-offline-with-online", SeriesID: "ser-cov-offline-first", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-cov-corrupt", []domain.SeriesMembership{
+				{VolumeID: "vol-cov-corrupt", SeriesID: "ser-cov-corrupt-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-cov-corrupt", SeriesID: "ser-cov-corrupt-only", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+			}},
 			{"vol-cov-nofile", []domain.SeriesMembership{{VolumeID: "vol-cov-nofile", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
 			{"vol-cov-offline", []domain.SeriesMembership{{VolumeID: "vol-cov-offline", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
 			{"vol-cov-trashed", []domain.SeriesMembership{{VolumeID: "vol-cov-trashed", SeriesID: "ser-cov-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p3, Source: domain.MembershipSourceManual}}},
@@ -1438,6 +1462,15 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 			return err
 		}
 		if err := moveAsset("offline-only.cbz", "vol-cov-offline", offlineRootID); err != nil {
+			return err
+		}
+		if err := moveAsset("offline-pref.cbz", "vol-cov-offline-with-online", offlineRootID); err != nil {
+			return err
+		}
+		if err := moveAsset("offline-fallback-online.cbz", "vol-cov-offline-with-online", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("corrupt-cover.cbz", "vol-cov-corrupt", ""); err != nil {
 			return err
 		}
 
@@ -1648,4 +1681,301 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 	if _, err := slowSvc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-alpha"); !errors.Is(err, app.ErrServiceBusy) {
 		t.Fatalf("slow worker series GetCover = %v, want ErrServiceBusy", err)
 	}
+
+	// 7. Offline preferred asset with a visible online variant stays on the same volume (both volume & FIRST series).
+	offlineMultiVol, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeVolume), readerPrincipal, "vol-cov-offline-with-online")
+	if err != nil {
+		t.Fatalf("GetCover(vol-cov-offline-with-online): %v", err)
+	}
+	assertDominantColor(t, offlineMultiVol.Data, 180, 40, 200)
+
+	offlineFirstSer, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-offline-first")
+	if err != nil {
+		t.Fatalf("GetCover(ser-cov-offline-first): %v", err)
+	}
+	assertDominantColor(t, offlineFirstSer.Data, 180, 40, 200)
+
+	// 8. Structurally valid CBZ with damaged cover image falls back to next volume, or returns ErrNotFound (404) when none is usable.
+	corruptFallback, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-corrupt-fallback")
+	if err != nil {
+		t.Fatalf("GetCover(ser-cov-corrupt-fallback): %v", err)
+	}
+	assertDominantColor(t, corruptFallback.Data, 30, 210, 30)
+
+	if _, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeVolume), readerPrincipal, "vol-cov-corrupt"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("GetCover(vol-cov-corrupt) = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-corrupt-only"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("GetCover(ser-cov-corrupt-only) = %v, want ErrNotFound", err)
+	}
+
+	// 9. Infrastructure error (ErrNoPipeline) is preserved rather than masked as 404 fallback.
+	noPipeSvc, _ := newTestCoverService(t, tx, tobitenimage.NewRegistry(), 2*time.Second)
+	if _, err := noPipeSvc.GetCover(app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries), readerPrincipal, "ser-cov-alpha"); !errors.Is(err, tobitenimage.ErrNoPipeline) {
+		t.Fatalf("no-pipeline GetCover = %v, want ErrNoPipeline", err)
+	}
+}
+
+type countingTxBeginner struct {
+	pool    *pgxpool.Pool
+	queries atomic.Int64
+}
+
+func (c *countingTxBeginner) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.queries.Add(1)
+	return c.pool.Exec(ctx, sql, args...)
+}
+
+func (c *countingTxBeginner) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	c.queries.Add(1)
+	return c.pool.Query(ctx, sql, args...)
+}
+
+func (c *countingTxBeginner) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	c.queries.Add(1)
+	return c.pool.QueryRow(ctx, sql, args...)
+}
+
+func (c *countingTxBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &countingPgxTx{Tx: tx, queries: &c.queries}, nil
+}
+
+func (c *countingTxBeginner) BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := c.pool.BeginTx(ctx, txOptions)
+	if err != nil {
+		return nil, err
+	}
+	return &countingPgxTx{Tx: tx, queries: &c.queries}, nil
+}
+
+type countingPgxTx struct {
+	pgx.Tx
+	queries *atomic.Int64
+}
+
+func (c *countingPgxTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	sub, err := c.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &countingPgxTx{Tx: sub, queries: c.queries}, nil
+}
+
+func (c *countingPgxTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.queries.Add(1)
+	return c.Tx.Exec(ctx, sql, args...)
+}
+
+func (c *countingPgxTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	c.queries.Add(1)
+	return c.Tx.Query(ctx, sql, args...)
+}
+
+func (c *countingPgxTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	c.queries.Add(1)
+	return c.Tx.QueryRow(ctx, sql, args...)
+}
+
+func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testing.T) {
+	t.Parallel()
+
+	rootDir := filepath.Join(t.TempDir(), "library")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 40, B: 220, A: 255})
+
+	writeCBZ(t, []byte(filepath.Join(rootDir, "long-01.cbz")), cbzEntry{name: "001.png", data: blue})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "batch-healthy.cbz")), cbzEntry{name: "001.png", data: green})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "batch-corrupt.cbz")), cbzEntry{name: "001.png", data: []byte("corrupt-png")})
+
+	db := testdb.New(t)
+	ctx := t.Context()
+	if err := migrations.RunFS(ctx, db, migrations.CoreFS); err != nil {
+		t.Fatalf("migrations.RunFS: %v", err)
+	}
+	tx := postgres.NewTransactor(db.Pool)
+
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		if err := st.Libraries().CreateLibrary(ctx, &domain.Library{
+			ID:            "lib-long",
+			Name:          "Long Series Lib",
+			Mode:          domain.LibraryModeVirtual,
+			ResolverChain: domain.DefaultResolverChain(),
+		}); err != nil {
+			return err
+		}
+		return st.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+			ID:        "root-long",
+			LibraryID: "lib-long",
+			Path:      domain.NewPathIdentity([]byte(rootDir)),
+			State:     domain.LibraryRootStateOnline,
+		})
+	}); err != nil {
+		t.Fatalf("seed lib/root: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, "lib-long", scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, "root-long")
+	byName := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byName[a.RelPathDisplay] = a
+	}
+
+	var readerUser domain.User
+	var readerRole domain.Role
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		var ok bool
+		readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName)
+		if !ok {
+			return errors.New("missing Reader role")
+		}
+		readerUser = domain.User{ID: "u-long-reader", Username: "longreader", CreatedAt: now, UpdatedAt: now}
+		if err := st.Users().CreateUser(ctx, &readerUser); err != nil {
+			return err
+		}
+		if err := st.Users().AssignUserRole(ctx, readerUser.ID, readerRole.ID); err != nil {
+			return err
+		}
+
+		cw := st.CatalogueWrites()
+		sm := st.SeriesMemberships()
+		for _, s := range []domain.Series{
+			{ID: "ser-long-1", LibraryID: "lib-long", Title: "One Vol", TitleSort: "one vol", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-long-64", LibraryID: "lib-long", Title: "Sixty Four", TitleSort: "sixty four", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-batch-11", LibraryID: "lib-long", Title: "Batched Fallback", TitleSort: "batched fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+		} {
+			ser := s
+			if err := cw.CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+		}
+
+		seedVolWithAsset := func(seriesID, volID string, pos float64, tmplName string) error {
+			vol := domain.Volume{ID: volID, LibraryID: "lib-long", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now}
+			if err := cw.CreateVolume(ctx, &vol); err != nil {
+				return err
+			}
+			if err := sm.SetVolumeMemberships(ctx, volID, []domain.SeriesMembership{{
+				VolumeID:  volID,
+				SeriesID:  seriesID,
+				IsPrimary: true,
+				Kind:      domain.MembershipKindSeries,
+				Position:  &pos,
+				Source:    domain.MembershipSourceManual,
+			}}); err != nil {
+				return err
+			}
+			tmpl := byName[tmplName]
+			dig, _ := tmpl.CurrentDigest(domain.DigestKindXXH364Partial)
+			relName := fmt.Sprintf("%s-%s.cbz", seriesID, volID)
+			raw, rErr := os.ReadFile(filepath.Join(rootDir, tmplName))
+			if rErr != nil {
+				return rErr
+			}
+			if wErr := os.WriteFile(filepath.Join(rootDir, relName), raw, 0o644); wErr != nil {
+				return wErr
+			}
+			asset := domain.MediaAsset{
+				ID:             "a-" + volID,
+				VolumeID:       volID,
+				LibraryRootID:  "root-long",
+				RelPathBytes:   []byte(relName),
+				RelPathDisplay: relName,
+				RelPathMatch:   relName,
+				FileSize:       int64(len(raw)),
+				Format:         domain.MediaFormatCBZ,
+				PageCount:      1,
+				CoverPageIndex: 0,
+				Digests: []domain.AssetDigest{{
+					AssetID:   "a-" + volID,
+					Kind:      domain.DigestKindXXH364Partial,
+					Value:     dig.Value,
+					IsCurrent: true,
+					Reason:    domain.DigestReasonScan,
+				}},
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			return cw.CreateAsset(ctx, &asset)
+		}
+
+		if err := seedVolWithAsset("ser-long-1", "v-one-1", 1, "long-01.cbz"); err != nil {
+			return err
+		}
+		for i := 1; i <= 64; i++ {
+			if err := seedVolWithAsset("ser-long-64", fmt.Sprintf("v64-%02d", i), float64(i), "long-01.cbz"); err != nil {
+				return err
+			}
+		}
+		// 10 corrupt volumes (> seriesCoverBatchSize=8) followed by 1 healthy volume at position 11.
+		for i := 1; i <= 10; i++ {
+			if err := seedVolWithAsset("ser-batch-11", fmt.Sprintf("vb-%02d", i), float64(i), "batch-corrupt.cbz"); err != nil {
+				return err
+			}
+		}
+		return seedVolWithAsset("ser-batch-11", "vb-11", 11, "batch-healthy.cbz")
+	}); err != nil {
+		t.Fatalf("seed long series fixture: %v", err)
+	}
+
+	counter := &countingTxBeginner{pool: db.Pool}
+	countingTx := postgres.NewTransactor(counter)
+	spy, reg := newSpyImagePipeline(t, nil)
+	svc, _ := newTestCoverService(t, countingTx, reg, 2*time.Second)
+
+	readerPrincipal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-long", nil)
+	seriesCtx := app.ContextWithCoverTargetKind(ctx, domain.ItemTypeSeries)
+
+	// Warm both 1-volume and 64-volume first covers.
+	if _, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-long-1"); err != nil {
+		t.Fatalf("warm ser-long-1: %v", err)
+	}
+	if _, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-long-64"); err != nil {
+		t.Fatalf("warm ser-long-64: %v", err)
+	}
+
+	// Warm first-cover lookup must execute the exact same bounded SQL query count for 1 and 64 volumes, with 0 renders.
+	rendersBefore := spy.calls.Load()
+	counter.queries.Store(0)
+	if _, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-long-1"); err != nil {
+		t.Fatalf("warm hit ser-long-1: %v", err)
+	}
+	queriesOne := counter.queries.Load()
+
+	counter.queries.Store(0)
+	got64, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-long-64")
+	if err != nil {
+		t.Fatalf("warm hit ser-long-64: %v", err)
+	}
+	queries64 := counter.queries.Load()
+	if spy.calls.Load() != rendersBefore {
+		t.Fatalf("warm first-cover triggered %d renders, want 0", spy.calls.Load()-rendersBefore)
+	}
+	if queries64 != queriesOne || queries64 > 6 {
+		t.Fatalf("warm 64-volume series executed %d queries (1-vol=%d), want identical bounded count <= 6", queries64, queriesOne)
+	}
+	assertDominantColor(t, got64.Data, 30, 40, 220)
+
+	// Batched fallback across 10 corrupt volumes (> batch size 8) reaches healthy position 11.
+	gotBatch, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-batch-11")
+	if err != nil {
+		t.Fatalf("ser-batch-11 GetCover: %v", err)
+	}
+	assertDominantColor(t, gotBatch.Data, 30, 210, 30)
 }

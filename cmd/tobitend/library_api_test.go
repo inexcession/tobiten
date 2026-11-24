@@ -1282,11 +1282,33 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 		}
 	}
 
-	makeCBZ("alpha-1-nsfw.cbz", color.RGBA{R: 30, G: 40, B: 220, A: 255})  // blue
-	makeCBZ("alpha-1-clean.cbz", color.RGBA{R: 220, G: 30, B: 30, A: 255}) // red
-	makeCBZ("alpha-2-clean.cbz", color.RGBA{R: 30, G: 210, B: 30, A: 255}) // green
-	makeCBZ("kids-1.cbz", color.RGBA{R: 220, G: 210, B: 30, A: 255})       // yellow
-	makeCBZ("trashed.cbz", color.RGBA{R: 180, G: 40, B: 180, A: 255})
+	makeRawCBZ := func(filename, entryName string, payload []byte) {
+		var zipBuf bytes.Buffer
+		zw := zip.NewWriter(&zipBuf)
+		w, err := zw.Create(entryName)
+		if err != nil {
+			t.Fatalf("zip.Create: %v", err)
+		}
+		if _, err := w.Write(payload); err != nil {
+			t.Fatalf("zip.Write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("zip.Close: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rootDir, filename), zipBuf.Bytes(), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", filename, err)
+		}
+	}
+
+	makeCBZ("alpha-1-nsfw.cbz", color.RGBA{R: 30, G: 40, B: 220, A: 255})    // blue
+	makeCBZ("alpha-1-clean.cbz", color.RGBA{R: 220, G: 30, B: 30, A: 255})   // red
+	makeCBZ("alpha-2-clean.cbz", color.RGBA{R: 30, G: 210, B: 30, A: 255})   // green
+	makeCBZ("kids-1.cbz", color.RGBA{R: 220, G: 210, B: 30, A: 255})         // yellow
+	makeCBZ("trashed.cbz", color.RGBA{R: 180, G: 40, B: 180, A: 255})        // magenta
+	makeCBZ("offline-pref.cbz", color.RGBA{R: 30, G: 40, B: 220, A: 255})    // blue
+	makeCBZ("offline-online.cbz", color.RGBA{R: 230, G: 130, B: 20, A: 255}) // orange
+	makeRawCBZ("corrupt-cover.cbz", "001.png", []byte("not-a-valid-png"))    // corrupt cover image
+	makeCBZ("long-64.cbz", color.RGBA{R: 30, G: 40, B: 220, A: 255})         // blue
 
 	cfg, err := config.Load(nil, config.WithoutEnvFile(), config.WithEnviron([]string{
 		"TOBITEN_STORAGE_MODE=postgres",
@@ -1384,6 +1406,17 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 		t.Fatalf("ScanLibrary: %v", err)
 	}
 
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		return st.Libraries().CreateLibraryRoot(ctx, &domain.LibraryRoot{
+			ID:        "root-thumb-offline",
+			LibraryID: "lib-thumb",
+			Path:      domain.NewPathIdentity([]byte(filepath.Join(t.TempDir(), "offline-root"))),
+			State:     domain.LibraryRootStateOffline,
+		})
+	}); err != nil {
+		t.Fatalf("create offline root: %v", err)
+	}
+
 	byName := make(map[string]domain.MediaAsset)
 	if err := tx.WithTx(ctx, func(st storage.Tx) error {
 		list, listErr := st.CatalogueWrites().ListAssetsByRoot(ctx, "root-thumb")
@@ -1399,6 +1432,10 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 			{ID: "ser-thumb-alpha", LibraryID: "lib-thumb", Title: "Alpha", TitleSort: "alpha", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-thumb-kids", LibraryID: "lib-thumb", Title: "Kids", TitleSort: "kids", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-thumb-trashed", LibraryID: "lib-thumb", Title: "Trashed", TitleSort: "trashed", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-offline-first", LibraryID: "lib-thumb", Title: "Offline First", TitleSort: "offline first", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-corrupt-fallback", LibraryID: "lib-thumb", Title: "Corrupt Fallback", TitleSort: "corrupt fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-corrupt-only", LibraryID: "lib-thumb", Title: "Corrupt Only", TitleSort: "corrupt only", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-thumb-64", LibraryID: "lib-thumb", Title: "Long 64", TitleSort: "long 64", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 		} {
 			ser := s
 			if err := cw.CreateSeries(ctx, &ser); err != nil {
@@ -1407,12 +1444,15 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 		}
 
 		prefNSFW := byName["alpha-1-nsfw.cbz"].ID
+		prefOffline := byName["offline-pref.cbz"].ID
 		for _, v := range []domain.Volume{
 			{ID: "vol-thumb-multi", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PreferredAssetID: &prefNSFW, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-thumb-restr", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-thumb-clean2", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-thumb-kids", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 			{ID: "vol-thumb-trashed", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-offline-multi", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PreferredAssetID: &prefOffline, PageCount: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "vol-thumb-corrupt", LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now},
 		} {
 			vol := v
 			if err := cw.CreateVolume(ctx, &vol); err != nil {
@@ -1427,7 +1467,16 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 			list  []domain.SeriesMembership
 		}{
 			{"vol-thumb-restr", []domain.SeriesMembership{{VolumeID: "vol-thumb-restr", SeriesID: "ser-thumb-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
-			{"vol-thumb-clean2", []domain.SeriesMembership{{VolumeID: "vol-thumb-clean2", SeriesID: "ser-thumb-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual}}},
+			{"vol-thumb-clean2", []domain.SeriesMembership{
+				{VolumeID: "vol-thumb-clean2", SeriesID: "ser-thumb-alpha", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-thumb-clean2", SeriesID: "ser-thumb-offline-first", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-thumb-clean2", SeriesID: "ser-thumb-corrupt-fallback", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+			}},
+			{"vol-thumb-offline-multi", []domain.SeriesMembership{{VolumeID: "vol-thumb-offline-multi", SeriesID: "ser-thumb-offline-first", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
+			{"vol-thumb-corrupt", []domain.SeriesMembership{
+				{VolumeID: "vol-thumb-corrupt", SeriesID: "ser-thumb-corrupt-fallback", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+				{VolumeID: "vol-thumb-corrupt", SeriesID: "ser-thumb-corrupt-only", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+			}},
 			{"vol-thumb-kids", []domain.SeriesMembership{{VolumeID: "vol-thumb-kids", SeriesID: "ser-thumb-kids", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
 			{"vol-thumb-trashed", []domain.SeriesMembership{{VolumeID: "vol-thumb-trashed", SeriesID: "ser-thumb-trashed", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual}}},
 		} {
@@ -1436,28 +1485,94 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 			}
 		}
 
-		moveAsset := func(name, volID string) error {
+		moveAsset := func(name, volID, rootOverride string) error {
 			a, getErr := cw.GetAssetByIDForUpdate(ctx, byName[name].ID)
 			if getErr != nil {
 				return getErr
 			}
 			a.VolumeID = volID
+			if rootOverride != "" {
+				a.LibraryRootID = rootOverride
+			}
 			return cw.UpdateAsset(ctx, a)
 		}
-		if err := moveAsset("alpha-1-nsfw.cbz", "vol-thumb-multi"); err != nil {
+		if err := moveAsset("alpha-1-nsfw.cbz", "vol-thumb-multi", ""); err != nil {
 			return err
 		}
-		if err := moveAsset("alpha-1-clean.cbz", "vol-thumb-multi"); err != nil {
+		if err := moveAsset("alpha-1-clean.cbz", "vol-thumb-multi", ""); err != nil {
 			return err
 		}
-		if err := moveAsset("alpha-2-clean.cbz", "vol-thumb-clean2"); err != nil {
+		if err := moveAsset("alpha-2-clean.cbz", "vol-thumb-clean2", ""); err != nil {
 			return err
 		}
-		if err := moveAsset("kids-1.cbz", "vol-thumb-kids"); err != nil {
+		if err := moveAsset("kids-1.cbz", "vol-thumb-kids", ""); err != nil {
 			return err
 		}
-		if err := moveAsset("trashed.cbz", "vol-thumb-trashed"); err != nil {
+		if err := moveAsset("trashed.cbz", "vol-thumb-trashed", ""); err != nil {
 			return err
+		}
+		if err := moveAsset("offline-pref.cbz", "vol-thumb-offline-multi", "root-thumb-offline"); err != nil {
+			return err
+		}
+		if err := moveAsset("offline-online.cbz", "vol-thumb-offline-multi", ""); err != nil {
+			return err
+		}
+		if err := moveAsset("corrupt-cover.cbz", "vol-thumb-corrupt", ""); err != nil {
+			return err
+		}
+
+		// Seed 64 volumes in ser-thumb-64.
+		longTmpl := byName["long-64.cbz"]
+		longDig, _ := longTmpl.CurrentDigest(domain.DigestKindXXH364Partial)
+		longBytes, readLongErr := os.ReadFile(filepath.Join(rootDir, "long-64.cbz"))
+		if readLongErr != nil {
+			return readLongErr
+		}
+		for i := 1; i <= 64; i++ {
+			vid := "vol-thumb-64-" + string(rune('0'+i/10)) + string(rune('0'+i%10))
+			pos := float64(i)
+			vol := domain.Volume{ID: vid, LibraryID: "lib-thumb", Kind: domain.VolumeKindVolume, PageCount: 1, CreatedAt: now, UpdatedAt: now}
+			if err := cw.CreateVolume(ctx, &vol); err != nil {
+				return err
+			}
+			if err := sm.SetVolumeMemberships(ctx, vid, []domain.SeriesMembership{{
+				VolumeID:  vid,
+				SeriesID:  "ser-thumb-64",
+				IsPrimary: true,
+				Kind:      domain.MembershipKindSeries,
+				Position:  &pos,
+				Source:    domain.MembershipSourceManual,
+			}}); err != nil {
+				return err
+			}
+			relName := vid + ".cbz"
+			if writeErr := os.WriteFile(filepath.Join(rootDir, relName), longBytes, 0o644); writeErr != nil {
+				return writeErr
+			}
+			a := domain.MediaAsset{
+				ID:             "a-" + vid,
+				VolumeID:       vid,
+				LibraryRootID:  "root-thumb",
+				RelPathBytes:   []byte(relName),
+				RelPathDisplay: relName,
+				RelPathMatch:   relName,
+				FileSize:       int64(len(longBytes)),
+				Format:         domain.MediaFormatCBZ,
+				PageCount:      1,
+				CoverPageIndex: 0,
+				Digests: []domain.AssetDigest{{
+					AssetID:   "a-" + vid,
+					Kind:      domain.DigestKindXXH364Partial,
+					Value:     longDig.Value,
+					IsCurrent: true,
+					Reason:    domain.DigestReasonScan,
+				}},
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			if err := cw.CreateAsset(ctx, &a); err != nil {
+				return err
+			}
 		}
 
 		// Re-point vol-thumb-restr to a copy of alpha-1-nsfw.cbz so its sole asset is restricted.
@@ -1681,6 +1796,8 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 		{"kid unallowed series with admin ETag", "/api/v1/series/ser-thumb-alpha/thumbnail", "thumbkid", "kid-pass-123", admSerETag},
 		{"kid unallowed volume with reader ETag", "/api/v1/volumes/vol-thumb-multi/thumbnail", "thumbkid", "kid-pass-123", rdrVolETag},
 		{"blank kid zero ALLOW", "/api/v1/series/ser-thumb-kids/thumbnail", "thumbblank", "blank-pass-123", "*"},
+		{"corrupt sole cover volume", "/api/v1/volumes/vol-thumb-corrupt/thumbnail", "thumbreader", "reader-pass-123", "*"},
+		{"corrupt sole cover series", "/api/v1/series/ser-thumb-corrupt-only/thumbnail", "thumbreader", "reader-pass-123", "*"},
 	} {
 		resp, _ := doThumbReq(http.MethodGet, tc.path, tc.user, tc.pass, "", tc.ifNoneMatch)
 		if resp.StatusCode != http.StatusNotFound {
@@ -1691,7 +1808,39 @@ func TestDaemonThumbnailRoutes(t *testing.T) {
 		}
 	}
 
-	// 5. After trashing vol-thumb-clean2, revalidating with the previously valid ETag must return 404 (not 304).
+	// 5. Offline preferred asset with visible online variant serves 200 on both volume and FIRST series.
+	offVolResp, offVolBody := doThumbReq(http.MethodGet, "/api/v1/volumes/vol-thumb-offline-multi/thumbnail", "thumbreader", "reader-pass-123", "", "")
+	if offVolResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET vol-thumb-offline-multi = %d, want 200", offVolResp.StatusCode)
+	}
+	assertJPEGColor(t, offVolBody, 230, 130, 20)
+
+	offSerResp, offSerBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-offline-first/thumbnail", "thumbreader", "reader-pass-123", "", "")
+	if offSerResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET ser-thumb-offline-first = %d, want 200", offSerResp.StatusCode)
+	}
+	assertJPEGColor(t, offSerBody, 230, 130, 20)
+
+	// 6. Structurally valid CBZ with corrupt cover image falls back to healthy second volume.
+	corruptFbResp, corruptFbBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-corrupt-fallback/thumbnail", "thumbreader", "reader-pass-123", "", "")
+	if corruptFbResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET ser-thumb-corrupt-fallback = %d, want 200", corruptFbResp.StatusCode)
+	}
+	assertJPEGColor(t, corruptFbBody, 30, 210, 30)
+
+	// 7. 64-volume series first-cover 200 and conditional 304 revalidation.
+	longResp, longBody := doThumbReq(http.MethodGet, "/api/v1/series/ser-thumb-64/thumbnail", "thumbreader", "reader-pass-123", "", "")
+	if longResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET ser-thumb-64 = %d, want 200", longResp.StatusCode)
+	}
+	assertJPEGColor(t, longBody, 30, 40, 220)
+	longETag := longResp.Header.Get("ETag")
+	long304, long304Body := doThumbReq(http.MethodGet, "/comics/api/v1/series/ser-thumb-64/thumbnail", "thumbreader", "reader-pass-123", "", longETag)
+	if long304.StatusCode != http.StatusNotModified || len(long304Body) != 0 {
+		t.Fatalf("GET ser-thumb-64 If-None-Match = (%d, len=%d), want (304, 0)", long304.StatusCode, len(long304Body))
+	}
+
+	// 8. After trashing vol-thumb-clean2, revalidating with the previously valid ETag must return 404 (not 304).
 	if _, err := db.Exec(ctx, `INSERT INTO item_labels (label_id, item_type, item_id) VALUES ($1, 'VOLUME', 'vol-thumb-clean2')`, domain.LabelMarkedForDeletionID); err != nil {
 		t.Fatalf("trash vol-thumb-clean2: %v", err)
 	}
