@@ -463,8 +463,34 @@ func TestCoverCache_RekeyPreservesExistingDestinationRendition(t *testing.T) {
 	if _, err := cache.Get(ctx, old800); !errors.Is(err, tobitenimage.ErrCacheMiss) {
 		t.Errorf("moved old800 still present: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(coversDir, "11")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("empty old shard dir still exists: %v", err)
+
+	// An unusable destination (such as a directory) must fail and retain the valid source.
+	const blockedOldDigest = "2222333344445555"
+	const blockedNewDigest = "7777666655554444"
+	blockedOldKey := tobitenimage.ArchiveCoverKey(blockedOldDigest, 0, opts400)
+	blockedOldBytes := []byte("valid-source-preserved-on-dir-dest")
+	if _, err := cache.Put(ctx, blockedOldKey, blockedOldBytes); err != nil {
+		t.Fatalf("Put(blockedOld): %v", err)
+	}
+	blockedDestPath, err := cache.PathFor(tobitenimage.ArchiveCoverKey(blockedNewDigest, 0, opts400))
+	if err != nil {
+		t.Fatalf("PathFor(blockedDest): %v", err)
+	}
+	if err := os.MkdirAll(blockedDestPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(blockedDestPath): %v", err)
+	}
+	if _, err := cache.Rekey(ctx, tobitenimage.ArchiveSource(blockedOldDigest), tobitenimage.ArchiveSource(blockedNewDigest)); err == nil {
+		t.Fatal("expected Rekey with directory destination to fail")
+	}
+	gotPreserved, err := cache.Get(ctx, blockedOldKey)
+	if err != nil {
+		t.Fatalf("source entry lost after invalid destination Rekey: %v", err)
+	}
+	if !bytes.Equal(gotPreserved.Data, blockedOldBytes) {
+		t.Errorf("preserved source bytes = %q, want %q", gotPreserved.Data, blockedOldBytes)
+	}
+	if info, err := os.Stat(blockedDestPath); err != nil || !info.IsDir() {
+		t.Errorf("destination directory altered: info=%v err=%v", info, err)
 	}
 }
 

@@ -301,12 +301,10 @@ func syncDirectory(dir string) error {
 // CoverCache stores persistent, content-addressed cover renditions in a
 // two-level sharded directory tree under TOBITEN_COVERS_DIR (ADR-0015 §2, ADR-0018 S8).
 type CoverCache struct {
-	rootDir   string
-	shards    [256]sync.Mutex
-	rootMu    sync.Mutex
-	dirtyMu   sync.Mutex
-	dirtyDirs map[string]bool
-	ops       fsOps
+	rootDir string
+	shards  [256]sync.Mutex
+	rootMu  sync.Mutex
+	ops     fsOps
 }
 
 // NewCoverCache constructs a CoverCache rooted at rootDir (TOBITEN_COVERS_DIR).
@@ -324,9 +322,8 @@ func NewCoverCache(rootDir string) (*CoverCache, error) {
 		return nil, fmt.Errorf("%w: stat %q: %v", ErrInvalidCacheDir, cleaned, err)
 	}
 	return &CoverCache{
-		rootDir:   cleaned,
-		dirtyDirs: make(map[string]bool),
-		ops:       defaultFSOps(),
+		rootDir: cleaned,
+		ops:     defaultFSOps(),
 	}, nil
 }
 
@@ -612,77 +609,8 @@ func (c *CoverCache) writeCrashSafe(dir, finalPath string, data []byte) error {
 		_ = c.ops.remove(tmpPath)
 		return fmt.Errorf("image: rename cover cache entry: %w", err)
 	}
-	c.markDirtyDir(dir)
-	if err := c.syncDirDurable(dir); err != nil {
-		return fmt.Errorf("image: fsync cover shard directory: %w", err)
-	}
-	return nil
-}
-
-func (c *CoverCache) markDirtyDir(dir string) {
-	c.dirtyMu.Lock()
-	c.dirtyDirs[dir] = true
-	c.dirtyMu.Unlock()
-}
-
-func (c *CoverCache) clearDirtyDir(dir string) {
-	c.dirtyMu.Lock()
-	delete(c.dirtyDirs, dir)
-	c.dirtyMu.Unlock()
-}
-
-func (c *CoverCache) isDirtyDir(dir string) bool {
-	c.dirtyMu.Lock()
-	dirty := c.dirtyDirs[dir]
-	c.dirtyMu.Unlock()
-	return dirty
-}
-
-func (c *CoverCache) hasDirtyDirs() bool {
-	c.dirtyMu.Lock()
-	has := len(c.dirtyDirs) > 0
-	c.dirtyMu.Unlock()
-	return has
-}
-
-func (c *CoverCache) syncDirDurable(dir string) error {
 	if err := c.ops.syncDir(dir); err != nil {
-		return err
-	}
-	c.clearDirtyDir(dir)
-	return nil
-}
-
-func (c *CoverCache) flushDirtyDirIfPresent(dir string) error {
-	if !c.isDirtyDir(dir) {
-		return nil
-	}
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		c.clearDirtyDir(dir)
-		return nil
-	}
-	return c.syncDirDurable(dir)
-}
-
-func (c *CoverCache) flushDirtyAncestors(target string) error {
-	if !c.hasDirtyDirs() {
-		return nil
-	}
-	var chain []string
-	for cur := filepath.Clean(target); ; {
-		if c.isDirtyDir(cur) {
-			chain = append(chain, cur)
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			break
-		}
-		cur = parent
-	}
-	for i := len(chain) - 1; i >= 0; i-- {
-		if err := c.flushDirtyDirIfPresent(chain[i]); err != nil {
-			return err
-		}
+		return fmt.Errorf("image: fsync cover shard directory: %w", err)
 	}
 	return nil
 }
@@ -712,13 +640,18 @@ func (c *CoverCache) ensureRootDir() error {
 		cur = parent
 	}
 
-	if err := c.flushDirtyAncestors(cur); err != nil {
-		return fmt.Errorf("image: fsync covers ancestor directory: %w", err)
-	}
 	for i := len(missing) - 1; i >= 0; i-- {
 		dir := missing[i]
-		if err := c.mkdirSynced(dir, filepath.Dir(dir)); err != nil {
+		parent := filepath.Dir(dir)
+		err := os.Mkdir(dir, 0o755)
+		if err != nil && !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("image: create covers directory %s: %w", dir, err)
+		}
+		if syncErr := c.ops.syncDir(parent); syncErr != nil {
+			if err == nil {
+				_ = c.ops.remove(dir)
+			}
+			return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, syncErr)
 		}
 	}
 	return nil
@@ -740,21 +673,18 @@ func (c *CoverCache) ensureShardDir(s1, s2 string) (string, error) {
 }
 
 func (c *CoverCache) mkdirSynced(dir, parent string) error {
-	err := os.Mkdir(dir, 0o755)
-	if err == nil {
-		c.markDirtyDir(parent)
-		return c.syncDirDurable(parent)
+	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
 	}
-	if errors.Is(err, os.ErrExist) {
-		return c.flushDirtyDirIfPresent(parent)
-	}
-	return err
+	return c.ops.syncDir(parent)
 }
 
 // Rekey moves cached renditions for from to to without re-encoding their
-// image payloads. When a rendition already exists at the destination key, the
-// existing destination entry is preserved and the superseded source entry is
-// removed (not counted as moved). Returns the number of moved entries.
+// image payloads. When a valid destination file already exists, the existing
+// destination entry is preserved and the superseded source entry is removed
+// (not counted as moved). Invalid destination paths (such as a directory)
+// return an error without modifying the source. Returns the number of moved
+// entries.
 func (c *CoverCache) Rekey(ctx context.Context, from, to CoverSource) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -801,78 +731,123 @@ func (c *CoverCache) rekeyLocked(ctx context.Context, from, to CoverSource) (int
 		return 0, err
 	}
 	if len(matched) == 0 {
-		if err := c.flushRekeyPending(fromS1, fromS2, toS1, toS2); err != nil {
-			return 0, err
-		}
-		return 0, nil
+		return 0, c.syncRekeyExistingDirs(fromDir, toDir)
 	}
 
-	moved := 0
-	fromModified := false
-	toModified := false
-	toDirEnsured := false
-
+	state := rekeyState{fromDir: fromDir, toDir: toDir, toS1: toS1, toS2: toS2}
 	for _, k := range matched {
 		if err := ctx.Err(); err != nil {
-			c.syncMovedDirs(fromDir, toDir, fromModified, toModified)
-			return moved, err
+			c.syncMovedDirs(fromDir, toDir, state.fromModified, state.toModified)
+			return state.moved, err
 		}
-		oldPath := filepath.Join(fromDir, entryFilename(k))
-		newKey := k
-		newKey.Digest = to.Digest
-		newPath := filepath.Join(toDir, entryFilename(newKey))
-
-		exists, err := fileExists(newPath)
-		if err != nil {
-			c.syncMovedDirs(fromDir, toDir, fromModified, toModified)
-			return moved, fmt.Errorf("image: stat rekey destination %s: %w", newPath, err)
+		if err := c.rekeyOneEntry(&state, k, to.Digest); err != nil {
+			c.syncMovedDirs(fromDir, toDir, state.fromModified, state.toModified)
+			return state.moved, err
 		}
-		if exists {
-			c.markDirtyDir(fromDir)
-			if err := c.ops.remove(oldPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				c.syncMovedDirs(fromDir, toDir, fromModified, toModified)
-				return moved, fmt.Errorf("image: remove superseded cover entry %s: %w", oldPath, err)
-			}
-			fromModified = true
-			continue
-		}
-
-		if !toDirEnsured {
-			if _, err := c.ensureShardDir(toS1, toS2); err != nil {
-				c.syncMovedDirs(fromDir, toDir, fromModified, toModified)
-				return moved, err
-			}
-			toDirEnsured = true
-		}
-
-		c.markDirtyDir(toDir)
-		if fromDir != toDir {
-			c.markDirtyDir(fromDir)
-		}
-		if err := c.ops.rename(oldPath, newPath); err != nil {
-			c.syncMovedDirs(fromDir, toDir, fromModified, toModified)
-			return moved, fmt.Errorf("image: rekey cover entry %s -> %s: %w", oldPath, newPath, err)
-		}
-		moved++
-		toModified = true
-		fromModified = true
 	}
 
-	if err := c.finishRekeySyncs(fromS1, fromS2, toS1, toS2, fromModified, toModified); err != nil {
-		return moved, err
+	if err := c.syncRekeyModifiedDirs(&state); err != nil {
+		return state.moved, err
 	}
-	return moved, nil
+	return state.moved, nil
 }
 
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
+type rekeyState struct {
+	fromDir      string
+	toDir        string
+	toS1         string
+	toS2         string
+	moved        int
+	fromModified bool
+	toModified   bool
+	toDirEnsured bool
+}
+
+func (c *CoverCache) rekeyOneEntry(st *rekeyState, k CoverKey, toDigest string) error {
+	oldPath := filepath.Join(st.fromDir, entryFilename(k))
+	newKey := k
+	newKey.Digest = toDigest
+	newPath := filepath.Join(st.toDir, entryFilename(newKey))
+
+	exists, err := destinationFileExists(newPath)
+	if err != nil {
+		return err
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+	if exists {
+		if err := c.ops.remove(oldPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("image: remove superseded cover entry %s: %w", oldPath, err)
+		}
+		st.fromModified = true
+		return nil
 	}
-	return false, err
+
+	if !st.toDirEnsured {
+		if _, err := c.ensureShardDir(st.toS1, st.toS2); err != nil {
+			return err
+		}
+		st.toDirEnsured = true
+	}
+	if err := c.ops.rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("image: rekey cover entry %s -> %s: %w", oldPath, newPath, err)
+	}
+	st.moved++
+	st.toModified = true
+	st.fromModified = true
+	return nil
+}
+
+func (c *CoverCache) syncRekeyExistingDirs(fromDir, toDir string) error {
+	if err := c.syncExistingDir(toDir); err != nil {
+		return fmt.Errorf("image: fsync target shard directory %s: %w", toDir, err)
+	}
+	if fromDir != toDir {
+		if err := c.syncExistingDir(fromDir); err != nil {
+			return fmt.Errorf("image: fsync source shard directory %s: %w", fromDir, err)
+		}
+	}
+	return nil
+}
+
+func (c *CoverCache) syncRekeyModifiedDirs(st *rekeyState) error {
+	if st.toModified {
+		if err := c.ops.syncDir(st.toDir); err != nil {
+			return fmt.Errorf("image: fsync target shard directory %s: %w", st.toDir, err)
+		}
+	}
+	if st.fromModified && st.fromDir != st.toDir {
+		if err := c.ops.syncDir(st.fromDir); err != nil {
+			return fmt.Errorf("image: fsync source shard directory %s: %w", st.fromDir, err)
+		}
+	}
+	return nil
+}
+
+func destinationFileExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("image: stat rekey destination %s: %w", path, err)
+	}
+	if info.IsDir() || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("image: invalid rekey destination %s: not a regular file", path)
+	}
+	return true, nil
+}
+
+func (c *CoverCache) syncExistingDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	return c.ops.syncDir(dir)
 }
 
 func (c *CoverCache) matchingKeysInDir(dir string, source CoverSource, match func(CoverKey) bool) ([]CoverKey, error) {
@@ -900,50 +875,12 @@ func (c *CoverCache) matchingKeysInDir(dir string, source CoverSource, match fun
 	return matched, nil
 }
 
-func (c *CoverCache) finishRekeySyncs(fromS1, fromS2, toS1, toS2 string, fromModified, toModified bool) error {
-	fromDir := filepath.Join(c.rootDir, fromS1, fromS2)
-	toDir := filepath.Join(c.rootDir, toS1, toS2)
-
-	if toModified || c.isDirtyDir(toDir) {
-		if err := c.flushDirtyAncestors(toDir); err != nil {
-			return fmt.Errorf("image: fsync target shard directory %s: %w", toDir, err)
-		}
-	}
-	if fromDir != toDir {
-		if fromModified || c.isDirtyDir(fromDir) {
-			if err := c.flushDirtyDirIfPresent(fromDir); err != nil {
-				return fmt.Errorf("image: fsync source shard directory %s: %w", fromDir, err)
-			}
-		}
-		if err := c.flushDirtyDirIfPresent(filepath.Join(c.rootDir, fromS1)); err != nil {
-			return fmt.Errorf("image: fsync source shard directory %s: %w", filepath.Join(c.rootDir, fromS1), err)
-		}
-		if err := c.pruneEmptyShardDirs(fromS1, fromS2); err != nil {
-			return err
-		}
-		c.rootMu.Lock()
-		err := c.flushDirtyDirIfPresent(c.rootDir)
-		c.rootMu.Unlock()
-		if err != nil {
-			return fmt.Errorf("image: fsync covers root directory %s: %w", c.rootDir, err)
-		}
-	}
-	return nil
-}
-
-func (c *CoverCache) flushRekeyPending(fromS1, fromS2, toS1, toS2 string) error {
-	if !c.hasDirtyDirs() {
-		return nil
-	}
-	return c.finishRekeySyncs(fromS1, fromS2, toS1, toS2, false, false)
-}
-
 func (c *CoverCache) syncMovedDirs(fromDir, toDir string, fromModified, toModified bool) {
 	if toModified {
-		_ = c.syncDirDurable(toDir)
+		_ = c.ops.syncDir(toDir)
 	}
 	if fromModified && fromDir != toDir {
-		_ = c.syncDirDurable(fromDir)
+		_ = c.ops.syncDir(fromDir)
 	}
 }
 
@@ -989,8 +926,8 @@ func (c *CoverCache) invalidateMatching(ctx context.Context, source CoverSource,
 		return 0, err
 	}
 	if len(matched) == 0 {
-		if err := c.flushShardPending(s1, s2); err != nil {
-			return 0, err
+		if err := c.syncExistingDir(shard2Dir); err != nil {
+			return 0, fmt.Errorf("image: fsync cover shard directory %s: %w", shard2Dir, err)
 		}
 		return 0, nil
 	}
@@ -999,83 +936,24 @@ func (c *CoverCache) invalidateMatching(ctx context.Context, source CoverSource,
 	for _, k := range matched {
 		if err := ctx.Err(); err != nil {
 			if removed > 0 {
-				_ = c.syncDirDurable(shard2Dir)
+				_ = c.ops.syncDir(shard2Dir)
 			}
 			return removed, err
 		}
 		p := filepath.Join(shard2Dir, entryFilename(k))
-		c.markDirtyDir(shard2Dir)
 		if err := c.ops.remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			if removed > 0 {
-				_ = c.syncDirDurable(shard2Dir)
+				_ = c.ops.syncDir(shard2Dir)
 			}
 			return removed, fmt.Errorf("image: remove cover cache entry %s: %w", p, err)
 		}
 		removed++
 	}
 
-	if err := c.syncDirDurable(shard2Dir); err != nil {
+	if err := c.ops.syncDir(shard2Dir); err != nil {
 		return removed, fmt.Errorf("image: fsync cover shard directory %s: %w", shard2Dir, err)
 	}
-	if err := c.pruneEmptyShardDirs(s1, s2); err != nil {
-		return removed, err
-	}
 	return removed, nil
-}
-
-func (c *CoverCache) flushShardPending(s1, s2 string) error {
-	if !c.hasDirtyDirs() {
-		return nil
-	}
-	shard2Dir := filepath.Join(c.rootDir, s1, s2)
-	if err := c.flushDirtyDirIfPresent(shard2Dir); err != nil {
-		return fmt.Errorf("image: fsync cover shard directory %s: %w", shard2Dir, err)
-	}
-	shard1Dir := filepath.Join(c.rootDir, s1)
-	if err := c.flushDirtyDirIfPresent(shard1Dir); err != nil {
-		return fmt.Errorf("image: fsync cover shard directory %s: %w", shard1Dir, err)
-	}
-	if err := c.pruneEmptyShardDirs(s1, s2); err != nil {
-		return err
-	}
-	c.rootMu.Lock()
-	err := c.flushDirtyDirIfPresent(c.rootDir)
-	c.rootMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("image: fsync covers root directory %s: %w", c.rootDir, err)
-	}
-	return nil
-}
-
-func (c *CoverCache) removeEmptyShard1Dir(shard1Dir string) error {
-	c.rootMu.Lock()
-	defer c.rootMu.Unlock()
-	if err := c.ops.remove(shard1Dir); err == nil {
-		c.clearDirtyDir(shard1Dir)
-		c.markDirtyDir(c.rootDir)
-		if syncErr := c.syncDirDurable(c.rootDir); syncErr != nil {
-			return fmt.Errorf("image: fsync covers root directory %s: %w", c.rootDir, syncErr)
-		}
-	}
-	return nil
-}
-
-func (c *CoverCache) pruneEmptyShardDirs(s1, s2 string) error {
-	shard1Dir := filepath.Join(c.rootDir, s1)
-	shard2Dir := filepath.Join(shard1Dir, s2)
-	if entries, err := os.ReadDir(shard2Dir); err == nil && len(entries) == 0 {
-		if err := c.ops.remove(shard2Dir); err == nil {
-			c.clearDirtyDir(shard2Dir)
-			c.markDirtyDir(shard1Dir)
-			if syncErr := c.syncDirDurable(shard1Dir); syncErr != nil {
-				return fmt.Errorf("image: fsync cover shard directory %s: %w", shard1Dir, syncErr)
-			}
-		}
-	}
-	if entries, err := os.ReadDir(shard1Dir); err == nil && len(entries) == 0 {
-		return c.removeEmptyShard1Dir(shard1Dir)
-	}
-	return nil
 }
 
 // CleanupTemp removes leftover cover-cache temporary files (.tobiten-tmp-cover-*)
@@ -1111,14 +989,6 @@ func (c *CoverCache) CleanupTemp(ctx context.Context) (int, error) {
 			return removed, err
 		}
 	}
-	if c.hasDirtyDirs() {
-		c.rootMu.Lock()
-		err := c.flushDirtyDirIfPresent(c.rootDir)
-		c.rootMu.Unlock()
-		if err != nil {
-			return removed, fmt.Errorf("image: fsync covers root directory %s: %w", c.rootDir, err)
-		}
-	}
 	return removed, nil
 }
 
@@ -1152,10 +1022,6 @@ func (c *CoverCache) cleanupShardTemp(ctx context.Context, s1 string, idx int) (
 			return removed, err
 		}
 	}
-
-	if err := c.flushDirtyDirIfPresent(shard1Dir); err != nil {
-		return removed, fmt.Errorf("image: fsync cover shard directory %s: %w", shard1Dir, err)
-	}
 	return removed, nil
 }
 
@@ -1173,7 +1039,7 @@ func (c *CoverCache) cleanupLeafShardTemp(ctx context.Context, s1, s2 string) (i
 	for _, ent := range entries {
 		if err := ctx.Err(); err != nil {
 			if removed > 0 {
-				_ = c.syncDirDurable(dir)
+				_ = c.ops.syncDir(dir)
 			}
 			return removed, err
 		}
@@ -1181,25 +1047,17 @@ func (c *CoverCache) cleanupLeafShardTemp(ctx context.Context, s1, s2 string) (i
 			continue
 		}
 		p := filepath.Join(dir, ent.Name())
-		c.markDirtyDir(dir)
 		if err := c.ops.remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			if removed > 0 {
-				_ = c.syncDirDurable(dir)
+				_ = c.ops.syncDir(dir)
 			}
 			return removed, fmt.Errorf("image: remove leftover cover temp %s: %w", p, err)
 		}
 		removed++
 	}
 
-	if removed > 0 {
-		if err := c.syncDirDurable(dir); err != nil {
-			return removed, fmt.Errorf("image: fsync cover shard directory %s: %w", dir, err)
-		}
-		if err := c.pruneEmptyShardDirs(s1, s2); err != nil {
-			return removed, err
-		}
-	} else if err := c.flushShardPending(s1, s2); err != nil {
-		return 0, err
+	if err := c.ops.syncDir(dir); err != nil {
+		return removed, fmt.Errorf("image: fsync cover shard directory %s: %w", dir, err)
 	}
 	return removed, nil
 }
