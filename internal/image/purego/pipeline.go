@@ -35,23 +35,16 @@ type Options struct {
 	// MaxPixels caps source image pixel count (width * height) before full
 	// decode. Zero selects image.DefaultMaxPixels. Negative values are rejected.
 	MaxPixels int64
-
-	// MaxPreflightBytes caps header bytes read and buffered during preflight
-	// config probing before full decode. Zero selects image.DefaultMaxPreflightBytes.
-	// Negative values are rejected.
-	MaxPreflightBytes int64
 }
 
 // Pipeline is the Tier 1 pure-Go implementation of image.ImagePipeline.
 type Pipeline struct {
-	maxPixels         int64
-	maxPreflightBytes int64
+	maxPixels int64
 }
 
 var (
-	_ tobitenimage.ImagePipeline            = (*Pipeline)(nil)
-	_ tobitenimage.PlaceholderProvider      = (*Pipeline)(nil)
-	_ tobitenimage.PreflightLimitedPipeline = (*Pipeline)(nil)
+	_ tobitenimage.ImagePipeline       = (*Pipeline)(nil)
+	_ tobitenimage.PlaceholderProvider = (*Pipeline)(nil)
 )
 
 // New constructs a Tier 1 pure-Go ImagePipeline with the given options.
@@ -59,20 +52,12 @@ func New(opts Options) (*Pipeline, error) {
 	if opts.MaxPixels < 0 {
 		return nil, fmt.Errorf("%w: max pixels cannot be negative", tobitenimage.ErrInvalidOptions)
 	}
-	if opts.MaxPreflightBytes < 0 {
-		return nil, fmt.Errorf("%w: max preflight bytes cannot be negative", tobitenimage.ErrInvalidOptions)
-	}
 	maxPixels := opts.MaxPixels
 	if maxPixels == 0 {
 		maxPixels = tobitenimage.DefaultMaxPixels
 	}
-	maxPreflightBytes := opts.MaxPreflightBytes
-	if maxPreflightBytes == 0 {
-		maxPreflightBytes = tobitenimage.DefaultMaxPreflightBytes
-	}
 	return &Pipeline{
-		maxPixels:         maxPixels,
-		maxPreflightBytes: maxPreflightBytes,
+		maxPixels: maxPixels,
 	}, nil
 }
 
@@ -110,23 +95,11 @@ func (p *Pipeline) MaxPixels() int64 {
 	return p.maxPixels
 }
 
-// MaxPreflightBytes returns the configured maximum header preflight byte budget.
-func (p *Pipeline) MaxPreflightBytes() int64 {
-	return p.maxPreflightBytes
-}
-
 func (p *Pipeline) effectiveMaxPixels(override int64) int64 {
 	if override > 0 && override < p.maxPixels {
 		return override
 	}
 	return p.maxPixels
-}
-
-func (p *Pipeline) effectiveMaxPreflightBytes(override int64) int64 {
-	if override > 0 && override < p.maxPreflightBytes {
-		return override
-	}
-	return p.maxPreflightBytes
 }
 
 // RenderCover implements image.ImagePipeline.
@@ -145,7 +118,7 @@ func (p *Pipeline) RenderCover(ctx context.Context, src io.Reader, opts tobiteni
 		return tobitenimage.Result{}, fmt.Errorf("%w: nil image reader", tobitenimage.ErrCorrupt)
 	}
 
-	preflightLimit := p.effectiveMaxPreflightBytes(norm.MaxPreflightBytes)
+	preflightLimit := tobitenimage.EffectivePreflightBytes(norm.MaxPreflightBytes)
 	codec, replay, err := tobitenimage.SniffReaderBounded(src, preflightLimit)
 	if err != nil {
 		return tobitenimage.Result{}, err

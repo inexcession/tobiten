@@ -228,13 +228,6 @@ type PlaceholderProvider interface {
 	PlaceholderFormats() []Codec
 }
 
-// PreflightLimitedPipeline is an optional interface implemented by an
-// ImagePipeline to declare its maximum header preflight byte budget.
-type PreflightLimitedPipeline interface {
-	ImagePipeline
-	MaxPreflightBytes() int64
-}
-
 // Registry manages registered ImagePipeline implementations, advertises their
 // aggregate decode and encode codecs, and routes cover rendering requests.
 type Registry struct {
@@ -439,23 +432,18 @@ func selectFromCandidates(encodeCapable []ImagePipeline, srcCodec Codec) (ImageP
 	return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, src)
 }
 
-func effectivePreflightBudget(pipelines []ImagePipeline, override int64) int64 {
-	budget := override
-	for _, p := range pipelines {
-		pl, ok := p.(PreflightLimitedPipeline)
-		if !ok {
-			continue
-		}
-		if lim := pl.MaxPreflightBytes(); lim > 0 && (budget == 0 || lim < budget) {
-			budget = lim
-		}
+// EffectivePreflightBytes returns DefaultMaxPreflightBytes or a tighter
+// positive per-call override.
+func EffectivePreflightBytes(override int64) int64 {
+	if override > 0 && override < DefaultMaxPreflightBytes {
+		return override
 	}
-	return budget
+	return DefaultMaxPreflightBytes
 }
 
 // RenderCover validates options, sniffs the source codec from leading bytes
-// within the effective preflight budget, selects an appropriate registered
-// pipeline, and renders the cover rendition.
+// within the shared preflight budget (or tighter per-call override), selects an
+// appropriate registered pipeline, and renders the cover rendition.
 func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOptions) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
@@ -473,7 +461,7 @@ func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOp
 		return Result{}, err
 	}
 
-	budget := effectivePreflightBudget(encodeCapable, norm.MaxPreflightBytes)
+	budget := EffectivePreflightBytes(norm.MaxPreflightBytes)
 	codec, replay, err := SniffReaderBounded(src, budget)
 	if err != nil {
 		return Result{}, err

@@ -18,7 +18,6 @@ type stubPipeline struct {
 	decodes      []tobitenimage.Codec
 	encodes      []tobitenimage.Codec
 	placeholders []tobitenimage.Codec
-	maxPreflight int64
 	renderFn     func(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error)
 }
 
@@ -27,7 +26,6 @@ func (s *stubPipeline) Priority() int                            { return s.prio
 func (s *stubPipeline) DecodeFormats() []tobitenimage.Codec      { return s.decodes }
 func (s *stubPipeline) EncodeFormats() []tobitenimage.Codec      { return s.encodes }
 func (s *stubPipeline) PlaceholderFormats() []tobitenimage.Codec { return s.placeholders }
-func (s *stubPipeline) MaxPreflightBytes() int64                 { return s.maxPreflight }
 func (s *stubPipeline) RenderCover(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
 	if s.renderFn != nil {
 		return s.renderFn(ctx, src, opts)
@@ -221,14 +219,15 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 		encodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
 		placeholders: []tobitenimage.Codec{tobitenimage.CodecJXL, tobitenimage.CodecAVIF},
 		renderFn: func(_ context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
-			b, err := io.ReadAll(src)
-			if err != nil {
-				return tobitenimage.Result{}, err
-			}
-			seenBytes = b
 			seenCodec = opts.SourceCodec
+			if opts.SourceCodec != tobitenimage.CodecAVIF {
+				b, err := io.ReadAll(src)
+				if err != nil {
+					return tobitenimage.Result{}, err
+				}
+				seenBytes = b
+			}
 			return tobitenimage.Result{
-				Data:        b,
 				Format:      opts.OutputFormat,
 				SourceCodec: opts.SourceCodec,
 				Placeholder: opts.SourceCodec == tobitenimage.CodecJXL || opts.SourceCodec == tobitenimage.CodecAVIF,
@@ -275,51 +274,50 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 		t.Fatalf("RenderCover(zero bounds) err = %v, want ErrInvalidOptions", err)
 	}
 
-	// Provider preflight limit is enforced before Registry sniffing reads past it.
-	regLimited := tobitenimage.NewRegistry()
-	if err := regLimited.Register(&stubPipeline{
-		name:         "limited",
-		decodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
-		encodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
-		placeholders: []tobitenimage.Codec{tobitenimage.CodecAVIF},
-		maxPreflight: 24,
-		renderFn: func(_ context.Context, _ io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
-			return tobitenimage.Result{
-				Format:      opts.OutputFormat,
-				SourceCodec: opts.SourceCodec,
-				Placeholder: true,
-			}, nil
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	ftyp64 := make([]byte, 64)
-	binary.BigEndian.PutUint32(ftyp64[0:4], 64)
-	copy(ftyp64[4:8], "ftyp")
-	copy(ftyp64[8:12], "mif1")
-	copy(ftyp64[16:20], "avif")
-	cr := &countingReader{r: bytes.NewReader(ftyp64)}
-	res, err = regLimited.RenderCover(context.Background(), cr, tobitenimage.DefaultCoverOptions())
-	if err != nil {
-		t.Fatalf("RenderCover(64B ftyp early avif) err = %v", err)
-	}
-	if !res.Placeholder || res.SourceCodec != tobitenimage.CodecAVIF {
-		t.Fatalf("unexpected result: %+v", res)
-	}
-	if cr.n != 24 {
-		t.Errorf("registry sniff consumed %d bytes, want 24", cr.n)
-	}
-
-	// Late avif brand past 24-byte budget stops at 24 bytes with ErrPreflightLimitExceeded.
+	// With two providers (jpeg-only priority 10, purego priority 0), the shared
+	// default cap lets a 64-byte ftyp box with a late AVIF brand at byte 32 route
+	// to purego, while a tighter per-call override bounds sniffing before select.
 	ftypLate := make([]byte, 64)
 	binary.BigEndian.PutUint32(ftypLate[0:4], 64)
 	copy(ftypLate[4:8], "ftyp")
 	copy(ftypLate[8:12], "mif1")
 	copy(ftypLate[32:36], "avif")
+	crDefault := &countingReader{r: bytes.NewReader(ftypLate)}
+	res, err = reg.RenderCover(context.Background(), crDefault, tobitenimage.DefaultCoverOptions())
+	if err != nil {
+		t.Fatalf("RenderCover(64B ftyp late avif under default cap) err = %v", err)
+	}
+	if !res.Placeholder || res.SourceCodec != tobitenimage.CodecAVIF || seenCodec != tobitenimage.CodecAVIF {
+		t.Fatalf("unexpected late avif result: %+v (seenCodec=%q)", res, seenCodec)
+	}
+	if crDefault.n != 64 {
+		t.Errorf("default cap consumed %d bytes, want 64", crDefault.n)
+	}
+
+	tightOpts := tobitenimage.DefaultCoverOptions()
+	tightOpts.MaxPreflightBytes = 24
+
+	ftypEarly := make([]byte, 64)
+	binary.BigEndian.PutUint32(ftypEarly[0:4], 64)
+	copy(ftypEarly[4:8], "ftyp")
+	copy(ftypEarly[8:12], "mif1")
+	copy(ftypEarly[16:20], "avif")
+	crEarly := &countingReader{r: bytes.NewReader(ftypEarly)}
+	res, err = reg.RenderCover(context.Background(), crEarly, tightOpts)
+	if err != nil {
+		t.Fatalf("RenderCover(64B ftyp early avif under 24B override) err = %v", err)
+	}
+	if !res.Placeholder || res.SourceCodec != tobitenimage.CodecAVIF {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if crEarly.n != 24 {
+		t.Errorf("registry sniff consumed %d bytes, want 24", crEarly.n)
+	}
+
+	// Late avif brand past 24-byte per-call override stops at 24 bytes with ErrPreflightLimitExceeded.
 	crLate := &countingReader{r: bytes.NewReader(ftypLate)}
-	if _, err := regLimited.RenderCover(context.Background(), crLate, tobitenimage.DefaultCoverOptions()); !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
-		t.Fatalf("RenderCover(64B ftyp late avif) err = %v, want ErrPreflightLimitExceeded", err)
+	if _, err := reg.RenderCover(context.Background(), crLate, tightOpts); !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+		t.Fatalf("RenderCover(64B ftyp late avif under 24B override) err = %v, want ErrPreflightLimitExceeded", err)
 	}
 	if crLate.n != 24 {
 		t.Errorf("registry sniff consumed %d bytes on late brand, want 24", crLate.n)
