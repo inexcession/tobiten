@@ -137,10 +137,20 @@ type AuthorizedAssetFile struct {
 	RetiredAt       *time.Time
 }
 
+// SeriesCoverCursor identifies a volume's position in a series' FIRST sort
+// order so batched cover lookups resume without ordinal drift across snapshots.
+type SeriesCoverCursor struct {
+	Position *float64
+	Number   *float64
+	VolumeID string
+}
+
 // SeriesCoverCandidate pairs one visible, non-trashed series member volume with its
-// preference-ranked, visible, available, non-trashed asset files (ADR-0006 §5, ADR-0010 §2).
+// FIRST sort cursor and preference-ranked, visible, available, non-trashed asset files
+// (ADR-0006 §5, ADR-0010 §2).
 type SeriesCoverCandidate struct {
 	VolumeID string
+	Cursor   SeriesCoverCursor
 	Files    []AuthorizedAssetFile
 }
 
@@ -180,7 +190,7 @@ type CatalogueRepository interface {
 	GetAuthorizedAssetFile(ctx context.Context, scope CatalogueReadScope, assetID string) (*AuthorizedAssetFile, error)
 	SelectPreferredAssetFileForVolume(ctx context.Context, scope CatalogueReadScope, volumeID string) (*AuthorizedAssetFile, error)
 	ListAuthorizedVolumeAssetFiles(ctx context.Context, scope CatalogueReadScope, volumeID string) ([]AuthorizedAssetFile, error)
-	ListSeriesCoverCandidates(ctx context.Context, scope CatalogueReadScope, seriesID string, limit, offset int) ([]SeriesCoverCandidate, error)
+	ListSeriesCoverCandidates(ctx context.Context, scope CatalogueReadScope, seriesID string, limit int, after *SeriesCoverCursor) ([]SeriesCoverCandidate, error)
 
 	GetReadingProgress(ctx context.Context, scope CatalogueReadScope, volumeID string) (*domain.ReadingProgress, error)
 	ListReadingProgress(ctx context.Context, scope CatalogueReadScope, filter ReadingProgressReadFilter) ([]domain.ReadingProgress, error)

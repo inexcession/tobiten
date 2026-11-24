@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -137,7 +138,7 @@ var catalogueReadEnforcementSpecs = map[string]catalogueReadEnforcementSpec{
 	"ListSeriesCoverCandidates": {
 		runEnforcement: enforceListSeriesCoverCandidates,
 		callWithRepo: func(ctx context.Context, repo *postgres.CatalogueRepository, scope storage.CatalogueReadScope) error {
-			_, err := repo.ListSeriesCoverCandidates(ctx, scope, "s-any", 8, 0)
+			_, err := repo.ListSeriesCoverCandidates(ctx, scope, "s-any", 8, nil)
 			return err
 		},
 	},
@@ -999,13 +1000,13 @@ func enforceListAuthorizedVolumeAssetFiles(t *testing.T, ec *catalogueEnforcemen
 }
 
 func enforceListSeriesCoverCandidates(t *testing.T, ec *catalogueEnforcementCtx) {
-	// Admin sees visible non-trashed volumes of sKids that have available non-trashed assets, bounded by limit/offset.
-	allAdmin, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.sKids, 20, 0)
+	// Admin sees visible non-trashed volumes of sKids that have available non-trashed assets, bounded by limit/cursor.
+	allAdmin, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.sKids, 20, nil)
 	if err != nil {
 		t.Fatalf("admin ListSeriesCoverCandidates(sKids): %v", err)
 	}
-	if len(allAdmin) == 0 {
-		t.Fatal("expected at least 1 candidate for admin on sKids")
+	if len(allAdmin) < 2 {
+		t.Fatalf("expected at least 2 candidates for admin on sKids, got %d", len(allAdmin))
 	}
 	for _, c := range allAdmin {
 		if c.VolumeID == ec.cat.vZeroAssetsInKids || c.VolumeID == ec.cat.vTrashedInKids {
@@ -1014,16 +1015,37 @@ func enforceListSeriesCoverCandidates(t *testing.T, ec *catalogueEnforcementCtx)
 		if len(c.Files) == 0 {
 			t.Fatalf("candidate %s had zero files", c.VolumeID)
 		}
+		if c.Cursor.VolumeID != c.VolumeID {
+			t.Fatalf("candidate %s cursor VolumeID = %q", c.VolumeID, c.Cursor.VolumeID)
+		}
 	}
 
-	// Limit=1 returns only the first candidate; offset=1 advances to the second when present.
-	page1, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.sKids, 1, 0)
-	if err != nil || len(page1) != 1 || page1[0].VolumeID != allAdmin[0].VolumeID {
-		t.Fatalf("page1(limit=1) = (%+v, %v), want [%s]", page1, err, allAdmin[0].VolumeID)
+	// Limit=1 returns only the first candidate; advancing via Cursor iterates allAdmin in exact order.
+	var gotIDs []string
+	var after *storage.SeriesCoverCursor
+	for range len(allAdmin) + 1 {
+		page, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.sKids, 1, after)
+		if err != nil {
+			t.Fatalf("cursor page ListSeriesCoverCandidates(after=%+v): %v", after, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		gotIDs = append(gotIDs, page[0].VolumeID)
+		c := page[0].Cursor
+		after = &c
+	}
+	if len(gotIDs) != len(allAdmin) {
+		t.Fatalf("cursor walk len = %d (%v), want %d", len(gotIDs), gotIDs, len(allAdmin))
+	}
+	for i := range allAdmin {
+		if gotIDs[i] != allAdmin[i].VolumeID {
+			t.Fatalf("cursor walk[%d] = %s, want %s", i, gotIDs[i], allAdmin[i].VolumeID)
+		}
 	}
 
 	// Reader excludes vInKidsVolRestricted and vAltPathRestrictedSec and aKidsNSFW.
-	readerCands, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.sKids, 20, 0)
+	readerCands, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.reader}, ec.cat.sKids, 20, nil)
 	if err != nil {
 		t.Fatalf("reader ListSeriesCoverCandidates(sKids): %v", err)
 	}
@@ -1035,6 +1057,17 @@ func enforceListSeriesCoverCandidates(t *testing.T, ec *catalogueEnforcementCtx)
 			if f.AssetID == ec.cat.aKidsNSFW {
 				t.Fatalf("reader ListSeriesCoverCandidates leaked restricted asset %s", f.AssetID)
 			}
+		}
+	}
+
+	// Invalid cursors fail closed rather than silently resetting to page 0.
+	nanVal := math.NaN()
+	for _, bad := range []*storage.SeriesCoverCursor{
+		{},
+		{VolumeID: allAdmin[0].VolumeID, Position: &nanVal},
+	} {
+		if _, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, storage.CatalogueReadScope{Principal: ec.admin}, ec.cat.sKids, 8, bad); err == nil {
+			t.Fatalf("expected error for invalid cursor %+v", bad)
 		}
 	}
 
@@ -1050,7 +1083,7 @@ func enforceListSeriesCoverCandidates(t *testing.T, ec *catalogueEnforcementCtx)
 		{"timmy on sClean", storage.CatalogueReadScope{Principal: ec.timmy}, ec.cat.sClean},
 		{"admin IncludeTrashed=true on sTrashed", storage.CatalogueReadScope{Principal: ec.admin, IncludeTrashed: true}, ec.cat.sTrashed},
 	} {
-		_, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, tc.scope, tc.seriesID, 8, 0)
+		_, err := ec.repo.ListSeriesCoverCandidates(ec.ctx, tc.scope, tc.seriesID, 8, nil)
 		assertNotFound(t, tc.name, err)
 	}
 }
@@ -1552,5 +1585,106 @@ func TestCatalogueRepository_MissingAndRetiredAssetsExcludedFromAvailableReads(t
 				t.Fatalf("GetReadingProgress after asset missing/retired = (%+v, %v)", rp, err)
 			}
 		})
+	}
+}
+
+func TestCatalogueRepository_SeriesCoverKeysetContinuationWithNullsAndDeletes(t *testing.T) {
+	ctx := context.Background()
+	cat := setupSeededCatalogue(t)
+	tx := postgres.NewTransactor(cat.tdb.Pool)
+	repo := postgres.NewCatalogueRepository(cat.tdb.Pool)
+	reader := domain.NewPrincipal(*cat.readerUser, []domain.Role{cat.readerRole}, domain.CredentialKindPassword, "c-reader", nil)
+	scope := storage.CatalogueReadScope{Principal: reader}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	pos1 := 1.0
+	num2 := 2.0
+	num10 := 10.0
+
+	// Exercise all four NULL/non-NULL FIRST cursor branches plus tie-breaking on v.id:
+	//   1) v-cur-1: pos=1,   num=10
+	//   2) v-cur-2: pos=1,   num=NULL
+	//   3) v-cur-3: pos=NULL, num=2
+	//   4) v-cur-4: pos=NULL, num=NULL (tie A)
+	//   5) v-cur-5: pos=NULL, num=NULL (tie B)
+	type seedSpec struct {
+		volID string
+		pos   *float64
+		num   *float64
+	}
+	specs := []seedSpec{
+		{volID: "v-cur-5", pos: nil, num: nil},
+		{volID: "v-cur-2", pos: &pos1, num: nil},
+		{volID: "v-cur-4", pos: nil, num: nil},
+		{volID: "v-cur-1", pos: &pos1, num: &num10},
+		{volID: "v-cur-3", pos: nil, num: &num2},
+	}
+
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		ser := domain.Series{
+			ID: "ser-keyset", LibraryID: cat.libraryID, Title: "Keyset", TitleSort: "keyset",
+			Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := st.CatalogueWrites().CreateSeries(ctx, &ser); err != nil {
+			return err
+		}
+		for _, sp := range specs {
+			v := domain.Volume{
+				ID: sp.volID, LibraryID: cat.libraryID, Kind: domain.VolumeKindVolume,
+				Number: sp.num, PageCount: 1, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := st.CatalogueWrites().CreateVolume(ctx, &v); err != nil {
+				return err
+			}
+			if err := st.SeriesMemberships().SetVolumeMemberships(ctx, sp.volID, []domain.SeriesMembership{{
+				VolumeID: sp.volID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+				Position: sp.pos, Source: domain.MembershipSourceManual,
+			}}); err != nil {
+				return err
+			}
+			rel := sp.volID + ".cbz"
+			a := domain.MediaAsset{
+				ID: "a-" + sp.volID, VolumeID: sp.volID, LibraryRootID: cat.rootID,
+				RelPathBytes: []byte(rel), RelPathDisplay: rel, RelPathMatch: rel,
+				FileSize: 128, Format: domain.MediaFormatCBZ, PageCount: 1, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := st.CatalogueWrites().CreateAsset(ctx, &a); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed keyset series: %v", err)
+	}
+
+	batch1, err := repo.ListSeriesCoverCandidates(ctx, scope, "ser-keyset", 2, nil)
+	if err != nil {
+		t.Fatalf("batch1: %v", err)
+	}
+	if len(batch1) != 2 || batch1[0].VolumeID != "v-cur-1" || batch1[1].VolumeID != "v-cur-2" {
+		t.Fatalf("batch1 = %+v, want [v-cur-1, v-cur-2]", batch1)
+	}
+
+	// Simulate an earlier candidate disappearing between batch snapshots.
+	if _, err := cat.tdb.Exec(ctx, `UPDATE media_assets SET missing_since = NOW() WHERE id = 'a-v-cur-1'`); err != nil {
+		t.Fatalf("mark a-v-cur-1 missing: %v", err)
+	}
+
+	after := batch1[1].Cursor
+	var remaining []string
+	for range 5 {
+		page, err := repo.ListSeriesCoverCandidates(ctx, scope, "ser-keyset", 1, &after)
+		if err != nil {
+			t.Fatalf("next page after %+v: %v", after, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		remaining = append(remaining, page[0].VolumeID)
+		after = page[0].Cursor
+	}
+	wantRemaining := []string{"v-cur-3", "v-cur-4", "v-cur-5"}
+	if !slices.Equal(remaining, wantRemaining) {
+		t.Fatalf("remaining after snapshot delete = %v, want %v", remaining, wantRemaining)
 	}
 }

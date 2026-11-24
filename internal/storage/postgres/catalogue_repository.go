@@ -875,14 +875,16 @@ func (r *CatalogueRepository) ListAuthorizedVolumeAssetFiles(ctx context.Context
 }
 
 // ListSeriesCoverCandidates returns up to limit visible, non-trashed volumes of seriesID
-// in FIRST order (sm.position, v.number, v.id) starting at offset, paired with each volume's
-// preference-ranked visible, available, non-trashed asset files. Returns storage.ErrNotFound
-// when seriesID itself is missing, restricted, or trashed.
+// in FIRST order (sm.position ASC NULLS LAST, v.number ASC NULLS LAST, v.id ASC)
+// strictly after after (when non-nil), paired with each volume's preference-ranked
+// visible, available, non-trashed asset files. Returns storage.ErrNotFound when
+// seriesID itself is missing, restricted, or trashed.
 func (r *CatalogueRepository) ListSeriesCoverCandidates(
 	ctx context.Context,
 	scope storage.CatalogueReadScope,
 	seriesID string,
-	limit, offset int,
+	limit int,
+	after *storage.SeriesCoverCursor,
 ) ([]storage.SeriesCoverCandidate, error) {
 	readableScope := scope
 	readableScope.IncludeTrashed = false
@@ -890,15 +892,18 @@ func (r *CatalogueRepository) ListSeriesCoverCandidates(
 	if err != nil {
 		return nil, err
 	}
-	normLimit, err := normalizeCataloguePageFilter(limit, offset)
+	normLimit, err := normalizeCataloguePageFilter(limit, 0)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSeriesCoverCursor(after); err != nil {
 		return nil, err
 	}
 	if _, err := r.getSeriesWithPredicate(ctx, pred, seriesID); err != nil {
 		return nil, err
 	}
 
-	vols, err := r.listSeriesCoverVolumesPageWithPredicate(ctx, pred, seriesID, normLimit, offset)
+	vols, err := r.listSeriesCoverVolumesPageWithPredicate(ctx, pred, seriesID, normLimit, after)
 	if err != nil || len(vols) == 0 {
 		return nil, err
 	}
@@ -924,7 +929,12 @@ func (r *CatalogueRepository) ListSeriesCoverCandidates(
 		}
 		out = append(out, storage.SeriesCoverCandidate{
 			VolumeID: v.id,
-			Files:    ranked,
+			Cursor: storage.SeriesCoverCursor{
+				Position: float8Ptr(v.position),
+				Number:   float8Ptr(v.number),
+				VolumeID: v.id,
+			},
+			Files: ranked,
 		})
 	}
 	return out, nil
@@ -933,23 +943,105 @@ func (r *CatalogueRepository) ListSeriesCoverCandidates(
 type seriesCoverVolumeRow struct {
 	id               string
 	preferredAssetID *string
+	position         pgtype.Float8
+	number           pgtype.Float8
+}
+
+func validateSeriesCoverCursor(after *storage.SeriesCoverCursor) error {
+	if after == nil {
+		return nil
+	}
+	if strings.TrimSpace(after.VolumeID) == "" {
+		return errors.New("invalid series cover cursor: blank volume id")
+	}
+	if after.Position != nil && (math.IsNaN(*after.Position) || math.IsInf(*after.Position, 0)) {
+		return errors.New("invalid series cover cursor: invalid position")
+	}
+	if after.Number != nil && (math.IsNaN(*after.Number) || math.IsInf(*after.Number, 0)) {
+		return errors.New("invalid series cover cursor: invalid number")
+	}
+	return nil
+}
+
+func appendSeriesCoverCursorFilter(
+	whereParts []string,
+	args []any,
+	after *storage.SeriesCoverCursor,
+) ([]string, []any) {
+	if after == nil {
+		return whereParts, args
+	}
+	nextParam := func(val any) string {
+		args = append(args, val)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	switch {
+	case after.Position != nil && after.Number != nil:
+		posP := nextParam(*after.Position)
+		numP := nextParam(*after.Number)
+		volP := nextParam(after.VolumeID)
+		whereParts = append(whereParts, fmt.Sprintf(
+			`((sm_f.position > %s OR sm_f.position IS NULL)
+			  OR (sm_f.position = %s AND (v.number > %s OR v.number IS NULL))
+			  OR (sm_f.position = %s AND v.number = %s AND v.id > %s))`,
+			posP, posP, numP, posP, numP, volP,
+		))
+	case after.Position != nil && after.Number == nil:
+		posP := nextParam(*after.Position)
+		volP := nextParam(after.VolumeID)
+		whereParts = append(whereParts, fmt.Sprintf(
+			`((sm_f.position > %s OR sm_f.position IS NULL)
+			  OR (sm_f.position = %s AND v.number IS NULL AND v.id > %s))`,
+			posP, posP, volP,
+		))
+	case after.Position == nil && after.Number != nil:
+		numP := nextParam(*after.Number)
+		volP := nextParam(after.VolumeID)
+		whereParts = append(whereParts, fmt.Sprintf(
+			`(sm_f.position IS NULL AND (
+			  (v.number > %s OR v.number IS NULL)
+			  OR (v.number = %s AND v.id > %s)
+			))`,
+			numP, numP, volP,
+		))
+	default:
+		volP := nextParam(after.VolumeID)
+		whereParts = append(whereParts, fmt.Sprintf(
+			`(sm_f.position IS NULL AND v.number IS NULL AND v.id > %s)`,
+			volP,
+		))
+	}
+	return whereParts, args
+}
+
+func float8Ptr(v pgtype.Float8) *float64 {
+	if !v.Valid {
+		return nil
+	}
+	val := v.Float64
+	return &val
 }
 
 func (r *CatalogueRepository) listSeriesCoverVolumesPageWithPredicate(
 	ctx context.Context,
 	pred *LabelPredicate,
 	seriesID string,
-	limit, offset int,
+	limit int,
+	after *storage.SeriesCoverCursor,
 ) ([]seriesCoverVolumeRow, error) {
+	whereParts := []string{"sm_f.series_id = $1", "a_c.missing_since IS NULL", "a_c.retired_at IS NULL"}
+	args := []any{seriesID}
+	whereParts, args = appendSeriesCoverCursorFilter(whereParts, args, after)
+
 	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
 		selectFrom: `
-			SELECT v.id, v.preferred_asset_id
+			SELECT v.id, v.preferred_asset_id, sm_f.position, v.number
 			FROM volumes v
 			JOIN series_memberships sm_f ON sm_f.volume_id = v.id
 			JOIN series s_f ON s_f.id = sm_f.series_id
 			JOIN media_assets a_c ON a_c.volume_id = v.id`,
-		whereParts: []string{"sm_f.series_id = $1", "a_c.missing_since IS NULL", "a_c.retired_at IS NULL"},
-		args:       []any{seriesID},
+		whereParts: whereParts,
+		args:       args,
 		predicates: []predicateClause{
 			{alias: "v", fragmentFn: (*LabelPredicate).VolumeFragment},
 			{alias: "s_f", fragmentFn: (*LabelPredicate).SeriesFragment},
@@ -958,7 +1050,6 @@ func (r *CatalogueRepository) listSeriesCoverVolumesPageWithPredicate(
 		groupBy: " GROUP BY v.id, v.preferred_asset_id, sm_f.position, v.number",
 		orderBy: " ORDER BY sm_f.position ASC NULLS LAST, v.number ASC NULLS LAST, v.id ASC",
 		limit:   limit,
-		offset:  offset,
 	})
 	if err != nil {
 		return nil, err
@@ -968,7 +1059,7 @@ func (r *CatalogueRepository) listSeriesCoverVolumesPageWithPredicate(
 	var out []seriesCoverVolumeRow
 	for rows.Next() {
 		var row seriesCoverVolumeRow
-		if err := rows.Scan(&row.id, &row.preferredAssetID); err != nil {
+		if err := rows.Scan(&row.id, &row.preferredAssetID, &row.position, &row.number); err != nil {
 			return nil, mapPgError(err)
 		}
 		out = append(out, row)

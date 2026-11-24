@@ -721,6 +721,180 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 			t.Fatalf("render calls after cache hit = %d, want 1", got)
 		}
 	})
+
+	t.Run("GetCover shares single caller wait across successive fallback candidates", func(t *testing.T) {
+		writeCBZ(t, []byte(filepath.Join(rootDir, "wait_alpha.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-wait-1")})
+		writeCBZ(t, []byte(filepath.Join(rootDir, "wait_beta.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-wait-2")})
+		healthyImg := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+		writeCBZ(t, []byte(filepath.Join(rootDir, "wait_gamma.cbz")), cbzEntry{name: "001.png", data: healthyImg})
+
+		if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
+			t.Fatalf("ScanLibrary fallback fixtures: %v", err)
+		}
+		allAssets := listRootAssets(t, tx, root.ID)
+		byRel := make(map[string]domain.MediaAsset, len(allAssets))
+		for _, a := range allAssets {
+			byRel[a.RelPathDisplay] = a
+		}
+
+		var readerUser domain.User
+		var readerRole domain.Role
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
+			var ok bool
+			readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName)
+			if !ok {
+				return errors.New("missing Reader role")
+			}
+			readerUser = domain.User{ID: "u-wait-reader", Username: "waitreader", CreatedAt: now, UpdatedAt: now}
+			if err := st.Users().CreateUser(t.Context(), &readerUser); err != nil {
+				return err
+			}
+			if err := st.Users().AssignUserRole(t.Context(), readerUser.ID, readerRole.ID); err != nil {
+				return err
+			}
+			ser := domain.Series{
+				ID: "ser-shared-wait", LibraryID: lib.ID, Title: "Shared Wait", TitleSort: "shared wait",
+				Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := st.CatalogueWrites().CreateSeries(t.Context(), &ser); err != nil {
+				return err
+			}
+			seenVols := make(map[string]struct{}, 3)
+			for idx, relName := range []string{"wait_alpha.cbz", "wait_beta.cbz", "wait_gamma.cbz"} {
+				pos := float64(idx + 1)
+				tmpl, exists := byRel[relName]
+				if !exists {
+					return fmt.Errorf("missing scanned asset %q", relName)
+				}
+				if _, dup := seenVols[tmpl.VolumeID]; dup {
+					return fmt.Errorf("expected distinct volume for %q (got duplicate %s)", relName, tmpl.VolumeID)
+				}
+				seenVols[tmpl.VolumeID] = struct{}{}
+				if err := st.SeriesMemberships().SetVolumeMemberships(t.Context(), tmpl.VolumeID, []domain.SeriesMembership{{
+					VolumeID: tmpl.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+					Position: &pos, Source: domain.MembershipSourceManual,
+				}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed shared-wait series: %v", err)
+		}
+
+		okAsset := byRel["wait_gamma.cbz"]
+		okDigest, ok := okAsset.CurrentDigest(domain.DigestKindXXH364Partial)
+		if !ok {
+			t.Fatal("missing wait-ok digest")
+		}
+		cand3Key := tobitenimage.ArchiveCoverKey(okDigest.Value, 0, tobitenimage.DefaultCoverOptions())
+
+		gate := make(chan struct{})
+		cand3Started := make(chan struct{})
+		cand3Finished := make(chan struct{})
+		var attempt atomic.Int32
+		var cand3StartOnce, cand3DoneOnce sync.Once
+
+		spy, reg := newSpyImagePipeline(t, func(ctx context.Context) error {
+			switch attempt.Add(1) {
+			case 1, 2:
+				// Each corrupt candidate consumes ~80ms before failing decode.
+				timer := time.NewTimer(80 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			case 3:
+				cand3StartOnce.Do(func() { close(cand3Started) })
+				select {
+				case <-gate:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			default:
+				return nil
+			}
+		})
+		spy.setAfterRender(func(_ context.Context) error {
+			if attempt.Load() >= 3 {
+				cand3DoneOnce.Do(func() { close(cand3Finished) })
+			}
+			return nil
+		})
+
+		const callerWait = 250 * time.Millisecond
+		svc, cache := newTestCoverService(t, tx, reg, callerWait)
+		principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-wait", nil)
+		seriesCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeSeries)
+
+		start := time.Now()
+		_, err := svc.GetCover(seriesCtx, principal, "ser-shared-wait")
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, app.ErrServiceBusy) || !errors.Is(err, curation.ErrCoverWaitTimeout) {
+			close(gate)
+			t.Fatalf("GetCover shared wait err = %v, want ErrServiceBusy + ErrCoverWaitTimeout", err)
+		}
+		var timeoutErr *curation.CoverWaitTimeoutError
+		if !errors.As(err, &timeoutErr) || !timeoutErr.IsTimeout() {
+			close(gate)
+			t.Fatalf("GetCover err %T does not unwrap *CoverWaitTimeoutError", err)
+		}
+		if timeoutErr.Timeout >= 180*time.Millisecond {
+			close(gate)
+			t.Fatalf("third candidate wait timeout = %s, want shared remaining budget < 180ms (of %s)", timeoutErr.Timeout, callerWait)
+		}
+		if elapsed >= 450*time.Millisecond {
+			close(gate)
+			t.Fatalf("GetCover total elapsed = %s, want single shared wait near %s", elapsed, callerWait)
+		}
+
+		select {
+		case <-cand3Started:
+		case <-time.After(time.Second):
+			close(gate)
+			t.Fatal("expected candidate 3 worker to start before shared wait expired")
+		}
+		if _, statErr := cache.Stat(t.Context(), cand3Key); !errors.Is(statErr, tobitenimage.ErrCacheMiss) {
+			close(gate)
+			t.Fatalf("expected ErrCacheMiss while worker blocked on gate, got %v", statErr)
+		}
+
+		// Releasing the worker finishes generation in background and caches candidate 3.
+		close(gate)
+		select {
+		case <-cand3Finished:
+		case <-time.After(3 * time.Second):
+			t.Fatal("candidate 3 background worker did not finish")
+		}
+		// Give cache.Put a moment after RenderCover returns inside the worker.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, statErr := cache.Stat(t.Context(), cand3Key); statErr == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if _, statErr := cache.Stat(t.Context(), cand3Key); statErr != nil {
+			t.Fatalf("expected cached cand3 entry after background worker completion: %v", statErr)
+		}
+
+		callsBeforeRetry := spy.calls.Load()
+		volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
+		gotVol3, err := svc.GetCover(volCtx, principal, okAsset.VolumeID)
+		if err != nil {
+			t.Fatalf("retry wait-ok volume after background cache completion: %v", err)
+		}
+		assertDominantColor(t, gotVol3.Data, 30, 210, 30)
+		if spy.calls.Load() != callsBeforeRetry {
+			t.Fatalf("wait-ok volume triggered %d extra renders after background cache completion, want 0", spy.calls.Load()-callsBeforeRetry)
+		}
+	})
 }
 
 func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) {
@@ -1717,8 +1891,10 @@ func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 }
 
 type countingTxBeginner struct {
-	pool    *pgxpool.Pool
-	queries atomic.Int64
+	pool      *pgxpool.Pool
+	queries   atomic.Int64
+	begins    atomic.Int64
+	onBeginTx func(call int64)
 }
 
 func (c *countingTxBeginner) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -1745,6 +1921,10 @@ func (c *countingTxBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 }
 
 func (c *countingTxBeginner) BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {
+	call := c.begins.Add(1)
+	if c.onBeginTx != nil {
+		c.onBeginTx(call)
+	}
 	tx, err := c.pool.BeginTx(ctx, txOptions)
 	if err != nil {
 		return nil, err
@@ -1790,9 +1970,11 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 
 	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
 	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 40, B: 220, A: 255})
+	orange := makeSolidPNG(t, 80, 120, color.RGBA{R: 230, G: 130, B: 20, A: 255})
 
 	writeCBZ(t, []byte(filepath.Join(rootDir, "long-01.cbz")), cbzEntry{name: "001.png", data: blue})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "batch-healthy.cbz")), cbzEntry{name: "001.png", data: green})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "shift-healthy.cbz")), cbzEntry{name: "001.png", data: orange})
 	writeCBZ(t, []byte(filepath.Join(rootDir, "batch-corrupt.cbz")), cbzEntry{name: "001.png", data: []byte("corrupt-png")})
 
 	db := testdb.New(t)
@@ -1859,6 +2041,7 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 			{ID: "ser-long-1", LibraryID: "lib-long", Title: "One Vol", TitleSort: "one vol", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-long-64", LibraryID: "lib-long", Title: "Sixty Four", TitleSort: "sixty four", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 			{ID: "ser-batch-11", LibraryID: "lib-long", Title: "Batched Fallback", TitleSort: "batched fallback", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-batch-shift", LibraryID: "lib-long", Title: "Batched Shift", TitleSort: "batched shift", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
 		} {
 			ser := s
 			if err := cw.CreateSeries(ctx, &ser); err != nil {
@@ -1929,7 +2112,16 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 				return err
 			}
 		}
-		return seedVolWithAsset("ser-batch-11", "vb-11", 11, "batch-healthy.cbz")
+		if err := seedVolWithAsset("ser-batch-11", "vb-11", 11, "batch-healthy.cbz"); err != nil {
+			return err
+		}
+		// Exactly 8 corrupt volumes (full batch 1) + 1 healthy volume at position 9 (batch 2).
+		for i := 1; i <= 8; i++ {
+			if err := seedVolWithAsset("ser-batch-shift", fmt.Sprintf("vs-%02d", i), float64(i), "batch-corrupt.cbz"); err != nil {
+				return err
+			}
+		}
+		return seedVolWithAsset("ser-batch-shift", "vs-09", 9, "shift-healthy.cbz")
 	}); err != nil {
 		t.Fatalf("seed long series fixture: %v", err)
 	}
@@ -1978,4 +2170,23 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 		t.Fatalf("ser-batch-11 GetCover: %v", err)
 	}
 	assertDominantColor(t, gotBatch.Data, 30, 210, 30)
+
+	// Earlier candidate disappearing between batch 1 and batch 2 snapshots must not shift and skip vs-09.
+	counter.begins.Store(0)
+	counter.onBeginTx = func(call int64) {
+		if call == 2 {
+			if _, execErr := db.Exec(ctx, `UPDATE media_assets SET missing_since = NOW() WHERE id = 'a-vs-01'`); execErr != nil {
+				t.Errorf("mark a-vs-01 missing between batches: %v", execErr)
+			}
+		}
+	}
+	gotShift, err := svc.GetCover(seriesCtx, readerPrincipal, "ser-batch-shift")
+	counter.onBeginTx = nil
+	if err != nil {
+		t.Fatalf("ser-batch-shift GetCover after snapshot mutation: %v", err)
+	}
+	if begins := counter.begins.Load(); begins != 2 {
+		t.Fatalf("ser-batch-shift read tx begins = %d, want 2 batches", begins)
+	}
+	assertDominantColor(t, gotShift.Data, 230, 130, 20)
 }

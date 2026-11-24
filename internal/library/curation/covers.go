@@ -977,9 +977,14 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 		Principal:      principal,
 		IncludeTrashed: false,
 	}
+	waitTimeout := s.waitTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = DefaultCoverWaitTimeout
+	}
+	deadline := time.Now().Add(waitTimeout)
 
 	if !hasTargetKind || targetKind == domain.ItemTypeVolume {
-		rendition, handled, err := s.getVolumeCover(ctx, scope, targetID)
+		rendition, handled, err := s.getVolumeCover(ctx, scope, targetID, deadline, waitTimeout)
 		if handled {
 			return rendition, err
 		}
@@ -988,13 +993,15 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 		}
 	}
 
-	return s.getSeriesCover(ctx, scope, targetID)
+	return s.getSeriesCover(ctx, scope, targetID, deadline, waitTimeout)
 }
 
 func (s *CoverService) getVolumeCover(
 	ctx context.Context,
 	scope storage.CatalogueReadScope,
 	volumeID string,
+	deadline time.Time,
+	totalWait time.Duration,
 ) (*app.CoverRendition, bool, error) {
 	var files []storage.AuthorizedAssetFile
 	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
@@ -1016,7 +1023,9 @@ func (s *CoverService) getVolumeCover(
 		return nil, false, nil
 	}
 
-	rendition, sawOffline, lastUnavail, err := s.tryVolumeAssetCandidates(ctx, domain.ItemTypeVolume, volumeID, volumeID, files)
+	rendition, sawOffline, lastUnavail, err := s.tryVolumeAssetCandidates(
+		ctx, domain.ItemTypeVolume, volumeID, volumeID, files, deadline, totalWait,
+	)
 	if err != nil {
 		return nil, true, err
 	}
@@ -1036,9 +1045,19 @@ func (s *CoverService) getSeriesCover(
 	ctx context.Context,
 	scope storage.CatalogueReadScope,
 	seriesID string,
+	deadline time.Time,
+	totalWait time.Duration,
 ) (*app.CoverRendition, error) {
-	var lastUnavail error
-	for offset := 0; ; {
+	var (
+		after       *storage.SeriesCoverCursor
+		lastUnavail error
+	)
+	for {
+		if after != nil && time.Until(deadline) <= 0 {
+			return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, &CoverWaitTimeoutError{
+				Timeout: totalWait,
+			})
+		}
 		var batch []storage.SeriesCoverCandidate
 		err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
 			catRepo := tx.Catalogue()
@@ -1046,7 +1065,7 @@ func (s *CoverService) getSeriesCover(
 				return errors.New("curation: read transaction missing catalogue repository")
 			}
 			var listErr error
-			batch, listErr = catRepo.ListSeriesCoverCandidates(ctx, scope, seriesID, seriesCoverBatchSize, offset)
+			batch, listErr = catRepo.ListSeriesCoverCandidates(ctx, scope, seriesID, seriesCoverBatchSize, after)
 			return listErr
 		})
 		if err != nil {
@@ -1060,7 +1079,9 @@ func (s *CoverService) getSeriesCover(
 		}
 
 		for _, volCand := range batch {
-			rendition, _, unavailErr, tryErr := s.tryVolumeAssetCandidates(ctx, domain.ItemTypeSeries, seriesID, volCand.VolumeID, volCand.Files)
+			rendition, _, unavailErr, tryErr := s.tryVolumeAssetCandidates(
+				ctx, domain.ItemTypeSeries, seriesID, volCand.VolumeID, volCand.Files, deadline, totalWait,
+			)
 			if tryErr != nil {
 				return nil, tryErr
 			}
@@ -1075,7 +1096,8 @@ func (s *CoverService) getSeriesCover(
 		if len(batch) < seriesCoverBatchSize {
 			break
 		}
-		offset += len(batch)
+		cursor := batch[len(batch)-1].Cursor
+		after = &cursor
 	}
 
 	if lastUnavail != nil {
@@ -1090,10 +1112,18 @@ func (s *CoverService) tryVolumeAssetCandidates(
 	targetID string,
 	volumeID string,
 	files []storage.AuthorizedAssetFile,
+	deadline time.Time,
+	totalWait time.Duration,
 ) (rendition *app.CoverRendition, sawOffline bool, lastUnavail error, err error) {
 	for i := range files {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, &CoverWaitTimeoutError{
+				Timeout: totalWait,
+			})
+		}
 		src := coverAssetSourceFromAuthorizedFile(&files[i])
-		entry, genErr := s.GetOrGenerateCover(ctx, src)
+		entry, genErr := s.GetOrGenerateCover(ctx, src, CoverRequestOptions{WaitTimeout: remaining})
 		if genErr == nil {
 			return &app.CoverRendition{
 				TargetID:    targetID,
