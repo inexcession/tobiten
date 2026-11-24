@@ -49,8 +49,9 @@ type Pipeline struct {
 }
 
 var (
-	_ tobitenimage.ImagePipeline       = (*Pipeline)(nil)
-	_ tobitenimage.PlaceholderProvider = (*Pipeline)(nil)
+	_ tobitenimage.ImagePipeline            = (*Pipeline)(nil)
+	_ tobitenimage.PlaceholderProvider      = (*Pipeline)(nil)
+	_ tobitenimage.PreflightLimitedPipeline = (*Pipeline)(nil)
 )
 
 // New constructs a Tier 1 pure-Go ImagePipeline with the given options.

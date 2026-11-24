@@ -18,6 +18,7 @@ type stubPipeline struct {
 	decodes      []tobitenimage.Codec
 	encodes      []tobitenimage.Codec
 	placeholders []tobitenimage.Codec
+	maxPreflight int64
 	renderFn     func(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error)
 }
 
@@ -26,6 +27,7 @@ func (s *stubPipeline) Priority() int                            { return s.prio
 func (s *stubPipeline) DecodeFormats() []tobitenimage.Codec      { return s.decodes }
 func (s *stubPipeline) EncodeFormats() []tobitenimage.Codec      { return s.encodes }
 func (s *stubPipeline) PlaceholderFormats() []tobitenimage.Codec { return s.placeholders }
+func (s *stubPipeline) MaxPreflightBytes() int64                 { return s.maxPreflight }
 func (s *stubPipeline) RenderCover(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
 	if s.renderFn != nil {
 		return s.renderFn(ctx, src, opts)
@@ -272,6 +274,67 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 	if _, err := reg.RenderCover(context.Background(), bytes.NewReader(jxlInput), tobitenimage.RenderOptions{}); !errors.Is(err, tobitenimage.ErrInvalidOptions) {
 		t.Fatalf("RenderCover(zero bounds) err = %v, want ErrInvalidOptions", err)
 	}
+
+	// Provider preflight limit is enforced before Registry sniffing reads past it.
+	regLimited := tobitenimage.NewRegistry()
+	if err := regLimited.Register(&stubPipeline{
+		name:         "limited",
+		decodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		encodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		placeholders: []tobitenimage.Codec{tobitenimage.CodecAVIF},
+		maxPreflight: 24,
+		renderFn: func(_ context.Context, _ io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+			return tobitenimage.Result{
+				Format:      opts.OutputFormat,
+				SourceCodec: opts.SourceCodec,
+				Placeholder: true,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ftyp64 := make([]byte, 64)
+	binary.BigEndian.PutUint32(ftyp64[0:4], 64)
+	copy(ftyp64[4:8], "ftyp")
+	copy(ftyp64[8:12], "mif1")
+	copy(ftyp64[16:20], "avif")
+	cr := &countingReader{r: bytes.NewReader(ftyp64)}
+	res, err = regLimited.RenderCover(context.Background(), cr, tobitenimage.DefaultCoverOptions())
+	if err != nil {
+		t.Fatalf("RenderCover(64B ftyp early avif) err = %v", err)
+	}
+	if !res.Placeholder || res.SourceCodec != tobitenimage.CodecAVIF {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if cr.n != 24 {
+		t.Errorf("registry sniff consumed %d bytes, want 24", cr.n)
+	}
+
+	// Late avif brand past 24-byte budget stops at 24 bytes with ErrPreflightLimitExceeded.
+	ftypLate := make([]byte, 64)
+	binary.BigEndian.PutUint32(ftypLate[0:4], 64)
+	copy(ftypLate[4:8], "ftyp")
+	copy(ftypLate[8:12], "mif1")
+	copy(ftypLate[32:36], "avif")
+	crLate := &countingReader{r: bytes.NewReader(ftypLate)}
+	if _, err := regLimited.RenderCover(context.Background(), crLate, tobitenimage.DefaultCoverOptions()); !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+		t.Fatalf("RenderCover(64B ftyp late avif) err = %v, want ErrPreflightLimitExceeded", err)
+	}
+	if crLate.n != 24 {
+		t.Errorf("registry sniff consumed %d bytes on late brand, want 24", crLate.n)
+	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }
 
 func TestSniffHeaderAndReader(t *testing.T) {
@@ -333,7 +396,9 @@ func TestFitDimensionsAndPixelLimit(t *testing.T) {
 		{800, 1600, 400, 400, 200, 400},
 		{300, 450, 400, 600, 300, 450}, // no upscale
 		{1000, 500, 0, 250, 500, 250},
-		{10000, 1, 100, 100, 100, 1},          // floor >= 1
+		{10000, 1, 100, 100, 100, 1}, // floor >= 1
+		{10, 45, 7, 0, 7, 32},        // exact half-up rounding (31.5 -> 32)
+		{math.MaxInt, math.MaxInt, math.MaxInt - 1, 0, math.MaxInt - 1, math.MaxInt - 1},
 		{100, 300, 40, math.MaxInt, 40, 120},  // large unbound axis must not overflow
 		{100, 300, math.MaxInt, 120, 40, 120}, // large width bound must not overflow
 		{100, 300, math.MaxInt, math.MaxInt, 100, 300},

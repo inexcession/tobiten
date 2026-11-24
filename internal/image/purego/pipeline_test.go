@@ -398,6 +398,14 @@ func TestRenderCover_DecodeResizeAndDeterministicEncode(t *testing.T) {
 			wantW:     8,
 			wantH:     65535,
 		},
+		{
+			name:      "png half-up aspect rounding 10x45 to width 7 yields 7x32",
+			src:       encodeUniformPNG(t, 10, 45),
+			wantCodec: tobitenimage.CodecPNG,
+			opts:      tobitenimage.RenderOptions{MaxWidth: 7, Quality: 85},
+			wantW:     7,
+			wantH:     32,
+		},
 	}
 
 	for _, tc := range cases {
@@ -619,6 +627,59 @@ func TestRenderCover_CorruptAndPixelLimitFailBeforeFullDecode(t *testing.T) {
 		}
 		if _, err := p.RenderCover(context.Background(), bytes.NewReader(bigJPEG), opts); err != nil {
 			t.Fatalf("valid JPEG with compact header failed under 1024-byte preflight budget: %v", err)
+		}
+
+		// Registry enforces provider's tighter MaxPreflightBytes before reading stream.
+		tightProvider, err := purego.New(purego.Options{MaxPixels: 10_000, MaxPreflightBytes: 24})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg := tobitenimage.NewRegistry()
+		if err := reg.Register(tightProvider); err != nil {
+			t.Fatal(err)
+		}
+
+		ftypEarlyAVIF := make([]byte, 64)
+		binary.BigEndian.PutUint32(ftypEarlyAVIF[0:4], 64)
+		copy(ftypEarlyAVIF[4:8], "ftyp")
+		copy(ftypEarlyAVIF[8:12], "mif1")
+		copy(ftypEarlyAVIF[16:20], "avif")
+
+		directReader := &failPastOffsetReader{header: ftypEarlyAVIF}
+		directRes, err := tightProvider.RenderCover(context.Background(), directReader, opts)
+		if err != nil {
+			t.Fatalf("direct tightProvider RenderCover(ftyp) err = %v", err)
+		}
+		regReader := &failPastOffsetReader{header: ftypEarlyAVIF}
+		regRes, err := reg.RenderCover(context.Background(), regReader, opts)
+		if err != nil {
+			t.Fatalf("registry RenderCover(ftyp) err = %v", err)
+		}
+		if !directRes.Placeholder || !regRes.Placeholder || directRes.SourceCodec != tobitenimage.CodecAVIF || regRes.SourceCodec != tobitenimage.CodecAVIF {
+			t.Fatalf("unexpected placeholder results: direct=%+v reg=%+v", directRes, regRes)
+		}
+		if directReader.pos != 24 || regReader.pos != 24 {
+			t.Errorf("bytes read: direct=%d reg=%d, want 24 for both", directReader.pos, regReader.pos)
+		}
+
+		// Also verify registry preserves ErrPreflightLimitExceeded, ErrPixelLimitExceeded, and ErrCorrupt.
+		regFull := tobitenimage.NewRegistry()
+		if err := regFull.Register(p); err != nil {
+			t.Fatal(err)
+		}
+		jrReg := &failPastOffsetReader{header: jpegData}
+		if _, err := regFull.RenderCover(context.Background(), jrReg, opts); !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+			t.Fatalf("registry oversized metadata err = %v, want ErrPreflightLimitExceeded", err)
+		}
+		if jrReg.pos > 1024 {
+			t.Errorf("registry oversized metadata read %d bytes, want <= 1024", jrReg.pos)
+		}
+		pngOver := &failPastOffsetReader{header: buildForgedPNGHeader(200, 100)}
+		if _, err := regFull.RenderCover(context.Background(), pngOver, opts); !errors.Is(err, tobitenimage.ErrPixelLimitExceeded) {
+			t.Fatalf("registry pixel limit err = %v, want ErrPixelLimitExceeded", err)
+		}
+		if _, err := regFull.RenderCover(context.Background(), bytes.NewReader([]byte("\x89PNG\r\n\x1a\n\x00")), opts); !errors.Is(err, tobitenimage.ErrCorrupt) {
+			t.Fatalf("registry corrupt png err = %v, want ErrCorrupt", err)
 		}
 	})
 

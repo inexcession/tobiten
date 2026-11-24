@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/bits"
 	"slices"
 	"sort"
@@ -229,6 +228,13 @@ type PlaceholderProvider interface {
 	PlaceholderFormats() []Codec
 }
 
+// PreflightLimitedPipeline is an optional interface implemented by an
+// ImagePipeline to declare its maximum header preflight byte budget.
+type PreflightLimitedPipeline interface {
+	ImagePipeline
+	MaxPreflightBytes() int64
+}
+
 // Registry manages registered ImagePipeline implementations, advertises their
 // aggregate decode and encode codecs, and routes cover rendering requests.
 type Registry struct {
@@ -405,26 +411,14 @@ func pipelineSupports(codecs []Codec, target Codec) bool {
 // Select chooses the highest-priority registered pipeline that can encode
 // dstCodec and either decode srcCodec or provide a placeholder for srcCodec.
 func (r *Registry) Select(srcCodec, dstCodec Codec) (ImagePipeline, error) {
-	pipelines := r.Pipelines()
-	if len(pipelines) == 0 {
-		return nil, ErrNoPipeline
+	encodeCapable, err := r.encodeCapable(dstCodec)
+	if err != nil {
+		return nil, err
 	}
+	return selectFromCandidates(encodeCapable, srcCodec)
+}
 
-	dst := NormalizeCodec(string(dstCodec))
-	if dst == "" {
-		dst = CodecJPEG
-	}
-
-	var encodeCapable []ImagePipeline
-	for _, p := range pipelines {
-		if pipelineSupports(p.EncodeFormats(), dst) {
-			encodeCapable = append(encodeCapable, p)
-		}
-	}
-	if len(encodeCapable) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedEncodeFormat, dst)
-	}
-
+func selectFromCandidates(encodeCapable []ImagePipeline, srcCodec Codec) (ImagePipeline, error) {
 	src := NormalizeCodec(string(srcCodec))
 	if src == "" {
 		return encodeCapable[0], nil
@@ -445,8 +439,23 @@ func (r *Registry) Select(srcCodec, dstCodec Codec) (ImagePipeline, error) {
 	return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, src)
 }
 
-// RenderCover validates options, sniffs the source codec from leading bytes,
-// selects an appropriate registered pipeline, and renders the cover rendition.
+func effectivePreflightBudget(pipelines []ImagePipeline, override int64) int64 {
+	budget := override
+	for _, p := range pipelines {
+		pl, ok := p.(PreflightLimitedPipeline)
+		if !ok {
+			continue
+		}
+		if lim := pl.MaxPreflightBytes(); lim > 0 && (budget == 0 || lim < budget) {
+			budget = lim
+		}
+	}
+	return budget
+}
+
+// RenderCover validates options, sniffs the source codec from leading bytes
+// within the effective preflight budget, selects an appropriate registered
+// pipeline, and renders the cover rendition.
 func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOptions) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
@@ -459,11 +468,13 @@ func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOp
 		return Result{}, fmt.Errorf("%w: nil image reader", ErrCorrupt)
 	}
 
-	if _, err := r.Select("", norm.OutputFormat); err != nil {
+	encodeCapable, err := r.encodeCapable(norm.OutputFormat)
+	if err != nil {
 		return Result{}, err
 	}
 
-	codec, replay, err := SniffReaderBounded(src, norm.MaxPreflightBytes)
+	budget := effectivePreflightBudget(encodeCapable, norm.MaxPreflightBytes)
+	codec, replay, err := SniffReaderBounded(src, budget)
 	if err != nil {
 		return Result{}, err
 	}
@@ -471,12 +482,35 @@ func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOp
 		return Result{}, fmt.Errorf("%w: unrecognized image header", ErrCorrupt)
 	}
 
-	p, err := r.Select(codec, norm.OutputFormat)
+	p, err := selectFromCandidates(encodeCapable, codec)
 	if err != nil {
 		return Result{}, err
 	}
 	norm.SourceCodec = codec
 	return p.RenderCover(ctx, replay, norm)
+}
+
+func (r *Registry) encodeCapable(dstCodec Codec) ([]ImagePipeline, error) {
+	pipelines := r.Pipelines()
+	if len(pipelines) == 0 {
+		return nil, ErrNoPipeline
+	}
+
+	dst := NormalizeCodec(string(dstCodec))
+	if dst == "" {
+		dst = CodecJPEG
+	}
+
+	var out []ImagePipeline
+	for _, p := range pipelines {
+		if pipelineSupports(p.EncodeFormats(), dst) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedEncodeFormat, dst)
+	}
+	return out, nil
 }
 
 // SniffHeader identifies an image codec from its leading magic bytes, or
@@ -563,6 +597,26 @@ func SniffReader(r io.Reader) (Codec, io.Reader, error) {
 	return SniffReaderBounded(r, 0)
 }
 
+type replayReader struct {
+	codec Codec
+	buf   []byte
+	off   int
+	eof   bool
+	rest  io.Reader
+}
+
+func (rr *replayReader) Read(p []byte) (int, error) {
+	if rr.off < len(rr.buf) {
+		n := copy(p, rr.buf[rr.off:])
+		rr.off += n
+		return n, nil
+	}
+	if rr.eof || rr.rest == nil {
+		return 0, io.EOF
+	}
+	return rr.rest.Read(p)
+}
+
 // SniffReaderBounded behaves like SniffReader while enforcing maxBytes (when
 // positive) as an upper bound on header bytes read during sniffing.
 func SniffReaderBounded(r io.Reader, maxBytes int64) (Codec, io.Reader, error) {
@@ -571,6 +625,12 @@ func SniffReaderBounded(r io.Reader, maxBytes int64) (Codec, io.Reader, error) {
 	}
 	if maxBytes < 0 {
 		return "", nil, fmt.Errorf("%w: max preflight bytes cannot be negative", ErrInvalidOptions)
+	}
+	if rr, ok := r.(*replayReader); ok && rr.off == 0 {
+		if maxBytes > 0 && int64(len(rr.buf)) > maxBytes {
+			return "", nil, fmt.Errorf("%w: header exceeds %d bytes", ErrPreflightLimitExceeded, maxBytes)
+		}
+		return rr.codec, rr, nil
 	}
 
 	initLimit := initialSniffBytes
@@ -614,10 +674,12 @@ func SniffReaderBounded(r io.Reader, maxBytes int64) (Codec, io.Reader, error) {
 	if maxBytes > 0 && int64(len(buf)) >= maxBytes && !eof && codec == "" {
 		return "", nil, fmt.Errorf("%w: header exceeds %d bytes", ErrPreflightLimitExceeded, maxBytes)
 	}
-	if eof {
-		return codec, bytes.NewReader(buf), nil
-	}
-	return codec, io.MultiReader(bytes.NewReader(buf), r), nil
+	return codec, &replayReader{
+		codec: codec,
+		buf:   buf,
+		eof:   eof,
+		rest:  r,
+	}, nil
 }
 
 func cmpMul64(a, b, c, d uint64) int {
@@ -636,6 +698,17 @@ func cmpMul64(a, b, c, d uint64) int {
 		return 1
 	}
 	return 0
+}
+
+// mulDivRoundHalfUp computes round_half_up(a * b / den) using exact 128-bit
+// arithmetic. Callers must ensure b <= den and a <= math.MaxInt so the result
+// fits in int without overflow.
+func mulDivRoundHalfUp(a, b, den uint64) int {
+	hi, lo := bits.Mul64(a, b)
+	lo, carry := bits.Add64(lo, den/2, 0)
+	hi, _ = bits.Add64(hi, 0, carry)
+	q, _ := bits.Div64(hi, lo, den)
+	return int(q)
 }
 
 // FitDimensions computes aspect-preserving target dimensions bounded by maxW
@@ -663,10 +736,10 @@ func FitDimensions(srcW, srcH, maxW, maxH int) (int, int) {
 	// Compare effW/srcW vs effH/srcH via 128-bit unsigned products to avoid
 	// signed integer overflow on large bounds.
 	if cmpMul64(uint64(effW), uint64(srcH), uint64(effH), uint64(srcW)) <= 0 {
-		dstH := int(math.Round(float64(srcH) * (float64(effW) / float64(srcW))))
+		dstH := mulDivRoundHalfUp(uint64(srcH), uint64(effW), uint64(srcW))
 		return effW, max(1, min(effH, dstH))
 	}
-	dstW := int(math.Round(float64(srcW) * (float64(effH) / float64(srcH))))
+	dstW := mulDivRoundHalfUp(uint64(srcW), uint64(effH), uint64(srcH))
 	return max(1, min(effW, dstW)), effH
 }
 
