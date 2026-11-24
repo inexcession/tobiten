@@ -764,7 +764,7 @@ func (f *fsnotifyOSWatcher) watchRuntimeDirTree(
 	ancestry []os.FileInfo,
 ) (bool, error) {
 	dirStr := string(absDir)
-	entry, ok := f.stageRuntimeWatch(rootID, dirStr, true, false)
+	entry, ok := f.stageRuntimeWatch(rootID, dirStr, true, false, true)
 	if !ok {
 		return false, nil
 	}
@@ -841,7 +841,7 @@ func (f *fsnotifyOSWatcher) visitRuntimeDirEntry(
 	if err != nil {
 		if isTransientDisappearance(err) || (needsFollow && classifyStatError(err) != SkipReasonUnreadable) {
 			if needsFollow && isSymlinkEntry(absChild, entryType) {
-				_, _ = f.stageRuntimeWatch(rootID, string(absChild), false, true)
+				_, _ = f.stageRuntimeWatch(rootID, string(absChild), false, true, false)
 			}
 			return false, nil
 		}
@@ -867,7 +867,7 @@ func (f *fsnotifyOSWatcher) visitRuntimeDirEntry(
 
 func (f *fsnotifyOSWatcher) watchRuntimeFileSymlink(h fsnotifyHandle, rootID, linkPath string) error {
 	addKernel := runtime.GOOS != "darwin"
-	entry, ok := f.stageRuntimeWatch(rootID, linkPath, false, true)
+	entry, ok := f.stageRuntimeWatch(rootID, linkPath, false, true, addKernel)
 	if !ok || !addKernel {
 		return nil
 	}
@@ -906,6 +906,7 @@ func (f *fsnotifyOSWatcher) stageRuntimeWatch(
 	path string,
 	isDir bool,
 	isFileLink bool,
+	addKernelWatch bool,
 ) (*osRootEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -921,6 +922,11 @@ func (f *fsnotifyOSWatcher) stageRuntimeWatch(
 	}
 	if isFileLink {
 		entry.fileLinks[path] = struct{}{}
+	}
+	if addKernelWatch {
+		// Record staged kernel ownership before calling h.Add so concurrent rebuild
+		// finishRootRegistration cleanup preserves an already-installed native watch.
+		entry.watches[path] = struct{}{}
 	}
 	return entry, true
 }
@@ -940,7 +946,6 @@ func (f *fsnotifyOSWatcher) completeRuntimeWatch(
 	}
 	active := !f.closed && entry != nil && !entry.removed && f.roots[rootID] == entry
 	if active && addErr == nil {
-		entry.watches[path] = struct{}{}
 		return true, nil
 	}
 	if entry != nil {

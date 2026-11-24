@@ -1857,13 +1857,14 @@ func TestWatcher_LocalFilesystemUsesFSNotifyForExistingAndNewSubdirectories(t *t
 }
 
 type faultInjectingFSNotifyHandle struct {
-	inner     fsnotifyHandle
-	eventsCh  chan fsnotify.Event
-	errorsCh  chan error
-	stopCh    chan struct{}
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-	addHook   func(inner fsnotifyHandle, name string) error
+	inner       fsnotifyHandle
+	eventsCh    chan fsnotify.Event
+	errorsCh    chan error
+	stopCh      chan struct{}
+	closeOnce   sync.Once
+	wg          sync.WaitGroup
+	addHook     func(inner fsnotifyHandle, name string) error
+	postAddHook func(name string, err error)
 
 	dropMu    sync.Mutex
 	dropEvent func(fsnotify.Event) bool
@@ -1943,7 +1944,11 @@ func (h *faultInjectingFSNotifyHandle) Add(name string) error {
 			return err
 		}
 	}
-	return h.inner.Add(name)
+	err := h.inner.Add(name)
+	if h.postAddHook != nil {
+		h.postAddHook(name, err)
+	}
+	return err
 }
 
 func (h *faultInjectingFSNotifyHandle) Remove(name string) error      { return h.inner.Remove(name) }
@@ -2327,9 +2332,13 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 
 	dir1B := t.TempDir()
 	sub1B := filepath.Join(dir1B, "sub1b")
+	vanishingSub1B := filepath.Join(dir1B, "vanishing-sub1b")
 	rebuildSub1B := filepath.Join(dir1B, "rebuild-inflight-sub1b")
 	inflightSub1B := filepath.Join(dir1B, "inflight-sub1b")
 	writeWatcherFile(t, filepath.Join(sub1B, "vol01.cbz"), []byte("v1b"), time.Time{})
+	if err := os.MkdirAll(vanishingSub1B, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", vanishingSub1B, err)
+	}
 
 	dir2 := t.TempDir()
 	sub2 := filepath.Join(dir2, "sub2")
@@ -2353,6 +2362,19 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 	t.Cleanup(releaseRebuild)
 	var rebuildHoldTriggered atomic.Bool
 
+	var armVanishingRebuild atomic.Bool
+	var vanishingOmitDirOnce atomic.Bool
+	var vanishingPauseSubOnce atomic.Bool
+	vanishingWalkPaused := make(chan struct{})
+	vanishingRuntimeInstalled := make(chan struct{})
+	releaseVanishingCompletion := make(chan struct{})
+	var releaseVanishingOnce sync.Once
+	releaseVanishing := func() {
+		releaseVanishingOnce.Do(func() { close(releaseVanishingCompletion) })
+	}
+	t.Cleanup(releaseVanishing)
+	var vanishingPostTriggered atomic.Bool
+
 	inflightAddEntered := make(chan struct{})
 	releaseInflightAdd := make(chan struct{})
 	inflightAddInstalled := make(chan struct{})
@@ -2375,6 +2397,30 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		Trigger:        trig,
 		PollInterval:   time.Hour,
 		DebounceWindow: 30 * time.Millisecond,
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			entries, err := os.ReadDir(string(rawDir))
+			if err != nil {
+				return nil, err
+			}
+			if armVanishingRebuild.Load() && string(rawDir) == dir1B && vanishingOmitDirOnce.CompareAndSwap(false, true) {
+				filtered := entries[:0]
+				vanishName := filepath.Base(vanishingSub1B)
+				for _, de := range entries {
+					if de.Name() != vanishName {
+						filtered = append(filtered, de)
+					}
+				}
+				return filtered, nil
+			}
+			if armVanishingRebuild.Load() && string(rawDir) == sub1B && vanishingPauseSubOnce.CompareAndSwap(false, true) {
+				close(vanishingWalkPaused)
+				select {
+				case <-vanishingRuntimeInstalled:
+				case <-t.Context().Done():
+				}
+			}
+			return entries, nil
+		},
 		MountDetector: MountDetectorFunc(func(rawPath []byte) (mount.FilesystemInfo, error) {
 			if armRebuildDetect.Load() && string(rawPath) == dir1B {
 				rebuildDetectOnce.Do(func() {
@@ -2412,6 +2458,15 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 			if err != nil {
 				return nil, err
 			}
+			h.postAddHook = func(name string, addErr error) {
+				if addErr == nil && name == vanishingSub1B && armVanishingRebuild.Load() && vanishingPostTriggered.CompareAndSwap(false, true) {
+					close(vanishingRuntimeInstalled)
+					select {
+					case <-releaseVanishingCompletion:
+					case <-t.Context().Done():
+					}
+				}
+			}
 			handleMu.Lock()
 			activeHandle = h
 			handleMu.Unlock()
@@ -2426,6 +2481,7 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 	}
 	defer w.Stop()
 	defer releaseInflight()
+	defer releaseVanishing()
 	defer releaseRebuild()
 
 	waitForOSWatchedRoot(t, w, root1A.ID)
@@ -2439,7 +2495,7 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		t.Fatal("expected active fsnotify handle")
 	}
 
-	wantAll := []string{dir1A, sub1A, dir1B, sub1B, dir2, sub2}
+	wantAll := []string{dir1A, sub1A, dir1B, sub1B, vanishingSub1B, dir2, sub2}
 	slices.Sort(wantAll)
 	if got := w.WatchedPaths(); !slices.Equal(got, wantAll) {
 		t.Fatalf("WatchedPaths = %v, want %v", got, wantAll)
@@ -2479,7 +2535,44 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		t.Fatalf("after-rebuild write triggered %d total scans, want 4", got)
 	}
 
-	// 2. Trigger a runtime subdirectory Add on root1B, hold it in flight while removing
+	// 2. Previously watched vanishingSub1B misses the rebuild's ReadDir snapshot, then returns
+	// while the rebuild is still in flight. Pause readLoop AFTER native Add installs the watch
+	// and let finishRootRegistration complete before completeRuntimeWatch records watches.
+	armVanishingRebuild.Store(true)
+	h.injectError(fsnotify.ErrEventOverflow)
+	select {
+	case <-vanishingWalkPaused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rebuild walk to pause after ReadDir(dir1B)")
+	}
+	h.setDropEvent(func(ev fsnotify.Event) bool {
+		return ev.Name == vanishingSub1B && !ev.Op.Has(fsnotify.Create)
+	})
+	if err := os.Remove(vanishingSub1B); err != nil {
+		t.Fatalf("Remove(%s): %v", vanishingSub1B, err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	h.setDropEvent(nil)
+	if err := os.Mkdir(vanishingSub1B, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", vanishingSub1B, err)
+	}
+	// Wait for the rebuild's overflow scans (after finishRootRegistration completed).
+	waitForTriggerCount(t, trig, 6)
+	releaseVanishing()
+	writeWatcherFile(t, filepath.Join(sub2, "sync-vanishing.cbz"), []byte("sync"), time.Time{})
+	waitForTriggerCount(t, trig, 7)
+
+	if got := w.WatchedPaths(); !slices.Contains(got, vanishingSub1B) {
+		t.Fatalf("WatchedPaths after rebuild stale-cleanup race = %v, want to preserve %s", got, vanishingSub1B)
+	}
+	writeWatcherFile(t, filepath.Join(vanishingSub1B, "after-vanish.cbz"), []byte("av"), time.Time{})
+	waitForTriggerCount(t, trig, 8)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 8 {
+		t.Fatalf("after-vanish write triggered %d total scans, want 8", got)
+	}
+
+	// 3. Trigger a runtime subdirectory Add on root1B, hold it in flight while removing
 	// root1B via NotifySync, then release the held Add and verify no native watch leaks.
 	if err := os.Mkdir(inflightSub1B, 0o755); err != nil {
 		t.Fatalf("Mkdir(%s): %v", inflightSub1B, err)
@@ -2515,21 +2608,22 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Changes in removed root1B (including rebuildSub1B and inflightSub1B) must not trigger any scan.
+	// Changes in removed root1B (including sub1B, vanishingSub1B, rebuildSub1B, and inflightSub1B) must not trigger any scan.
 	writeWatcherFile(t, filepath.Join(sub1B, "ignored.cbz"), []byte("ignored"), time.Time{})
+	writeWatcherFile(t, filepath.Join(vanishingSub1B, "ignored-vanish.cbz"), []byte("ignored"), time.Time{})
 	writeWatcherFile(t, filepath.Join(rebuildSub1B, "ignored-rebuild.cbz"), []byte("ignored"), time.Time{})
 	writeWatcherFile(t, filepath.Join(inflightSub1B, "ignored-inflight.cbz"), []byte("ignored"), time.Time{})
 	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 4 {
-		t.Fatalf("removed root triggered %d scans total, want 4", got)
+	if got := len(trig.snapshot()); got != 8 {
+		t.Fatalf("removed root triggered %d scans total, want 8", got)
 	}
 
 	// Remaining root1A in lib-1 still triggers normally.
 	writeWatcherFile(t, filepath.Join(sub1A, "active.cbz"), []byte("active"), time.Time{})
-	reqs := waitForTriggerCount(t, trig, 5)
-	assertAutomaticScanRequest(t, reqs[4], "lib-1")
+	reqs := waitForTriggerCount(t, trig, 9)
+	assertAutomaticScanRequest(t, reqs[8], "lib-1")
 
-	// 3. Remove library lib-2 (root2) -> releases watches for dir2 and sub2.
+	// 4. Remove library lib-2 (root2) -> releases watches for dir2 and sub2.
 	lister.setRoots([]domain.LibraryRoot{root1A})
 	w.NotifySync()
 	waitForRootRemoved(t, w, root2.ID)
@@ -2542,8 +2636,8 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 
 	writeWatcherFile(t, filepath.Join(sub2, "ignored2.cbz"), []byte("ignored2"), time.Time{})
 	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 5 {
-		t.Fatalf("removed library triggered scan: got %d total, want 5", got)
+	if got := len(trig.snapshot()); got != 9 {
+		t.Fatalf("removed library triggered scan: got %d total, want 9", got)
 	}
 
 	// 4. Stop closes the OS watcher, releases all remaining watches, and leaves no goroutine running.
