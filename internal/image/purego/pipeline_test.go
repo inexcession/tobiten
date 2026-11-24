@@ -11,6 +11,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"testing"
 
 	"golang.org/x/image/webp"
@@ -53,6 +54,68 @@ func encodeTestPNG(t *testing.T, w, h int, withAlpha bool) []byte {
 	if err := png.Encode(&buf, makeTestRGBA(w, h, withAlpha)); err != nil {
 		t.Fatalf("png.Encode: %v", err)
 	}
+	return buf.Bytes()
+}
+
+func encodeUniformPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	c := color.NRGBA{R: 42, G: 128, B: 210, A: 255}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetNRGBA(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("png.Encode(uniform): %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildLargeJPEGPreflight returns SOI + APP0 metadata padding of appBytes + SOF0.
+func buildLargeJPEGPreflight(appBytes int, w, h uint16) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xff, 0xd8}) // SOI
+	remaining := appBytes
+	for remaining > 0 {
+		chunk := min(remaining, 65533)
+		buf.Write([]byte{0xff, 0xe0}) // APP0
+		var lenBuf [2]byte
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(chunk+2))
+		buf.Write(lenBuf[:])
+		buf.Write(make([]byte, chunk))
+		remaining -= chunk
+	}
+	buf.Write(buildForgedJPEGHeader(w, h)[2:])
+	return buf.Bytes()
+}
+
+// buildPalettedPNGHeader returns PNG signature + IHDR (paletted color type 3) + PLTE.
+func buildPalettedPNGHeader(w, h uint32, paletteEntries int) []byte {
+	var ihdr [13]byte
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 3 // indexed-color (paletted)
+
+	var buf bytes.Buffer
+	buf.WriteString("\x89PNG\r\n\x1a\n")
+	writePNGChunk := func(kind string, payload []byte) {
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+		buf.Write(lenBuf[:])
+		buf.WriteString(kind)
+		buf.Write(payload)
+		crc := crc32.NewIEEE()
+		crc.Write([]byte(kind))
+		crc.Write(payload)
+		var crcBuf [4]byte
+		binary.BigEndian.PutUint32(crcBuf[:], crc.Sum32())
+		buf.Write(crcBuf[:])
+	}
+	writePNGChunk("IHDR", ihdr[:])
+	writePNGChunk("PLTE", make([]byte, paletteEntries*3))
 	return buf.Bytes()
 }
 
@@ -319,6 +382,22 @@ func TestRenderCover_DecodeResizeAndDeterministicEncode(t *testing.T) {
 			wantW:     120,
 			wantH:     180,
 		},
+		{
+			name:      "png with large unbound height fits without overflow",
+			src:       encodeUniformPNG(t, 100, 300),
+			wantCodec: tobitenimage.CodecPNG,
+			opts:      tobitenimage.RenderOptions{MaxWidth: 40, MaxHeight: math.MaxInt, Quality: 85},
+			wantW:     40,
+			wantH:     120,
+		},
+		{
+			name:      "tall png above JPEG axis limit fits within 65535",
+			src:       encodeUniformPNG(t, 8, 65536),
+			wantCodec: tobitenimage.CodecPNG,
+			opts:      tobitenimage.DefaultCoverOptions(),
+			wantW:     8,
+			wantH:     65535,
+		},
 	}
 
 	for _, tc := range cases {
@@ -359,12 +438,29 @@ func TestRenderCover_DecodeResizeAndDeterministicEncode(t *testing.T) {
 	}
 }
 
+type jpegOnlyStub struct{}
+
+func (jpegOnlyStub) Name() string  { return "jpeg-only" }
+func (jpegOnlyStub) Priority() int { return 100 }
+func (jpegOnlyStub) DecodeFormats() []tobitenimage.Codec {
+	return []tobitenimage.Codec{tobitenimage.CodecJPEG}
+}
+func (jpegOnlyStub) EncodeFormats() []tobitenimage.Codec {
+	return []tobitenimage.Codec{tobitenimage.CodecJPEG}
+}
+func (jpegOnlyStub) RenderCover(context.Context, io.Reader, tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+	return tobitenimage.Result{}, errors.New("jpeg-only stub cannot render placeholders")
+}
+
 func TestRenderCover_JXLAndAVIFReturnPlaceholderWithCodec(t *testing.T) {
 	p, err := purego.New(purego.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg := tobitenimage.NewRegistry()
+	if err := reg.Register(jpegOnlyStub{}); err != nil {
+		t.Fatal(err)
+	}
 	if err := reg.Register(p); err != nil {
 		t.Fatal(err)
 	}
@@ -429,8 +525,11 @@ func TestRenderCover_CorruptAndPixelLimitFailBeforeFullDecode(t *testing.T) {
 	if _, err := purego.New(purego.Options{MaxPixels: -1}); !errors.Is(err, tobitenimage.ErrInvalidOptions) {
 		t.Fatalf("negative MaxPixels error = %v, want ErrInvalidOptions", err)
 	}
+	if _, err := purego.New(purego.Options{MaxPreflightBytes: -1}); !errors.Is(err, tobitenimage.ErrInvalidOptions) {
+		t.Fatalf("negative MaxPreflightBytes error = %v, want ErrInvalidOptions", err)
+	}
 
-	p, err := purego.New(purego.Options{MaxPixels: 10_000})
+	p, err := purego.New(purego.Options{MaxPixels: 10_000, MaxPreflightBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,6 +580,45 @@ func TestRenderCover_CorruptAndPixelLimitFailBeforeFullDecode(t *testing.T) {
 		tight.MaxPixels = 9_999
 		if _, err := p.RenderCover(context.Background(), bytes.NewReader(exact), tight); !errors.Is(err, tobitenimage.ErrPixelLimitExceeded) {
 			t.Fatalf("override limit err = %v, want ErrPixelLimitExceeded", err)
+		}
+	})
+
+	t.Run("preflight buffer bound rejects oversized metadata before reading body", func(t *testing.T) {
+		// JPEG with 1500 bytes of APP0 metadata before SOF0 exceeds 1024-byte preflight limit.
+		jpegData := buildLargeJPEGPreflight(1500, 50, 50)
+		jr := &failPastOffsetReader{header: jpegData}
+		_, err := p.RenderCover(context.Background(), jr, opts)
+		if !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+			t.Fatalf("oversized jpeg metadata err = %v, want ErrPreflightLimitExceeded", err)
+		}
+		if errors.Is(err, tobitenimage.ErrCorrupt) {
+			t.Fatalf("oversized jpeg metadata must not report ErrCorrupt: %v", err)
+		}
+		if jr.pos > 1024 || jr.bodyRead {
+			t.Errorf("expected preflight limit to stop at <=1024 bytes, read %d (bodyRead=%v)", jr.pos, jr.bodyRead)
+		}
+
+		// Paletted PNG whose PLTE pushes DecodeConfig past a 128-byte per-call preflight override.
+		pngData := buildPalettedPNGHeader(50, 50, 128)
+		pr := &failPastOffsetReader{header: pngData}
+		tightPreflight := opts
+		tightPreflight.MaxPreflightBytes = 128
+		_, err = p.RenderCover(context.Background(), pr, tightPreflight)
+		if !errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+			t.Fatalf("oversized png preflight err = %v, want ErrPreflightLimitExceeded", err)
+		}
+		if pr.pos > 128 || pr.bodyRead {
+			t.Errorf("expected png preflight limit to stop at <=128 bytes, read %d (bodyRead=%v)", pr.pos, pr.bodyRead)
+		}
+
+		// A valid image whose total byte length exceeds MaxPreflightBytes still succeeds
+		// when its header/SOF+tables finish within the preflight budget.
+		bigJPEG := encodeTestJPEG(t, 100, 100)
+		if len(bigJPEG) <= 1024 {
+			t.Fatalf("expected encoded 100x100 JPEG > 1024 bytes, got %d", len(bigJPEG))
+		}
+		if _, err := p.RenderCover(context.Background(), bytes.NewReader(bigJPEG), opts); err != nil {
+			t.Fatalf("valid JPEG with compact header failed under 1024-byte preflight budget: %v", err)
 		}
 	})
 

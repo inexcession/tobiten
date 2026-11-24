@@ -8,6 +8,7 @@ package purego
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -34,25 +35,44 @@ type Options struct {
 	// MaxPixels caps source image pixel count (width * height) before full
 	// decode. Zero selects image.DefaultMaxPixels. Negative values are rejected.
 	MaxPixels int64
+
+	// MaxPreflightBytes caps header bytes read and buffered during preflight
+	// config probing before full decode. Zero selects image.DefaultMaxPreflightBytes.
+	// Negative values are rejected.
+	MaxPreflightBytes int64
 }
 
 // Pipeline is the Tier 1 pure-Go implementation of image.ImagePipeline.
 type Pipeline struct {
-	maxPixels int64
+	maxPixels         int64
+	maxPreflightBytes int64
 }
 
-var _ tobitenimage.ImagePipeline = (*Pipeline)(nil)
+var (
+	_ tobitenimage.ImagePipeline       = (*Pipeline)(nil)
+	_ tobitenimage.PlaceholderProvider = (*Pipeline)(nil)
+)
 
 // New constructs a Tier 1 pure-Go ImagePipeline with the given options.
 func New(opts Options) (*Pipeline, error) {
 	if opts.MaxPixels < 0 {
 		return nil, fmt.Errorf("%w: max pixels cannot be negative", tobitenimage.ErrInvalidOptions)
 	}
+	if opts.MaxPreflightBytes < 0 {
+		return nil, fmt.Errorf("%w: max preflight bytes cannot be negative", tobitenimage.ErrInvalidOptions)
+	}
 	maxPixels := opts.MaxPixels
 	if maxPixels == 0 {
 		maxPixels = tobitenimage.DefaultMaxPixels
 	}
-	return &Pipeline{maxPixels: maxPixels}, nil
+	maxPreflightBytes := opts.MaxPreflightBytes
+	if maxPreflightBytes == 0 {
+		maxPreflightBytes = tobitenimage.DefaultMaxPreflightBytes
+	}
+	return &Pipeline{
+		maxPixels:         maxPixels,
+		maxPreflightBytes: maxPreflightBytes,
+	}, nil
 }
 
 // Name implements image.ImagePipeline.
@@ -76,9 +96,22 @@ func (p *Pipeline) EncodeFormats() []tobitenimage.Codec {
 	}
 }
 
+// PlaceholderFormats implements image.PlaceholderProvider.
+func (p *Pipeline) PlaceholderFormats() []tobitenimage.Codec {
+	return []tobitenimage.Codec{
+		tobitenimage.CodecJXL,
+		tobitenimage.CodecAVIF,
+	}
+}
+
 // MaxPixels returns the configured maximum source pixel count.
 func (p *Pipeline) MaxPixels() int64 {
 	return p.maxPixels
+}
+
+// MaxPreflightBytes returns the configured maximum header preflight byte budget.
+func (p *Pipeline) MaxPreflightBytes() int64 {
+	return p.maxPreflightBytes
 }
 
 func (p *Pipeline) effectiveMaxPixels(override int64) int64 {
@@ -86,6 +119,13 @@ func (p *Pipeline) effectiveMaxPixels(override int64) int64 {
 		return override
 	}
 	return p.maxPixels
+}
+
+func (p *Pipeline) effectiveMaxPreflightBytes(override int64) int64 {
+	if override > 0 && override < p.maxPreflightBytes {
+		return override
+	}
+	return p.maxPreflightBytes
 }
 
 // RenderCover implements image.ImagePipeline.
@@ -104,7 +144,8 @@ func (p *Pipeline) RenderCover(ctx context.Context, src io.Reader, opts tobiteni
 		return tobitenimage.Result{}, fmt.Errorf("%w: nil image reader", tobitenimage.ErrCorrupt)
 	}
 
-	codec, replay, err := tobitenimage.SniffReader(src)
+	preflightLimit := p.effectiveMaxPreflightBytes(norm.MaxPreflightBytes)
+	codec, replay, err := tobitenimage.SniffReaderBounded(src, preflightLimit)
 	if err != nil {
 		return tobitenimage.Result{}, err
 	}
@@ -113,7 +154,7 @@ func (p *Pipeline) RenderCover(ctx context.Context, src io.Reader, opts tobiteni
 	case tobitenimage.CodecJXL, tobitenimage.CodecAVIF:
 		return renderPlaceholder(codec, norm)
 	case tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP:
-		return p.renderSupported(ctx, codec, replay, norm)
+		return p.renderSupported(ctx, codec, replay, norm, preflightLimit)
 	case "":
 		return tobitenimage.Result{}, fmt.Errorf("%w: unrecognized image header", tobitenimage.ErrCorrupt)
 	default:
@@ -126,9 +167,10 @@ func (p *Pipeline) renderSupported(
 	codec tobitenimage.Codec,
 	r io.Reader,
 	opts tobitenimage.RenderOptions,
+	preflightLimit int64,
 ) (tobitenimage.Result, error) {
 	maxPixels := p.effectiveMaxPixels(opts.MaxPixels)
-	img, err := decodeBounded(ctx, codec, r, maxPixels)
+	img, err := decodeBounded(ctx, codec, r, maxPixels, preflightLimit)
 	if err != nil {
 		return tobitenimage.Result{}, err
 	}
@@ -138,7 +180,7 @@ func (p *Pipeline) renderSupported(
 	}
 
 	bounds := img.Bounds()
-	dstW, dstH := tobitenimage.FitDimensions(bounds.Dx(), bounds.Dy(), opts.MaxWidth, opts.MaxHeight)
+	dstW, dstH := tobitenimage.FitCodecDimensions(opts.OutputFormat, bounds.Dx(), bounds.Dy(), opts.MaxWidth, opts.MaxHeight)
 	dst := resizeOrFlatten(img, dstW, dstH)
 
 	if err := ctx.Err(); err != nil {
@@ -161,11 +203,45 @@ func (p *Pipeline) renderSupported(
 	}, nil
 }
 
-func decodeBounded(ctx context.Context, codec tobitenimage.Codec, r io.Reader, maxPixels int64) (image.Image, error) {
-	var headerBuf bytes.Buffer
-	probe := io.TeeReader(r, &headerBuf)
+type preflightLimitedReader struct {
+	r         io.Reader
+	buf       bytes.Buffer
+	remaining int64
+	exceeded  bool
+}
 
-	cfg, err := decodeConfig(codec, probe)
+func (pr *preflightLimitedReader) Read(dst []byte) (int, error) {
+	if pr.remaining <= 0 {
+		pr.exceeded = true
+		return 0, tobitenimage.ErrPreflightLimitExceeded
+	}
+	if int64(len(dst)) > pr.remaining {
+		dst = dst[:pr.remaining]
+	}
+	n, err := pr.r.Read(dst)
+	if n > 0 {
+		pr.buf.Write(dst[:n])
+		pr.remaining -= int64(n)
+	}
+	return n, err
+}
+
+func decodeBounded(
+	ctx context.Context,
+	codec tobitenimage.Codec,
+	r io.Reader,
+	maxPixels int64,
+	maxPreflightBytes int64,
+) (image.Image, error) {
+	pr := &preflightLimitedReader{
+		r:         r,
+		remaining: maxPreflightBytes,
+	}
+
+	cfg, err := decodeConfig(codec, pr)
+	if pr.exceeded || errors.Is(err, tobitenimage.ErrPreflightLimitExceeded) {
+		return nil, fmt.Errorf("%w: exceeded %d bytes", tobitenimage.ErrPreflightLimitExceeded, maxPreflightBytes)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", tobitenimage.ErrCorrupt, err)
 	}
@@ -181,7 +257,7 @@ func decodeBounded(ctx context.Context, codec tobitenimage.Codec, r io.Reader, m
 		return nil, err
 	}
 
-	full := io.MultiReader(bytes.NewReader(headerBuf.Bytes()), r)
+	full := io.MultiReader(bytes.NewReader(pr.buf.Bytes()), r)
 	img, err := decodeImage(codec, full)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", tobitenimage.ErrCorrupt, err)
@@ -259,7 +335,7 @@ func encodeJPEG(img image.Image, quality int) ([]byte, error) {
 }
 
 func renderPlaceholder(codec tobitenimage.Codec, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
-	w, h := tobitenimage.FitDimensions(placeholderBaseWidth, placeholderBaseHeight, opts.MaxWidth, opts.MaxHeight)
+	w, h := tobitenimage.FitCodecDimensions(opts.OutputFormat, placeholderBaseWidth, placeholderBaseHeight, opts.MaxWidth, opts.MaxHeight)
 	canvas := drawPlaceholderCard(w, h)
 	data, err := encodeJPEG(canvas, opts.Quality)
 	if err != nil {

@@ -6,23 +6,26 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"testing"
 
 	tobitenimage "github.com/inexcession/tobiten/internal/image"
 )
 
 type stubPipeline struct {
-	name     string
-	priority int
-	decodes  []tobitenimage.Codec
-	encodes  []tobitenimage.Codec
-	renderFn func(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error)
+	name         string
+	priority     int
+	decodes      []tobitenimage.Codec
+	encodes      []tobitenimage.Codec
+	placeholders []tobitenimage.Codec
+	renderFn     func(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error)
 }
 
-func (s *stubPipeline) Name() string                        { return s.name }
-func (s *stubPipeline) Priority() int                       { return s.priority }
-func (s *stubPipeline) DecodeFormats() []tobitenimage.Codec { return s.decodes }
-func (s *stubPipeline) EncodeFormats() []tobitenimage.Codec { return s.encodes }
+func (s *stubPipeline) Name() string                             { return s.name }
+func (s *stubPipeline) Priority() int                            { return s.priority }
+func (s *stubPipeline) DecodeFormats() []tobitenimage.Codec      { return s.decodes }
+func (s *stubPipeline) EncodeFormats() []tobitenimage.Codec      { return s.encodes }
+func (s *stubPipeline) PlaceholderFormats() []tobitenimage.Codec { return s.placeholders }
 func (s *stubPipeline) RenderCover(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
 	if s.renderFn != nil {
 		return s.renderFn(ctx, src, opts)
@@ -62,6 +65,9 @@ func TestRegistry_RegisterValidationAndAdvertisement(t *testing.T) {
 	}
 	if err := reg.Register(&stubPipeline{name: "bad-encode", encodes: []tobitenimage.Codec{" "}}); err == nil {
 		t.Error("expected empty encode codec to be rejected")
+	}
+	if err := reg.Register(&stubPipeline{name: "bad-placeholder", placeholders: []tobitenimage.Codec{""}}); err == nil {
+		t.Error("expected empty placeholder codec to be rejected")
 	}
 
 	p1 := &stubPipeline{
@@ -122,39 +128,67 @@ func TestRegistry_PriorityAndSelection(t *testing.T) {
 		t.Fatalf("empty Select err = %v, want ErrNoPipeline", err)
 	}
 
-	tier1 := plainPipeline{
-		name:    "purego",
-		decodes: []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP},
-		encodes: []tobitenimage.Codec{tobitenimage.CodecJPEG},
+	tier1 := &stubPipeline{
+		name:         "purego",
+		priority:     0,
+		decodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP},
+		encodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		placeholders: []tobitenimage.Codec{tobitenimage.CodecJXL, tobitenimage.CodecAVIF},
 	}
-	tier2 := &stubPipeline{
-		name:     "vips",
+	jpegOnly := &stubPipeline{
+		name:     "jpeg-only",
 		priority: 10,
-		decodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP, tobitenimage.CodecJXL, tobitenimage.CodecAVIF},
-		encodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
-	}
-	tie := &stubPipeline{
-		name:     "purego-alt",
-		priority: 0,
 		decodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
 		encodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
 	}
+	tie := plainPipeline{
+		name:    "purego-alt",
+		decodes: []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		encodes: []tobitenimage.Codec{tobitenimage.CodecJPEG},
+	}
 
-	for _, p := range []tobitenimage.ImagePipeline{tier1, tier2, tie} {
+	for _, p := range []tobitenimage.ImagePipeline{tier1, jpegOnly, tie} {
 		if err := reg.Register(p); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	list := reg.Pipelines()
-	if len(list) != 3 || list[0].Name() != "vips" || list[1].Name() != "purego" || list[2].Name() != "purego-alt" {
-		t.Fatalf("Pipelines() order = [%s, %s, %s], want [vips, purego, purego-alt]",
+	if len(list) != 3 || list[0].Name() != "jpeg-only" || list[1].Name() != "purego" || list[2].Name() != "purego-alt" {
+		t.Fatalf("Pipelines() order = [%s, %s, %s], want [jpeg-only, purego, purego-alt]",
 			list[0].Name(), list[1].Name(), list[2].Name())
 	}
 
-	sel, err := reg.Select(tobitenimage.CodecJXL, tobitenimage.CodecJPEG)
-	if err != nil || sel.Name() != "vips" {
-		t.Fatalf("Select(jxl, jpeg) = (%v, %v), want vips", sel, err)
+	// Higher-priority JPEG-only provider cannot decode or placeholder JXL/AVIF,
+	// so placeholder routing must fall back to the capable purego provider.
+	for _, codec := range []tobitenimage.Codec{tobitenimage.CodecJXL, tobitenimage.CodecAVIF} {
+		sel, err := reg.Select(codec, tobitenimage.CodecJPEG)
+		if err != nil || sel.Name() != "purego" {
+			t.Fatalf("Select(%s, jpeg) without decoder = (%v, %v), want purego", codec, sel, err)
+		}
+	}
+	if sel, err := reg.Select(tobitenimage.CodecJPEG, tobitenimage.CodecJPEG); err != nil || sel.Name() != "jpeg-only" {
+		t.Fatalf("Select(jpeg, jpeg) = (%v, %v), want jpeg-only", sel, err)
+	}
+	if !reg.SupportsPlaceholder(tobitenimage.CodecJXL) || !reg.SupportsPlaceholder(tobitenimage.CodecAVIF) || reg.SupportsPlaceholder(tobitenimage.CodecPNG) {
+		t.Fatalf("unexpected PlaceholderFormats(): %v", reg.PlaceholderFormats())
+	}
+
+	// When a higher-priority compatible decoder is registered, it wins over placeholder fallback.
+	tier2 := &stubPipeline{
+		name:     "vips",
+		priority: 20,
+		decodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP, tobitenimage.CodecJXL, tobitenimage.CodecAVIF},
+		encodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
+	}
+	if err := reg.Register(tier2); err != nil {
+		t.Fatal(err)
+	}
+	for _, codec := range []tobitenimage.Codec{tobitenimage.CodecJXL, tobitenimage.CodecAVIF} {
+		sel, err := reg.Select(codec, tobitenimage.CodecJPEG)
+		if err != nil || sel.Name() != "vips" {
+			t.Fatalf("Select(%s, jpeg) with decoder = (%v, %v), want vips", codec, sel, err)
+		}
 	}
 
 	if _, err := reg.Select(tobitenimage.CodecJPEG, tobitenimage.CodecWebP); !errors.Is(err, tobitenimage.ErrUnsupportedEncodeFormat) {
@@ -169,10 +203,21 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 	reg := tobitenimage.NewRegistry()
 	var seenBytes []byte
 	var seenCodec tobitenimage.Codec
+	jpegOnly := &stubPipeline{
+		name:     "jpeg-only",
+		priority: 10,
+		decodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		encodes:  []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		renderFn: func(_ context.Context, _ io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+			return tobitenimage.Result{}, errors.New("jpeg-only provider should not handle JXL/AVIF placeholders")
+		},
+	}
 	p := &stubPipeline{
-		name:    "purego",
-		decodes: []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP},
-		encodes: []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		name:         "purego",
+		priority:     0,
+		decodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG, tobitenimage.CodecPNG, tobitenimage.CodecWebP},
+		encodes:      []tobitenimage.Codec{tobitenimage.CodecJPEG},
+		placeholders: []tobitenimage.Codec{tobitenimage.CodecJXL, tobitenimage.CodecAVIF},
 		renderFn: func(_ context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
 			b, err := io.ReadAll(src)
 			if err != nil {
@@ -188,12 +233,15 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 			}, nil
 		},
 	}
+	if err := reg.Register(jpegOnly); err != nil {
+		t.Fatal(err)
+	}
 	if err := reg.Register(p); err != nil {
 		t.Fatal(err)
 	}
 
-	// JXL falls back to encode-capable pipeline for placeholder even though
-	// DecodeFormats does not advertise JXL.
+	// JXL and AVIF route past the higher-priority jpeg-only provider to purego
+	// for placeholder generation and preserve the original source codec.
 	jxlInput := append([]byte("\x00\x00\x00\x0cJXL \r\n\x87\n"), []byte("payload")...)
 	res, err := reg.RenderCover(context.Background(), bytes.NewReader(jxlInput), tobitenimage.DefaultCoverOptions())
 	if err != nil {
@@ -204,6 +252,15 @@ func TestRegistry_RenderCoverRouting(t *testing.T) {
 	}
 	if !bytes.Equal(seenBytes, jxlInput) {
 		t.Fatal("SniffReader replay modified input bytes")
+	}
+
+	avifInput := []byte("\x00\x00\x00\x10ftypavif\x00\x00\x00\x00")
+	res, err = reg.RenderCover(context.Background(), bytes.NewReader(avifInput), tobitenimage.DefaultCoverOptions())
+	if err != nil {
+		t.Fatalf("RenderCover(avif) err = %v", err)
+	}
+	if !res.Placeholder || res.SourceCodec != tobitenimage.CodecAVIF || seenCodec != tobitenimage.CodecAVIF {
+		t.Fatalf("unexpected avif result: %+v (seenCodec=%q)", res, seenCodec)
 	}
 
 	// Corrupt/unrecognized bytes fail with ErrCorrupt before invoking pipeline.
@@ -276,12 +333,32 @@ func TestFitDimensionsAndPixelLimit(t *testing.T) {
 		{800, 1600, 400, 400, 200, 400},
 		{300, 450, 400, 600, 300, 450}, // no upscale
 		{1000, 500, 0, 250, 500, 250},
-		{10000, 1, 100, 100, 100, 1}, // floor >= 1
+		{10000, 1, 100, 100, 100, 1},          // floor >= 1
+		{100, 300, 40, math.MaxInt, 40, 120},  // large unbound axis must not overflow
+		{100, 300, math.MaxInt, 120, 40, 120}, // large width bound must not overflow
+		{100, 300, math.MaxInt, math.MaxInt, 100, 300},
+		{math.MaxInt, 1, 100, math.MaxInt, 100, 1},
 	}
 	for _, tc := range fitCases {
 		gotW, gotH := tobitenimage.FitDimensions(tc.srcW, tc.srcH, tc.maxW, tc.maxH)
 		if gotW != tc.wantW || gotH != tc.wantH {
 			t.Errorf("FitDimensions(%d,%d,%d,%d) = (%d,%d), want (%d,%d)",
+				tc.srcW, tc.srcH, tc.maxW, tc.maxH, gotW, gotH, tc.wantW, tc.wantH)
+		}
+	}
+
+	jpegFitCases := []struct {
+		srcW, srcH, maxW, maxH int
+		wantW, wantH           int
+	}{
+		{8, 65536, 400, 0, 8, 65535},
+		{65536, 8, 0, 400, 65535, 8},
+		{100, 300, 40, math.MaxInt, 40, 120},
+	}
+	for _, tc := range jpegFitCases {
+		gotW, gotH := tobitenimage.FitCodecDimensions(tobitenimage.CodecJPEG, tc.srcW, tc.srcH, tc.maxW, tc.maxH)
+		if gotW != tc.wantW || gotH != tc.wantH {
+			t.Errorf("FitCodecDimensions(jpeg, %d,%d,%d,%d) = (%d,%d), want (%d,%d)",
 				tc.srcW, tc.srcH, tc.maxW, tc.maxH, gotW, gotH, tc.wantW, tc.wantH)
 		}
 	}

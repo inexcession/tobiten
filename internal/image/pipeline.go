@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"strings"
@@ -32,9 +33,13 @@ const (
 
 // Default rendition and safety limits.
 const (
-	DefaultCoverMaxWidth = 400
-	DefaultJPEGQuality   = 85
-	DefaultMaxPixels     = int64(100_000_000)
+	DefaultCoverMaxWidth     = 400
+	DefaultJPEGQuality       = 85
+	DefaultMaxPixels         = int64(100_000_000)
+	DefaultMaxPreflightBytes = int64(1 << 20)
+
+	// MaxJPEGDimension is the maximum width or height representable in a JPEG SOF marker.
+	MaxJPEGDimension = 65535
 
 	initialSniffBytes = 12
 	maxSniffBytes     = 512
@@ -56,6 +61,8 @@ var (
 	ErrCorrupt = errors.New("image: corrupt image")
 	// ErrPixelLimitExceeded means the source dimensions exceed the configured pixel limit.
 	ErrPixelLimitExceeded = errors.New("image: pixel limit exceeded")
+	// ErrPreflightLimitExceeded means header sniffing/config probing exceeded the preflight byte budget.
+	ErrPreflightLimitExceeded = errors.New("image: preflight header limit exceeded")
 )
 
 // NormalizeCodec canonicalizes codec names, common aliases, and MIME types.
@@ -131,6 +138,10 @@ type RenderOptions struct {
 	// and stricter than the pipeline's configured limit.
 	MaxPixels int64
 
+	// MaxPreflightBytes caps header bytes read and buffered during preflight
+	// config probing when positive and stricter than the pipeline's limit.
+	MaxPreflightBytes int64
+
 	// SourceCodec is an optional caller hint (for example from an entry extension).
 	// Content sniffing takes precedence when magic bytes identify the input format.
 	SourceCodec Codec
@@ -155,6 +166,9 @@ func (o RenderOptions) Validate() (RenderOptions, error) {
 	}
 	if o.MaxPixels < 0 {
 		return RenderOptions{}, fmt.Errorf("%w: max pixels cannot be negative", ErrInvalidOptions)
+	}
+	if o.MaxPreflightBytes < 0 {
+		return RenderOptions{}, fmt.Errorf("%w: max preflight bytes cannot be negative", ErrInvalidOptions)
 	}
 
 	out := o
@@ -207,6 +221,14 @@ type PrioritizedPipeline interface {
 	Priority() int
 }
 
+// PlaceholderProvider is an optional interface implemented by an ImagePipeline
+// to advertise source codecs for which it can render a fallback placeholder
+// when no registered pipeline can decode them (ADR-0004 §1, ADR-0018 S8).
+type PlaceholderProvider interface {
+	ImagePipeline
+	PlaceholderFormats() []Codec
+}
+
 // Registry manages registered ImagePipeline implementations, advertises their
 // aggregate decode and encode codecs, and routes cover rendering requests.
 type Registry struct {
@@ -250,6 +272,11 @@ func (r *Registry) Register(p ImagePipeline) error {
 	}
 	if err := validatePipelineFormats(p.Name(), p.EncodeFormats(), "encode"); err != nil {
 		return err
+	}
+	if pp, ok := p.(PlaceholderProvider); ok {
+		if err := validatePipelineFormats(p.Name(), pp.PlaceholderFormats(), "placeholder"); err != nil {
+			return err
+		}
 	}
 
 	r.mu.Lock()
@@ -306,6 +333,17 @@ func (r *Registry) EncodeFormats() []Codec {
 	return r.collectFormats(func(p ImagePipeline) []Codec { return p.EncodeFormats() })
 }
 
+// PlaceholderFormats returns the deduplicated list of source codecs for which
+// registered pipelines advertise placeholder fallback support.
+func (r *Registry) PlaceholderFormats() []Codec {
+	return r.collectFormats(func(p ImagePipeline) []Codec {
+		if pp, ok := p.(PlaceholderProvider); ok {
+			return pp.PlaceholderFormats()
+		}
+		return nil
+	})
+}
+
 func (r *Registry) collectFormats(get func(ImagePipeline) []Codec) []Codec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -345,6 +383,16 @@ func (r *Registry) SupportsEncode(codec Codec) bool {
 	return slices.Contains(r.EncodeFormats(), target)
 }
 
+// SupportsPlaceholder reports whether at least one registered pipeline
+// advertises placeholder fallback support for codec.
+func (r *Registry) SupportsPlaceholder(codec Codec) bool {
+	target := NormalizeCodec(string(codec))
+	if target == "" {
+		return false
+	}
+	return slices.Contains(r.PlaceholderFormats(), target)
+}
+
 func pipelineSupports(codecs []Codec, target Codec) bool {
 	for _, c := range codecs {
 		if NormalizeCodec(string(c)) == target {
@@ -355,8 +403,7 @@ func pipelineSupports(codecs []Codec, target Codec) bool {
 }
 
 // Select chooses the highest-priority registered pipeline that can encode
-// dstCodec and handle srcCodec (or generate a Tier 1 placeholder for JXL/AVIF
-// when no pipeline decodes them).
+// dstCodec and either decode srcCodec or provide a placeholder for srcCodec.
 func (r *Registry) Select(srcCodec, dstCodec Codec) (ImagePipeline, error) {
 	pipelines := r.Pipelines()
 	if len(pipelines) == 0 {
@@ -389,8 +436,10 @@ func (r *Registry) Select(srcCodec, dstCodec Codec) (ImagePipeline, error) {
 		}
 	}
 
-	if src == CodecJXL || src == CodecAVIF {
-		return encodeCapable[0], nil
+	for _, p := range encodeCapable {
+		if pp, ok := p.(PlaceholderProvider); ok && pipelineSupports(pp.PlaceholderFormats(), src) {
+			return p, nil
+		}
 	}
 
 	return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, src)
@@ -414,7 +463,7 @@ func (r *Registry) RenderCover(ctx context.Context, src io.Reader, opts RenderOp
 		return Result{}, err
 	}
 
-	codec, replay, err := SniffReader(src)
+	codec, replay, err := SniffReaderBounded(src, norm.MaxPreflightBytes)
 	if err != nil {
 		return Result{}, err
 	}
@@ -511,10 +560,24 @@ func readUpTo(r io.Reader, limit int) ([]byte, bool, error) {
 // SniffReader reads the minimum leading bytes needed to detect the image
 // codec and returns a replay io.Reader covering the full stream from byte 0.
 func SniffReader(r io.Reader) (Codec, io.Reader, error) {
+	return SniffReaderBounded(r, 0)
+}
+
+// SniffReaderBounded behaves like SniffReader while enforcing maxBytes (when
+// positive) as an upper bound on header bytes read during sniffing.
+func SniffReaderBounded(r io.Reader, maxBytes int64) (Codec, io.Reader, error) {
 	if r == nil {
 		return "", nil, fmt.Errorf("%w: nil image reader", ErrCorrupt)
 	}
-	buf, eof, err := readUpTo(r, initialSniffBytes)
+	if maxBytes < 0 {
+		return "", nil, fmt.Errorf("%w: max preflight bytes cannot be negative", ErrInvalidOptions)
+	}
+
+	initLimit := initialSniffBytes
+	if maxBytes > 0 && maxBytes < int64(initLimit) {
+		initLimit = int(maxBytes)
+	}
+	buf, eof, err := readUpTo(r, initLimit)
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: read header: %v", ErrCorrupt, err)
 	}
@@ -523,11 +586,16 @@ func SniffReader(r io.Reader) (Codec, io.Reader, error) {
 	}
 
 	// For ISOBMFF containers whose major brand is generic (e.g. mif1), inspect
-	// the rest of the ftyp box up to maxSniffBytes to check compatible brands.
+	// the rest of the ftyp box up to maxSniffBytes (and maxBytes) for compatible brands.
 	if !eof && isISOBMFFFtyp(buf) && !isAVIFBrand(buf[8:12]) && !bytes.HasPrefix(buf, []byte("\x00\x00\x00\x0cJXL \r\n\x87\n")) {
 		target := maxSniffBytes
 		if boxSize := int(binary.BigEndian.Uint32(buf[0:4])); boxSize > len(buf) && boxSize < target {
 			target = boxSize
+		}
+		budgetExceeded := false
+		if maxBytes > 0 && int64(target) > maxBytes {
+			target = int(maxBytes)
+			budgetExceeded = true
 		}
 		if target > len(buf) {
 			extra, extraEOF, extraErr := readUpTo(r, target-len(buf))
@@ -537,13 +605,37 @@ func SniffReader(r io.Reader) (Codec, io.Reader, error) {
 			buf = append(buf, extra...)
 			eof = extraEOF
 		}
+		if budgetExceeded && !eof && SniffHeader(buf) == Codec("heif") {
+			return "", nil, fmt.Errorf("%w: container header exceeds %d bytes", ErrPreflightLimitExceeded, maxBytes)
+		}
 	}
 
 	codec := SniffHeader(buf)
+	if maxBytes > 0 && int64(len(buf)) >= maxBytes && !eof && codec == "" {
+		return "", nil, fmt.Errorf("%w: header exceeds %d bytes", ErrPreflightLimitExceeded, maxBytes)
+	}
 	if eof {
 		return codec, bytes.NewReader(buf), nil
 	}
 	return codec, io.MultiReader(bytes.NewReader(buf), r), nil
+}
+
+func cmpMul64(a, b, c, d uint64) int {
+	hi1, lo1 := bits.Mul64(a, b)
+	hi2, lo2 := bits.Mul64(c, d)
+	if hi1 != hi2 {
+		if hi1 < hi2 {
+			return -1
+		}
+		return 1
+	}
+	if lo1 != lo2 {
+		if lo1 < lo2 {
+			return -1
+		}
+		return 1
+	}
+	return 0
 }
 
 // FitDimensions computes aspect-preserving target dimensions bounded by maxW
@@ -555,26 +647,42 @@ func FitDimensions(srcW, srcH, maxW, maxH int) (int, int) {
 	if maxW <= 0 && maxH <= 0 {
 		return srcW, srcH
 	}
-	if (maxW == 0 || srcW <= maxW) && (maxH == 0 || srcH <= maxH) {
+	if (maxW <= 0 || srcW <= maxW) && (maxH <= 0 || srcH <= maxH) {
 		return srcW, srcH
 	}
 
-	switch {
-	case maxW > 0 && maxH <= 0:
-		dstH := int(math.Round(float64(srcH) * float64(maxW) / float64(srcW)))
-		return maxW, max(1, dstH)
-	case maxH > 0 && maxW <= 0:
-		dstW := int(math.Round(float64(srcW) * float64(maxH) / float64(srcH)))
-		return max(1, dstW), maxH
-	default:
-		// Both maxW > 0 and maxH > 0: pick the constraining axis without float division precision bugs.
-		if int64(srcW)*int64(maxH) >= int64(srcH)*int64(maxW) {
-			dstH := int(math.Round(float64(srcH) * float64(maxW) / float64(srcW)))
-			return maxW, max(1, min(maxH, dstH))
-		}
-		dstW := int(math.Round(float64(srcW) * float64(maxH) / float64(srcH)))
-		return max(1, min(maxW, dstW)), maxH
+	effW := srcW
+	if maxW > 0 && maxW < effW {
+		effW = maxW
 	}
+	effH := srcH
+	if maxH > 0 && maxH < effH {
+		effH = maxH
+	}
+
+	// Compare effW/srcW vs effH/srcH via 128-bit unsigned products to avoid
+	// signed integer overflow on large bounds.
+	if cmpMul64(uint64(effW), uint64(srcH), uint64(effH), uint64(srcW)) <= 0 {
+		dstH := int(math.Round(float64(srcH) * (float64(effW) / float64(srcW))))
+		return effW, max(1, min(effH, dstH))
+	}
+	dstW := int(math.Round(float64(srcW) * (float64(effH) / float64(srcH))))
+	return max(1, min(effW, dstW)), effH
+}
+
+// FitCodecDimensions computes aspect-preserving target dimensions bounded by
+// both the requested limits and any format-specific encoder axis limits
+// (such as JPEG's 65,535-pixel per-axis maximum).
+func FitCodecDimensions(codec Codec, srcW, srcH, maxW, maxH int) (int, int) {
+	if NormalizeCodec(string(codec)) == CodecJPEG {
+		if maxW <= 0 || maxW > MaxJPEGDimension {
+			maxW = MaxJPEGDimension
+		}
+		if maxH <= 0 || maxH > MaxJPEGDimension {
+			maxH = MaxJPEGDimension
+		}
+	}
+	return FitDimensions(srcW, srcH, maxW, maxH)
 }
 
 // ExceedsPixelLimit reports whether width * height exceeds maxPixels without
