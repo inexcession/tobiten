@@ -15,6 +15,7 @@ import (
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/container"
 	"github.com/inexcession/tobiten/internal/domain"
+	tobitenimage "github.com/inexcession/tobiten/internal/image"
 )
 
 // Migration ranges for core and modules (ADR-0018 §2).
@@ -210,6 +211,12 @@ type ContainerFormatProvider interface {
 	ContainerFormats() []container.Format
 }
 
+// ImagePipelineProvider indicates a module provides image processing pipelines
+// advertising decode and encode codecs (ADR-0004, ADR-0018 S8).
+type ImagePipelineProvider interface {
+	ImagePipelines() []tobitenimage.ImagePipeline
+}
+
 // Registry manages compiled-in modules, their lifecycle, route mounts, and extension seams.
 type Registry interface {
 	// Register registers a compiled-in module. Returns ErrDuplicateModule if already registered.
@@ -247,6 +254,9 @@ type Registry interface {
 
 	// ContainerFormats returns all container formats from enabled modules.
 	ContainerFormats() []container.Format
+
+	// ImagePipelines returns all image pipelines from enabled modules.
+	ImagePipelines() []tobitenimage.ImagePipeline
 
 	// MigrationSources returns migration filesystems from ALL registered modules
 	// (both enabled and disabled), ensuring applied migrations are never missing (ADR-0018 §2).
@@ -458,6 +468,22 @@ func (r *registryImpl) ContainerFormats() []container.Format {
 	return formats
 }
 
+func (r *registryImpl) ImagePipelines() []tobitenimage.ImagePipeline {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var pipelines []tobitenimage.ImagePipeline
+	for _, m := range r.modules {
+		if r.disabled[canonicalName(m.Name())] {
+			continue
+		}
+		if provider, ok := m.(ImagePipelineProvider); ok {
+			pipelines = append(pipelines, provider.ImagePipelines()...)
+		}
+	}
+	return pipelines
+}
+
 // MigrationSources returns migration filesystems from ALL registered modules
 // (both enabled and disabled). Disabling a module must not remove its migrations
 // from the sequence (ADR-0018 §2).
@@ -583,6 +609,7 @@ type SimpleModule struct {
 	Jobs        []JobKind
 	Subscribers []EventSubscriber
 	Formats     []container.Format
+	Pipelines   []tobitenimage.ImagePipeline
 }
 
 // NewSimpleModule creates a new SimpleModule.
@@ -622,6 +649,10 @@ func (s *SimpleModule) EventSubscribers() []EventSubscriber {
 
 func (s *SimpleModule) ContainerFormats() []container.Format {
 	return s.Formats
+}
+
+func (s *SimpleModule) ImagePipelines() []tobitenimage.ImagePipeline {
+	return s.Pipelines
 }
 
 // NamedAuthenticator is a simple string-backed Authenticator descriptor.

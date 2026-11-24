@@ -8,8 +8,9 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/crypto v0.53.0
-	golang.org/x/sys v0.46.0
-	golang.org/x/text v0.41.0
+	golang.org/x/image v0.48.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/text v0.44.0
 )
 
 require (
@@ -17,5 +18,5 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
-	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
 )

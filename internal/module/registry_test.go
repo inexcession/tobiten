@@ -12,6 +12,8 @@ import (
 	"github.com/inexcession/tobiten/internal/container"
 	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
+	tobitenimage "github.com/inexcession/tobiten/internal/image"
+	"github.com/inexcession/tobiten/internal/image/purego"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
 	"github.com/inexcession/tobiten/internal/testdb"
 )
@@ -436,5 +438,49 @@ func TestRegistry_ContainerFormats(t *testing.T) {
 	reg.SetEnabled("cbz", false)
 	if got := reg.ContainerFormats(); len(got) != 0 {
 		t.Fatalf("disabled module still provides %d formats", len(got))
+	}
+}
+
+func TestRegistry_ImagePipelines(t *testing.T) {
+	reg := NewRegistry()
+	if got := reg.ImagePipelines(); len(got) != 0 {
+		t.Fatalf("empty registry ImagePipelines() = %d pipelines, want 0", len(got))
+	}
+
+	p, err := purego.New(purego.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&SimpleModule{ModuleName: "plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&SimpleModule{
+		ModuleName: "image-purego",
+		Pipelines:  []tobitenimage.ImagePipeline{p},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pipelines := reg.ImagePipelines()
+	if len(pipelines) != 1 || pipelines[0].Name() != purego.PipelineName {
+		t.Fatalf("ImagePipelines() = %+v, want only %q", pipelines, purego.PipelineName)
+	}
+
+	imgReg := tobitenimage.NewRegistry()
+	for _, pl := range pipelines {
+		if err := imgReg.Register(pl); err != nil {
+			t.Fatalf("Register(%q): %v", pl.Name(), err)
+		}
+	}
+	if !imgReg.SupportsDecode(tobitenimage.CodecJPEG) || !imgReg.SupportsDecode(tobitenimage.CodecPNG) || !imgReg.SupportsDecode(tobitenimage.CodecWebP) {
+		t.Fatalf("unexpected DecodeFormats(): %v", imgReg.DecodeFormats())
+	}
+	if !imgReg.SupportsEncode(tobitenimage.CodecJPEG) {
+		t.Fatalf("unexpected EncodeFormats(): %v", imgReg.EncodeFormats())
+	}
+
+	reg.SetEnabled("image-purego", false)
+	if got := reg.ImagePipelines(); len(got) != 0 {
+		t.Fatalf("disabled module still provides %d pipelines", len(got))
 	}
 }
