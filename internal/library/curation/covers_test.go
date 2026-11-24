@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +22,8 @@ import (
 	"time"
 
 	"github.com/inexcession/tobiten/internal/app"
+	"github.com/inexcession/tobiten/internal/container"
+	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
 	tobitenimage "github.com/inexcession/tobiten/internal/image"
 	"github.com/inexcession/tobiten/internal/image/purego"
@@ -56,7 +59,7 @@ func makeSolidPNG(t *testing.T, w, h int, c color.RGBA) []byte {
 	return buf.Bytes()
 }
 
-func buildCBZ(t *testing.T, entries ...cbzEntry) []byte {
+func buildCBZWithComment(t *testing.T, comment string, entries ...cbzEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -69,10 +72,36 @@ func buildCBZ(t *testing.T, entries ...cbzEntry) []byte {
 			t.Fatalf("zip write %q: %v", e.name, err)
 		}
 	}
+	if comment != "" {
+		if err := zw.SetComment(comment); err != nil {
+			t.Fatalf("zip set comment: %v", err)
+		}
+	}
 	if err := zw.Close(); err != nil {
 		t.Fatalf("zip close: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func buildCBZ(t *testing.T, entries ...cbzEntry) []byte {
+	t.Helper()
+	return buildCBZWithComment(t, "", entries...)
+}
+
+func buildSameSizeCBZPair(t *testing.T, entriesA, entriesB []cbzEntry) ([]byte, []byte) {
+	t.Helper()
+	rawA := buildCBZ(t, entriesA...)
+	rawB := buildCBZ(t, entriesB...)
+	switch {
+	case len(rawA) < len(rawB):
+		rawA = buildCBZWithComment(t, strings.Repeat(" ", len(rawB)-len(rawA)), entriesA...)
+	case len(rawB) < len(rawA):
+		rawB = buildCBZWithComment(t, strings.Repeat(" ", len(rawA)-len(rawB)), entriesB...)
+	}
+	if len(rawA) != len(rawB) {
+		t.Fatalf("expected equal CBZ lengths, got %d vs %d", len(rawA), len(rawB))
+	}
+	return rawA, rawB
 }
 
 func writeCBZ(t *testing.T, pathBytes []byte, entries ...cbzEntry) {
@@ -241,19 +270,31 @@ func listRootAssets(t *testing.T, tx storage.Transactor, rootID string) []domain
 	return assets
 }
 
-func newTestCoverService(t *testing.T, tx storage.Transactor, reg *tobitenimage.Registry, waitTimeout time.Duration) (*curation.CoverService, *tobitenimage.CoverCache) {
+func newTestCoverService(
+	t *testing.T,
+	tx storage.Transactor,
+	reg *tobitenimage.Registry,
+	waitTimeout time.Duration,
+	configure ...func(*curation.CoverServiceOptions),
+) (*curation.CoverService, *tobitenimage.CoverCache) {
 	t.Helper()
 	cache, err := tobitenimage.NewCoverCache(filepath.Join(t.TempDir(), "covers"))
 	if err != nil {
 		t.Fatalf("NewCoverCache: %v", err)
 	}
-	svc, err := curation.NewCoverService(curation.CoverServiceOptions{
+	opts := curation.CoverServiceOptions{
 		Tx:          tx,
 		Cache:       cache,
 		Pipelines:   reg,
 		Workers:     2,
 		WaitTimeout: waitTimeout,
-	})
+	}
+	for _, fn := range configure {
+		if fn != nil {
+			fn(&opts)
+		}
+	}
+	svc, err := curation.NewCoverService(opts)
 	if err != nil {
 		t.Fatalf("NewCoverService: %v", err)
 	}
@@ -687,16 +728,25 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	origPath := filepath.Join(rootDir, "dir1", "vol1.cbz")
 	movedPath := filepath.Join(rootDir, "dir2", "renamed_vol1.cbz")
 	coldPath := filepath.Join(rootDir, "dir1", "cold.cbz")
+	revertedPath := filepath.Join(rootDir, "dir1", "reverted.cbz")
 	red := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 30, B: 30, A: 255})
 	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
 	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 30, B: 220, A: 255})
 
 	coldRedCBZ := buildCBZ(t, cbzEntry{name: "001.png", data: red}, cbzEntry{name: "002.png", data: blue})
 	coldGreenCBZ := buildCBZ(t, cbzEntry{name: "001.png", data: green}, cbzEntry{name: "002.png", data: red})
+	rev1CBZ, rev2CBZ := buildSameSizeCBZPair(
+		t,
+		[]cbzEntry{{name: "001.png", data: red}, {name: "002.png", data: green}},
+		[]cbzEntry{{name: "001.png", data: green}, {name: "002.png", data: blue}},
+	)
 
 	writeCBZ(t, []byte(origPath), cbzEntry{name: "001.png", data: red})
 	if err := os.WriteFile(coldPath, coldRedCBZ, 0o644); err != nil {
 		t.Fatalf("write cold cbz: %v", err)
+	}
+	if err := os.WriteFile(revertedPath, rev1CBZ, 0o644); err != nil {
+		t.Fatalf("write reverted cbz: %v", err)
 	}
 
 	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
@@ -709,15 +759,16 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	}
 
 	assets := listRootAssets(t, tx, root.ID)
-	if len(assets) != 2 {
-		t.Fatalf("initial assets = %d, want 2", len(assets))
+	if len(assets) != 3 {
+		t.Fatalf("initial assets = %d, want 3", len(assets))
 	}
-	byRel := map[string]domain.MediaAsset{
-		assets[0].RelPathDisplay: assets[0],
-		assets[1].RelPathDisplay: assets[1],
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
 	}
 	vol1 := byRel["dir1/vol1.cbz"]
 	cold := byRel["dir1/cold.cbz"]
+	reverted := byRel["dir1/reverted.cbz"]
 	digest1, ok := vol1.CurrentDigest(domain.DigestKindXXH364Partial)
 	if !ok {
 		t.Fatal("missing initial XXH3_64_PARTIAL digest for vol1")
@@ -727,9 +778,46 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatal("missing initial XXH3_64_PARTIAL digest for cold")
 	}
 	oldColdKey := tobitenimage.ArchiveCoverKey(coldDigest1.Value, 0, tobitenimage.DefaultCoverOptions())
+	revDigest1, ok := reverted.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok {
+		t.Fatal("missing initial XXH3_64_PARTIAL digest for reverted")
+	}
+	revDigest2, err := scanner.PartialFingerprint(bytes.NewReader(rev2CBZ), int64(len(rev2CBZ)))
+	if err != nil || revDigest2 == revDigest1.Value {
+		t.Fatalf("expected distinct same-size rev2 digest (err=%v, d1=%s, d2=%s)", err, revDigest1.Value, revDigest2)
+	}
+	oldRevertedKey := tobitenimage.ArchiveCoverKey(revDigest1.Value, 0, tobitenimage.DefaultCoverOptions())
+
+	var beforeOpenMu sync.Mutex
+	var beforeOpenFn func() error
+	setBeforeOpen := func(fn func() error) {
+		beforeOpenMu.Lock()
+		beforeOpenFn = fn
+		beforeOpenMu.Unlock()
+	}
+
+	baseCBZ := cbz.Format()
+	wrappedCBZ := baseCBZ
+	wrappedCBZ.Open = func(ra io.ReaderAt, size int64) (container.ContainerReader, error) {
+		beforeOpenMu.Lock()
+		fn := beforeOpenFn
+		beforeOpenMu.Unlock()
+		if fn != nil {
+			if hookErr := fn(); hookErr != nil {
+				return nil, hookErr
+			}
+		}
+		return baseCBZ.Open(ra, size)
+	}
+	formats := container.NewFormatRegistry()
+	if err := formats.Register(wrappedCBZ); err != nil {
+		t.Fatalf("register wrapped cbz format: %v", err)
+	}
 
 	spy, reg := newSpyImagePipeline(t, nil)
-	svc, cache := newTestCoverService(t, tx, reg, 5*time.Second)
+	svc, cache := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+		o.Formats = formats
+	})
 
 	entry1, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
 	if err != nil {
@@ -916,6 +1004,37 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	}
 	if _, err := cache.Stat(t.Context(), oldColdKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
 		t.Fatalf("old key Stat after post-scan regeneration = %v, want ErrCacheMiss", err)
+	}
+
+	// Same-size edit written before archive parsing and reverted back to the original
+	// bytes (with changed mtime) before publication must be rejected and leave the old key empty.
+	revMtime2 := future2.Add(2 * time.Second)
+	revMtime3 := revMtime2.Add(2 * time.Second)
+	setBeforeOpen(func() error {
+		if err := os.WriteFile(revertedPath, rev2CBZ, 0o644); err != nil {
+			return err
+		}
+		return os.Chtimes(revertedPath, revMtime2, revMtime2)
+	})
+	spy.setAfterRender(func(context.Context) error {
+		if err := os.WriteFile(revertedPath, rev1CBZ, 0o644); err != nil {
+			return err
+		}
+		return os.Chtimes(revertedPath, revMtime3, revMtime3)
+	})
+	defer setBeforeOpen(nil)
+	defer spy.setAfterRender(nil)
+
+	if _, err := svc.GetOrGenerateAssetCover(t.Context(), reverted.ID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("reverted same-size edit err = %v, want ErrCoverUnavailable", err)
+	} else {
+		var unavailErr *curation.CoverUnavailableError
+		if !errors.As(err, &unavailErr) || unavailErr.Reason != "source_changed" {
+			t.Fatalf("reverted same-size edit unavailErr = %+v, want Reason=source_changed", unavailErr)
+		}
+	}
+	if _, err := cache.Stat(t.Context(), oldRevertedKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Fatalf("old key Stat after reverted same-size edit = %v, want ErrCacheMiss", err)
 	}
 }
 

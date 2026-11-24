@@ -85,7 +85,7 @@ func (e *CoverWaitTimeoutError) IsTimeout() bool {
 
 // CoverUnavailableError reports that an asset or its cover source is
 // unavailable (missing, retired, OFFLINE root, absent file, digest mismatch,
-// or no displayable page).
+// concurrent source modification, or no displayable page).
 type CoverUnavailableError struct {
 	AssetID string
 	Reason  string
@@ -745,13 +745,16 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		_ = f.Close()
 	}()
 
-	size, err := verifyOpenedArchiveFingerprint(genCtx, f, spec)
+	obs0, err := verifyOpenedArchive(genCtx, f, spec, nil)
 	if err != nil {
 		return image.CoverEntry{}, err
 	}
 
-	cr, err := s.formats.Open(f, size)
+	cr, err := s.formats.Open(f, obs0.size)
 	if err != nil {
+		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+			return image.CoverEntry{}, chErr
+		}
 		return image.CoverEntry{}, fmt.Errorf("curation: open archive %s: %w", spec.assetID, err)
 	}
 	defer func() {
@@ -760,12 +763,18 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 
 	pages := cr.Pages()
 	if spec.pageIdx < 0 || spec.pageIdx >= len(pages) || spec.suppressedSet[spec.pageIdx] {
+		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+			return image.CoverEntry{}, chErr
+		}
 		return image.CoverEntry{}, &CoverUnavailableError{AssetID: spec.assetID, Reason: "no_displayable_page"}
 	}
 
 	pageEntry := pages[spec.pageIdx]
 	rc, err := cr.Open(pageEntry.Index)
 	if err != nil {
+		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+			return image.CoverEntry{}, chErr
+		}
 		return image.CoverEntry{}, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err)
 	}
 	defer func() {
@@ -779,10 +788,15 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 
 	rendered, err := s.pipelines.RenderCover(genCtx, rc, renderOpts)
 	if err != nil {
+		if genCtx.Err() == nil {
+			if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+				return image.CoverEntry{}, chErr
+			}
+		}
 		return image.CoverEntry{}, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err)
 	}
 
-	if _, err := verifyOpenedArchiveFingerprint(genCtx, f, spec); err != nil {
+	if _, err := verifyOpenedArchive(genCtx, f, spec, &obs0); err != nil {
 		return image.CoverEntry{}, err
 	}
 
@@ -793,32 +807,94 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 	return entry, nil
 }
 
-func verifyOpenedArchiveFingerprint(ctx context.Context, f ReadAtCloser, spec archiveCoverSpec) (int64, error) {
-	size := spec.fileSize
-	if statable, ok := f.(statReadAtCloser); ok {
-		info, err := statable.Stat()
-		if err != nil {
-			return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
+type archiveObservation struct {
+	hasStat bool
+	size    int64
+	modTime time.Time
+}
+
+func observeOpenedArchive(f ReadAtCloser, spec archiveCoverSpec) (archiveObservation, error) {
+	statable, ok := f.(statReadAtCloser)
+	if !ok {
+		return archiveObservation{size: spec.fileSize}, nil
+	}
+	info, err := statable.Stat()
+	if err != nil {
+		return archiveObservation{}, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
+	}
+	if !info.Mode().IsRegular() {
+		return archiveObservation{}, &CoverUnavailableError{AssetID: spec.assetID, Reason: "non_regular_file"}
+	}
+	return archiveObservation{
+		hasStat: true,
+		size:    info.Size(),
+		modTime: info.ModTime(),
+	}, nil
+}
+
+func checkObservationUnchanged(assetID string, before, after archiveObservation) error {
+	if !before.hasStat || !after.hasStat {
+		return nil
+	}
+	if after.size != before.size || !after.modTime.Equal(before.modTime) {
+		return &CoverUnavailableError{
+			AssetID: assetID,
+			Reason:  "source_changed",
+			Err: fmt.Errorf("opened archive changed during cover generation (size %d->%d, mtime %s->%s)",
+				before.size, after.size, before.modTime.UTC().Format(time.RFC3339Nano), after.modTime.UTC().Format(time.RFC3339Nano)),
 		}
-		if !info.Mode().IsRegular() {
-			return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "non_regular_file"}
-		}
-		size = info.Size()
+	}
+	return nil
+}
+
+func checkOpenedArchiveUnchanged(f ReadAtCloser, spec archiveCoverSpec, baseline archiveObservation) error {
+	cur, err := observeOpenedArchive(f, spec)
+	if err != nil {
+		return err
+	}
+	return checkObservationUnchanged(spec.assetID, baseline, cur)
+}
+
+func verifyOpenedArchive(
+	ctx context.Context,
+	f ReadAtCloser,
+	spec archiveCoverSpec,
+	baseline *archiveObservation,
+) (archiveObservation, error) {
+	obs, err := observeOpenedArchive(f, spec)
+	if err != nil {
+		return archiveObservation{}, err
 	}
 
-	digest, err := scanner.PartialFingerprint(f, size)
+	digest, err := scanner.PartialFingerprint(f, obs.size)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, ctxErr
+			return archiveObservation{}, ctxErr
 		}
-		return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
+		return archiveObservation{}, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
 	}
 	if digest != spec.key.Digest {
-		return 0, &CoverUnavailableError{
+		return archiveObservation{}, &CoverUnavailableError{
 			AssetID: spec.assetID,
 			Reason:  "digest_mismatch",
 			Err:     fmt.Errorf("archive fingerprint %s differs from expected %s", digest, spec.key.Digest),
 		}
 	}
-	return size, nil
+
+	expected := obs
+	if baseline != nil {
+		if err := checkObservationUnchanged(spec.assetID, *baseline, obs); err != nil {
+			return archiveObservation{}, err
+		}
+		expected = *baseline
+	}
+
+	afterFP, err := observeOpenedArchive(f, spec)
+	if err != nil {
+		return archiveObservation{}, err
+	}
+	if err := checkObservationUnchanged(spec.assetID, expected, afterFP); err != nil {
+		return archiveObservation{}, err
+	}
+	return expected, nil
 }
