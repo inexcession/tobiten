@@ -278,12 +278,25 @@ type daemonServices struct {
 	jobs         *jobs.Service
 	events       *events.StreamService
 	cover        *curation.CoverService
+	coverCache   *tobitenimage.CoverCache
 	triggerScan  func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error)
 	rootsChanged atomic.Pointer[func()]
 }
 
 func (ds *daemonServices) startBackground(ctx context.Context) error {
-	if ds != nil && ds.cover != nil {
+	if ds == nil {
+		return nil
+	}
+	if ds.coverCache != nil {
+		removed, err := ds.coverCache.CleanupTemp(ctx)
+		if err != nil {
+			return fmt.Errorf("cleaning interrupted cover cache temp files: %w", err)
+		}
+		if removed > 0 {
+			slog.Info("cleaned interrupted cover cache temp files", slog.Int("removed", removed))
+		}
+	}
+	if ds.cover != nil {
 		return ds.cover.Start(ctx)
 	}
 	return nil
@@ -704,11 +717,12 @@ func newDaemonServices(
 			return scanner.TriggerScan(ctx, jobService, libraryID, opts)
 		},
 	}
-	coverService, err := newDaemonCoverService(transactor, cfg)
+	coverService, coverCache, err := newDaemonCoverService(transactor, cfg)
 	if err != nil {
 		return nil, err
 	}
 	ds.cover = coverService
+	ds.coverCache = coverCache
 	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
 		DefaultMode:    defaultLibraryMode,
 		Notifier:       jobService,
@@ -732,7 +746,7 @@ func newDaemonServices(
 	return ds, nil
 }
 
-func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation.CoverService, error) {
+func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation.CoverService, *tobitenimage.CoverCache, error) {
 	coversDir := filepath.Join(config.DefaultDataDir, "covers")
 	waitTimeout := config.DefaultThumbnailWaitTimeout
 	if cfg != nil {
@@ -746,22 +760,22 @@ func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation
 
 	coverCache, err := tobitenimage.NewCoverCache(coversDir)
 	if err != nil {
-		return nil, fmt.Errorf("initializing cover cache: %w", err)
+		return nil, nil, fmt.Errorf("initializing cover cache: %w", err)
 	}
 
 	imgReg := tobitenimage.NewRegistry()
 	for _, p := range buildDaemonRegistry(cfg, nil, RegistryDeps{}).ImagePipelines() {
 		if err := imgReg.Register(p); err != nil {
-			return nil, fmt.Errorf("registering image pipeline %q: %w", p.Name(), err)
+			return nil, nil, fmt.Errorf("registering image pipeline %q: %w", p.Name(), err)
 		}
 	}
 
 	formats := container.NewFormatRegistry()
 	if err := formats.Register(cbz.Format()); err != nil {
-		return nil, fmt.Errorf("registering cbz container format: %w", err)
+		return nil, nil, fmt.Errorf("registering cbz container format: %w", err)
 	}
 
-	return curation.NewCoverService(curation.CoverServiceOptions{
+	coverSvc, err := curation.NewCoverService(curation.CoverServiceOptions{
 		Tx:          tx,
 		Cache:       coverCache,
 		Pipelines:   imgReg,
@@ -769,6 +783,10 @@ func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation
 		WaitTimeout: waitTimeout,
 		Logger:      slog.Default(),
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return coverSvc, coverCache, nil
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock

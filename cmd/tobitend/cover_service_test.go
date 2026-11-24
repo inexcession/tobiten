@@ -36,6 +36,28 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 		t.Fatalf("mkdir root: %v", err)
 	}
 
+	// Seed an interrupted cover temp and a foreign temp in a configured leaf shard
+	// before runDaemon starts; startup must sweep the cover temp and keep the foreign temp.
+	seedCache, err := tobitenimage.NewCoverCache(coversDir)
+	if err != nil {
+		t.Fatalf("NewCoverCache seed: %v", err)
+	}
+	samplePath, err := seedCache.PathFor(tobitenimage.ArchiveCoverKey("5566778899aabbcc", 0, tobitenimage.DefaultCoverOptions()))
+	if err != nil {
+		t.Fatalf("PathFor seed: %v", err)
+	}
+	shardDir := filepath.Dir(samplePath)
+	if err := os.MkdirAll(shardDir, 0o755); err != nil {
+		t.Fatalf("mkdir leaf shard: %v", err)
+	}
+	interruptedCoverTemp := filepath.Join(shardDir, ".tobiten-tmp-cover-interrupted")
+	foreignTemp := filepath.Join(shardDir, ".tobiten-tmp-job42-foreign")
+	for _, p := range []string{interruptedCoverTemp, foreignTemp} {
+		if err := os.WriteFile(p, []byte("leftover"), 0o600); err != nil {
+			t.Fatalf("seed temp %s: %v", p, err)
+		}
+	}
+
 	var pngBuf bytes.Buffer
 	img := image.NewRGBA(image.Rect(0, 0, 64, 96))
 	for y := range 96 {
@@ -88,6 +110,12 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 	}
 
 	err = runDaemon(t.Context(), cfg, func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, _ *app.Services) error {
+		if _, statErr := os.Stat(interruptedCoverTemp); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("interrupted cover temp %s still exists after daemon startup: %v", interruptedCoverTemp, statErr)
+		}
+		if _, statErr := os.Stat(foreignTemp); statErr != nil {
+			t.Fatalf("foreign temp %s did not survive daemon startup: %v", foreignTemp, statErr)
+		}
 		if capturedCover == nil {
 			t.Fatal("daemonServices.cover was not initialized")
 		}

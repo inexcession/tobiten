@@ -23,6 +23,7 @@ import (
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/image"
 	"github.com/inexcession/tobiten/internal/library/paths"
+	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/storage"
 )
 
@@ -83,7 +84,8 @@ func (e *CoverWaitTimeoutError) IsTimeout() bool {
 }
 
 // CoverUnavailableError reports that an asset or its cover source is
-// unavailable (missing, retired, OFFLINE root, absent file, or no displayable page).
+// unavailable (missing, retired, OFFLINE root, absent file, digest mismatch,
+// or no displayable page).
 type CoverUnavailableError struct {
 	AssetID string
 	Reason  string
@@ -743,7 +745,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		_ = f.Close()
 	}()
 
-	size, err := resolveArchiveSize(f, spec)
+	size, err := verifyOpenedArchiveFingerprint(genCtx, f, spec)
 	if err != nil {
 		return image.CoverEntry{}, err
 	}
@@ -780,6 +782,10 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		return image.CoverEntry{}, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err)
 	}
 
+	if _, err := verifyOpenedArchiveFingerprint(genCtx, f, spec); err != nil {
+		return image.CoverEntry{}, err
+	}
+
 	entry, err := s.cache.Put(genCtx, spec.key, rendered.Data)
 	if err != nil {
 		return image.CoverEntry{}, fmt.Errorf("curation: cache cover %s: %w", spec.assetID, err)
@@ -787,17 +793,32 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 	return entry, nil
 }
 
-func resolveArchiveSize(f ReadAtCloser, spec archiveCoverSpec) (int64, error) {
-	statable, ok := f.(statReadAtCloser)
-	if !ok {
-		return spec.fileSize, nil
+func verifyOpenedArchiveFingerprint(ctx context.Context, f ReadAtCloser, spec archiveCoverSpec) (int64, error) {
+	size := spec.fileSize
+	if statable, ok := f.(statReadAtCloser); ok {
+		info, err := statable.Stat()
+		if err != nil {
+			return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
+		}
+		if !info.Mode().IsRegular() {
+			return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "non_regular_file"}
+		}
+		size = info.Size()
 	}
-	info, err := statable.Stat()
+
+	digest, err := scanner.PartialFingerprint(f, size)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
 		return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "file_unreadable", Err: err}
 	}
-	if !info.Mode().IsRegular() {
-		return 0, &CoverUnavailableError{AssetID: spec.assetID, Reason: "non_regular_file"}
+	if digest != spec.key.Digest {
+		return 0, &CoverUnavailableError{
+			AssetID: spec.assetID,
+			Reason:  "digest_mismatch",
+			Err:     fmt.Errorf("archive fingerprint %s differs from expected %s", digest, spec.key.Digest),
+		}
 	}
-	return info.Size(), nil
+	return size, nil
 }

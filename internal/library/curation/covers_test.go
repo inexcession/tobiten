@@ -56,11 +56,8 @@ func makeSolidPNG(t *testing.T, w, h int, c color.RGBA) []byte {
 	return buf.Bytes()
 }
 
-func writeCBZ(t *testing.T, pathBytes []byte, entries ...cbzEntry) {
+func buildCBZ(t *testing.T, entries ...cbzEntry) []byte {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(string(pathBytes)), 0o755); err != nil {
-		t.Fatalf("mkdir parent for %q: %v", string(pathBytes), err)
-	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, e := range entries {
@@ -75,7 +72,15 @@ func writeCBZ(t *testing.T, pathBytes []byte, entries ...cbzEntry) {
 	if err := zw.Close(); err != nil {
 		t.Fatalf("zip close: %v", err)
 	}
-	if err := os.WriteFile(string(pathBytes), buf.Bytes(), 0o644); err != nil {
+	return buf.Bytes()
+}
+
+func writeCBZ(t *testing.T, pathBytes []byte, entries ...cbzEntry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(string(pathBytes)), 0o755); err != nil {
+		t.Fatalf("mkdir parent for %q: %v", string(pathBytes), err)
+	}
+	if err := os.WriteFile(string(pathBytes), buildCBZ(t, entries...), 0o644); err != nil {
 		t.Fatalf("write cbz %q: %v", string(pathBytes), err)
 	}
 }
@@ -112,11 +117,13 @@ func assertDominantColor(t *testing.T, jpegData []byte, wantR, wantG, wantB uint
 }
 
 type spyImagePipeline struct {
-	inner     *purego.Pipeline
-	calls     atomic.Int32
-	active    atomic.Int32
-	maxActive atomic.Int32
-	onRender  func(ctx context.Context) error
+	inner       *purego.Pipeline
+	calls       atomic.Int32
+	active      atomic.Int32
+	maxActive   atomic.Int32
+	onRender    func(ctx context.Context) error
+	hookMu      sync.Mutex
+	afterRender func(ctx context.Context) error
 }
 
 func newSpyImagePipeline(t *testing.T, onRender func(context.Context) error) (*spyImagePipeline, *tobitenimage.Registry) {
@@ -134,6 +141,12 @@ func newSpyImagePipeline(t *testing.T, onRender func(context.Context) error) (*s
 		t.Fatalf("registry.Register: %v", err)
 	}
 	return spy, reg
+}
+
+func (s *spyImagePipeline) setAfterRender(fn func(context.Context) error) {
+	s.hookMu.Lock()
+	s.afterRender = fn
+	s.hookMu.Unlock()
 }
 
 func (s *spyImagePipeline) Name() string                        { return s.inner.Name() }
@@ -158,7 +171,19 @@ func (s *spyImagePipeline) RenderCover(ctx context.Context, src io.Reader, opts 
 			return tobitenimage.Result{}, err
 		}
 	}
-	return s.inner.RenderCover(ctx, src, opts)
+	res, err := s.inner.RenderCover(ctx, src, opts)
+	if err != nil {
+		return tobitenimage.Result{}, err
+	}
+	s.hookMu.Lock()
+	after := s.afterRender
+	s.hookMu.Unlock()
+	if after != nil {
+		if err := after(ctx); err != nil {
+			return tobitenimage.Result{}, err
+		}
+	}
+	return res, nil
 }
 
 func setupDBAndLibrary(t *testing.T, rootBytes []byte) (*postgres.Transactor, *domain.Library, *domain.LibraryRoot) {
@@ -661,10 +686,18 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 
 	origPath := filepath.Join(rootDir, "dir1", "vol1.cbz")
 	movedPath := filepath.Join(rootDir, "dir2", "renamed_vol1.cbz")
+	coldPath := filepath.Join(rootDir, "dir1", "cold.cbz")
 	red := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 30, B: 30, A: 255})
 	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	blue := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 30, B: 220, A: 255})
+
+	coldRedCBZ := buildCBZ(t, cbzEntry{name: "001.png", data: red}, cbzEntry{name: "002.png", data: blue})
+	coldGreenCBZ := buildCBZ(t, cbzEntry{name: "001.png", data: green}, cbzEntry{name: "002.png", data: red})
 
 	writeCBZ(t, []byte(origPath), cbzEntry{name: "001.png", data: red})
+	if err := os.WriteFile(coldPath, coldRedCBZ, 0o644); err != nil {
+		t.Fatalf("write cold cbz: %v", err)
+	}
 
 	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
 	sc, err := scanner.NewScanner(tx, scanner.Options{})
@@ -676,19 +709,29 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	}
 
 	assets := listRootAssets(t, tx, root.ID)
-	if len(assets) != 1 {
-		t.Fatalf("initial assets = %d, want 1", len(assets))
+	if len(assets) != 2 {
+		t.Fatalf("initial assets = %d, want 2", len(assets))
 	}
-	assetID := assets[0].ID
-	digest1, ok := assets[0].CurrentDigest(domain.DigestKindXXH364Partial)
+	byRel := map[string]domain.MediaAsset{
+		assets[0].RelPathDisplay: assets[0],
+		assets[1].RelPathDisplay: assets[1],
+	}
+	vol1 := byRel["dir1/vol1.cbz"]
+	cold := byRel["dir1/cold.cbz"]
+	digest1, ok := vol1.CurrentDigest(domain.DigestKindXXH364Partial)
 	if !ok {
-		t.Fatal("missing initial XXH3_64_PARTIAL digest")
+		t.Fatal("missing initial XXH3_64_PARTIAL digest for vol1")
 	}
+	coldDigest1, ok := cold.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok {
+		t.Fatal("missing initial XXH3_64_PARTIAL digest for cold")
+	}
+	oldColdKey := tobitenimage.ArchiveCoverKey(coldDigest1.Value, 0, tobitenimage.DefaultCoverOptions())
 
 	spy, reg := newSpyImagePipeline(t, nil)
 	svc, cache := newTestCoverService(t, tx, reg, 5*time.Second)
 
-	entry1, err := svc.GetOrGenerateAssetCover(t.Context(), assetID)
+	entry1, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
 	if err != nil {
 		t.Fatalf("initial GetOrGenerateAssetCover: %v", err)
 	}
@@ -712,7 +755,7 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatalf("MovedCount = %d, want 1", scanMove.MovedCount)
 	}
 
-	entryMoved, err := svc.GetOrGenerateAssetCover(t.Context(), assetID)
+	entryMoved, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
 	if err != nil {
 		t.Fatalf("moved GetOrGenerateAssetCover: %v", err)
 	}
@@ -723,7 +766,7 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatalf("render calls after move/rename = %d, want 1 (must reuse cache)", spy.calls.Load())
 	}
 
-	// Externally modify the file with new cover artwork and distinct size/mtime, then rescan.
+	// Externally modify the moved file with new cover artwork and distinct size/mtime, then rescan.
 	writeCBZ(t, []byte(movedPath),
 		cbzEntry{name: "001.png", data: green},
 		cbzEntry{name: "002.png", data: red},
@@ -742,12 +785,18 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	}
 
 	assetsAfterMod := listRootAssets(t, tx, root.ID)
-	digest2, ok := assetsAfterMod[0].CurrentDigest(domain.DigestKindXXH364Partial)
+	var digest2 domain.AssetDigest
+	for _, a := range assetsAfterMod {
+		if a.ID == vol1.ID {
+			digest2, ok = a.CurrentDigest(domain.DigestKindXXH364Partial)
+			break
+		}
+	}
 	if !ok || digest2.Value == digest1.Value {
 		t.Fatalf("expected new digest after external modify, old=%s new=%+v", digest1.Value, digest2)
 	}
 
-	entryMod, err := svc.GetOrGenerateAssetCover(t.Context(), assetID)
+	entryMod, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
 	if err != nil {
 		t.Fatalf("modified GetOrGenerateAssetCover: %v", err)
 	}
@@ -760,6 +809,113 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	}
 	if _, err := cache.Stat(t.Context(), tobitenimage.ArchiveCoverKey(digest2.Value, 0, tobitenimage.DefaultCoverOptions())); err != nil {
 		t.Fatalf("Stat new digest cache entry: %v", err)
+	}
+
+	// Cold request after an unscanned external edit must fail verification and leave old key empty.
+	if err := os.WriteFile(coldPath, coldGreenCBZ, 0o644); err != nil {
+		t.Fatalf("overwrite cold cbz before cold request: %v", err)
+	}
+	if _, err := svc.GetOrGenerateAssetCover(t.Context(), cold.ID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("cold modified before rescan err = %v, want ErrCoverUnavailable", err)
+	} else {
+		var unavailErr *curation.CoverUnavailableError
+		if !errors.As(err, &unavailErr) || unavailErr.Reason != "digest_mismatch" {
+			t.Fatalf("cold modified unavailErr = %+v, want Reason=digest_mismatch", unavailErr)
+		}
+	}
+	if spy.calls.Load() != 2 {
+		t.Fatalf("render calls after pre-extraction mismatch = %d, want 2", spy.calls.Load())
+	}
+	if _, err := cache.Stat(t.Context(), oldColdKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Fatalf("old key Stat after pre-extraction mismatch = %v, want ErrCacheMiss", err)
+	}
+
+	// Restore matching cold archive bytes, then overwrite mid-generation (after RenderCover, before cache.Put).
+	if err := os.WriteFile(coldPath, coldRedCBZ, 0o644); err != nil {
+		t.Fatalf("restore cold cbz: %v", err)
+	}
+	afterEntered := make(chan struct{})
+	releaseAfter := make(chan struct{})
+	spy.setAfterRender(func(ctx context.Context) error {
+		close(afterEntered)
+		select {
+		case <-releaseAfter:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	midGenErrCh := make(chan error, 1)
+	go func() {
+		_, gErr := svc.GetOrGenerateAssetCover(t.Context(), cold.ID)
+		midGenErrCh <- gErr
+	}()
+
+	select {
+	case <-afterEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for cold generation render completion")
+	}
+
+	future2 := future.Add(2 * time.Second)
+	if err := os.WriteFile(coldPath, coldGreenCBZ, 0o644); err != nil {
+		close(releaseAfter)
+		t.Fatalf("overwrite cold cbz mid-generation: %v", err)
+	}
+	if err := os.Chtimes(coldPath, future2, future2); err != nil {
+		close(releaseAfter)
+		t.Fatalf("chtimes cold cbz mid-generation: %v", err)
+	}
+	close(releaseAfter)
+
+	if err := <-midGenErrCh; !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("mid-generation write err = %v, want ErrCoverUnavailable", err)
+	} else {
+		var unavailErr *curation.CoverUnavailableError
+		if !errors.As(err, &unavailErr) || unavailErr.Reason != "digest_mismatch" {
+			t.Fatalf("mid-generation write unavailErr = %+v, want Reason=digest_mismatch", unavailErr)
+		}
+	}
+	if _, err := cache.Stat(t.Context(), oldColdKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Fatalf("old key Stat after mid-generation rejection = %v, want ErrCacheMiss", err)
+	}
+
+	// Clear hook and rescan: regeneration succeeds under the new digest while the old key stays empty.
+	spy.setAfterRender(nil)
+	scanColdMod, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("cold modify ScanLibrary: %v", err)
+	}
+	if scanColdMod.ModifiedCount != 1 {
+		t.Fatalf("cold ModifiedCount = %d, want 1", scanColdMod.ModifiedCount)
+	}
+
+	assetsAfterColdMod := listRootAssets(t, tx, root.ID)
+	var coldDigest2 domain.AssetDigest
+	for _, a := range assetsAfterColdMod {
+		if a.ID == cold.ID {
+			coldDigest2, ok = a.CurrentDigest(domain.DigestKindXXH364Partial)
+			break
+		}
+	}
+	if !ok || coldDigest2.Value == coldDigest1.Value {
+		t.Fatalf("expected new digest for cold cbz after rescan, old=%s new=%+v", coldDigest1.Value, coldDigest2)
+	}
+
+	entryColdMod, err := svc.GetOrGenerateAssetCover(t.Context(), cold.ID)
+	if err != nil {
+		t.Fatalf("cold post-scan GetOrGenerateAssetCover: %v", err)
+	}
+	assertDominantColor(t, entryColdMod.Data, 30, 210, 30)
+	if entryColdMod.Key.Digest != coldDigest2.Value {
+		t.Fatalf("cold regenerated digest = %s, want %s", entryColdMod.Key.Digest, coldDigest2.Value)
+	}
+	if _, err := cache.Stat(t.Context(), tobitenimage.ArchiveCoverKey(coldDigest2.Value, 0, tobitenimage.DefaultCoverOptions())); err != nil {
+		t.Fatalf("Stat regenerated cold digest entry: %v", err)
+	}
+	if _, err := cache.Stat(t.Context(), oldColdKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Fatalf("old key Stat after post-scan regeneration = %v, want ErrCacheMiss", err)
 	}
 }
 
@@ -908,7 +1064,14 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	rootDir := t.TempDir()
 	cbzPath := filepath.Join(rootDir, "restart.cbz")
 	red := makeSolidPNG(t, 64, 96, color.RGBA{R: 220, G: 30, B: 30, A: 255})
-	writeCBZ(t, []byte(cbzPath), cbzEntry{name: "001.png", data: red})
+	cbzBytes := buildCBZ(t, cbzEntry{name: "001.png", data: red})
+	if err := os.WriteFile(cbzPath, cbzBytes, 0o644); err != nil {
+		t.Fatalf("write restart cbz: %v", err)
+	}
+	restartDigest, err := scanner.PartialFingerprint(bytes.NewReader(cbzBytes), int64(len(cbzBytes)))
+	if err != nil {
+		t.Fatalf("PartialFingerprint: %v", err)
+	}
 
 	src := curation.CoverAssetSource{
 		AssetID:        "a-1",
@@ -918,7 +1081,7 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 		RelPathBytes:   []byte("restart.cbz"),
 		Format:         domain.MediaFormatCBZ,
 		DigestKind:     domain.DigestKindXXH364Partial,
-		Digest:         "0123456789abcdef",
+		Digest:         restartDigest,
 		PageCount:      1,
 		CoverPageIndex: 0,
 	}
