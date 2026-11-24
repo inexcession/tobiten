@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -639,4 +641,207 @@ func TestRunDaemon_ConfiguredPollIntervalReachesProductionWatcher(t *testing.T) 
 			})
 		}
 	})
+}
+
+func TestRunDaemon_LocalFSNotifyWatcherTriggersScanReleasesWatchesAndStopsCleanly(t *testing.T) {
+	db := testdb.New(t)
+	migrateStartupDB(t, db)
+
+	originalNewWatcher := newDaemonWatcher
+	originalLogger := slog.Default()
+	t.Cleanup(func() {
+		newDaemonWatcher = originalNewWatcher
+		slog.SetDefault(originalLogger)
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	rootDirA := filepath.Join(t.TempDir(), "local-manga-a")
+	rootDirB := filepath.Join(t.TempDir(), "local-manga-b")
+	subB := filepath.Join(rootDirB, "EmptySub")
+	writeTestFile(t, filepath.Join(rootDirA, "SeriesA/Vol01.cbz"), buildTestCBZ(t, "SeriesA", "One", "1"))
+	if err := os.MkdirAll(subB, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", subB, err)
+	}
+	writeTestFile(t, filepath.Join(rootDirB, scanner.RootMarkerFilename), nil)
+
+	lib, rootA := seedTestLibrary(ctx, t, db.Pool, "Local FSNotify Library", rootDirA)
+	libRepo := postgres.NewLibraryRepository(db.Pool)
+	rootBPath, err := domain.NewRootPathIdentity([]byte(rootDirB))
+	if err != nil {
+		t.Fatalf("NewRootPathIdentity(%s): %v", rootDirB, err)
+	}
+	rootB := domain.LibraryRoot{
+		LibraryID: lib.ID,
+		Path:      rootBPath,
+		State:     domain.LibraryRootStateOnline,
+	}
+	if err := libRepo.CreateLibraryRoot(ctx, &rootB); err != nil {
+		t.Fatalf("CreateLibraryRoot(rootB): %v", err)
+	}
+
+	var pollTicks atomic.Int32
+	var activeWatcher atomic.Pointer[scanner.Watcher]
+
+	newDaemonWatcher = func(pool *pgxpool.Pool, _ *config.Config, ds *daemonServices) (*scanner.Watcher, error) {
+		w, err := scanner.NewWatcher(scanner.WatcherOptions{
+			Roots:          postgres.NewLibraryRepository(pool),
+			Trigger:        ds.jobs,
+			Jobs:           postgres.NewJobRepository(pool),
+			PollInterval:   time.Hour,
+			DebounceWindow: 35 * time.Millisecond,
+			Logger:         slog.Default(),
+			OnPoll: func() {
+				pollTicks.Add(1)
+			},
+		})
+		if err == nil {
+			activeWatcher.Store(w)
+		}
+		return w, err
+	}
+
+	jobRepo := postgres.NewJobRepository(db.Pool)
+
+	err = runDaemon(ctx, hostedConfig(t, db.URL), func(serveCtx context.Context, _ *config.Config, _ *slog.Logger, services *app.Services) error {
+		w := activeWatcher.Load()
+		if w == nil {
+			return errors.New("expected active daemon watcher")
+		}
+
+		// Wait for both local roots to register with fsnotify (WatchModeOS).
+		waitDeadline := time.Now().Add(3 * time.Second)
+		for {
+			stA, okA := w.RootStatus(rootA.ID)
+			stB, okB := w.RootStatus(rootB.ID)
+			if okA && okB && stA.Mode == scanner.WatchModeOS && stB.Mode == scanner.WatchModeOS {
+				if stA.IsNetwork || stB.IsNetwork {
+					return fmt.Errorf("expected local roots (IsNetwork=false), got A=%+v B=%+v", stA, stB)
+				}
+				break
+			}
+			if time.Now().After(waitDeadline) {
+				return fmt.Errorf("timed out waiting for WatchModeOS on roots (statuses=%+v)", w.RootStatuses())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Verify initial directories are watched.
+		watched := w.WatchedPaths()
+		for _, wantDir := range []string{rootDirA, filepath.Join(rootDirA, "SeriesA"), rootDirB, subB} {
+			if !slices.Contains(watched, wantDir) {
+				return fmt.Errorf("initial WatchedPaths %v missing %q", watched, wantDir)
+			}
+		}
+
+		// Create a file in a newly created subdirectory under rootDirA -> automatic SCAN runs without waiting for a poll tick.
+		newSeriesDir := filepath.Join(rootDirA, "SeriesB")
+		writeTestFile(t, filepath.Join(newSeriesDir, "Vol02.cbz"), buildTestCBZ(t, "SeriesB", "Two", "2"))
+
+		kindScan := domain.JobKindScan
+		var scanJobs []domain.Job
+		scanDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(scanDeadline) {
+			scanJobs, err = jobRepo.ListJobs(serveCtx, storage.JobFilter{Kind: &kindScan})
+			if err != nil {
+				return err
+			}
+			if len(scanJobs) > 0 && scanJobs[0].State == domain.JobStateSucceeded {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		if len(scanJobs) != 1 || scanJobs[0].State != domain.JobStateSucceeded {
+			return fmt.Errorf("got scanJobs=%+v, want 1 SUCCEEDED", scanJobs)
+		}
+		if scanJobs[0].CreatedBy != nil {
+			return fmt.Errorf("SCAN CreatedBy = %v, want nil", *scanJobs[0].CreatedBy)
+		}
+		wantDedupe := "SCAN:" + lib.ID
+		if scanJobs[0].DedupeKey == nil || *scanJobs[0].DedupeKey != wantDedupe {
+			return fmt.Errorf("SCAN DedupeKey = %v, want %q", scanJobs[0].DedupeKey, wantDedupe)
+		}
+		if !slices.Contains(w.WatchedPaths(), newSeriesDir) {
+			return fmt.Errorf("WatchedPaths %v missing newly created subdir %q", w.WatchedPaths(), newSeriesDir)
+		}
+
+		var volumeCount int
+		if err := db.QueryRow(serveCtx, `SELECT COUNT(*) FROM volumes WHERE library_id = $1`, lib.ID).Scan(&volumeCount); err != nil {
+			return err
+		}
+		if volumeCount != 2 {
+			return fmt.Errorf("indexed volumes = %d, want 2", volumeCount)
+		}
+
+		// Remove rootB via LibraryConfigService.RemoveRoot -> NotifySync releases rootB's watches immediately.
+		adminPrincipal := &domain.Principal{
+			User:        domain.User{ID: "admin-user"},
+			Permissions: []domain.Permission{domain.PermissionLibraryAdmin},
+		}
+		if err := services.LibraryConfig.RemoveRoot(serveCtx, adminPrincipal, app.RemoveLibraryRootRequest{
+			LibraryID: lib.ID,
+			RootID:    rootB.ID,
+		}); err != nil {
+			return fmt.Errorf("RemoveRoot(rootB): %w", err)
+		}
+
+		removeDeadline := time.Now().Add(3 * time.Second)
+		for {
+			curWatched := w.WatchedPaths()
+			_, stillTracked := w.RootStatus(rootB.ID)
+			if !stillTracked && !slices.Contains(curWatched, rootDirB) && !slices.Contains(curWatched, subB) {
+				break
+			}
+			if time.Now().After(removeDeadline) {
+				return fmt.Errorf("rootB watches remained after RemoveRoot: tracked=%v watched=%v", stillTracked, curWatched)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Mutating removed rootDirB must not enqueue another SCAN.
+		writeTestFile(t, filepath.Join(subB, "Ignored.cbz"), buildTestCBZ(t, "Ignored", "One", "1"))
+		time.Sleep(80 * time.Millisecond)
+		scanJobsAfterRemove, err := jobRepo.ListJobs(serveCtx, storage.JobFilter{Kind: &kindScan})
+		if err != nil {
+			return err
+		}
+		if len(scanJobsAfterRemove) != 1 {
+			return fmt.Errorf("got %d SCAN jobs after mutating removed rootB, want 1", len(scanJobsAfterRemove))
+		}
+		if gotPolls := pollTicks.Load(); gotPolls != 0 {
+			return fmt.Errorf("pollTicks = %d, want 0", gotPolls)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runDaemon err = %v", err)
+	}
+
+	w := activeWatcher.Load()
+	if w == nil {
+		t.Fatal("expected captured watcher")
+	}
+	if got := w.WatchedPaths(); len(got) != 0 {
+		t.Fatalf("WatchedPaths after daemon shutdown = %v, want empty", got)
+	}
+
+	// Verify no watcher or fsnotify goroutine remains running after daemon shutdown.
+	stopDeadline := time.Now().Add(2 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		stacks := string(buf[:n])
+		hasLeak := strings.Contains(stacks, "(*Watcher).runLoop") ||
+			strings.Contains(stacks, "(*fsnotifyOSWatcher).readLoop") ||
+			strings.Contains(stacks, "fsnotify.(*inotify).readEvents") ||
+			strings.Contains(stacks, "fsnotify.(*kqueue).readEvents")
+		if !hasLeak {
+			break
+		}
+		if time.Now().After(stopDeadline) {
+			t.Fatalf("watcher or fsnotify goroutine remained after daemon shutdown:\n%s", stacks)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

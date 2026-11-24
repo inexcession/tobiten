@@ -9,12 +9,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/jobs"
@@ -1547,4 +1551,642 @@ func TestWatcher_StopCancelsDuringMountProbeAndSkipsSecondRoot(t *testing.T) {
 			t.Fatalf("mount probe calls = %d, want 1 (second root must not be probed after parent context cancellation)", calls)
 		}
 	})
+}
+
+func (h *memoryLogHandler) snapshotRecords() []capturedLogRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.records)
+}
+
+func (h *memoryLogHandler) hasWarnMessage(substr string) bool {
+	for _, rec := range h.snapshotRecords() {
+		if rec.Level == slog.LevelWarn && strings.Contains(rec.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForOSWatchedRoot(t *testing.T, w *Watcher, rootID string) RootWatchStatus {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if st, ok := w.RootStatus(rootID); ok && st.Mode == WatchModeOS {
+			return st
+		}
+		if time.Now().After(deadline) {
+			st, ok := w.RootStatus(rootID)
+			t.Fatalf("timed out waiting for root %q mode=os (got ok=%v status=%+v)", rootID, ok, st)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForRootRemoved(t *testing.T, w *Watcher, rootID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := w.RootStatus(rootID); !ok && len(w.RootWatchedPaths(rootID)) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			st, ok := w.RootStatus(rootID)
+			t.Fatalf("timed out waiting for root %q removal (ok=%v status=%+v watched=%v)", rootID, ok, st, w.RootWatchedPaths(rootID))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForTriggerCount(t *testing.T, trig *recordedTrigger, want int) []jobs.TriggerRequest {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		reqs := trig.snapshot()
+		if len(reqs) >= want {
+			return reqs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d triggered SCAN jobs, got %d", want, len(reqs))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForWatchedPathsContain(t *testing.T, w *Watcher, wantPaths ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		watched := w.WatchedPaths()
+		allFound := true
+		for _, p := range wantPaths {
+			if !slices.Contains(watched, p) {
+				allFound = false
+				break
+			}
+		}
+		if allFound {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for WatchedPaths to contain %v; got %v", wantPaths, watched)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func assertNoWatcherGoroutinesRunning(t *testing.T, baselineGoroutines int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		stacks := string(buf[:n])
+		hasLeak := strings.Contains(stacks, "(*Watcher).runLoop") ||
+			strings.Contains(stacks, "(*fsnotifyOSWatcher).readLoop") ||
+			strings.Contains(stacks, "fsnotify.(*inotify).readEvents") ||
+			strings.Contains(stacks, "fsnotify.(*kqueue).readEvents")
+		cur := runtime.NumGoroutine()
+		if !hasLeak && cur <= baselineGoroutines {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watcher goroutines remained after Stop (goroutines=%d baseline=%d hasLeak=%v):\n%s",
+				cur, baselineGoroutines, hasLeak, stacks)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func assertAutomaticScanRequest(t *testing.T, req jobs.TriggerRequest, wantLibID string) {
+	t.Helper()
+	if req.Kind != domain.JobKindScan {
+		t.Fatalf("Kind = %s, want SCAN", req.Kind)
+	}
+	if req.CreatedBy != nil {
+		t.Fatalf("CreatedBy = %v, want nil (automatic job)", *req.CreatedBy)
+	}
+	wantDedupe := "SCAN:" + wantLibID
+	if req.DedupeKey == nil || *req.DedupeKey != wantDedupe {
+		t.Fatalf("DedupeKey = %v, want %s", req.DedupeKey, wantDedupe)
+	}
+	var payload ScanJobPayload
+	if err := json.Unmarshal(req.Payload, &payload); err != nil || payload.LibraryID != wantLibID {
+		t.Fatalf("Payload = %s (%v), want library_id=%s", req.Payload, err, wantLibID)
+	}
+}
+
+func TestWatcher_LocalFilesystemUsesFSNotifyForExistingAndNewSubdirectories(t *testing.T) {
+	dir := t.TempDir()
+	existingSub := filepath.Join(dir, "existing")
+	writeWatcherFile(t, filepath.Join(existingSub, "vol01.cbz"), []byte("v1"), time.Time{})
+	// Hidden and temporary directories must never be watched.
+	writeWatcherFile(t, filepath.Join(dir, ".hidden", "ignored.cbz"), []byte("hidden"), time.Time{})
+	writeWatcherFile(t, filepath.Join(dir, ".tobiten-tmp-1", "temp.cbz"), []byte("temp"), time.Time{})
+
+	root := makeWatcherTestRoot(t, "lib-local", "root-local", dir)
+	trig := &recordedTrigger{}
+	var pollTicks atomic.Int32
+
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots:    []domain.LibraryRoot{root},
+		Trigger:        trig,
+		PollInterval:   time.Hour,
+		DebounceWindow: 35 * time.Millisecond,
+		OnPoll: func() {
+			pollTicks.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	st := waitForOSWatchedRoot(t, w, root.ID)
+	if st.IsNetwork {
+		t.Fatalf("RootWatchStatus.IsNetwork = true for local root: %+v", st)
+	}
+
+	// Verify only directories (and neither regular files nor hidden/temp dirs) are watched.
+	wantInitialWatches := []string{dir, existingSub}
+	slices.Sort(wantInitialWatches)
+	if got := w.WatchedPaths(); !slices.Equal(got, wantInitialWatches) {
+		t.Fatalf("initial WatchedPaths = %v, want %v (directories only)", got, wantInitialWatches)
+	}
+
+	// Quiet baseline produces zero triggers.
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 0 {
+		t.Fatalf("quiet baseline triggered %d scans, want 0", got)
+	}
+
+	// 1. Existing subdirectory: create, rename, delete without waiting for a poll tick.
+	createdExisting := filepath.Join(existingSub, "vol02.cbz")
+	renamedExisting := filepath.Join(existingSub, "vol02-renamed.cbz")
+
+	writeWatcherFile(t, createdExisting, []byte("v2"), time.Time{})
+	reqs := waitForTriggerCount(t, trig, 1)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("create in existing subdir triggered %d scans, want 1", got)
+	}
+	assertAutomaticScanRequest(t, reqs[0], "lib-local")
+
+	if err := os.Rename(createdExisting, renamedExisting); err != nil {
+		t.Fatalf("Rename in existing subdir: %v", err)
+	}
+	reqs = waitForTriggerCount(t, trig, 2)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("rename in existing subdir triggered %d total scans, want 2", got)
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-local")
+
+	if err := os.Remove(renamedExisting); err != nil {
+		t.Fatalf("Remove in existing subdir: %v", err)
+	}
+	reqs = waitForTriggerCount(t, trig, 3)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 3 {
+		t.Fatalf("delete in existing subdir triggered %d total scans, want 3", got)
+	}
+	assertAutomaticScanRequest(t, reqs[2], "lib-local")
+
+	// 2. Newly created subdirectory: create directory + file, verify new directories are watched,
+	// then rename and delete the file inside the newly created subdirectory.
+	newSub := filepath.Join(dir, "newseries")
+	nestedSub := filepath.Join(newSub, "arc1")
+	createdNew := filepath.Join(nestedSub, "vol03.cbz")
+	renamedNew := filepath.Join(nestedSub, "vol03-renamed.cbz")
+
+	writeWatcherFile(t, createdNew, []byte("v3"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 4)
+	waitForWatchedPathsContain(t, w, newSub, nestedSub)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 4 {
+		t.Fatalf("create in newly created subdir triggered %d total scans, want 4", got)
+	}
+	assertAutomaticScanRequest(t, reqs[3], "lib-local")
+	if slices.Contains(w.WatchedPaths(), createdNew) {
+		t.Fatalf("WatchedPaths contains regular file %q; must watch directories only", createdNew)
+	}
+
+	if err := os.Rename(createdNew, renamedNew); err != nil {
+		t.Fatalf("Rename in newly created subdir: %v", err)
+	}
+	reqs = waitForTriggerCount(t, trig, 5)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 5 {
+		t.Fatalf("rename in newly created subdir triggered %d total scans, want 5", got)
+	}
+	assertAutomaticScanRequest(t, reqs[4], "lib-local")
+
+	if err := os.Remove(renamedNew); err != nil {
+		t.Fatalf("Remove in newly created subdir: %v", err)
+	}
+	reqs = waitForTriggerCount(t, trig, 6)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 6 {
+		t.Fatalf("delete in newly created subdir triggered %d total scans, want 6", got)
+	}
+	assertAutomaticScanRequest(t, reqs[5], "lib-local")
+
+	// 3. Also verify creating an empty subdirectory first adds a watch on it, and a later file
+	// creation inside that subdirectory triggers one debounced automatic SCAN.
+	emptyThenPopulated := filepath.Join(dir, "later-sub")
+	if err := os.Mkdir(emptyThenPopulated, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", emptyThenPopulated, err)
+	}
+	waitForWatchedPathsContain(t, w, emptyThenPopulated)
+	writeWatcherFile(t, filepath.Join(emptyThenPopulated, "vol04.cbz"), []byte("v4"), time.Time{})
+	waitForTriggerCount(t, trig, 7)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 7 {
+		t.Fatalf("create in pre-created new subdir triggered %d total scans, want 7", got)
+	}
+
+	// 4. Hidden and temporary files inside watched directories are ignored, while a burst
+	// of multiple file changes coalesces into a single debounced automatic SCAN.
+	writeWatcherFile(t, filepath.Join(existingSub, ".DS_Store"), []byte("meta"), time.Time{})
+	writeWatcherFile(t, filepath.Join(nestedSub, "downloading.cbz.part"), []byte("part"), time.Time{})
+	time.Sleep(70 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 7 {
+		t.Fatalf("hidden/temp files triggered scan: got %d, want 7", got)
+	}
+
+	writeWatcherFile(t, filepath.Join(existingSub, "burst1.cbz"), []byte("b1"), time.Time{})
+	writeWatcherFile(t, filepath.Join(nestedSub, "burst2.cbz"), []byte("b2"), time.Time{})
+	writeWatcherFile(t, filepath.Join(emptyThenPopulated, "burst3.cbz"), []byte("b3"), time.Time{})
+	waitForTriggerCount(t, trig, 8)
+	time.Sleep(70 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 8 {
+		t.Fatalf("burst across subdirectories triggered %d total scans, want 8", got)
+	}
+
+	if gotPolls := pollTicks.Load(); gotPolls != 0 {
+		t.Fatalf("pollTicks = %d, want 0 (all triggers must come from fsnotify without waiting for a poll tick)", gotPolls)
+	}
+}
+
+type faultInjectingFSNotifyHandle struct {
+	inner     fsnotifyHandle
+	eventsCh  chan fsnotify.Event
+	errorsCh  chan error
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	addHook   func(name string) error
+}
+
+func newFaultInjectingFSNotifyHandle(addHook func(name string) error) (*faultInjectingFSNotifyHandle, error) {
+	inner, err := newRealFSNotifyHandle()
+	if err != nil {
+		return nil, err
+	}
+	h := &faultInjectingFSNotifyHandle{
+		inner:    inner,
+		eventsCh: make(chan fsnotify.Event, 16),
+		errorsCh: make(chan error, 16),
+		stopCh:   make(chan struct{}),
+		addHook:  addHook,
+	}
+	h.wg.Add(1)
+	go h.forward()
+	return h, nil
+}
+
+func (h *faultInjectingFSNotifyHandle) forward() {
+	defer h.wg.Done()
+	defer close(h.eventsCh)
+	defer close(h.errorsCh)
+
+	inEvents := h.inner.Events()
+	inErrors := h.inner.Errors()
+	for inEvents != nil || inErrors != nil {
+		select {
+		case <-h.stopCh:
+			return
+		case ev, ok := <-inEvents:
+			if !ok {
+				inEvents = nil
+				continue
+			}
+			select {
+			case h.eventsCh <- ev:
+			case <-h.stopCh:
+				return
+			}
+		case err, ok := <-inErrors:
+			if !ok {
+				inErrors = nil
+				continue
+			}
+			select {
+			case h.errorsCh <- err:
+			case <-h.stopCh:
+				return
+			}
+		}
+	}
+}
+
+func (h *faultInjectingFSNotifyHandle) Add(name string) error {
+	if h.addHook != nil {
+		if err := h.addHook(name); err != nil {
+			return err
+		}
+	}
+	return h.inner.Add(name)
+}
+
+func (h *faultInjectingFSNotifyHandle) Remove(name string) error      { return h.inner.Remove(name) }
+func (h *faultInjectingFSNotifyHandle) WatchList() []string           { return h.inner.WatchList() }
+func (h *faultInjectingFSNotifyHandle) Events() <-chan fsnotify.Event { return h.eventsCh }
+func (h *faultInjectingFSNotifyHandle) Errors() <-chan error          { return h.errorsCh }
+
+func (h *faultInjectingFSNotifyHandle) Close() error {
+	var err error
+	h.closeOnce.Do(func() {
+		close(h.stopCh)
+		err = h.inner.Close()
+		h.wg.Wait()
+	})
+	return err
+}
+
+func (h *faultInjectingFSNotifyHandle) injectError(err error) {
+	select {
+	case h.errorsCh <- err:
+	case <-h.stopCh:
+	}
+}
+
+func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
+	dir := t.TempDir()
+	writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), time.Time{})
+	failSubDir := filepath.Join(dir, "unwatchable-new-sub")
+
+	var handleMu sync.Mutex
+	var activeHandle *faultInjectingFSNotifyHandle
+
+	root := makeWatcherTestRoot(t, "lib-overflow", "root-overflow", dir)
+	trig := &recordedTrigger{}
+	logHandler := &memoryLogHandler{}
+	var pollTicks atomic.Int32
+
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots:    []domain.LibraryRoot{root},
+		Trigger:        trig,
+		Logger:         slog.New(logHandler),
+		PollInterval:   time.Hour,
+		DebounceWindow: 35 * time.Millisecond,
+		OnPoll: func() {
+			pollTicks.Add(1)
+		},
+		newFSNotify: func() (fsnotifyHandle, error) {
+			h, err := newFaultInjectingFSNotifyHandle(func(name string) error {
+				if name == failSubDir {
+					return syscall.ENOSPC
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			handleMu.Lock()
+			activeHandle = h
+			handleMu.Unlock()
+			return h, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	waitForOSWatchedRoot(t, w, root.ID)
+
+	handleMu.Lock()
+	h := activeHandle
+	handleMu.Unlock()
+	if h == nil {
+		t.Fatal("expected active fsnotify handle")
+	}
+
+	// 1. Event-queue overflow burst triggers exactly one full scan.
+	h.injectError(fsnotify.ErrEventOverflow)
+	h.injectError(fsnotify.ErrEventOverflow)
+	reqs := waitForTriggerCount(t, trig, 1)
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("event-queue overflow burst triggered %d scans, want 1", got)
+	}
+	assertAutomaticScanRequest(t, reqs[0], "lib-overflow")
+	if !logHandler.hasWarnMessage("fsnotify event queue overflow") {
+		t.Fatalf("expected overflow warning log, got records=%+v", logHandler.snapshotRecords())
+	}
+
+	// 2. Watch error on Errors channel triggers exactly one full scan.
+	h.injectError(errors.New("kernel watch descriptor failure"))
+	reqs = waitForTriggerCount(t, trig, 2)
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("watch error triggered %d total scans, want 2", got)
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-overflow")
+	if !logHandler.hasWarnMessage("fsnotify watch error") {
+		t.Fatalf("expected watch error warning log, got records=%+v", logHandler.snapshotRecords())
+	}
+
+	// 3. Watch error when adding a newly created subdirectory triggers one full scan.
+	if err := os.Mkdir(failSubDir, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", failSubDir, err)
+	}
+	reqs = waitForTriggerCount(t, trig, 3)
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 3 {
+		t.Fatalf("subdirectory watch error triggered %d total scans, want 3", got)
+	}
+	assertAutomaticScanRequest(t, reqs[2], "lib-overflow")
+	if !logHandler.hasWarnMessage("failed to add OS watch for new subdirectory") {
+		t.Fatalf("expected subdirectory watch failure warning log, got records=%+v", logHandler.snapshotRecords())
+	}
+
+	if gotPolls := pollTicks.Load(); gotPolls != 0 {
+		t.Fatalf("pollTicks = %d, want 0", gotPolls)
+	}
+}
+
+func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing.T) {
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	fallbackDir := t.TempDir()
+	fallbackSub := filepath.Join(fallbackDir, "sub")
+	writeWatcherFile(t, filepath.Join(fallbackSub, "vol01.cbz"), []byte("v1"), t0)
+
+	healthyDir := t.TempDir()
+	writeWatcherFile(t, filepath.Join(healthyDir, "vol01.cbz"), []byte("v1"), t0)
+
+	rootFallback := makeWatcherTestRoot(t, "lib-fallback", "root-fallback", fallbackDir)
+	rootHealthy := makeWatcherTestRoot(t, "lib-healthy", "root-healthy", healthyDir)
+
+	trig := &recordedTrigger{}
+	logHandler := &memoryLogHandler{}
+	clk := newFakeWatcherClock(t0)
+
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots:    []domain.LibraryRoot{rootFallback, rootHealthy},
+		Trigger:        trig,
+		Clock:          clk,
+		Logger:         slog.New(logHandler),
+		PollInterval:   15 * time.Millisecond,
+		DebounceWindow: 30 * time.Millisecond,
+		newFSNotify: func() (fsnotifyHandle, error) {
+			return newFaultInjectingFSNotifyHandle(func(name string) error {
+				// Fail watching the child subdirectory of fallbackDir so partial-watch rollback is also verified.
+				if name == fallbackSub {
+					return syscall.ENOSPC
+				}
+				return nil
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+	clk.waitForParked(t, 1)
+
+	stFallback, ok := w.RootStatus(rootFallback.ID)
+	if !ok || stFallback.Mode != WatchModePoll || stFallback.IsNetwork {
+		t.Fatalf("fallback root status = %+v (ok=%v), want Mode=poll IsNetwork=false", stFallback, ok)
+	}
+	stHealthy, ok := w.RootStatus(rootHealthy.ID)
+	if !ok || stHealthy.Mode != WatchModeOS || stHealthy.IsNetwork {
+		t.Fatalf("healthy root status = %+v (ok=%v), want Mode=os IsNetwork=false", stHealthy, ok)
+	}
+
+	// Partial watch on fallbackDir must have been rolled back when fallbackSub failed.
+	if got := w.WatchedPaths(); !slices.Equal(got, []string{healthyDir}) {
+		t.Fatalf("WatchedPaths after partial rollback = %v, want [%s]", got, healthyDir)
+	}
+	if !logHandler.hasWarnMessage("failed to register OS watch; falling back to polling") {
+		t.Fatalf("expected fallback diagnostic warning log, got %+v", logHandler.snapshotRecords())
+	}
+
+	// Mutating fallbackDir is detected on the next poll tick and triggers one automatic SCAN.
+	writeWatcherFile(t, filepath.Join(fallbackSub, "vol02.cbz"), []byte("v2"), t0.Add(time.Second))
+	for range 4 {
+		clk.advanceAndWait(t, 15*time.Millisecond)
+	}
+	reqs := trig.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("fallback polling triggered %d scans, want 1", len(reqs))
+	}
+	assertAutomaticScanRequest(t, reqs[0], "lib-fallback")
+}
+
+func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(t *testing.T) {
+	runtime.GC()
+	baselineGoroutines := runtime.NumGoroutine()
+
+	dir1A := t.TempDir()
+	sub1A := filepath.Join(dir1A, "sub1a")
+	writeWatcherFile(t, filepath.Join(sub1A, "vol01.cbz"), []byte("v1a"), time.Time{})
+
+	dir1B := t.TempDir()
+	sub1B := filepath.Join(dir1B, "sub1b")
+	writeWatcherFile(t, filepath.Join(sub1B, "vol01.cbz"), []byte("v1b"), time.Time{})
+
+	dir2 := t.TempDir()
+	sub2 := filepath.Join(dir2, "sub2")
+	writeWatcherFile(t, filepath.Join(sub2, "vol01.cbz"), []byte("v2"), time.Time{})
+
+	root1A := makeWatcherTestRoot(t, "lib-1", "root-1a", dir1A)
+	root1B := makeWatcherTestRoot(t, "lib-1", "root-1b", dir1B)
+	root2 := makeWatcherTestRoot(t, "lib-2", "root-2", dir2)
+
+	lister := &stubRootLister{
+		roots: []domain.LibraryRoot{root1A, root1B, root2},
+	}
+	trig := &recordedTrigger{}
+
+	w, err := NewWatcher(WatcherOptions{
+		Roots:          lister,
+		Trigger:        trig,
+		PollInterval:   time.Hour,
+		DebounceWindow: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	waitForOSWatchedRoot(t, w, root1A.ID)
+	waitForOSWatchedRoot(t, w, root1B.ID)
+	waitForOSWatchedRoot(t, w, root2.ID)
+
+	wantAll := []string{dir1A, sub1A, dir1B, sub1B, dir2, sub2}
+	slices.Sort(wantAll)
+	if got := w.WatchedPaths(); !slices.Equal(got, wantAll) {
+		t.Fatalf("WatchedPaths = %v, want %v", got, wantAll)
+	}
+
+	// 1. Remove root1B from lib-1 -> releases watches for dir1B and sub1B.
+	lister.setRoots([]domain.LibraryRoot{root1A, root2})
+	w.NotifySync()
+	waitForRootRemoved(t, w, root1B.ID)
+
+	wantAfterRootRemove := []string{dir1A, sub1A, dir2, sub2}
+	slices.Sort(wantAfterRootRemove)
+	if got := w.WatchedPaths(); !slices.Equal(got, wantAfterRootRemove) {
+		t.Fatalf("WatchedPaths after removing root-1b = %v, want %v", got, wantAfterRootRemove)
+	}
+
+	// Changes in removed root1B must not trigger any scan.
+	writeWatcherFile(t, filepath.Join(sub1B, "ignored.cbz"), []byte("ignored"), time.Time{})
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 0 {
+		t.Fatalf("removed root triggered %d scans, want 0", got)
+	}
+
+	// Remaining root1A in lib-1 still triggers normally.
+	writeWatcherFile(t, filepath.Join(sub1A, "active.cbz"), []byte("active"), time.Time{})
+	reqs := waitForTriggerCount(t, trig, 1)
+	assertAutomaticScanRequest(t, reqs[0], "lib-1")
+
+	// 2. Remove library lib-2 (root2) -> releases watches for dir2 and sub2.
+	lister.setRoots([]domain.LibraryRoot{root1A})
+	w.NotifySync()
+	waitForRootRemoved(t, w, root2.ID)
+
+	wantAfterLibRemove := []string{dir1A, sub1A}
+	slices.Sort(wantAfterLibRemove)
+	if got := w.WatchedPaths(); !slices.Equal(got, wantAfterLibRemove) {
+		t.Fatalf("WatchedPaths after removing lib-2 = %v, want %v", got, wantAfterLibRemove)
+	}
+
+	writeWatcherFile(t, filepath.Join(sub2, "ignored2.cbz"), []byte("ignored2"), time.Time{})
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("removed library triggered scan: got %d total, want 1", got)
+	}
+
+	// 3. Stop closes the OS watcher, releases all remaining watches, and leaves no goroutine running.
+	w.Stop()
+	if got := w.WatchedPaths(); len(got) != 0 {
+		t.Fatalf("WatchedPaths after Stop = %v, want empty", got)
+	}
+	assertNoWatcherGoroutinesRunning(t, baselineGoroutines+2)
 }

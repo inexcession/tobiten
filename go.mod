@@ -3,6 +3,7 @@ module github.com/inexcession/tobiten
 go 1.27.3
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/zeebo/xxh3 v1.1.0
