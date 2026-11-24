@@ -492,6 +492,37 @@ func TestCoverCache_RekeyPreservesExistingDestinationRendition(t *testing.T) {
 	if info, err := os.Stat(blockedDestPath); err != nil || !info.IsDir() {
 		t.Errorf("destination directory altered: info=%v err=%v", info, err)
 	}
+
+	// Same-shard collision-only re-key preserves destination inode/bytes and removes source.
+	const sameOldDigest = "3344111122223333"
+	const sameNewDigest = "3344999988887777"
+	sameOldKey := tobitenimage.ArchiveCoverKey(sameOldDigest, 0, opts400)
+	sameNewKey := tobitenimage.ArchiveCoverKey(sameNewDigest, 0, opts400)
+	if _, err := cache.Put(ctx, sameOldKey, []byte("same-shard-old")); err != nil {
+		t.Fatalf("Put(sameOld): %v", err)
+	}
+	sameDestEntry, err := cache.Put(ctx, sameNewKey, []byte("same-shard-dest"))
+	if err != nil {
+		t.Fatalf("Put(sameNew): %v", err)
+	}
+	sameDestInfo, err := os.Stat(sameDestEntry.Path)
+	if err != nil {
+		t.Fatalf("Stat(sameNew): %v", err)
+	}
+	if movedSame, err := cache.Rekey(ctx, tobitenimage.ArchiveSource(sameOldDigest), tobitenimage.ArchiveSource(sameNewDigest)); err != nil || movedSame != 0 {
+		t.Fatalf("same-shard collision Rekey = (%d, %v), want (0, nil)", movedSame, err)
+	}
+	gotSameDest, err := cache.Get(ctx, sameNewKey)
+	if err != nil || !bytes.Equal(gotSameDest.Data, []byte("same-shard-dest")) {
+		t.Fatalf("Get(sameNew) = (%v, %v)", gotSameDest, err)
+	}
+	gotSameDestInfo, err := os.Stat(gotSameDest.Path)
+	if err != nil || !os.SameFile(sameDestInfo, gotSameDestInfo) {
+		t.Errorf("same-shard destination file replaced or missing: err=%v", err)
+	}
+	if _, err := cache.Get(ctx, sameOldKey); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Errorf("same-shard superseded source still present: %v", err)
+	}
 }
 
 func TestCoverCache_InvalidateRemovesEveryRendition(t *testing.T) {

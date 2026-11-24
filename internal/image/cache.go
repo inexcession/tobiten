@@ -301,10 +301,11 @@ func syncDirectory(dir string) error {
 // CoverCache stores persistent, content-addressed cover renditions in a
 // two-level sharded directory tree under TOBITEN_COVERS_DIR (ADR-0015 §2, ADR-0018 S8).
 type CoverCache struct {
-	rootDir string
-	shards  [256]sync.Mutex
-	rootMu  sync.Mutex
-	ops     fsOps
+	rootDir     string
+	shards      [256]sync.Mutex
+	rootMu      sync.Mutex
+	rootEnsured bool
+	ops         fsOps
 }
 
 // NewCoverCache constructs a CoverCache rooted at rootDir (TOBITEN_COVERS_DIR).
@@ -640,6 +641,14 @@ func (c *CoverCache) ensureRootDir() error {
 		cur = parent
 	}
 
+	if !c.rootEnsured {
+		if parent := filepath.Dir(cur); parent != cur {
+			if err := c.ops.syncDir(parent); err != nil {
+				return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, err)
+			}
+		}
+	}
+
 	for i := len(missing) - 1; i >= 0; i-- {
 		dir := missing[i]
 		parent := filepath.Dir(dir)
@@ -654,6 +663,7 @@ func (c *CoverCache) ensureRootDir() error {
 			return fmt.Errorf("image: fsync covers parent directory %s: %w", parent, syncErr)
 		}
 	}
+	c.rootEnsured = true
 	return nil
 }
 
@@ -737,11 +747,11 @@ func (c *CoverCache) rekeyLocked(ctx context.Context, from, to CoverSource) (int
 	state := rekeyState{fromDir: fromDir, toDir: toDir, toS1: toS1, toS2: toS2}
 	for _, k := range matched {
 		if err := ctx.Err(); err != nil {
-			c.syncMovedDirs(fromDir, toDir, state.fromModified, state.toModified)
+			_ = c.syncRekeyModifiedDirs(&state)
 			return state.moved, err
 		}
 		if err := c.rekeyOneEntry(&state, k, to.Digest); err != nil {
-			c.syncMovedDirs(fromDir, toDir, state.fromModified, state.toModified)
+			_ = c.syncRekeyModifiedDirs(&state)
 			return state.moved, err
 		}
 	}
@@ -761,6 +771,7 @@ type rekeyState struct {
 	fromModified bool
 	toModified   bool
 	toDirEnsured bool
+	toDirSynced  bool
 }
 
 func (c *CoverCache) rekeyOneEntry(st *rekeyState, k CoverKey, toDigest string) error {
@@ -773,7 +784,21 @@ func (c *CoverCache) rekeyOneEntry(st *rekeyState, k CoverKey, toDigest string) 
 	if err != nil {
 		return err
 	}
+	if !st.toDirEnsured {
+		if _, err := c.ensureShardDir(st.toS1, st.toS2); err != nil {
+			return err
+		}
+		st.toDirEnsured = true
+	}
 	if exists {
+		// Ensure the existing destination file's directory entry is durable
+		// before removing the superseded source entry.
+		if !st.toDirSynced {
+			if err := c.ops.syncDir(st.toDir); err != nil {
+				return fmt.Errorf("image: fsync target shard directory %s: %w", st.toDir, err)
+			}
+			st.toDirSynced = true
+		}
 		if err := c.ops.remove(oldPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("image: remove superseded cover entry %s: %w", oldPath, err)
 		}
@@ -781,12 +806,6 @@ func (c *CoverCache) rekeyOneEntry(st *rekeyState, k CoverKey, toDigest string) 
 		return nil
 	}
 
-	if !st.toDirEnsured {
-		if _, err := c.ensureShardDir(st.toS1, st.toS2); err != nil {
-			return err
-		}
-		st.toDirEnsured = true
-	}
 	if err := c.ops.rename(oldPath, newPath); err != nil {
 		return fmt.Errorf("image: rekey cover entry %s -> %s: %w", oldPath, newPath, err)
 	}
@@ -809,12 +828,20 @@ func (c *CoverCache) syncRekeyExistingDirs(fromDir, toDir string) error {
 }
 
 func (c *CoverCache) syncRekeyModifiedDirs(st *rekeyState) error {
+	if st.fromDir == st.toDir {
+		if st.fromModified || st.toModified {
+			if err := c.ops.syncDir(st.toDir); err != nil {
+				return fmt.Errorf("image: fsync shard directory %s: %w", st.toDir, err)
+			}
+		}
+		return nil
+	}
 	if st.toModified {
 		if err := c.ops.syncDir(st.toDir); err != nil {
 			return fmt.Errorf("image: fsync target shard directory %s: %w", st.toDir, err)
 		}
 	}
-	if st.fromModified && st.fromDir != st.toDir {
+	if st.fromModified {
 		if err := c.ops.syncDir(st.fromDir); err != nil {
 			return fmt.Errorf("image: fsync source shard directory %s: %w", st.fromDir, err)
 		}
@@ -873,15 +900,6 @@ func (c *CoverCache) matchingKeysInDir(dir string, source CoverSource, match fun
 		matched = append(matched, parsed)
 	}
 	return matched, nil
-}
-
-func (c *CoverCache) syncMovedDirs(fromDir, toDir string, fromModified, toModified bool) {
-	if toModified {
-		_ = c.ops.syncDir(toDir)
-	}
-	if fromModified && fromDir != toDir {
-		_ = c.ops.syncDir(fromDir)
-	}
 }
 
 // Invalidate removes every cached rendition (across all pages, sizes, and

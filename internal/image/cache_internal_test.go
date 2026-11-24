@@ -248,6 +248,75 @@ func TestCoverCache_SimulatedCrashLeavesNoPartialEntryAndCleansTemp(t *testing.T
 			}
 		})
 	}
+
+	for _, tc := range []struct {
+		name     string
+		crashDir string
+	}{
+		{name: "crash_after_covers_root_mkdir_before_parent_sync", crashDir: "nested"},
+		{name: "crash_after_nested_ancestor_mkdir_before_parent_sync", crashDir: "base"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			nested := filepath.Join(base, "nested")
+			coversDir := filepath.Join(nested, "covers")
+
+			cache, err := NewCoverCache(coversDir)
+			if err != nil {
+				t.Fatalf("NewCoverCache: %v", err)
+			}
+
+			targetParent := base
+			if tc.crashDir == "nested" {
+				targetParent = nested
+			}
+			origSyncDir := cache.ops.syncDir
+			cache.ops.syncDir = func(dir string) error {
+				if dir == targetParent {
+					// Simulate abrupt process crash after Mkdir(child) and before syncDir(parent).
+					panic(simulatedCrashPanic{stage: "root_mkdir_parent_sync"})
+				}
+				return origSyncDir(dir)
+			}
+
+			key := ArchiveCoverKey("1122334455667788", 0, DefaultCoverOptions())
+			func() {
+				defer func() {
+					r := recover()
+					if r == nil {
+						t.Fatalf("expected simulated crash panic at %s", targetParent)
+					}
+					if _, ok := r.(simulatedCrashPanic); !ok {
+						panic(r)
+					}
+				}()
+				_, _ = cache.Put(ctx, key, []byte("interrupted-root-cover"))
+			}()
+
+			// Reopen with a fresh CoverCache handle; interrupted parent sync must complete before Put succeeds.
+			reopened, err := NewCoverCache(coversDir)
+			if err != nil {
+				t.Fatalf("reopen NewCoverCache: %v", err)
+			}
+			var synced []string
+			reopenOrigSync := reopened.ops.syncDir
+			reopened.ops.syncDir = func(dir string) error {
+				synced = append(synced, dir)
+				return reopenOrigSync(dir)
+			}
+
+			if _, err := reopened.Put(ctx, key, []byte("interrupted-root-cover")); err != nil {
+				t.Fatalf("Put after reopened interrupted root creation: %v", err)
+			}
+			if !slices.Contains(synced, targetParent) {
+				t.Fatalf("reopened Put did not sync interrupted parent %q; synced=%v", targetParent, synced)
+			}
+			got, err := reopened.Get(ctx, key)
+			if err != nil || string(got.Data) != "interrupted-root-cover" {
+				t.Fatalf("Get after reopened Put = (%v, %v)", got, err)
+			}
+		})
+	}
 }
 
 func TestCoverCache_PutErrorRemovesOwnTempFile(t *testing.T) {
@@ -320,6 +389,7 @@ func TestCoverCache_FreshNestedRootSyncsAllCreatedDirectories(t *testing.T) {
 	}
 
 	wantSynced := []string{
+		filepath.Dir(base),
 		base,
 		filepath.Join(base, "nested"),
 		filepath.Join(base, "nested", "storage"),
@@ -679,6 +749,136 @@ func TestCoverCache_DirectorySyncFailuresFinishOnRetry(t *testing.T) {
 		mu.Unlock()
 		if !slices.Contains(gotRetrySynced, coversDir) {
 			t.Fatalf("retry Put(shard-bb) skipped syncDir(%q) after overlapping shard sync; retrySynced=%v", coversDir, gotRetrySynced)
+		}
+	})
+
+	t.Run("rekey_same_shard_collision_only_syncs_and_retries", func(t *testing.T) {
+		coversDir := t.TempDir()
+		cache, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+
+		const oldDigest = "abcd111122223333"
+		const newDigest = "abcd444455556666"
+		opts := DefaultCoverOptions()
+		oldKey := ArchiveCoverKey(oldDigest, 0, opts)
+		newKey := ArchiveCoverKey(newDigest, 0, opts)
+
+		if _, err := cache.Put(ctx, oldKey, []byte("old-same-shard")); err != nil {
+			t.Fatalf("Put(old): %v", err)
+		}
+		if _, err := cache.Put(ctx, newKey, []byte("dest-same-shard")); err != nil {
+			t.Fatalf("Put(new): %v", err)
+		}
+
+		leafDir := filepath.Join(coversDir, "ab", "cd")
+		// Fail the post-unlink syncDir(leafDir) (2nd syncDir(leafDir): 1st is pre-remove dest sync).
+		var leafCalls int
+		origSyncDir := cache.ops.syncDir
+		cache.ops.syncDir = func(dir string) error {
+			if dir == leafDir {
+				leafCalls++
+				if leafCalls == 2 {
+					return boom
+				}
+			}
+			return origSyncDir(dir)
+		}
+
+		if _, err := cache.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest)); !errors.Is(err, boom) {
+			t.Fatalf("first same-shard collision Rekey err = %v, want %v", err, boom)
+		}
+		if leafCalls != 2 {
+			t.Fatalf("same-shard collision Rekey leaf sync calls = %d, want 2 (pre-remove dest + post-remove source)", leafCalls)
+		}
+
+		// Retry on reopened handle must sync leafDir and succeed.
+		reopened, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("reopen NewCoverCache: %v", err)
+		}
+		var retrySynced []string
+		reopenOrigSync := reopened.ops.syncDir
+		reopened.ops.syncDir = func(dir string) error {
+			retrySynced = append(retrySynced, dir)
+			return reopenOrigSync(dir)
+		}
+
+		if moved, err := reopened.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest)); err != nil || moved != 0 {
+			t.Fatalf("retry same-shard collision Rekey = (%d, %v), want (0, nil)", moved, err)
+		}
+		if !slices.Contains(retrySynced, leafDir) {
+			t.Fatalf("retry Rekey skipped syncDir(%q); synced=%v", leafDir, retrySynced)
+		}
+		got, err := reopened.Get(ctx, newKey)
+		if err != nil || string(got.Data) != "dest-same-shard" {
+			t.Fatalf("Get(newKey) = (%v, %v), want dest-same-shard", got, err)
+		}
+		if _, err := reopened.Get(ctx, oldKey); !errors.Is(err, ErrCacheMiss) {
+			t.Fatalf("oldKey still present: %v", err)
+		}
+	})
+
+	t.Run("rekey_collision_retains_source_until_unsynced_destination_is_durable", func(t *testing.T) {
+		coversDir := t.TempDir()
+		cache, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+
+		const oldDigest = "1122000011112222"
+		const newDigest = "9988000011112222"
+		opts := DefaultCoverOptions()
+		oldKey := ArchiveCoverKey(oldDigest, 0, opts)
+		newKey := ArchiveCoverKey(newDigest, 0, opts)
+
+		if _, err := cache.Put(ctx, oldKey, []byte("durable-source")); err != nil {
+			t.Fatalf("Put(old): %v", err)
+		}
+
+		destLeafDir := filepath.Join(coversDir, "99", "88")
+		sourceLeafDir := filepath.Join(coversDir, "11", "22")
+		failDestSync := true
+		origSyncDir := cache.ops.syncDir
+		var synced []string
+		cache.ops.syncDir = func(dir string) error {
+			if failDestSync && dir == destLeafDir {
+				return boom
+			}
+			synced = append(synced, dir)
+			return origSyncDir(dir)
+		}
+
+		// Destination Put leaves file visible in 99/88 while final syncDir(99/88) fails.
+		if _, err := cache.Put(ctx, newKey, []byte("unsynced-dest")); !errors.Is(err, boom) {
+			t.Fatalf("Put(new) err = %v, want %v", err, boom)
+		}
+
+		// With 99/88 sync still failing, cross-shard Rekey must fail and MUST retain oldKey.
+		if _, err := cache.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest)); !errors.Is(err, boom) {
+			t.Fatalf("Rekey with failing dest sync err = %v, want %v", err, boom)
+		}
+		gotOld, err := cache.Get(ctx, oldKey)
+		if err != nil || string(gotOld.Data) != "durable-source" {
+			t.Fatalf("source entry lost when destination durability check failed: (%v, %v)", gotOld, err)
+		}
+
+		// Once 99/88 sync recovers, Rekey confirms dest durability, removes oldKey, and syncs 11/22.
+		failDestSync = false
+		synced = nil
+		if moved, err := cache.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest)); err != nil || moved != 0 {
+			t.Fatalf("recovered Rekey = (%d, %v), want (0, nil)", moved, err)
+		}
+		if !slices.Contains(synced, destLeafDir) || !slices.Contains(synced, sourceLeafDir) {
+			t.Fatalf("recovered Rekey synced=%v, want both %q and %q", synced, destLeafDir, sourceLeafDir)
+		}
+		if _, err := cache.Get(ctx, oldKey); !errors.Is(err, ErrCacheMiss) {
+			t.Fatalf("superseded oldKey still present after recovered Rekey: %v", err)
+		}
+		gotNew, err := cache.Get(ctx, newKey)
+		if err != nil || string(gotNew.Data) != "unsynced-dest" {
+			t.Fatalf("Get(newKey) = (%v, %v), want unsynced-dest", gotNew, err)
 		}
 	})
 }
