@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type precedenceTestCase struct {
@@ -113,6 +114,17 @@ func TestPrecedence_TableDriven(t *testing.T) {
 			expectedEnv: 1024,
 			expectedFlg: 512,
 			getVal:      func(c *Config) any { return c.ExtractCacheMaxMB },
+		},
+		{
+			envKey:      "TOBITEN_THUMBNAIL_WAIT_TIMEOUT",
+			flagName:    "thumbnail-wait-timeout",
+			defaultVal:  5 * time.Second,
+			envFileVal:  "3s",
+			envVal:      "7s",
+			flagVal:     "12s",
+			expectedEnv: 7 * time.Second,
+			expectedFlg: 12 * time.Second,
+			getVal:      func(c *Config) any { return c.ThumbnailWaitTimeout },
 		},
 		{
 			envKey:      "TOBITEN_ADMIN_USER",
@@ -433,6 +445,7 @@ func TestBlankValuesUnset(t *testing.T) {
 			"TOBITEN_DATA_DIR",
 			"TOBITEN_THUMB_CACHE_MAX_MB",
 			"TOBITEN_EXTRACT_CACHE_MAX_MB",
+			"TOBITEN_THUMBNAIL_WAIT_TIMEOUT",
 			"TOBITEN_LOG_LEVEL",
 			"TOBITEN_LOG_FORMAT",
 			"TOBITEN_STORAGE_MODE",
@@ -506,9 +519,9 @@ func TestDocumentedKeysCoverage(t *testing.T) {
 		}
 	}
 
-	// Verify exact counts (22 daemon keys + 1 CLI key = 23 total)
-	if len(DaemonEnvKeys) != 22 {
-		t.Errorf("DaemonEnvKeys length = %d, want 22", len(DaemonEnvKeys))
+	// Verify exact counts (23 daemon keys + 1 CLI key = 24 total)
+	if len(DaemonEnvKeys) != 23 {
+		t.Errorf("DaemonEnvKeys length = %d, want 23", len(DaemonEnvKeys))
 	}
 	if len(CLIEnvKeys) != 1 || CLIEnvKeys[0] != "TOBITEN_API_KEY" {
 		t.Errorf("CLIEnvKeys = %v, want [TOBITEN_API_KEY]", CLIEnvKeys)
@@ -796,6 +809,31 @@ func TestOtherValidation(t *testing.T) {
 			t.Error("expected error for non-integer TOBITEN_PORT")
 		}
 	})
+
+	t.Run("invalid thumbnail wait timeout values", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			args []string
+			env  []string
+		}{
+			{name: "zero flag", args: []string{"--thumbnail-wait-timeout=0s"}},
+			{name: "negative flag", args: []string{"--thumbnail-wait-timeout=-1s"}},
+			{name: "zero env", env: []string{"TOBITEN_THUMBNAIL_WAIT_TIMEOUT=0s"}},
+			{name: "negative env", env: []string{"TOBITEN_THUMBNAIL_WAIT_TIMEOUT=-500ms"}},
+			{name: "malformed env", env: []string{"TOBITEN_THUMBNAIL_WAIT_TIMEOUT=not-a-duration"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := Load(tc.args, WithEnviron(tc.env), WithoutEnvFile())
+				if err == nil {
+					t.Fatalf("expected error for %s, got nil", tc.name)
+				}
+			})
+		}
+		_, err := Load([]string{"--thumbnail-wait-timeout=0s"}, WithEnviron(nil), WithoutEnvFile())
+		if !errors.Is(err, ErrInvalidThumbnailWaitTimeout) {
+			t.Errorf("error = %v, want ErrInvalidThumbnailWaitTimeout", err)
+		}
+	})
 }
 
 func TestEnvFileParser(t *testing.T) {
@@ -905,6 +943,7 @@ func TestPrintUsage(t *testing.T) {
 		"--scanner-workers",
 		"--storage-mode",
 		"--thumb-cache-max-mb",
+		"--thumbnail-wait-timeout",
 		"--trusted-proxies",
 		"--version",
 	}
@@ -1778,6 +1817,7 @@ func TestSystemSettings_AcceptedAliases_ResolutionAndReporting(t *testing.T) {
 			{envKey: "TOBITEN_CACHE_DIR", dbVal: "/db/cache", envVal: "/env/cache", wantDBVal: "/db/cache", wantEnvVal: "/env/cache"},
 			{envKey: "TOBITEN_THUMB_CACHE_MAX_MB", dbVal: "1024", envVal: "2048", wantDBVal: 1024, wantEnvVal: 2048},
 			{envKey: "TOBITEN_EXTRACT_CACHE_MAX_MB", dbVal: "512", envVal: "1024", wantDBVal: 512, wantEnvVal: 1024},
+			{envKey: "TOBITEN_THUMBNAIL_WAIT_TIMEOUT", dbVal: "3s", envVal: "8s", wantDBVal: "3s", wantEnvVal: "8s"},
 			{envKey: "TOBITEN_ADMIN_USER", dbVal: "db_admin", envVal: "env_admin", wantDBVal: "db_admin", wantEnvVal: "env_admin"},
 			{envKey: "TOBITEN_ADMIN_PASS", dbVal: "db_pass", envVal: "env_pass", wantDBVal: "", wantEnvVal: "[REDACTED]", isSecret: true},
 			{envKey: "TOBITEN_SECRET_KEY", dbVal: "db_secret_32bytes_long_secret_k", envVal: "env_secret_32bytes_long_secret_k", wantDBVal: "", wantEnvVal: "[REDACTED]", isSecret: true},

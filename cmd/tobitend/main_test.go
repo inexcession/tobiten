@@ -19,6 +19,7 @@ import (
 	"github.com/inexcession/tobiten/internal/config"
 	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
+	"github.com/inexcession/tobiten/internal/image/purego"
 	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/module"
@@ -593,6 +594,14 @@ func TestBuildRegistry(t *testing.T) {
 		}
 		if len(disabledReg.JobKinds()) != 0 {
 			t.Fatalf("disabled roots JobKinds() = %+v, want empty", disabledReg.JobKinds())
+		}
+	})
+
+	t.Run("registers purego image pipeline provider by default", func(t *testing.T) {
+		reg := BuildRegistry(nil)
+		pipelines := reg.ImagePipelines()
+		if len(pipelines) != 1 || pipelines[0].Name() != purego.PipelineName {
+			t.Fatalf("ImagePipelines() = %+v, want [%s]", pipelines, purego.PipelineName)
 		}
 	})
 }

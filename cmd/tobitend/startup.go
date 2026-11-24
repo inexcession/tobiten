@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,14 +18,19 @@ import (
 	"github.com/inexcession/tobiten/internal/auth"
 	"github.com/inexcession/tobiten/internal/bootstrap"
 	"github.com/inexcession/tobiten/internal/config"
+	"github.com/inexcession/tobiten/internal/container"
+	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/events"
+	tobitenimage "github.com/inexcession/tobiten/internal/image"
 	"github.com/inexcession/tobiten/internal/jobs"
 	"github.com/inexcession/tobiten/internal/library"
+	"github.com/inexcession/tobiten/internal/library/curation"
 	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/module"
+	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/embedded"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
 	"github.com/inexcession/tobiten/internal/storage/postgres/migrations"
@@ -271,8 +277,22 @@ type daemonServices struct {
 	app          *app.Services
 	jobs         *jobs.Service
 	events       *events.StreamService
+	cover        *curation.CoverService
 	triggerScan  func(ctx context.Context, libraryID string, opts scanner.TriggerScanOptions) (string, error)
 	rootsChanged atomic.Pointer[func()]
+}
+
+func (ds *daemonServices) startBackground(ctx context.Context) error {
+	if ds != nil && ds.cover != nil {
+		return ds.cover.Start(ctx)
+	}
+	return nil
+}
+
+func (ds *daemonServices) stopBackground() {
+	if ds != nil && ds.cover != nil {
+		ds.cover.Stop()
+	}
 }
 
 func (ds *daemonServices) setOnRootsChanged(fn func()) {
@@ -684,6 +704,11 @@ func newDaemonServices(
 			return scanner.TriggerScan(ctx, jobService, libraryID, opts)
 		},
 	}
+	coverService, err := newDaemonCoverService(transactor, cfg)
+	if err != nil {
+		return nil, err
+	}
+	ds.cover = coverService
 	libraryConfigService, err := roots.NewConfigService(transactor, roots.ConfigServiceOptions{
 		DefaultMode:    defaultLibraryMode,
 		Notifier:       jobService,
@@ -705,6 +730,45 @@ func newDaemonServices(
 	})
 	ds.app = services
 	return ds, nil
+}
+
+func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation.CoverService, error) {
+	coversDir := filepath.Join(config.DefaultDataDir, "covers")
+	waitTimeout := config.DefaultThumbnailWaitTimeout
+	if cfg != nil {
+		if strings.TrimSpace(cfg.CoversDir) != "" {
+			coversDir = cfg.CoversDir
+		}
+		if cfg.ThumbnailWaitTimeout > 0 {
+			waitTimeout = cfg.ThumbnailWaitTimeout
+		}
+	}
+
+	coverCache, err := tobitenimage.NewCoverCache(coversDir)
+	if err != nil {
+		return nil, fmt.Errorf("initializing cover cache: %w", err)
+	}
+
+	imgReg := tobitenimage.NewRegistry()
+	for _, p := range buildDaemonRegistry(cfg, nil, RegistryDeps{}).ImagePipelines() {
+		if err := imgReg.Register(p); err != nil {
+			return nil, fmt.Errorf("registering image pipeline %q: %w", p.Name(), err)
+		}
+	}
+
+	formats := container.NewFormatRegistry()
+	if err := formats.Register(cbz.Format()); err != nil {
+		return nil, fmt.Errorf("registering cbz container format: %w", err)
+	}
+
+	return curation.NewCoverService(curation.CoverServiceOptions{
+		Tx:          tx,
+		Cache:       coverCache,
+		Pipelines:   imgReg,
+		Formats:     formats,
+		WaitTimeout: waitTimeout,
+		Logger:      slog.Default(),
+	})
 }
 
 // runDaemon owns storage until HTTP serving has stopped. The dedicated lock
@@ -746,6 +810,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, serve func(context.Conte
 	if err != nil {
 		return err
 	}
+	if err := ds.startBackground(ctx); err != nil {
+		return err
+	}
+	defer ds.stopBackground()
 	workers, err := startDaemonJobs(ctx, cancel, d.pool, cfg, ds.app)
 	if err != nil {
 		return err

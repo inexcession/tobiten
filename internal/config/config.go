@@ -12,25 +12,27 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Predefined compiled defaults.
 const (
-	DefaultHost              = "0.0.0.0"
-	DefaultPort              = 8080
-	DefaultBaseURL           = "http://localhost:8080"
-	DefaultDataDir           = "./data"
-	DefaultThumbCacheMaxMB   = 2048
-	DefaultExtractCacheMaxMB = 4096
-	DefaultLogLevel          = "info"
-	DefaultLogFormat         = "json"
-	DefaultStorageMode       = "local"
-	DefaultLibraryMode       = "virtual"
-	DefaultIntakeMode        = "hardlink"
-	DefaultScannerWorkers    = 0
+	DefaultHost                 = "0.0.0.0"
+	DefaultPort                 = 8080
+	DefaultBaseURL              = "http://localhost:8080"
+	DefaultDataDir              = "./data"
+	DefaultThumbCacheMaxMB      = 2048
+	DefaultExtractCacheMaxMB    = 4096
+	DefaultThumbnailWaitTimeout = 5 * time.Second
+	DefaultLogLevel             = "info"
+	DefaultLogFormat            = "json"
+	DefaultStorageMode          = "local"
+	DefaultLibraryMode          = "virtual"
+	DefaultIntakeMode           = "hardlink"
+	DefaultScannerWorkers       = 0
 )
 
-// DaemonEnvKeys contains all 22 TOBITEN_* environment variables recognized by tobitend (I-7).
+// DaemonEnvKeys contains all 23 TOBITEN_* environment variables recognized by tobitend (I-7).
 var DaemonEnvKeys = []string{
 	"TOBITEN_HOST",
 	"TOBITEN_PORT",
@@ -40,6 +42,7 @@ var DaemonEnvKeys = []string{
 	"TOBITEN_CACHE_DIR",
 	"TOBITEN_THUMB_CACHE_MAX_MB",
 	"TOBITEN_EXTRACT_CACHE_MAX_MB",
+	"TOBITEN_THUMBNAIL_WAIT_TIMEOUT",
 	"TOBITEN_ADMIN_USER",
 	"TOBITEN_ADMIN_PASS",
 	"TOBITEN_SECRET_KEY",
@@ -63,16 +66,17 @@ var CLIEnvKeys = []string{
 
 // Sentinel errors for configuration and validation failures.
 var (
-	ErrLocalStorageConflict    = errors.New("storage mode 'local' requires an empty TOBITEN_DATABASE_URL; for a remote database, set TOBITEN_STORAGE_MODE=postgres")
-	ErrPostgresStorageConflict = errors.New("storage mode 'postgres' requires a non-empty TOBITEN_DATABASE_URL")
-	ErrInvalidStorageMode      = errors.New("unsupported storage mode: supported modes are 'local' and 'postgres'")
-	ErrInvalidLibraryMode      = errors.New("unsupported library mode: supported modes are 'virtual' and 'managed'")
-	ErrInvalidIntakeMode       = errors.New("unsupported intake mode: supported modes are 'hardlink', 'copy', and 'move'")
-	ErrInvalidLogLevel         = errors.New("unsupported log level: supported levels are 'debug', 'info', 'warn', and 'error'")
-	ErrInvalidLogFormat        = errors.New("unsupported log format: supported formats are 'json', 'text', and 'table'")
-	ErrInvalidPort             = errors.New("invalid port: port must be between 1 and 65535")
-	ErrInvalidBaseURL          = errors.New("invalid base URL: must be an absolute URL with http or https scheme, without query, fragment, or userinfo")
-	ErrInvalidFlag             = errors.New("invalid CLI flag")
+	ErrLocalStorageConflict        = errors.New("storage mode 'local' requires an empty TOBITEN_DATABASE_URL; for a remote database, set TOBITEN_STORAGE_MODE=postgres")
+	ErrPostgresStorageConflict     = errors.New("storage mode 'postgres' requires a non-empty TOBITEN_DATABASE_URL")
+	ErrInvalidStorageMode          = errors.New("unsupported storage mode: supported modes are 'local' and 'postgres'")
+	ErrInvalidLibraryMode          = errors.New("unsupported library mode: supported modes are 'virtual' and 'managed'")
+	ErrInvalidIntakeMode           = errors.New("unsupported intake mode: supported modes are 'hardlink', 'copy', and 'move'")
+	ErrInvalidLogLevel             = errors.New("unsupported log level: supported levels are 'debug', 'info', 'warn', and 'error'")
+	ErrInvalidLogFormat            = errors.New("unsupported log format: supported formats are 'json', 'text', and 'table'")
+	ErrInvalidPort                 = errors.New("invalid port: port must be between 1 and 65535")
+	ErrInvalidBaseURL              = errors.New("invalid base URL: must be an absolute URL with http or https scheme, without query, fragment, or userinfo")
+	ErrInvalidFlag                 = errors.New("invalid CLI flag")
+	ErrInvalidThumbnailWaitTimeout = errors.New("invalid thumbnail wait timeout: must be a positive duration")
 )
 
 // Source represents the origin of a configuration value.
@@ -108,14 +112,15 @@ type Config struct {
 	BaseURL string `json:"base_url"`
 
 	// Storage Directories & Independent Volume Redirection (ADR-0014, ADR-0015)
-	DataDir           string `json:"data_dir"`
-	CoversDir         string `json:"covers_dir"`
-	CacheDir          string `json:"cache_dir"`
-	PostgresDir       string `json:"postgres_dir"`
-	BackupsDir        string `json:"backups_dir"`
-	SecretKeyPath     string `json:"secret_key_path"`
-	ThumbCacheMaxMB   int    `json:"thumb_cache_max_mb"`
-	ExtractCacheMaxMB int    `json:"extract_cache_max_mb"`
+	DataDir              string        `json:"data_dir"`
+	CoversDir            string        `json:"covers_dir"`
+	CacheDir             string        `json:"cache_dir"`
+	PostgresDir          string        `json:"postgres_dir"`
+	BackupsDir           string        `json:"backups_dir"`
+	SecretKeyPath        string        `json:"secret_key_path"`
+	ThumbCacheMaxMB      int           `json:"thumb_cache_max_mb"`
+	ExtractCacheMaxMB    int           `json:"extract_cache_max_mb"`
+	ThumbnailWaitTimeout time.Duration `json:"thumbnail_wait_timeout"`
 
 	// First-Run Admin Bootstrap & Security (ADR-0006, ADR-0014)
 	AdminUser         string `json:"admin_user"`
@@ -263,6 +268,8 @@ func (c *Config) EffectiveSettings() map[string]EffectiveSetting {
 			val = c.ThumbCacheMaxMB
 		case "TOBITEN_EXTRACT_CACHE_MAX_MB":
 			val = c.ExtractCacheMaxMB
+		case "TOBITEN_THUMBNAIL_WAIT_TIMEOUT":
+			val = c.ThumbnailWaitTimeout.String()
 		case "TOBITEN_ADMIN_USER":
 			val = c.AdminUser
 		case "TOBITEN_ADMIN_PASS":
@@ -471,6 +478,17 @@ var systemSettingAppliers = []settingApplier{
 				return fmt.Errorf("invalid integer value for TOBITEN_EXTRACT_CACHE_MAX_MB in system_settings: %q", val)
 			}
 			c.ExtractCacheMaxMB = n
+			return nil
+		},
+	},
+	{
+		envKey: "TOBITEN_THUMBNAIL_WAIT_TIMEOUT",
+		apply: func(c *Config, val string) error {
+			d, err := time.ParseDuration(strings.TrimSpace(val))
+			if err != nil {
+				return fmt.Errorf("invalid duration value for TOBITEN_THUMBNAIL_WAIT_TIMEOUT in system_settings: %q", val)
+			}
+			c.ThumbnailWaitTimeout = d
 			return nil
 		},
 	},
@@ -692,6 +710,9 @@ func (c *Config) Validate() error {
 	if c.ExtractCacheMaxMB < 0 {
 		return fmt.Errorf("extract_cache_max_mb cannot be negative: %d", c.ExtractCacheMaxMB)
 	}
+	if c.ThumbnailWaitTimeout <= 0 {
+		return fmt.Errorf("%w: %s", ErrInvalidThumbnailWaitTimeout, c.ThumbnailWaitTimeout)
+	}
 	if c.ScannerWorkers < 0 {
 		return fmt.Errorf("scanner_workers cannot be negative: %d", c.ScannerWorkers)
 	}
@@ -786,28 +807,29 @@ func WithSystemSettingsJSON(settings map[string][]byte) Option {
 }
 
 type flagValues struct {
-	host              string
-	port              int
-	baseURL           string
-	dataDir           string
-	coversDir         string
-	cacheDir          string
-	thumbCacheMaxMB   int
-	extractCacheMaxMB int
-	adminUser         string
-	trustedProxies    string
-	oidcDefaultRole   string
-	oidcDefaultLabels string
-	logLevel          string
-	logFormat         string
-	storageMode       string
-	pgBin             string
-	libraryMode       string
-	scannerWorkers    int
-	intakeMode        string
-	envFile           string
-	version           bool
-	v                 bool
+	host                 string
+	port                 int
+	baseURL              string
+	dataDir              string
+	coversDir            string
+	cacheDir             string
+	thumbCacheMaxMB      int
+	extractCacheMaxMB    int
+	thumbnailWaitTimeout time.Duration
+	adminUser            string
+	trustedProxies       string
+	oidcDefaultRole      string
+	oidcDefaultLabels    string
+	logLevel             string
+	logFormat            string
+	storageMode          string
+	pgBin                string
+	libraryMode          string
+	scannerWorkers       int
+	intakeMode           string
+	envFile              string
+	version              bool
+	v                    bool
 }
 
 func registerFlags(fs *flag.FlagSet, fv *flagValues) {
@@ -819,6 +841,7 @@ func registerFlags(fs *flag.FlagSet, fv *flagValues) {
 	fs.StringVar(&fv.cacheDir, "cache-dir", "", "path to ephemeral cache directory")
 	fs.IntVar(&fv.thumbCacheMaxMB, "thumb-cache-max-mb", 0, "max disk budget for preview thumbnails in MB")
 	fs.IntVar(&fv.extractCacheMaxMB, "extract-cache-max-mb", 0, "max disk budget for extracted pages in MB")
+	fs.DurationVar(&fv.thumbnailWaitTimeout, "thumbnail-wait-timeout", 0, "maximum wait duration for on-demand thumbnail generation")
 	fs.StringVar(&fv.adminUser, "admin-user", "", "first-run admin bootstrap username")
 	fs.StringVar(&fv.trustedProxies, "trusted-proxies", "", "trusted reverse-proxy CIDRs")
 	fs.StringVar(&fv.oidcDefaultRole, "oidc-default-role", "", "default role for auto-provisioned OIDC users")
@@ -970,6 +993,10 @@ func (in *loadInputs) integer(flagName string, flagVal int, envKey string, defau
 	return resolveInt(in.visited[flagName], flagVal, envKey, in.envMap, in.envFileMap, in.systemSettings, defaultVal, sources)
 }
 
+func (in *loadInputs) duration(flagName string, flagVal time.Duration, envKey string, defaultVal time.Duration, sources map[string]Source) (time.Duration, error) {
+	return resolveDuration(in.visited[flagName], flagVal, envKey, in.envMap, in.envFileMap, in.systemSettings, defaultVal, sources)
+}
+
 func (in *loadInputs) derivedDir(flagName, flagVal, envKey, dataDir, subdir string, sources map[string]Source) string {
 	raw := in.str(flagName, flagVal, envKey, "", sources)
 	if strings.TrimSpace(raw) == "" {
@@ -1007,6 +1034,10 @@ func resolveNetworkAndStorage(cfg *Config, in *loadInputs) error {
 		return err
 	}
 	cfg.ExtractCacheMaxMB, err = in.integer("extract-cache-max-mb", in.fv.extractCacheMaxMB, "TOBITEN_EXTRACT_CACHE_MAX_MB", DefaultExtractCacheMaxMB, cfg.sources)
+	if err != nil {
+		return err
+	}
+	cfg.ThumbnailWaitTimeout, err = in.duration("thumbnail-wait-timeout", in.fv.thumbnailWaitTimeout, "TOBITEN_THUMBNAIL_WAIT_TIMEOUT", DefaultThumbnailWaitTimeout, cfg.sources)
 	return err
 }
 
@@ -1188,6 +1219,45 @@ func resolveInt(flagVisited bool, flagVal int, envKey string, envMap, envFileMap
 	return defaultVal, nil
 }
 
+func resolveDuration(flagVisited bool, flagVal time.Duration, envKey string, envMap, envFileMap, systemSettings map[string]string, defaultVal time.Duration, sources map[string]Source) (time.Duration, error) {
+	if flagVisited {
+		sources[envKey] = SourceFlag
+		return flagVal, nil
+	}
+	if val, ok := envMap[envKey]; ok {
+		if trimmed := strings.TrimSpace(val); trimmed != "" {
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration value for %s: %q", envKey, val)
+			}
+			sources[envKey] = SourceEnv
+			return d, nil
+		}
+	}
+	if val, ok := envFileMap[envKey]; ok {
+		if trimmed := strings.TrimSpace(val); trimmed != "" {
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration value for %s in env file: %q", envKey, val)
+			}
+			sources[envKey] = SourceEnvFile
+			return d, nil
+		}
+	}
+	if val, ok := lookupSystemSetting(systemSettings, envKey); ok {
+		if trimmed := strings.TrimSpace(val); trimmed != "" {
+			d, err := time.ParseDuration(trimmed)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration value for %s in system_settings: %q", envKey, val)
+			}
+			sources[envKey] = SourceSystemSettings
+			return d, nil
+		}
+	}
+	sources[envKey] = SourceDefault
+	return defaultVal, nil
+}
+
 func resolveSecret(envKey string, envMap, envFileMap map[string]string, sources map[string]Source) string {
 	if val, ok := envMap[envKey]; ok {
 		trimmed := strings.TrimSpace(val)
@@ -1208,28 +1278,29 @@ func resolveSecret(envKey string, envMap, envFileMap map[string]string, sources 
 }
 
 var envKeyAliases = map[string][]string{
-	"TOBITEN_HOST":                 {"server.host", "host"},
-	"TOBITEN_PORT":                 {"server.port", "port"},
-	"TOBITEN_BASE_URL":             {"server.base_url", "base_url"},
-	"TOBITEN_DATA_DIR":             {"storage.data_dir", "data_dir"},
-	"TOBITEN_COVERS_DIR":           {"storage.covers_dir", "covers_dir"},
-	"TOBITEN_CACHE_DIR":            {"storage.cache_dir", "cache_dir"},
-	"TOBITEN_THUMB_CACHE_MAX_MB":   {"cache.thumb_max_mb", "thumb_cache_max_mb"},
-	"TOBITEN_EXTRACT_CACHE_MAX_MB": {"cache.extract_max_mb", "extract_cache_max_mb"},
-	"TOBITEN_ADMIN_USER":           {"admin.user", "admin_user"},
-	"TOBITEN_ADMIN_PASS":           {"admin.pass", "admin_pass"},
-	"TOBITEN_SECRET_KEY":           {"security.secret_key", "secret_key"},
-	"TOBITEN_TRUSTED_PROXIES":      {"security.trusted_proxies", "trusted_proxies"},
-	"TOBITEN_OIDC_DEFAULT_ROLE":    {"oidc.default_role_id", "oidc.default_role", "oidc_default_role"},
-	"TOBITEN_OIDC_DEFAULT_LABELS":  {"oidc.default_labels", "oidc.default_label_ids", "oidc_default_labels"},
-	"TOBITEN_LOG_LEVEL":            {"log.level", "logging.level", "log_level"},
-	"TOBITEN_LOG_FORMAT":           {"log.format", "logging.format", "log_format"},
-	"TOBITEN_STORAGE_MODE":         {"storage.mode", "storage_mode"},
-	"TOBITEN_DATABASE_URL":         {"storage.database_url", "database_url"},
-	"TOBITEN_PG_BIN":               {"storage.pg_bin", "pg_bin"},
-	"TOBITEN_LIBRARY_MODE":         {"library.mode", "library_mode"},
-	"TOBITEN_SCANNER_WORKERS":      {"scanner.workers", "scanner_workers"},
-	"TOBITEN_INTAKE_MODE":          {"intake.mode", "intake_mode"},
+	"TOBITEN_HOST":                   {"server.host", "host"},
+	"TOBITEN_PORT":                   {"server.port", "port"},
+	"TOBITEN_BASE_URL":               {"server.base_url", "base_url"},
+	"TOBITEN_DATA_DIR":               {"storage.data_dir", "data_dir"},
+	"TOBITEN_COVERS_DIR":             {"storage.covers_dir", "covers_dir"},
+	"TOBITEN_CACHE_DIR":              {"storage.cache_dir", "cache_dir"},
+	"TOBITEN_THUMB_CACHE_MAX_MB":     {"cache.thumb_max_mb", "thumb_cache_max_mb"},
+	"TOBITEN_EXTRACT_CACHE_MAX_MB":   {"cache.extract_max_mb", "extract_cache_max_mb"},
+	"TOBITEN_THUMBNAIL_WAIT_TIMEOUT": {"thumbnail.wait_timeout", "thumbnail_wait_timeout"},
+	"TOBITEN_ADMIN_USER":             {"admin.user", "admin_user"},
+	"TOBITEN_ADMIN_PASS":             {"admin.pass", "admin_pass"},
+	"TOBITEN_SECRET_KEY":             {"security.secret_key", "secret_key"},
+	"TOBITEN_TRUSTED_PROXIES":        {"security.trusted_proxies", "trusted_proxies"},
+	"TOBITEN_OIDC_DEFAULT_ROLE":      {"oidc.default_role_id", "oidc.default_role", "oidc_default_role"},
+	"TOBITEN_OIDC_DEFAULT_LABELS":    {"oidc.default_labels", "oidc.default_label_ids", "oidc_default_labels"},
+	"TOBITEN_LOG_LEVEL":              {"log.level", "logging.level", "log_level"},
+	"TOBITEN_LOG_FORMAT":             {"log.format", "logging.format", "log_format"},
+	"TOBITEN_STORAGE_MODE":           {"storage.mode", "storage_mode"},
+	"TOBITEN_DATABASE_URL":           {"storage.database_url", "database_url"},
+	"TOBITEN_PG_BIN":                 {"storage.pg_bin", "pg_bin"},
+	"TOBITEN_LIBRARY_MODE":           {"library.mode", "library_mode"},
+	"TOBITEN_SCANNER_WORKERS":        {"scanner.workers", "scanner_workers"},
+	"TOBITEN_INTAKE_MODE":            {"intake.mode", "intake_mode"},
 }
 
 // envKeyAcceptedAliases maps each canonical TOBITEN_* environment variable key

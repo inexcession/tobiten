@@ -14,6 +14,8 @@ import (
 	"github.com/inexcession/tobiten/internal/api/openapi"
 	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/config"
+	tobitenimage "github.com/inexcession/tobiten/internal/image"
+	"github.com/inexcession/tobiten/internal/image/purego"
 	"github.com/inexcession/tobiten/internal/library/roots"
 	"github.com/inexcession/tobiten/internal/library/scanner"
 	"github.com/inexcession/tobiten/internal/logging"
@@ -119,6 +121,14 @@ func BuildRegistryWithDeps(cfg *config.Config, services *app.Services, deps Regi
 		} else {
 			_ = reg.Register(mod)
 		}
+	}
+	if puregoPipeline, err := purego.New(purego.Options{}); err != nil {
+		slog.Error("failed to initialize purego image pipeline", logging.Err(err))
+	} else {
+		_ = reg.Register(&module.SimpleModule{
+			ModuleName: purego.PipelineName,
+			Pipelines:  []tobitenimage.ImagePipeline{puregoPipeline},
+		})
 	}
 
 	// Apply configuration (e.g. disabled modules) after registering real modules
