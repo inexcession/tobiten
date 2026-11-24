@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -375,6 +376,98 @@ func TestCoverCache_RekeyMovesWithoutReencoding(t *testing.T) {
 	}
 }
 
+func TestCoverCache_RekeyPreservesExistingDestinationRendition(t *testing.T) {
+	ctx := context.Background()
+	coversDir := t.TempDir()
+	cache, err := tobitenimage.NewCoverCache(coversDir)
+	if err != nil {
+		t.Fatalf("NewCoverCache: %v", err)
+	}
+
+	const oldDigest = "1111222233334444"
+	const newDigest = "9999888877776666"
+
+	opts400 := tobitenimage.DefaultCoverOptions()
+	opts800 := tobitenimage.RenderOptions{MaxWidth: 800, OutputFormat: tobitenimage.CodecJPEG}
+
+	old400 := tobitenimage.ArchiveCoverKey(oldDigest, 0, opts400)
+	old800 := tobitenimage.ArchiveCoverKey(oldDigest, 0, opts800)
+	new400 := tobitenimage.ArchiveCoverKey(newDigest, 0, opts400)
+	new800 := tobitenimage.ArchiveCoverKey(newDigest, 0, opts800)
+
+	if _, err := cache.Put(ctx, old400, []byte("old-400-bytes")); err != nil {
+		t.Fatalf("Put(old400): %v", err)
+	}
+	old800Entry, err := cache.Put(ctx, old800, []byte("old-800-bytes"))
+	if err != nil {
+		t.Fatalf("Put(old800): %v", err)
+	}
+	old800Info, err := os.Stat(old800Entry.Path)
+	if err != nil {
+		t.Fatalf("Stat(old800): %v", err)
+	}
+
+	existingDestBytes := []byte("existing-destination-400-bytes")
+	destEntry, err := cache.Put(ctx, new400, existingDestBytes)
+	if err != nil {
+		t.Fatalf("Put(new400): %v", err)
+	}
+	destInfo, err := os.Stat(destEntry.Path)
+	if err != nil {
+		t.Fatalf("Stat(new400): %v", err)
+	}
+
+	// old400 collides with existing new400 (must preserve new400 and remove old400);
+	// old800 has no existing destination (must move in place to new800).
+	moved, err := cache.Rekey(ctx, tobitenimage.ArchiveSource(oldDigest), tobitenimage.ArchiveSource(newDigest))
+	if err != nil {
+		t.Fatalf("Rekey: %v", err)
+	}
+	if moved != 1 {
+		t.Fatalf("Rekey moved = %d, want 1", moved)
+	}
+
+	gotDest, err := cache.Get(ctx, new400)
+	if err != nil {
+		t.Fatalf("Get(new400): %v", err)
+	}
+	if !bytes.Equal(gotDest.Data, existingDestBytes) {
+		t.Errorf("new400 bytes = %q, want preserved %q", gotDest.Data, existingDestBytes)
+	}
+	gotDestInfo, err := os.Stat(gotDest.Path)
+	if err != nil {
+		t.Fatalf("Stat(gotDest): %v", err)
+	}
+	if !os.SameFile(destInfo, gotDestInfo) {
+		t.Errorf("existing destination file was replaced instead of preserved")
+	}
+
+	gotMoved, err := cache.Get(ctx, new800)
+	if err != nil {
+		t.Fatalf("Get(new800): %v", err)
+	}
+	if !bytes.Equal(gotMoved.Data, []byte("old-800-bytes")) {
+		t.Errorf("new800 bytes = %q, want old-800-bytes", gotMoved.Data)
+	}
+	gotMovedInfo, err := os.Stat(gotMoved.Path)
+	if err != nil {
+		t.Fatalf("Stat(new800): %v", err)
+	}
+	if !os.SameFile(old800Info, gotMovedInfo) {
+		t.Errorf("non-colliding entry was not moved in place")
+	}
+
+	if _, err := cache.Get(ctx, old400); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Errorf("superseded old400 still present: %v", err)
+	}
+	if _, err := cache.Get(ctx, old800); !errors.Is(err, tobitenimage.ErrCacheMiss) {
+		t.Errorf("moved old800 still present: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(coversDir, "11")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("empty old shard dir still exists: %v", err)
+	}
+}
+
 func TestCoverCache_InvalidateRemovesEveryRendition(t *testing.T) {
 	ctx := context.Background()
 	coversDir := t.TempDir()
@@ -468,13 +561,18 @@ func TestCoverCache_IgnoresAndRemovesLeftoverTempFiles(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
-	tempPaths := []string{
-		filepath.Join(coversDir, ".tobiten-tmp-root-orphan"),
-		filepath.Join(coversDir, "55", ".tobiten-tmp-shard1-orphan"),
+	coverTempPaths := []string{
 		filepath.Join(shardDir, ".tobiten-tmp-cover-12345"),
-		filepath.Join(shardDir, ".tobiten-tmp-"+filepath.Base(finalPath)),
+		filepath.Join(shardDir, ".tobiten-tmp-cover-"+filepath.Base(finalPath)),
 	}
-	for _, tp := range tempPaths {
+	foreignTempPaths := []string{
+		filepath.Join(coversDir, ".tobiten-tmp-job42-repack"),
+		filepath.Join(coversDir, ".tobiten-tmp-cover-outside-leaf"),
+		filepath.Join(coversDir, "55", ".tobiten-tmp-job42-shard1"),
+		filepath.Join(coversDir, "55", ".tobiten-tmp-cover-outside-leaf"),
+		filepath.Join(shardDir, ".tobiten-tmp-job42-leaf"),
+	}
+	for _, tp := range append(slices.Clone(coverTempPaths), foreignTempPaths...) {
 		if err := os.WriteFile(tp, []byte("incomplete-temp"), 0o600); err != nil {
 			t.Fatalf("WriteFile(%s): %v", tp, err)
 		}
@@ -504,12 +602,17 @@ func TestCoverCache_IgnoresAndRemovesLeftoverTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CleanupTemp: %v", err)
 	}
-	if removed != len(tempPaths) {
-		t.Fatalf("CleanupTemp removed = %d, want %d", removed, len(tempPaths))
+	if removed != len(coverTempPaths) {
+		t.Fatalf("CleanupTemp removed = %d, want %d", removed, len(coverTempPaths))
 	}
-	for _, tp := range tempPaths {
+	for _, tp := range coverTempPaths {
 		if _, err := os.Stat(tp); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("temp file %q still exists after CleanupTemp: %v", tp, err)
+			t.Errorf("cover temp file %q still exists after CleanupTemp: %v", tp, err)
+		}
+	}
+	for _, fp := range foreignTempPaths {
+		if _, err := os.Stat(fp); err != nil {
+			t.Errorf("foreign temp file %q did not survive CleanupTemp: %v", fp, err)
 		}
 	}
 	if got, err := cache.Get(ctx, completeKey); err != nil || !bytes.Equal(got.Data, []byte("valid-entry")) {

@@ -75,8 +75,8 @@ func TestCoverCache_WriteProtocolOrder(t *testing.T) {
 	if !slices.Equal(trace, wantTrace) {
 		t.Fatalf("write protocol order = %v, want %v", trace, wantTrace)
 	}
-	if !strings.HasPrefix(filepath.Base(createdTemp), tempFilePrefix) {
-		t.Errorf("temp file %q does not start with %q", createdTemp, tempFilePrefix)
+	if !strings.HasPrefix(filepath.Base(createdTemp), coverTempPrefix) {
+		t.Errorf("temp file %q does not start with %q", createdTemp, coverTempPrefix)
 	}
 	if filepath.Dir(createdTemp) != filepath.Dir(entry.Path) {
 		t.Errorf("temp dir %q != final dir %q", filepath.Dir(createdTemp), filepath.Dir(entry.Path))
@@ -294,6 +294,268 @@ func TestCoverCache_PutErrorRemovesOwnTempFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCoverCache_FreshNestedRootSyncsAllCreatedDirectories(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	coversDir := filepath.Join(base, "nested", "storage", "covers")
+
+	cache, err := NewCoverCache(coversDir)
+	if err != nil {
+		t.Fatalf("NewCoverCache: %v", err)
+	}
+
+	var synced []string
+	origSyncDir := cache.ops.syncDir
+	cache.ops.syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return origSyncDir(dir)
+	}
+
+	key := ArchiveCoverKey("abcdef0123456789", 0, DefaultCoverOptions())
+	if _, err := cache.Put(ctx, key, []byte("nested-root-cover")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	wantSynced := []string{
+		base,
+		filepath.Join(base, "nested"),
+		filepath.Join(base, "nested", "storage"),
+		coversDir,
+		filepath.Join(coversDir, "ab"),
+		filepath.Join(coversDir, "ab", "cd"),
+	}
+	if !slices.Equal(synced, wantSynced) {
+		t.Fatalf("synced dirs = %v, want %v", synced, wantSynced)
+	}
+}
+
+func TestCoverCache_DirectorySyncFailuresFinishOnRetry(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("injected syncDir failure")
+
+	t.Run("put_retries_root_ancestor_and_shard_parent_syncs", func(t *testing.T) {
+		base := t.TempDir()
+		nestedParent := filepath.Join(base, "nested")
+		coversDir := filepath.Join(nestedParent, "covers")
+		shard1Dir := filepath.Join(coversDir, "ab")
+
+		for _, failDir := range []string{nestedParent, coversDir, shard1Dir} {
+			t.Run(filepath.Base(failDir), func(t *testing.T) {
+				if err := os.RemoveAll(nestedParent); err != nil {
+					t.Fatalf("RemoveAll: %v", err)
+				}
+				cache, err := NewCoverCache(coversDir)
+				if err != nil {
+					t.Fatalf("NewCoverCache: %v", err)
+				}
+
+				var synced []string
+				failOnce := true
+				origSyncDir := cache.ops.syncDir
+				cache.ops.syncDir = func(dir string) error {
+					if failOnce && dir == failDir {
+						failOnce = false
+						return boom
+					}
+					synced = append(synced, dir)
+					return origSyncDir(dir)
+				}
+
+				key := ArchiveCoverKey("abcdef0123456789", 0, DefaultCoverOptions())
+				if _, err := cache.Put(ctx, key, []byte("retry-cover")); !errors.Is(err, boom) {
+					t.Fatalf("first Put err = %v, want %v", err, boom)
+				}
+
+				synced = nil
+				if _, err := cache.Put(ctx, key, []byte("retry-cover")); err != nil {
+					t.Fatalf("retry Put err = %v", err)
+				}
+				if !slices.Contains(synced, failDir) {
+					t.Errorf("retry Put skipped missing syncDir(%q); synced=%v", failDir, synced)
+				}
+				if !slices.Contains(synced, filepath.Join(shard1Dir, "cd")) {
+					t.Errorf("retry Put skipped leaf syncDir; synced=%v", synced)
+				}
+			})
+		}
+	})
+
+	t.Run("rekey_retries_pending_target_source_and_prune_syncs", func(t *testing.T) {
+		oldDigest := "1234567890abcdef"
+		newDigest := "fedcba0987654321"
+
+		cases := []struct {
+			name         string
+			seedDestDir  bool
+			wantRetryMov int
+		}{
+			{name: "toDir", wantRetryMov: 0},
+			{name: "fromDir", wantRetryMov: 0},
+			{name: "fromShard1", wantRetryMov: 0},
+			{name: "rootDir_before_rename", wantRetryMov: 1},
+			{name: "rootDir_after_prune", seedDestDir: true, wantRetryMov: 0},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				coversDir := t.TempDir()
+				cache, err := NewCoverCache(coversDir)
+				if err != nil {
+					t.Fatalf("NewCoverCache: %v", err)
+				}
+
+				oldKey := ArchiveCoverKey(oldDigest, 0, DefaultCoverOptions())
+				if _, err := cache.Put(ctx, oldKey, []byte("rekey-retry-bytes")); err != nil {
+					t.Fatalf("Put: %v", err)
+				}
+				if tc.seedDestDir {
+					if err := os.MkdirAll(filepath.Join(coversDir, "fe", "dc"), 0o755); err != nil {
+						t.Fatalf("MkdirAll: %v", err)
+					}
+				}
+
+				var failTarget string
+				switch tc.name {
+				case "toDir":
+					failTarget = filepath.Join(coversDir, "fe", "dc")
+				case "fromDir":
+					failTarget = filepath.Join(coversDir, "12", "34")
+				case "fromShard1":
+					failTarget = filepath.Join(coversDir, "12")
+				case "rootDir_before_rename", "rootDir_after_prune":
+					failTarget = coversDir
+				}
+
+				var synced []string
+				failOnce := true
+				origSyncDir := cache.ops.syncDir
+				cache.ops.syncDir = func(dir string) error {
+					if failOnce && dir == failTarget {
+						failOnce = false
+						return boom
+					}
+					synced = append(synced, dir)
+					return origSyncDir(dir)
+				}
+
+				if _, err := cache.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest)); !errors.Is(err, boom) {
+					t.Fatalf("first Rekey err = %v, want %v", err, boom)
+				}
+
+				synced = nil
+				moved, err := cache.Rekey(ctx, ArchiveSource(oldDigest), ArchiveSource(newDigest))
+				if err != nil || moved != tc.wantRetryMov {
+					t.Fatalf("retry Rekey = (%d, %v), want (%d, nil)", moved, err, tc.wantRetryMov)
+				}
+				if !slices.Contains(synced, failTarget) {
+					t.Errorf("retry Rekey skipped syncDir(%q); synced=%v", failTarget, synced)
+				}
+				if _, err := cache.Get(ctx, ArchiveCoverKey(newDigest, 0, DefaultCoverOptions())); err != nil {
+					t.Errorf("Get(newDigest) after retry Rekey: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("invalidate_retries_pending_leaf_shard_and_root_syncs", func(t *testing.T) {
+		digest := "aabbccddeeff0011"
+		for _, targetKind := range []string{"leafDir", "shard1Dir", "rootDir"} {
+			t.Run(targetKind, func(t *testing.T) {
+				coversDir := t.TempDir()
+				cache, err := NewCoverCache(coversDir)
+				if err != nil {
+					t.Fatalf("NewCoverCache: %v", err)
+				}
+
+				key := ArchiveCoverKey(digest, 0, DefaultCoverOptions())
+				if _, err := cache.Put(ctx, key, []byte("invalidate-retry-bytes")); err != nil {
+					t.Fatalf("Put: %v", err)
+				}
+
+				var failTarget string
+				switch targetKind {
+				case "leafDir":
+					failTarget = filepath.Join(coversDir, "aa", "bb")
+				case "shard1Dir":
+					failTarget = filepath.Join(coversDir, "aa")
+				case "rootDir":
+					failTarget = coversDir
+				}
+
+				var synced []string
+				failOnce := true
+				origSyncDir := cache.ops.syncDir
+				cache.ops.syncDir = func(dir string) error {
+					if failOnce && dir == failTarget {
+						failOnce = false
+						return boom
+					}
+					synced = append(synced, dir)
+					return origSyncDir(dir)
+				}
+
+				if _, err := cache.Invalidate(ctx, ArchiveSource(digest)); !errors.Is(err, boom) {
+					t.Fatalf("first Invalidate err = %v, want %v", err, boom)
+				}
+
+				synced = nil
+				if removed, err := cache.Invalidate(ctx, ArchiveSource(digest)); err != nil || removed != 0 {
+					t.Fatalf("retry Invalidate = (%d, %v), want (0, nil)", removed, err)
+				}
+				if !slices.Contains(synced, failTarget) {
+					t.Errorf("retry Invalidate skipped syncDir(%q); synced=%v", failTarget, synced)
+				}
+				if _, err := os.Stat(filepath.Join(coversDir, "aa")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("empty shard1 dir survived retry Invalidate: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("cleanup_temp_retries_pending_leaf_and_shard_syncs", func(t *testing.T) {
+		coversDir := t.TempDir()
+		cache, err := NewCoverCache(coversDir)
+		if err != nil {
+			t.Fatalf("NewCoverCache: %v", err)
+		}
+
+		leafDir := filepath.Join(coversDir, "aa", "bb")
+		if err := os.MkdirAll(leafDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(leafDir, coverTempPrefix+"orphan"), []byte("tmp"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var synced []string
+		failOnce := true
+		origSyncDir := cache.ops.syncDir
+		cache.ops.syncDir = func(dir string) error {
+			if failOnce && dir == leafDir {
+				failOnce = false
+				return boom
+			}
+			synced = append(synced, dir)
+			return origSyncDir(dir)
+		}
+
+		if _, err := cache.CleanupTemp(ctx); !errors.Is(err, boom) {
+			t.Fatalf("first CleanupTemp err = %v, want %v", err, boom)
+		}
+
+		synced = nil
+		if removed, err := cache.CleanupTemp(ctx); err != nil || removed != 0 {
+			t.Fatalf("retry CleanupTemp = (%d, %v), want (0, nil)", removed, err)
+		}
+		if !slices.Contains(synced, leafDir) {
+			t.Errorf("retry CleanupTemp skipped syncDir(%q); synced=%v", leafDir, synced)
+		}
+		if _, err := os.Stat(filepath.Join(coversDir, "aa")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("empty shard1 dir survived retry CleanupTemp: %v", err)
+		}
+	})
 }
 
 func mustNormalize(t *testing.T, k CoverKey) CoverKey {
