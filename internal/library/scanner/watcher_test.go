@@ -1972,13 +1972,18 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "watched-root")
 	writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), time.Time{})
 
-	// Also seed a followed file symlink present before startup so initial symlink target
-	// watching is exercised alongside overflow, root replacement, and fallback recovery.
+	// Also seed a followed file symlink present before startup and a dangling symlink whose
+	// external target does not exist yet at startup so both direct external target edits and
+	// scheduled polling for temporarily missing symlink targets are exercised.
 	extDir := t.TempDir()
 	extTarget := filepath.Join(extDir, "seeded-external.cbz")
 	writeWatcherFile(t, extTarget, []byte("seeded-ext-1"), time.Time{})
 	if err := os.Symlink(extTarget, filepath.Join(dir, "seeded-link.cbz")); err != nil {
 		t.Fatalf("Symlink seeded: %v", err)
+	}
+	danglingTarget := filepath.Join(extDir, "dangling-external.cbz")
+	if err := os.Symlink(danglingTarget, filepath.Join(dir, "dangling-link.cbz")); err != nil {
+		t.Fatalf("Symlink dangling: %v", err)
 	}
 
 	lostOverflowSubDir := filepath.Join(dir, "lost-overflow-sub")
@@ -2032,7 +2037,9 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 		t.Fatal("expected active fsnotify handle")
 	}
 
-	// 0. Editing the external target of the pre-existing file symlink triggers a scan.
+	// 0. Editing the external target of the pre-existing file symlink triggers a scan,
+	// and later creating the external target of the startup-dangling symlink triggers a
+	// scan on the scheduled poll tick without touching any entry inside the watched root.
 	writeWatcherFile(t, extTarget, []byte("seeded-ext-2-edited"), time.Time{})
 	reqs := waitForTriggerCount(t, trig, 1)
 	time.Sleep(55 * time.Millisecond)
@@ -2040,6 +2047,14 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 		t.Fatalf("editing seeded symlink target triggered %d scans, want 1", got)
 	}
 	assertAutomaticScanRequest(t, reqs[0], "lib-overflow")
+
+	writeWatcherFile(t, danglingTarget, []byte("dangling-target-appeared"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 2)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("appearing target for startup-dangling symlink triggered %d total scans, want 2", got)
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-overflow")
 
 	// 1. Event-queue overflow drops a directory-create event: overflow triggers one debounced
 	// full scan AND repairs directory watches so a later independent edit in the new directory triggers.
@@ -2054,34 +2069,34 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 
 	h.injectError(fsnotify.ErrEventOverflow)
 	h.injectError(fsnotify.ErrEventOverflow)
-	reqs = waitForTriggerCount(t, trig, 2)
+	reqs = waitForTriggerCount(t, trig, 3)
 	waitForWatchedPathsContain(t, w, lostOverflowSubDir)
 	time.Sleep(55 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 2 {
-		t.Fatalf("event-queue overflow burst triggered %d total scans, want 2", got)
+	if got := len(trig.snapshot()); got != 3 {
+		t.Fatalf("event-queue overflow burst triggered %d total scans, want 3", got)
 	}
-	assertAutomaticScanRequest(t, reqs[1], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[2], "lib-overflow")
 	if !logHandler.hasWarnMessage("fsnotify event queue overflow") {
 		t.Fatalf("expected overflow warning log, got records=%+v", logHandler.snapshotRecords())
 	}
 
 	// Later independent file edit inside lostOverflowSubDir must trigger a second scan.
 	writeWatcherFile(t, filepath.Join(lostOverflowSubDir, "after-overflow.cbz"), []byte("ao"), time.Time{})
-	reqs = waitForTriggerCount(t, trig, 3)
-	time.Sleep(55 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 3 {
-		t.Fatalf("edit in overflow-recovered subdir triggered %d total scans, want 3", got)
-	}
-	assertAutomaticScanRequest(t, reqs[2], "lib-overflow")
-
-	// 2. Watch error on Errors channel triggers one full scan.
-	h.injectError(errors.New("kernel watch descriptor failure"))
 	reqs = waitForTriggerCount(t, trig, 4)
 	time.Sleep(55 * time.Millisecond)
 	if got := len(trig.snapshot()); got != 4 {
-		t.Fatalf("watch error triggered %d total scans, want 4", got)
+		t.Fatalf("edit in overflow-recovered subdir triggered %d total scans, want 4", got)
 	}
 	assertAutomaticScanRequest(t, reqs[3], "lib-overflow")
+
+	// 2. Watch error on Errors channel triggers one full scan.
+	h.injectError(errors.New("kernel watch descriptor failure"))
+	reqs = waitForTriggerCount(t, trig, 5)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 5 {
+		t.Fatalf("watch error triggered %d total scans, want 5", got)
+	}
+	assertAutomaticScanRequest(t, reqs[4], "lib-overflow")
 	if !logHandler.hasWarnMessage("fsnotify watch error") {
 		t.Fatalf("expected watch error warning log, got records=%+v", logHandler.snapshotRecords())
 	}
@@ -2096,22 +2111,22 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 	if err := os.MkdirAll(replacedSub, 0o755); err != nil {
 		t.Fatalf("MkdirAll(%s): %v", replacedSub, err)
 	}
-	reqs = waitForTriggerCount(t, trig, 5)
+	reqs = waitForTriggerCount(t, trig, 6)
 	waitForWatchedPathsContain(t, w, dir, replacedSub)
 	time.Sleep(55 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 5 {
-		t.Fatalf("root replacement triggered %d total scans, want 5", got)
+	if got := len(trig.snapshot()); got != 6 {
+		t.Fatalf("root replacement triggered %d total scans, want 6", got)
 	}
-	assertAutomaticScanRequest(t, reqs[4], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[5], "lib-overflow")
 
 	// Later independent file edit inside the replaced root must trigger a scan.
 	writeWatcherFile(t, filepath.Join(replacedSub, "after-replace.cbz"), []byte("ar"), time.Time{})
-	reqs = waitForTriggerCount(t, trig, 6)
+	reqs = waitForTriggerCount(t, trig, 7)
 	time.Sleep(55 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 6 {
-		t.Fatalf("edit after root replacement triggered %d total scans, want 6", got)
+	if got := len(trig.snapshot()); got != 7 {
+		t.Fatalf("edit after root replacement triggered %d total scans, want 7", got)
 	}
-	assertAutomaticScanRequest(t, reqs[5], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[6], "lib-overflow")
 
 	// 4. Runtime registration failure on a new subdirectory: triggers one debounced scan for
 	// the incident, releases OS watches, and falls back to polling with a diagnostic so a
@@ -2119,12 +2134,12 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 	if err := os.Mkdir(failSubDir, 0o755); err != nil {
 		t.Fatalf("Mkdir(%s): %v", failSubDir, err)
 	}
-	reqs = waitForTriggerCount(t, trig, 7)
+	reqs = waitForTriggerCount(t, trig, 8)
 	time.Sleep(55 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 7 {
-		t.Fatalf("subdirectory watch error triggered %d total scans, want 7", got)
+	if got := len(trig.snapshot()); got != 8 {
+		t.Fatalf("subdirectory watch error triggered %d total scans, want 8", got)
 	}
-	assertAutomaticScanRequest(t, reqs[6], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[7], "lib-overflow")
 	if !logHandler.hasWarnMessage("failed to add OS watch for new subdirectory") {
 		t.Fatalf("expected subdirectory watch failure warning log, got records=%+v", logHandler.snapshotRecords())
 	}
@@ -2141,12 +2156,12 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 
 	// Later independent file edit inside failSubDir must trigger a scan via polling fallback.
 	writeWatcherFile(t, filepath.Join(failSubDir, "after-fallback.cbz"), []byte("af"), time.Time{})
-	reqs = waitForTriggerCount(t, trig, 8)
+	reqs = waitForTriggerCount(t, trig, 9)
 	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 8 {
-		t.Fatalf("edit after runtime fallback to polling triggered %d total scans, want 8", got)
+	if got := len(trig.snapshot()); got != 9 {
+		t.Fatalf("edit after runtime fallback to polling triggered %d total scans, want 9", got)
 	}
-	assertAutomaticScanRequest(t, reqs[7], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[8], "lib-overflow")
 }
 
 func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing.T) {
@@ -2312,6 +2327,7 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 
 	dir1B := t.TempDir()
 	sub1B := filepath.Join(dir1B, "sub1b")
+	inflightSub1B := filepath.Join(dir1B, "inflight-sub1b")
 	writeWatcherFile(t, filepath.Join(sub1B, "vol01.cbz"), []byte("v1b"), time.Time{})
 
 	dir2 := t.TempDir()
@@ -2321,6 +2337,16 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 	root1A := makeWatcherTestRoot(t, "lib-1", "root-1a", dir1A)
 	root1B := makeWatcherTestRoot(t, "lib-1", "root-1b", dir1B)
 	root2 := makeWatcherTestRoot(t, "lib-2", "root-2", dir2)
+
+	inflightAddEntered := make(chan struct{})
+	releaseInflightAdd := make(chan struct{})
+	inflightAddInstalled := make(chan struct{})
+	var releaseInflightOnce sync.Once
+	releaseInflight := func() {
+		releaseInflightOnce.Do(func() { close(releaseInflightAdd) })
+	}
+	t.Cleanup(releaseInflight)
+	var inflightHoldOnce sync.Once
 
 	lister := &stubRootLister{
 		roots: []domain.LibraryRoot{root1A, root1B, root2},
@@ -2332,6 +2358,22 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		Trigger:        trig,
 		PollInterval:   time.Hour,
 		DebounceWindow: 30 * time.Millisecond,
+		newFSNotify: func() (fsnotifyHandle, error) {
+			return newFaultInjectingFSNotifyHandle(func(inner fsnotifyHandle, name string) error {
+				if name == inflightSub1B {
+					inflightHoldOnce.Do(func() {
+						close(inflightAddEntered)
+						select {
+						case <-releaseInflightAdd:
+						case <-t.Context().Done():
+						}
+						_ = inner.Add(name)
+						close(inflightAddInstalled)
+					})
+				}
+				return nil
+			})
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewWatcher: %v", err)
@@ -2351,19 +2393,45 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		t.Fatalf("WatchedPaths = %v, want %v", got, wantAll)
 	}
 
-	// 1. Remove root1B from lib-1 -> releases watches for dir1B and sub1B.
+	// 1. Trigger a runtime subdirectory Add on root1B, hold it in flight while removing
+	// root1B via NotifySync, then release the held Add and verify no native watch leaks.
+	if err := os.Mkdir(inflightSub1B, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", inflightSub1B, err)
+	}
+	select {
+	case <-inflightAddEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight runtime Add on root-1b")
+	}
+
 	lister.setRoots([]domain.LibraryRoot{root1A, root2})
 	w.NotifySync()
 	waitForRootRemoved(t, w, root1B.ID)
+	releaseInflight()
+
+	select {
+	case <-inflightAddInstalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for held runtime Add to install before rollback check")
+	}
 
 	wantAfterRootRemove := []string{dir1A, sub1A, dir2, sub2}
 	slices.Sort(wantAfterRootRemove)
-	if got := w.WatchedPaths(); !slices.Equal(got, wantAfterRootRemove) {
-		t.Fatalf("WatchedPaths after removing root-1b = %v, want %v", got, wantAfterRootRemove)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := w.WatchedPaths()
+		if slices.Equal(got, wantAfterRootRemove) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("WatchedPaths after removing root-1b during in-flight Add = %v, want %v", got, wantAfterRootRemove)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Changes in removed root1B must not trigger any scan.
+	// Changes in removed root1B (including inside inflightSub1B) must not trigger any scan.
 	writeWatcherFile(t, filepath.Join(sub1B, "ignored.cbz"), []byte("ignored"), time.Time{})
+	writeWatcherFile(t, filepath.Join(inflightSub1B, "ignored-inflight.cbz"), []byte("ignored"), time.Time{})
 	time.Sleep(60 * time.Millisecond)
 	if got := len(trig.snapshot()); got != 0 {
 		t.Fatalf("removed root triggered %d scans, want 0", got)
