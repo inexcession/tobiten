@@ -168,6 +168,7 @@ type watchedRoot struct {
 	isNetwork          bool
 	mountDetected      bool
 	osWatched          bool
+	repairPending      bool
 	hasBaseline        bool
 	unreadable         bool
 	unreadableSubpaths map[string]struct{}
@@ -175,8 +176,9 @@ type watchedRoot struct {
 }
 
 type pendingScan struct {
-	fireAt    time.Time
-	errLogged bool
+	fireAt      time.Time
+	errLogged   bool
+	needsRepair bool
 }
 
 // Watcher monitors configured library roots using mount-type detection, directory
@@ -204,9 +206,10 @@ type Watcher struct {
 	syncCh    chan struct{}
 	osEventCh chan struct{}
 
-	osEventMu    sync.Mutex
-	osDirtyRoots map[string]struct{}
-	osOverflow   bool
+	osEventMu     sync.Mutex
+	osDirtyRoots  map[string]struct{}
+	osRepairRoots map[string]struct{}
+	osOverflow    bool
 
 	lifecycleMu sync.Mutex
 	running     bool
@@ -292,6 +295,7 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 		syncCh:         make(chan struct{}, 1),
 		osEventCh:      make(chan struct{}, 1),
 		osDirtyRoots:   make(map[string]struct{}),
+		osRepairRoots:  make(map[string]struct{}),
 		watched:        make(map[string]*watchedRoot),
 	}
 	if w.osWatcher == nil {
@@ -302,6 +306,7 @@ func NewWatcher(opts WatcherOptions) (*Watcher, error) {
 			customStat: customStat,
 			logger:     logger,
 			onChange:   w.notifyOSRootChange,
+			onRepair:   w.notifyOSRootRepair,
 			onOverflow: w.notifyOSOverflow,
 		})
 	}
@@ -385,6 +390,7 @@ func (w *Watcher) Stop() {
 
 	w.osEventMu.Lock()
 	clear(w.osDirtyRoots)
+	clear(w.osRepairRoots)
 	w.osOverflow = false
 	select {
 	case <-w.osEventCh:
@@ -435,8 +441,12 @@ func (w *Watcher) RootStatuses() []RootWatchStatus {
 	return out
 }
 
-// WatchedPaths returns a sorted snapshot of all directory paths currently
-// registered with the OS notification backend.
+// WatchedPaths returns a sorted snapshot of the paths explicitly registered
+// with the OS notification backend via fsnotify.Watcher.Add (WatchList):
+// watched directories, plus on Linux any explicitly registered followed file
+// symlinks. On Darwin (kqueue), fsnotify additionally opens an internal
+// O_EVTONLY file descriptor for each file entry inside a watched directory
+// even though WatchList reports only the parent directory path.
 func (w *Watcher) WatchedPaths() []string {
 	if w == nil || w.osWatcher == nil {
 		return nil
@@ -459,12 +469,36 @@ func (w *Watcher) RootWatchedPaths(rootID string) []string {
 	return nil
 }
 
+func (w *Watcher) rootHasFileSymlinks(rootID string) bool {
+	if w == nil || w.osWatcher == nil {
+		return false
+	}
+	if sw, ok := w.osWatcher.(symlinkAwareOSWatcher); ok {
+		return sw.RootHasFileSymlinks(rootID)
+	}
+	return false
+}
+
 func (w *Watcher) notifyOSRootChange(rootID string) {
 	if w == nil || rootID == "" {
 		return
 	}
 	w.osEventMu.Lock()
 	w.osDirtyRoots[rootID] = struct{}{}
+	select {
+	case w.osEventCh <- struct{}{}:
+	default:
+	}
+	w.osEventMu.Unlock()
+}
+
+func (w *Watcher) notifyOSRootRepair(rootID string) {
+	if w == nil || rootID == "" {
+		return
+	}
+	w.osEventMu.Lock()
+	w.osDirtyRoots[rootID] = struct{}{}
+	w.osRepairRoots[rootID] = struct{}{}
 	select {
 	case w.osEventCh <- struct{}{}:
 	default:
@@ -488,16 +522,23 @@ func (w *Watcher) notifyOSOverflow() {
 func (w *Watcher) clearRemovedRootDirty(rootID string) {
 	w.osEventMu.Lock()
 	delete(w.osDirtyRoots, rootID)
+	delete(w.osRepairRoots, rootID)
 	w.osEventMu.Unlock()
 }
 
-func (w *Watcher) drainOSEvents(pending map[string]*pendingScan) {
+type drainedOSActions struct {
+	dirtyLibs   []string
+	repairLibs  map[string]bool
+	repairRoots []*watchedRoot
+}
+
+func (w *Watcher) drainOSEvents(ctx context.Context, pending map[string]*pendingScan) {
 	w.osEventMu.Lock()
 	select {
 	case <-w.osEventCh:
 	default:
 	}
-	if len(w.osDirtyRoots) == 0 && !w.osOverflow {
+	if len(w.osDirtyRoots) == 0 && len(w.osRepairRoots) == 0 && !w.osOverflow {
 		w.osEventMu.Unlock()
 		return
 	}
@@ -506,46 +547,195 @@ func (w *Watcher) drainOSEvents(pending map[string]*pendingScan) {
 		dirtyRoots = append(dirtyRoots, rootID)
 	}
 	clear(w.osDirtyRoots)
+
+	repairRoots := make([]string, 0, len(w.osRepairRoots))
+	for rootID := range w.osRepairRoots {
+		repairRoots = append(repairRoots, rootID)
+	}
+	clear(w.osRepairRoots)
+
 	overflow := w.osOverflow
 	w.osOverflow = false
 	w.osEventMu.Unlock()
 
-	dirtyLibs := w.resolveDirtyOSLibraries(dirtyRoots, overflow)
-	if len(dirtyLibs) == 0 {
+	actions := w.resolveDrainedOSActions(dirtyRoots, repairRoots, overflow)
+	if len(actions.dirtyLibs) == 0 && len(actions.repairRoots) == 0 {
 		return
 	}
 	fireAt := w.clock.Now().Add(w.debounceWindow)
-	for _, libID := range dirtyLibs {
+	for _, libID := range actions.dirtyLibs {
 		markLibraryDirty(pending, libID, fireAt)
+		if actions.repairLibs[libID] {
+			pending[libID].needsRepair = true
+		}
+	}
+	for _, wr := range actions.repairRoots {
+		if ctx.Err() != nil {
+			return
+		}
+		w.tryImmediateRootRepair(ctx, wr)
 	}
 }
 
-func (w *Watcher) resolveDirtyOSLibraries(dirtyRoots []string, overflow bool) []string {
+func (w *Watcher) resolveDrainedOSActions(dirtyRoots, repairRoots []string, overflow bool) drainedOSActions {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	libs := make(map[string]struct{})
+	repairLibs := make(map[string]bool)
+	repairMap := make(map[string]*watchedRoot)
+
 	if overflow {
 		for _, wr := range w.watched {
-			if wr.osWatched {
+			if wr.osWatched || wr.repairPending {
 				libs[wr.root.LibraryID] = struct{}{}
+				repairLibs[wr.root.LibraryID] = true
+				repairMap[wr.root.ID] = wr
 			}
 		}
 	}
 	for _, rootID := range dirtyRoots {
-		if wr, ok := w.watched[rootID]; ok && wr.osWatched {
+		if wr, ok := w.watched[rootID]; ok && (wr.osWatched || wr.repairPending) {
 			libs[wr.root.LibraryID] = struct{}{}
 		}
 	}
-	if len(libs) == 0 {
-		return nil
+	for _, rootID := range repairRoots {
+		if wr, ok := w.watched[rootID]; ok && (wr.osWatched || wr.repairPending) {
+			libs[wr.root.LibraryID] = struct{}{}
+			repairLibs[wr.root.LibraryID] = true
+			repairMap[wr.root.ID] = wr
+		}
 	}
-	out := make([]string, 0, len(libs))
-	for libID := range libs {
-		out = append(out, libID)
+
+	var out drainedOSActions
+	out.repairLibs = repairLibs
+	if len(libs) > 0 {
+		out.dirtyLibs = make([]string, 0, len(libs))
+		for libID := range libs {
+			out.dirtyLibs = append(out.dirtyLibs, libID)
+		}
+		slices.Sort(out.dirtyLibs)
 	}
-	slices.Sort(out)
+	if len(repairMap) > 0 {
+		out.repairRoots = make([]*watchedRoot, 0, len(repairMap))
+		for _, wr := range repairMap {
+			out.repairRoots = append(out.repairRoots, wr)
+		}
+		slices.SortFunc(out.repairRoots, func(a, b *watchedRoot) int {
+			return strings.Compare(a.root.ID, b.root.ID)
+		})
+	}
 	return out
+}
+
+func (w *Watcher) tryImmediateRootRepair(ctx context.Context, wr *watchedRoot) {
+	if ctx.Err() != nil {
+		return
+	}
+	err := w.addOSWatchRoot(ctx, wr.root)
+	if ctx.Err() != nil {
+		return
+	}
+	if err == nil {
+		w.mu.Lock()
+		wr.mode = WatchModeOS
+		wr.osWatched = true
+		wr.repairPending = false
+		w.mu.Unlock()
+		return
+	}
+	if isTransientDisappearance(err) {
+		w.mu.Lock()
+		wr.repairPending = true
+		w.mu.Unlock()
+		return
+	}
+	w.fallbackRootToPolling(ctx, wr, err)
+}
+
+func (w *Watcher) finalizeLibraryWatchRepairs(ctx context.Context, libraryID string) {
+	roots := w.snapshotWatchedRoots()
+	for _, wr := range roots {
+		if ctx.Err() != nil {
+			return
+		}
+		if wr.root.LibraryID != libraryID {
+			continue
+		}
+		w.mu.Lock()
+		shouldRepair := wr.osWatched || wr.repairPending
+		w.mu.Unlock()
+		if !shouldRepair {
+			continue
+		}
+		err := w.addOSWatchRoot(ctx, wr.root)
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			w.mu.Lock()
+			wr.mode = WatchModeOS
+			wr.osWatched = true
+			wr.repairPending = false
+			w.mu.Unlock()
+			continue
+		}
+		w.fallbackRootToPolling(ctx, wr, err)
+	}
+}
+
+func (w *Watcher) fallbackRootToPolling(ctx context.Context, wr *watchedRoot, cause error) {
+	w.clearRemovedRootDirty(wr.root.ID)
+	if w.osWatcher != nil {
+		_ = w.osWatcher.RemoveRoot(wr.root.ID)
+	}
+	w.logger.Warn("failed to register OS watch; falling back to polling",
+		slog.String("library_id", wr.root.LibraryID),
+		slog.String("library_root_id", wr.root.ID),
+		slog.String("path", wr.root.Path.Display),
+		logging.Err(cause),
+	)
+	w.mu.Lock()
+	wr.mode = WatchModePoll
+	wr.osWatched = false
+	wr.repairPending = false
+	w.mu.Unlock()
+
+	w.baselineFallbackRoot(ctx, wr)
+}
+
+func (w *Watcher) baselineFallbackRoot(ctx context.Context, wr *watchedRoot) {
+	nextUnreadable := make(map[string]struct{})
+	snap, err := w.captureRootSnapshot(ctx, wr, nextUnreadable)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		wr.unreadable = true
+		return
+	}
+	wr.unreadable = false
+	wr.unreadableSubpaths = nextUnreadable
+	wr.snapshot = snap
+	wr.hasBaseline = true
+}
+
+func (w *Watcher) refreshSymlinkWatchedBaselines(ctx context.Context, libraryID string) {
+	roots := w.snapshotWatchedRoots()
+	for _, wr := range roots {
+		if ctx.Err() != nil {
+			return
+		}
+		if wr.root.LibraryID != libraryID {
+			continue
+		}
+		w.mu.Lock()
+		isOS := wr.mode == WatchModeOS
+		w.mu.Unlock()
+		if isOS && w.rootHasFileSymlinks(wr.root.ID) {
+			w.baselineFallbackRoot(ctx, wr)
+		}
+	}
 }
 
 func toRootWatchStatus(wr *watchedRoot) RootWatchStatus {
@@ -573,7 +763,7 @@ func (w *Watcher) runLoop(ctx context.Context) {
 			return
 		}
 
-		w.drainOSEvents(pending)
+		w.drainOSEvents(ctx, pending)
 		now := w.clock.Now()
 		w.fireDueScans(ctx, now, pending)
 
@@ -583,7 +773,7 @@ func (w *Watcher) runLoop(ctx context.Context) {
 				return
 			}
 			nextPollAt = w.clock.Now().Add(w.pollInterval)
-			w.drainOSEvents(pending)
+			w.drainOSEvents(ctx, pending)
 			w.fireDueScans(ctx, w.clock.Now(), pending)
 		}
 
@@ -644,6 +834,17 @@ func (w *Watcher) fireDueScans(ctx context.Context, now time.Time, pending map[s
 		entry := pending[libID]
 		if entry == nil {
 			continue
+		}
+		if entry.needsRepair {
+			w.finalizeLibraryWatchRepairs(ctx, libID)
+			if ctx.Err() != nil {
+				return
+			}
+			entry.needsRepair = false
+		}
+		w.refreshSymlinkWatchedBaselines(ctx, libID)
+		if ctx.Err() != nil {
+			return
 		}
 		admitted, jobID, err := w.admitScan(ctx, libID)
 		if ctx.Err() != nil {
@@ -738,7 +939,13 @@ func (w *Watcher) pollStep(ctx context.Context, pending map[string]*pendingScan)
 		if ctx.Err() != nil {
 			return
 		}
-		if baselined[wr.root.ID] || wr.mode != WatchModePoll {
+		if baselined[wr.root.ID] {
+			continue
+		}
+		w.mu.Lock()
+		mode := wr.mode
+		w.mu.Unlock()
+		if mode != WatchModePoll && !w.rootHasFileSymlinks(wr.root.ID) {
 			continue
 		}
 		if w.pollWatchedRoot(ctx, wr) {
@@ -772,7 +979,7 @@ func (w *Watcher) syncAndBaseline(ctx context.Context, pending map[string]*pendi
 		if ctx.Err() != nil {
 			return baselined
 		}
-		if wr.mode == WatchModePoll && !wr.hasBaseline {
+		if (wr.mode == WatchModePoll || w.rootHasFileSymlinks(wr.root.ID)) && !wr.hasBaseline {
 			_ = w.pollWatchedRoot(ctx, wr)
 			baselined[wr.root.ID] = true
 		}
@@ -955,6 +1162,7 @@ func (w *Watcher) resolveRootWatchMode(ctx context.Context, r domain.LibraryRoot
 		return resolvedWatchMode{}, false
 	}
 	if err := w.addOSWatchRoot(ctx, r); err != nil {
+		w.clearRemovedRootDirty(r.ID)
 		if ctx.Err() != nil {
 			return resolvedWatchMode{}, false
 		}

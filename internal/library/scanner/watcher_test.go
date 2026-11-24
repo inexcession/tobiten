@@ -1826,6 +1826,31 @@ func TestWatcher_LocalFilesystemUsesFSNotifyForExistingAndNewSubdirectories(t *t
 		t.Fatalf("burst across subdirectories triggered %d total scans, want 8", got)
 	}
 
+	// 5. Followed file symlink pointing outside the root (ADR-0003 §5, M1B-D6): creating the
+	// symlink triggers a scan, and editing the external target file directly through its
+	// external path triggers a follow-up scan on both Linux and Darwin without a poll tick.
+	externalDir := t.TempDir()
+	externalTarget := filepath.Join(externalDir, "external-target.cbz")
+	writeWatcherFile(t, externalTarget, []byte("ext-v1"), time.Time{})
+	linkInRoot := filepath.Join(existingSub, "linked-external.cbz")
+	if err := os.Symlink(externalTarget, linkInRoot); err != nil {
+		t.Fatalf("Symlink(%s -> %s): %v", linkInRoot, externalTarget, err)
+	}
+	waitForTriggerCount(t, trig, 9)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 9 {
+		t.Fatalf("creating file symlink triggered %d total scans, want 9", got)
+	}
+
+	// Edit the symlink's target through its external path outside the watched root.
+	writeWatcherFile(t, externalTarget, []byte("ext-v2-modified-directly"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 10)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 10 {
+		t.Fatalf("editing external target of followed file symlink triggered %d total scans, want 10", got)
+	}
+	assertAutomaticScanRequest(t, reqs[9], "lib-local")
+
 	if gotPolls := pollTicks.Load(); gotPolls != 0 {
 		t.Fatalf("pollTicks = %d, want 0 (all triggers must come from fsnotify without waiting for a poll tick)", gotPolls)
 	}
@@ -1838,10 +1863,13 @@ type faultInjectingFSNotifyHandle struct {
 	stopCh    chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
-	addHook   func(name string) error
+	addHook   func(inner fsnotifyHandle, name string) error
+
+	dropMu    sync.Mutex
+	dropEvent func(fsnotify.Event) bool
 }
 
-func newFaultInjectingFSNotifyHandle(addHook func(name string) error) (*faultInjectingFSNotifyHandle, error) {
+func newFaultInjectingFSNotifyHandle(addHook func(inner fsnotifyHandle, name string) error) (*faultInjectingFSNotifyHandle, error) {
 	inner, err := newRealFSNotifyHandle()
 	if err != nil {
 		return nil, err
@@ -1858,6 +1886,19 @@ func newFaultInjectingFSNotifyHandle(addHook func(name string) error) (*faultInj
 	return h, nil
 }
 
+func (h *faultInjectingFSNotifyHandle) setDropEvent(fn func(fsnotify.Event) bool) {
+	h.dropMu.Lock()
+	h.dropEvent = fn
+	h.dropMu.Unlock()
+}
+
+func (h *faultInjectingFSNotifyHandle) shouldDrop(ev fsnotify.Event) bool {
+	h.dropMu.Lock()
+	fn := h.dropEvent
+	h.dropMu.Unlock()
+	return fn != nil && fn(ev)
+}
+
 func (h *faultInjectingFSNotifyHandle) forward() {
 	defer h.wg.Done()
 	defer close(h.eventsCh)
@@ -1872,6 +1913,9 @@ func (h *faultInjectingFSNotifyHandle) forward() {
 		case ev, ok := <-inEvents:
 			if !ok {
 				inEvents = nil
+				continue
+			}
+			if h.shouldDrop(ev) {
 				continue
 			}
 			select {
@@ -1895,7 +1939,7 @@ func (h *faultInjectingFSNotifyHandle) forward() {
 
 func (h *faultInjectingFSNotifyHandle) Add(name string) error {
 	if h.addHook != nil {
-		if err := h.addHook(name); err != nil {
+		if err := h.addHook(h.inner, name); err != nil {
 			return err
 		}
 	}
@@ -1925,8 +1969,19 @@ func (h *faultInjectingFSNotifyHandle) injectError(err error) {
 }
 
 func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "watched-root")
 	writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), time.Time{})
+
+	// Also seed a followed file symlink present before startup so initial symlink target
+	// watching is exercised alongside overflow, root replacement, and fallback recovery.
+	extDir := t.TempDir()
+	extTarget := filepath.Join(extDir, "seeded-external.cbz")
+	writeWatcherFile(t, extTarget, []byte("seeded-ext-1"), time.Time{})
+	if err := os.Symlink(extTarget, filepath.Join(dir, "seeded-link.cbz")); err != nil {
+		t.Fatalf("Symlink seeded: %v", err)
+	}
+
+	lostOverflowSubDir := filepath.Join(dir, "lost-overflow-sub")
 	failSubDir := filepath.Join(dir, "unwatchable-new-sub")
 
 	var handleMu sync.Mutex
@@ -1935,20 +1990,18 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 	root := makeWatcherTestRoot(t, "lib-overflow", "root-overflow", dir)
 	trig := &recordedTrigger{}
 	logHandler := &memoryLogHandler{}
-	var pollTicks atomic.Int32
 
 	w, err := NewWatcher(WatcherOptions{
 		StaticRoots:    []domain.LibraryRoot{root},
 		Trigger:        trig,
 		Logger:         slog.New(logHandler),
-		PollInterval:   time.Hour,
+		PollInterval:   25 * time.Millisecond,
 		DebounceWindow: 35 * time.Millisecond,
-		OnPoll: func() {
-			pollTicks.Add(1)
-		},
 		newFSNotify: func() (fsnotifyHandle, error) {
-			h, err := newFaultInjectingFSNotifyHandle(func(name string) error {
+			h, err := newFaultInjectingFSNotifyHandle(func(inner fsnotifyHandle, name string) error {
 				if name == failSubDir {
+					// Register in inner first before returning ENOSPC to verify partial runtime Add cleanup.
+					_ = inner.Add(name)
 					return syscall.ENOSPC
 				}
 				return nil
@@ -1979,48 +2032,121 @@ func TestWatcher_FSNotifyWatchErrorAndOverflowTriggerOneFullScan(t *testing.T) {
 		t.Fatal("expected active fsnotify handle")
 	}
 
-	// 1. Event-queue overflow burst triggers exactly one full scan.
-	h.injectError(fsnotify.ErrEventOverflow)
-	h.injectError(fsnotify.ErrEventOverflow)
+	// 0. Editing the external target of the pre-existing file symlink triggers a scan.
+	writeWatcherFile(t, extTarget, []byte("seeded-ext-2-edited"), time.Time{})
 	reqs := waitForTriggerCount(t, trig, 1)
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(55 * time.Millisecond)
 	if got := len(trig.snapshot()); got != 1 {
-		t.Fatalf("event-queue overflow burst triggered %d scans, want 1", got)
+		t.Fatalf("editing seeded symlink target triggered %d scans, want 1", got)
 	}
 	assertAutomaticScanRequest(t, reqs[0], "lib-overflow")
+
+	// 1. Event-queue overflow drops a directory-create event: overflow triggers one debounced
+	// full scan AND repairs directory watches so a later independent edit in the new directory triggers.
+	h.setDropEvent(func(ev fsnotify.Event) bool {
+		return ev.Name == lostOverflowSubDir || strings.HasPrefix(ev.Name, lostOverflowSubDir+"/")
+	})
+	if err := os.Mkdir(lostOverflowSubDir, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", lostOverflowSubDir, err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	h.setDropEvent(nil)
+
+	h.injectError(fsnotify.ErrEventOverflow)
+	h.injectError(fsnotify.ErrEventOverflow)
+	reqs = waitForTriggerCount(t, trig, 2)
+	waitForWatchedPathsContain(t, w, lostOverflowSubDir)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("event-queue overflow burst triggered %d total scans, want 2", got)
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-overflow")
 	if !logHandler.hasWarnMessage("fsnotify event queue overflow") {
 		t.Fatalf("expected overflow warning log, got records=%+v", logHandler.snapshotRecords())
 	}
 
-	// 2. Watch error on Errors channel triggers exactly one full scan.
-	h.injectError(errors.New("kernel watch descriptor failure"))
-	reqs = waitForTriggerCount(t, trig, 2)
-	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 2 {
-		t.Fatalf("watch error triggered %d total scans, want 2", got)
+	// Later independent file edit inside lostOverflowSubDir must trigger a second scan.
+	writeWatcherFile(t, filepath.Join(lostOverflowSubDir, "after-overflow.cbz"), []byte("ao"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 3)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 3 {
+		t.Fatalf("edit in overflow-recovered subdir triggered %d total scans, want 3", got)
 	}
-	assertAutomaticScanRequest(t, reqs[1], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[2], "lib-overflow")
+
+	// 2. Watch error on Errors channel triggers one full scan.
+	h.injectError(errors.New("kernel watch descriptor failure"))
+	reqs = waitForTriggerCount(t, trig, 4)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 4 {
+		t.Fatalf("watch error triggered %d total scans, want 4", got)
+	}
+	assertAutomaticScanRequest(t, reqs[3], "lib-overflow")
 	if !logHandler.hasWarnMessage("fsnotify watch error") {
 		t.Fatalf("expected watch error warning log, got records=%+v", logHandler.snapshotRecords())
 	}
 
-	// 3. Watch error when adding a newly created subdirectory triggers one full scan.
+	// 3. Root replacement (rename away + recreate at configured root path): queues one debounced
+	// scan for the replacement incident and repairs watches so a later independent edit triggers.
+	movedRoot := filepath.Join(t.TempDir(), "moved-root")
+	replacedSub := filepath.Join(dir, "replaced-sub")
+	if err := os.Rename(dir, movedRoot); err != nil {
+		t.Fatalf("Rename root: %v", err)
+	}
+	if err := os.MkdirAll(replacedSub, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", replacedSub, err)
+	}
+	reqs = waitForTriggerCount(t, trig, 5)
+	waitForWatchedPathsContain(t, w, dir, replacedSub)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 5 {
+		t.Fatalf("root replacement triggered %d total scans, want 5", got)
+	}
+	assertAutomaticScanRequest(t, reqs[4], "lib-overflow")
+
+	// Later independent file edit inside the replaced root must trigger a scan.
+	writeWatcherFile(t, filepath.Join(replacedSub, "after-replace.cbz"), []byte("ar"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 6)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 6 {
+		t.Fatalf("edit after root replacement triggered %d total scans, want 6", got)
+	}
+	assertAutomaticScanRequest(t, reqs[5], "lib-overflow")
+
+	// 4. Runtime registration failure on a new subdirectory: triggers one debounced scan for
+	// the incident, releases OS watches, and falls back to polling with a diagnostic so a
+	// later independent file edit in the unwatchable subdirectory triggers a scan.
 	if err := os.Mkdir(failSubDir, 0o755); err != nil {
 		t.Fatalf("Mkdir(%s): %v", failSubDir, err)
 	}
-	reqs = waitForTriggerCount(t, trig, 3)
-	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 3 {
-		t.Fatalf("subdirectory watch error triggered %d total scans, want 3", got)
+	reqs = waitForTriggerCount(t, trig, 7)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 7 {
+		t.Fatalf("subdirectory watch error triggered %d total scans, want 7", got)
 	}
-	assertAutomaticScanRequest(t, reqs[2], "lib-overflow")
+	assertAutomaticScanRequest(t, reqs[6], "lib-overflow")
 	if !logHandler.hasWarnMessage("failed to add OS watch for new subdirectory") {
 		t.Fatalf("expected subdirectory watch failure warning log, got records=%+v", logHandler.snapshotRecords())
 	}
-
-	if gotPolls := pollTicks.Load(); gotPolls != 0 {
-		t.Fatalf("pollTicks = %d, want 0", gotPolls)
+	if !logHandler.hasWarnMessage("failed to register OS watch; falling back to polling") {
+		t.Fatalf("expected polling fallback diagnostic log after runtime watch failure, got records=%+v", logHandler.snapshotRecords())
 	}
+	stAfterFallback, ok := w.RootStatus(root.ID)
+	if !ok || stAfterFallback.Mode != WatchModePoll {
+		t.Fatalf("root status after runtime watch failure = %+v (ok=%v), want Mode=poll", stAfterFallback, ok)
+	}
+	if got := w.WatchedPaths(); len(got) != 0 {
+		t.Fatalf("WatchedPaths after runtime fallback = %v, want empty", got)
+	}
+
+	// Later independent file edit inside failSubDir must trigger a scan via polling fallback.
+	writeWatcherFile(t, filepath.Join(failSubDir, "after-fallback.cbz"), []byte("af"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 8)
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 8 {
+		t.Fatalf("edit after runtime fallback to polling triggered %d total scans, want 8", got)
+	}
+	assertAutomaticScanRequest(t, reqs[7], "lib-overflow")
 }
 
 func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing.T) {
@@ -2030,10 +2156,29 @@ func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing
 	writeWatcherFile(t, filepath.Join(fallbackSub, "vol01.cbz"), []byte("v1"), t0)
 
 	healthyDir := t.TempDir()
-	writeWatcherFile(t, filepath.Join(healthyDir, "vol01.cbz"), []byte("v1"), t0)
+	healthySub := filepath.Join(healthyDir, "sub")
+	writeWatcherFile(t, filepath.Join(healthySub, "vol01.cbz"), []byte("v1"), t0)
 
 	rootFallback := makeWatcherTestRoot(t, "lib-fallback", "root-fallback", fallbackDir)
 	rootHealthy := makeWatcherTestRoot(t, "lib-healthy", "root-healthy", healthyDir)
+
+	fallbackHoldEntered := make(chan struct{})
+	releaseFallbackHold := make(chan struct{})
+	var releaseFallbackOnce sync.Once
+	releaseFallback := func() {
+		releaseFallbackOnce.Do(func() { close(releaseFallbackHold) })
+	}
+	t.Cleanup(releaseFallback)
+	var fallbackHoldOnce sync.Once
+
+	healthyHoldEntered := make(chan struct{})
+	releaseHealthyHold := make(chan struct{})
+	var releaseHealthyOnce sync.Once
+	releaseHealthy := func() {
+		releaseHealthyOnce.Do(func() { close(releaseHealthyHold) })
+	}
+	t.Cleanup(releaseHealthy)
+	var healthyHoldOnce sync.Once
 
 	trig := &recordedTrigger{}
 	logHandler := &memoryLogHandler{}
@@ -2046,11 +2191,34 @@ func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing
 		Logger:         slog.New(logHandler),
 		PollInterval:   15 * time.Millisecond,
 		DebounceWindow: 30 * time.Millisecond,
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			if bytes.Equal(rawDir, []byte(fallbackDir)) {
+				fallbackHoldOnce.Do(func() {
+					close(fallbackHoldEntered)
+					select {
+					case <-releaseFallbackHold:
+					case <-t.Context().Done():
+					}
+				})
+			}
+			if bytes.Equal(rawDir, []byte(healthySub)) {
+				healthyHoldOnce.Do(func() {
+					close(healthyHoldEntered)
+					select {
+					case <-releaseHealthyHold:
+					case <-t.Context().Done():
+					}
+				})
+			}
+			return os.ReadDir(string(rawDir))
+		},
 		newFSNotify: func() (fsnotifyHandle, error) {
-			return newFaultInjectingFSNotifyHandle(func(name string) error {
-				// Fail watching the child subdirectory of fallbackDir so partial-watch rollback is also verified.
+			return newFaultInjectingFSNotifyHandle(func(inner fsnotifyHandle, name string) error {
+				// Simulate Darwin kqueue partial registration where the directory and initial
+				// descriptors are registered in inner before watchDirectoryFiles fails with EMFILE.
 				if name == fallbackSub {
-					return syscall.ENOSPC
+					_ = inner.Add(name)
+					return syscall.EMFILE
 				}
 				return nil
 			})
@@ -2063,6 +2231,32 @@ func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing
 		t.Fatalf("Start: %v", err)
 	}
 	defer w.Stop()
+
+	// 1. While fallbackDir is mid-registration (after kernel watch on fallbackDir is installed,
+	// before fallbackSub fails with EMFILE and rolls back), create a file in fallbackDir.
+	// Because registration rolls back to polling, this OS event must be discarded and baseline
+	// polling must remain quiet.
+	select {
+	case <-fallbackHoldEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fallbackDir ReadDir during registration")
+	}
+	writeWatcherFile(t, filepath.Join(fallbackDir, "during-rollback.cbz"), []byte("rb"), t0)
+	time.Sleep(25 * time.Millisecond)
+	releaseFallback()
+
+	// 2. While healthyDir is mid-registration (after kernel watch on healthyDir is installed,
+	// before healthySub finishes and rootHealthy is published), create a file in healthyDir.
+	// This event must be retained and trigger a debounced automatic SCAN once rootHealthy is ready.
+	select {
+	case <-healthyHoldEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for healthySub ReadDir during registration")
+	}
+	writeWatcherFile(t, filepath.Join(healthyDir, "during-init.cbz"), []byte("init"), t0)
+	time.Sleep(25 * time.Millisecond)
+	releaseHealthy()
+
 	clk.waitForParked(t, 1)
 
 	stFallback, ok := w.RootStatus(rootFallback.ID)
@@ -2074,24 +2268,38 @@ func TestWatcher_UnwatchableLocalRootFallsBackToPollingWithDiagnostic(t *testing
 		t.Fatalf("healthy root status = %+v (ok=%v), want Mode=os IsNetwork=false", stHealthy, ok)
 	}
 
-	// Partial watch on fallbackDir must have been rolled back when fallbackSub failed.
-	if got := w.WatchedPaths(); !slices.Equal(got, []string{healthyDir}) {
-		t.Fatalf("WatchedPaths after partial rollback = %v, want [%s]", got, healthyDir)
+	// Partial watches on both fallbackDir and fallbackSub (registered before EMFILE) must
+	// have been rolled back, while healthyDir and healthySub remain watched.
+	wantWatched := []string{healthyDir, healthySub}
+	slices.Sort(wantWatched)
+	if got := w.WatchedPaths(); !slices.Equal(got, wantWatched) {
+		t.Fatalf("WatchedPaths after partial EMFILE rollback = %v, want %v", got, wantWatched)
 	}
 	if !logHandler.hasWarnMessage("failed to register OS watch; falling back to polling") {
 		t.Fatalf("expected fallback diagnostic warning log, got %+v", logHandler.snapshotRecords())
 	}
 
-	// Mutating fallbackDir is detected on the next poll tick and triggers one automatic SCAN.
-	writeWatcherFile(t, filepath.Join(fallbackSub, "vol02.cbz"), []byte("v2"), t0.Add(time.Second))
-	for range 4 {
+	// Advance through debounce window: the retained event on healthyDir fires 1 scan for
+	// lib-healthy, while the rolled-back event on fallbackDir was discarded.
+	for range 3 {
 		clk.advanceAndWait(t, 15*time.Millisecond)
 	}
 	reqs := trig.snapshot()
 	if len(reqs) != 1 {
-		t.Fatalf("fallback polling triggered %d scans, want 1", len(reqs))
+		t.Fatalf("retained registration event triggered %d scans, want 1 (reqs=%+v)", len(reqs), reqs)
 	}
-	assertAutomaticScanRequest(t, reqs[0], "lib-fallback")
+	assertAutomaticScanRequest(t, reqs[0], "lib-healthy")
+
+	// Mutating fallbackDir is detected on the next poll tick and triggers one automatic SCAN for lib-fallback.
+	writeWatcherFile(t, filepath.Join(fallbackSub, "vol02.cbz"), []byte("v2"), t0.Add(time.Second))
+	for range 4 {
+		clk.advanceAndWait(t, 15*time.Millisecond)
+	}
+	reqs = trig.snapshot()
+	if len(reqs) != 2 {
+		t.Fatalf("fallback polling triggered %d total scans, want 2", len(reqs))
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-fallback")
 }
 
 func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(t *testing.T) {

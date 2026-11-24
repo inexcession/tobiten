@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -54,10 +55,16 @@ type watchPathInspector interface {
 	RootWatchedPaths(rootID string) []string
 }
 
+type symlinkAwareOSWatcher interface {
+	RootHasFileSymlinks(rootID string) bool
+}
+
 type osRootEntry struct {
-	root     domain.LibraryRoot
-	rootPath string
-	dirs     map[string]struct{}
+	root      domain.LibraryRoot
+	rootPath  string
+	dirs      map[string]struct{}
+	watches   map[string]struct{}
+	fileLinks map[string]struct{}
 }
 
 type fsnotifyOSWatcherOptions struct {
@@ -67,6 +74,7 @@ type fsnotifyOSWatcherOptions struct {
 	customStat bool
 	logger     *slog.Logger
 	onChange   func(rootID string)
+	onRepair   func(rootID string)
 	onOverflow func()
 }
 
@@ -77,6 +85,7 @@ type fsnotifyOSWatcher struct {
 	customStat bool
 	logger     *slog.Logger
 	onChange   func(rootID string)
+	onRepair   func(rootID string)
 	onOverflow func()
 
 	mu     sync.Mutex
@@ -114,6 +123,7 @@ func newFSNotifyOSWatcher(opts fsnotifyOSWatcherOptions) *fsnotifyOSWatcher {
 		customStat: opts.customStat,
 		logger:     logger,
 		onChange:   opts.onChange,
+		onRepair:   opts.onRepair,
 		onOverflow: opts.onOverflow,
 		roots:      make(map[string]*osRootEntry),
 	}
@@ -151,13 +161,17 @@ func (f *fsnotifyOSWatcher) AddRootContext(ctx context.Context, root domain.Libr
 		return err
 	}
 
-	dirs := make(map[string]struct{})
-	if err := f.watchInitialDir(ctx, h, rootBytes, []os.FileInfo{rootInfo}, dirs); err != nil {
-		f.rollbackAddedDirs(h, dirs)
+	candidate, prevWatches, err := f.beginRootRegistration(ctx, h, root, string(rootBytes))
+	if err != nil {
 		return err
 	}
 
-	return f.commitRootWatches(ctx, h, root, string(rootBytes), dirs)
+	if err := f.watchInitialDir(ctx, h, root.ID, candidate, rootBytes, []os.FileInfo{rootInfo}); err != nil {
+		f.abortRootRegistration(h, root.ID, candidate, prevWatches)
+		return err
+	}
+
+	return f.finishRootRegistration(ctx, h, root.ID, candidate, prevWatches)
 }
 
 func (f *fsnotifyOSWatcher) ensureHandle() (fsnotifyHandle, error) {
@@ -180,74 +194,150 @@ func (f *fsnotifyOSWatcher) ensureHandle() (fsnotifyHandle, error) {
 	return h, nil
 }
 
-func (f *fsnotifyOSWatcher) commitRootWatches(
+func (f *fsnotifyOSWatcher) beginRootRegistration(
 	ctx context.Context,
 	h fsnotifyHandle,
 	root domain.LibraryRoot,
 	rootPath string,
-	dirs map[string]struct{},
+) (*osRootEntry, map[string]struct{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed || f.handle != h {
+		return nil, nil, fsnotify.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	var prevWatches map[string]struct{}
+	if prev, exists := f.roots[root.ID]; exists && len(prev.watches) > 0 {
+		prevWatches = make(map[string]struct{}, len(prev.watches))
+		for p := range prev.watches {
+			prevWatches[p] = struct{}{}
+		}
+	}
+
+	candidate := &osRootEntry{
+		root:      root,
+		rootPath:  rootPath,
+		dirs:      make(map[string]struct{}),
+		watches:   make(map[string]struct{}),
+		fileLinks: make(map[string]struct{}),
+	}
+	// Publish the candidate before adding kernel watches so events delivered while
+	// walking subdirectories are matched to root.ID rather than dropped.
+	f.roots[root.ID] = candidate
+	return candidate, prevWatches, nil
+}
+
+func (f *fsnotifyOSWatcher) stageInitialWatch(
+	rootID string,
+	candidate *osRootEntry,
+	path string,
+	isDir bool,
+	isFileLink bool,
+	addKernelWatch bool,
+) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed || f.roots[rootID] != candidate {
+		return false
+	}
+	if isDir {
+		candidate.dirs[path] = struct{}{}
+	}
+	if isFileLink {
+		candidate.fileLinks[path] = struct{}{}
+	}
+	if addKernelWatch {
+		// Record the path before calling h.Add so a partial registration failure
+		// (e.g. Darwin kqueue failing in watchDirectoryFiles after opening the
+		// directory descriptor) is always cleaned up on rollback.
+		candidate.watches[path] = struct{}{}
+	}
+	return true
+}
+
+func (f *fsnotifyOSWatcher) abortRootRegistration(
+	h fsnotifyHandle,
+	rootID string,
+	candidate *osRootEntry,
+	prevWatches map[string]struct{},
+) {
+	if h == nil {
+		return
+	}
+	var toRemove []string
+	f.mu.Lock()
+	all := make(map[string]struct{}, len(candidate.watches)+len(prevWatches))
+	for p := range candidate.watches {
+		all[p] = struct{}{}
+	}
+	for p := range prevWatches {
+		all[p] = struct{}{}
+	}
+	if f.roots[rootID] == candidate {
+		delete(f.roots, rootID)
+	}
+	for p := range all {
+		if !f.isPathWatchedByOtherRootLocked(rootID, p) {
+			toRemove = append(toRemove, p)
+		}
+	}
+	f.mu.Unlock()
+
+	slices.Sort(toRemove)
+	for _, p := range toRemove {
+		_ = h.Remove(p)
+	}
+}
+
+func (f *fsnotifyOSWatcher) finishRootRegistration(
+	ctx context.Context,
+	h fsnotifyHandle,
+	rootID string,
+	candidate *osRootEntry,
+	prevWatches map[string]struct{},
 ) error {
 	if err := ctx.Err(); err != nil {
-		f.rollbackAddedDirs(h, dirs)
+		f.abortRootRegistration(h, rootID, candidate, prevWatches)
 		return err
 	}
 
 	var stale []string
 	f.mu.Lock()
-	if f.closed || f.handle != h {
+	if f.closed || f.handle != h || f.roots[rootID] != candidate {
 		f.mu.Unlock()
-		f.rollbackAddedDirs(h, dirs)
+		f.abortRootRegistration(h, rootID, candidate, prevWatches)
 		return fsnotify.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		f.mu.Unlock()
-		f.rollbackAddedDirs(h, dirs)
+		f.abortRootRegistration(h, rootID, candidate, prevWatches)
 		return err
 	}
-	if prev, exists := f.roots[root.ID]; exists {
-		for dir := range prev.dirs {
-			if _, keep := dirs[dir]; !keep && !f.isDirWatchedByOtherRootLocked(root.ID, dir) {
-				stale = append(stale, dir)
-			}
+	for p := range prevWatches {
+		if _, keep := candidate.watches[p]; !keep && !f.isPathWatchedByOtherRootLocked(rootID, p) {
+			stale = append(stale, p)
 		}
-	}
-	f.roots[root.ID] = &osRootEntry{
-		root:     root,
-		rootPath: rootPath,
-		dirs:     dirs,
 	}
 	f.mu.Unlock()
 
-	for _, dir := range stale {
-		_ = h.Remove(dir)
+	slices.Sort(stale)
+	for _, p := range stale {
+		_ = h.Remove(p)
 	}
 	return nil
 }
 
-func (f *fsnotifyOSWatcher) rollbackAddedDirs(h fsnotifyHandle, dirs map[string]struct{}) {
-	if h == nil || len(dirs) == 0 {
-		return
-	}
-	var toRemove []string
-	f.mu.Lock()
-	for dir := range dirs {
-		if !f.isDirWatchedByOtherRootLocked("", dir) {
-			toRemove = append(toRemove, dir)
-		}
-	}
-	f.mu.Unlock()
-
-	for _, dir := range toRemove {
-		_ = h.Remove(dir)
-	}
-}
-
-func (f *fsnotifyOSWatcher) isDirWatchedByOtherRootLocked(excludeRootID, dir string) bool {
+func (f *fsnotifyOSWatcher) isPathWatchedByOtherRootLocked(excludeRootID, path string) bool {
 	for id, entry := range f.roots {
 		if id == excludeRootID {
 			continue
 		}
-		if _, ok := entry.dirs[dir]; ok {
+		if _, ok := entry.watches[path]; ok {
 			return true
 		}
 	}
@@ -257,18 +347,21 @@ func (f *fsnotifyOSWatcher) isDirWatchedByOtherRootLocked(excludeRootID, dir str
 func (f *fsnotifyOSWatcher) watchInitialDir(
 	ctx context.Context,
 	h fsnotifyHandle,
+	rootID string,
+	candidate *osRootEntry,
 	absDir []byte,
 	ancestry []os.FileInfo,
-	dirs map[string]struct{},
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	dirStr := string(absDir)
+	if !f.stageInitialWatch(rootID, candidate, dirStr, true, false, true) {
+		return fsnotify.ErrClosed
+	}
 	if err := h.Add(dirStr); err != nil {
 		return err
 	}
-	dirs[dirStr] = struct{}{}
 
 	entries, err := f.readDir(absDir)
 	if err != nil {
@@ -282,7 +375,7 @@ func (f *fsnotifyOSWatcher) watchInitialDir(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := f.visitInitialEntry(ctx, h, absDir, ancestry, de, dirs); err != nil {
+		if err := f.visitInitialEntry(ctx, h, rootID, candidate, absDir, ancestry, de); err != nil {
 			return err
 		}
 	}
@@ -292,10 +385,11 @@ func (f *fsnotifyOSWatcher) watchInitialDir(
 func (f *fsnotifyOSWatcher) visitInitialEntry(
 	ctx context.Context,
 	h fsnotifyHandle,
+	rootID string,
+	candidate *osRootEntry,
 	absDir []byte,
 	ancestry []os.FileInfo,
 	de os.DirEntry,
-	dirs map[string]struct{},
 ) error {
 	nameBytes := []byte(de.Name())
 	if isTemporaryName(nameBytes) || isHiddenName(nameBytes) {
@@ -319,12 +413,38 @@ func (f *fsnotifyOSWatcher) visitInitialEntry(
 		}
 		return err
 	}
-	if !info.IsDir() || hasSameFile(ancestry, info) {
+	if info.IsDir() {
+		if hasSameFile(ancestry, info) {
+			return nil
+		}
+		nextAncestry := append(slices.Clone(ancestry), info)
+		return f.watchInitialDir(ctx, h, rootID, candidate, absChild, nextAncestry)
+	}
+	if info.Mode().IsRegular() && isSymlinkEntry(absChild, entryType) {
+		return f.watchInitialFileSymlink(h, rootID, candidate, string(absChild))
+	}
+	return nil
+}
+
+func (f *fsnotifyOSWatcher) watchInitialFileSymlink(
+	h fsnotifyHandle,
+	rootID string,
+	candidate *osRootEntry,
+	linkPath string,
+) error {
+	// Darwin's kqueue backend internally opens and watches child entries (following
+	// symlinks) when the parent directory is watched, whereas Linux inotify on the
+	// parent directory does not receive events when a symlink's external target file
+	// is edited directly. On non-Darwin platforms we register the symlink path with
+	// fsnotify so inotify watches the target inode and emits events under linkPath.
+	addKernel := runtime.GOOS != "darwin"
+	if !f.stageInitialWatch(rootID, candidate, linkPath, false, true, addKernel) {
+		return fsnotify.ErrClosed
+	}
+	if !addKernel {
 		return nil
 	}
-
-	nextAncestry := append(slices.Clone(ancestry), info)
-	return f.watchInitialDir(ctx, h, absChild, nextAncestry, dirs)
+	return h.Add(linkPath)
 }
 
 func (f *fsnotifyOSWatcher) resolveDirEntryInfo(absBytes []byte, de os.DirEntry, needsFollow bool) (os.FileInfo, error) {
@@ -344,9 +464,9 @@ func (f *fsnotifyOSWatcher) RemoveRoot(rootID string) error {
 	if ok {
 		delete(f.roots, rootID)
 		h = f.handle
-		for dir := range entry.dirs {
-			if !f.isDirWatchedByOtherRootLocked(rootID, dir) {
-				toRemove = append(toRemove, dir)
+		for p := range entry.watches {
+			if !f.isPathWatchedByOtherRootLocked(rootID, p) {
+				toRemove = append(toRemove, p)
 			}
 		}
 	}
@@ -354,8 +474,8 @@ func (f *fsnotifyOSWatcher) RemoveRoot(rootID string) error {
 
 	if h != nil {
 		slices.Sort(toRemove)
-		for _, dir := range toRemove {
-			_ = h.Remove(dir)
+		for _, p := range toRemove {
+			_ = h.Remove(p)
 		}
 	}
 	return nil
@@ -377,6 +497,10 @@ func (f *fsnotifyOSWatcher) Close() error {
 	return err
 }
 
+// WatchedPaths returns the paths explicitly registered via fsnotify.Watcher.Add
+// (WatchList). Note that on Darwin (kqueue), fsnotify additionally opens an
+// internal O_EVTONLY file descriptor for each file entry inside a watched
+// directory even though WatchList reports only the parent directory path.
 func (f *fsnotifyOSWatcher) WatchedPaths() []string {
 	f.mu.Lock()
 	h := f.handle
@@ -408,6 +532,17 @@ func (f *fsnotifyOSWatcher) RootWatchedPaths(rootID string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func (f *fsnotifyOSWatcher) RootHasFileSymlinks(rootID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		return false
+	}
+	entry, ok := f.roots[rootID]
+	return ok && len(entry.fileLinks) > 0
 }
 
 func (f *fsnotifyOSWatcher) readLoop(h fsnotifyHandle) {
@@ -485,7 +620,8 @@ func (f *fsnotifyOSWatcher) handleEvent(h fsnotifyHandle, ev fsnotify.Event) {
 func (f *fsnotifyOSWatcher) handleRootEvent(h fsnotifyHandle, m matchedOSRoot, evPath string, op fsnotify.Op) {
 	if evPath == m.rootPath {
 		if op.Has(fsnotify.Remove) || op.Has(fsnotify.Rename) {
-			f.emitChange(m.rootID)
+			f.clearRootWatches(h, m.rootID)
+			f.emitRepair(m.rootID)
 		}
 		return
 	}
@@ -512,14 +648,22 @@ func (f *fsnotifyOSWatcher) handleWatchedDirEvent(h fsnotifyHandle, rootID, evPa
 	if op.Has(fsnotify.Remove) || op.Has(fsnotify.Rename) {
 		f.removeWatchedPrefix(h, rootID, evPath)
 		if info, err := f.stat([]byte(evPath)); err == nil && info.IsDir() {
-			_, _ = f.watchRuntimeDirTree(h, rootID, []byte(evPath), []os.FileInfo{info})
+			if _, watchErr := f.watchRuntimeDirTree(h, rootID, []byte(evPath), []os.FileInfo{info}); watchErr != nil {
+				f.emitRepair(rootID)
+				return
+			}
 		}
 		f.emitChange(rootID)
 		return
 	}
 	if op.Has(fsnotify.Create) {
 		if info, err := f.stat([]byte(evPath)); err == nil && info.IsDir() {
-			if foundFiles, watchErr := f.watchRuntimeDirTree(h, rootID, []byte(evPath), []os.FileInfo{info}); foundFiles || watchErr != nil {
+			foundFiles, watchErr := f.watchRuntimeDirTree(h, rootID, []byte(evPath), []os.FileInfo{info})
+			if watchErr != nil {
+				f.emitRepair(rootID)
+				return
+			}
+			if foundFiles {
 				f.emitChange(rootID)
 			}
 		}
@@ -527,21 +671,40 @@ func (f *fsnotifyOSWatcher) handleWatchedDirEvent(h fsnotifyHandle, rootID, evPa
 }
 
 func (f *fsnotifyOSWatcher) handleChildPathEvent(h fsnotifyHandle, rootID, evPath string, op fsnotify.Op) {
+	wasFileLink := f.isWatchedFileSymlink(rootID, evPath)
 	info, err := f.stat([]byte(evPath))
 	if err == nil {
 		if info.IsDir() {
+			if wasFileLink {
+				f.removeWatchedFileSymlink(h, rootID, evPath)
+			}
 			foundFiles, watchErr := f.watchRuntimeDirTree(h, rootID, []byte(evPath), []os.FileInfo{info})
-			if foundFiles || watchErr != nil || op.Has(fsnotify.Rename) {
+			if watchErr != nil {
+				f.emitRepair(rootID)
+				return
+			}
+			if foundFiles || op.Has(fsnotify.Rename) {
 				f.emitChange(rootID)
 			}
 			return
 		}
-		if info.Mode().IsRegular() && op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Chmod) != 0 {
-			f.emitChange(rootID)
+		if info.Mode().IsRegular() {
+			if wasFileLink || isSymlinkPath(evPath) {
+				if watchErr := f.watchRuntimeFileSymlink(h, rootID, evPath); watchErr != nil {
+					f.emitRepair(rootID)
+					return
+				}
+			}
+			if op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Chmod) != 0 {
+				f.emitChange(rootID)
+			}
 		}
 		return
 	}
 
+	if wasFileLink && !isSymlinkPath(evPath) {
+		f.removeWatchedFileSymlink(h, rootID, evPath)
+	}
 	f.removeWatchedPrefix(h, rootID, evPath)
 	if op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Chmod) != 0 {
 		f.emitChange(rootID)
@@ -554,11 +717,12 @@ func (f *fsnotifyOSWatcher) watchRuntimeDirTree(
 	absDir []byte,
 	ancestry []os.FileInfo,
 ) (bool, error) {
-	if !f.isRootActive(rootID) {
+	dirStr := string(absDir)
+	if !f.stageRuntimeWatch(rootID, dirStr, true, false, true) {
 		return false, nil
 	}
-	dirStr := string(absDir)
 	if err := h.Add(dirStr); err != nil {
+		f.cleanupFailedRuntimeWatch(h, rootID, dirStr)
 		if isTransientDisappearance(err) || errors.Is(err, fsnotify.ErrClosed) {
 			return false, nil
 		}
@@ -569,14 +733,11 @@ func (f *fsnotifyOSWatcher) watchRuntimeDirTree(
 		)
 		return false, err
 	}
-	if !f.recordWatchedDir(rootID, dirStr) {
-		_ = h.Remove(dirStr)
-		return false, nil
-	}
 
 	entries, err := f.readDir(absDir)
 	if err != nil {
 		if isTransientDisappearance(err) {
+			f.cleanupFailedRuntimeWatch(h, rootID, dirStr)
 			return false, nil
 		}
 		f.logger.Warn("failed to read newly watched subdirectory; triggering full library scan",
@@ -643,14 +804,84 @@ func (f *fsnotifyOSWatcher) visitRuntimeDirEntry(
 		nextAncestry := append(slices.Clone(ancestry), info)
 		return f.watchRuntimeDirTree(h, rootID, absChild, nextAncestry)
 	}
-	return info.Mode().IsRegular(), nil
+	if info.Mode().IsRegular() {
+		if isSymlinkEntry(absChild, entryType) {
+			if err := f.watchRuntimeFileSymlink(h, rootID, string(absChild)); err != nil {
+				return true, err
+			}
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
-func (f *fsnotifyOSWatcher) isRootActive(rootID string) bool {
+func (f *fsnotifyOSWatcher) watchRuntimeFileSymlink(h fsnotifyHandle, rootID, linkPath string) error {
+	addKernel := runtime.GOOS != "darwin"
+	if !f.stageRuntimeWatch(rootID, linkPath, false, true, addKernel) {
+		return nil
+	}
+	if !addKernel {
+		return nil
+	}
+	if err := h.Add(linkPath); err != nil {
+		f.cleanupFailedRuntimeWatch(h, rootID, linkPath)
+		if isTransientDisappearance(err) || errors.Is(err, fsnotify.ErrClosed) {
+			return nil
+		}
+		f.logger.Warn("failed to add OS watch for followed file symlink; triggering full library scan",
+			slog.String("library_root_id", rootID),
+			slog.String("path", linkPath),
+			logging.Err(err),
+		)
+		return err
+	}
+	return nil
+}
+
+func (f *fsnotifyOSWatcher) stageRuntimeWatch(
+	rootID string,
+	path string,
+	isDir bool,
+	isFileLink bool,
+	addKernelWatch bool,
+) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_, ok := f.roots[rootID]
-	return !f.closed && ok
+	if f.closed {
+		return false
+	}
+	entry, ok := f.roots[rootID]
+	if !ok {
+		return false
+	}
+	if isDir {
+		entry.dirs[path] = struct{}{}
+	}
+	if isFileLink {
+		entry.fileLinks[path] = struct{}{}
+	}
+	if addKernelWatch {
+		entry.watches[path] = struct{}{}
+	}
+	return true
+}
+
+func (f *fsnotifyOSWatcher) cleanupFailedRuntimeWatch(h fsnotifyHandle, rootID, path string) {
+	shouldRemove := false
+	f.mu.Lock()
+	if entry, ok := f.roots[rootID]; ok {
+		delete(entry.dirs, path)
+		delete(entry.fileLinks, path)
+		delete(entry.watches, path)
+	}
+	if !f.isPathWatchedByOtherRootLocked(rootID, path) {
+		shouldRemove = true
+	}
+	f.mu.Unlock()
+
+	if shouldRemove && h != nil {
+		_ = h.Remove(path)
+	}
 }
 
 func (f *fsnotifyOSWatcher) isWatchedDir(rootID, dir string) bool {
@@ -664,18 +895,53 @@ func (f *fsnotifyOSWatcher) isWatchedDir(rootID, dir string) bool {
 	return watched
 }
 
-func (f *fsnotifyOSWatcher) recordWatchedDir(rootID, dir string) bool {
+func (f *fsnotifyOSWatcher) isWatchedFileSymlink(rootID, path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return false
-	}
 	entry, ok := f.roots[rootID]
 	if !ok {
 		return false
 	}
-	entry.dirs[dir] = struct{}{}
-	return true
+	_, watched := entry.fileLinks[path]
+	return watched
+}
+
+func (f *fsnotifyOSWatcher) removeWatchedFileSymlink(h fsnotifyHandle, rootID, path string) {
+	shouldRemove := false
+	f.mu.Lock()
+	if entry, ok := f.roots[rootID]; ok {
+		delete(entry.fileLinks, path)
+		if _, hadWatch := entry.watches[path]; hadWatch {
+			delete(entry.watches, path)
+			shouldRemove = !f.isPathWatchedByOtherRootLocked(rootID, path)
+		}
+	}
+	f.mu.Unlock()
+
+	if shouldRemove && h != nil {
+		_ = h.Remove(path)
+	}
+}
+
+func (f *fsnotifyOSWatcher) clearRootWatches(h fsnotifyHandle, rootID string) {
+	var toRemove []string
+	f.mu.Lock()
+	entry, ok := f.roots[rootID]
+	if ok {
+		for p := range entry.watches {
+			if !f.isPathWatchedByOtherRootLocked(rootID, p) {
+				toRemove = append(toRemove, p)
+			}
+		}
+		clear(entry.dirs)
+		clear(entry.watches)
+		clear(entry.fileLinks)
+	}
+	f.mu.Unlock()
+
+	for _, p := range toRemove {
+		_ = h.Remove(p)
+	}
 }
 
 func (f *fsnotifyOSWatcher) removeWatchedPrefix(h fsnotifyHandle, rootID, prefix string) {
@@ -686,16 +952,26 @@ func (f *fsnotifyOSWatcher) removeWatchedPrefix(h fsnotifyHandle, rootID, prefix
 		for dir := range entry.dirs {
 			if dir == prefix || isSubpathOf(dir, prefix) {
 				delete(entry.dirs, dir)
-				if !f.isDirWatchedByOtherRootLocked(rootID, dir) {
-					toRemove = append(toRemove, dir)
+			}
+		}
+		for link := range entry.fileLinks {
+			if link == prefix || isSubpathOf(link, prefix) {
+				delete(entry.fileLinks, link)
+			}
+		}
+		for p := range entry.watches {
+			if p == prefix || isSubpathOf(p, prefix) {
+				delete(entry.watches, p)
+				if !f.isPathWatchedByOtherRootLocked(rootID, p) {
+					toRemove = append(toRemove, p)
 				}
 			}
 		}
 	}
 	f.mu.Unlock()
 
-	for _, dir := range toRemove {
-		_ = h.Remove(dir)
+	for _, p := range toRemove {
+		_ = h.Remove(p)
 	}
 }
 
@@ -703,6 +979,31 @@ func (f *fsnotifyOSWatcher) emitChange(rootID string) {
 	if f.onChange != nil {
 		f.onChange(rootID)
 	}
+}
+
+func (f *fsnotifyOSWatcher) emitRepair(rootID string) {
+	if f.onRepair != nil {
+		f.onRepair(rootID)
+		return
+	}
+	if f.onChange != nil {
+		f.onChange(rootID)
+	}
+}
+
+func isSymlinkEntry(absPath []byte, entryType fs.FileMode) bool {
+	if entryType&os.ModeSymlink != 0 {
+		return true
+	}
+	if entryType != 0 {
+		return false
+	}
+	return isSymlinkPath(string(absPath))
+}
+
+func isSymlinkPath(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode()&os.ModeSymlink != 0
 }
 
 type watchRelClass int
