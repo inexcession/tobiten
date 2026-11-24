@@ -2327,6 +2327,7 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 
 	dir1B := t.TempDir()
 	sub1B := filepath.Join(dir1B, "sub1b")
+	rebuildSub1B := filepath.Join(dir1B, "rebuild-inflight-sub1b")
 	inflightSub1B := filepath.Join(dir1B, "inflight-sub1b")
 	writeWatcherFile(t, filepath.Join(sub1B, "vol01.cbz"), []byte("v1b"), time.Time{})
 
@@ -2338,6 +2339,20 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 	root1B := makeWatcherTestRoot(t, "lib-1", "root-1b", dir1B)
 	root2 := makeWatcherTestRoot(t, "lib-2", "root-2", dir2)
 
+	var armRebuildDetect atomic.Bool
+	rebuildDetectEntered := make(chan struct{})
+	var rebuildDetectOnce sync.Once
+
+	rebuildAddEntered := make(chan struct{})
+	releaseRebuildAdd := make(chan struct{})
+	rebuildAddInstalled := make(chan struct{})
+	var releaseRebuildOnce sync.Once
+	releaseRebuild := func() {
+		releaseRebuildOnce.Do(func() { close(releaseRebuildAdd) })
+	}
+	t.Cleanup(releaseRebuild)
+	var rebuildHoldTriggered atomic.Bool
+
 	inflightAddEntered := make(chan struct{})
 	releaseInflightAdd := make(chan struct{})
 	inflightAddInstalled := make(chan struct{})
@@ -2345,8 +2360,10 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 	releaseInflight := func() {
 		releaseInflightOnce.Do(func() { close(releaseInflightAdd) })
 	}
-	t.Cleanup(releaseInflight)
-	var inflightHoldOnce sync.Once
+	var inflightHoldTriggered atomic.Bool
+
+	var handleMu sync.Mutex
+	var activeHandle *faultInjectingFSNotifyHandle
 
 	lister := &stubRootLister{
 		roots: []domain.LibraryRoot{root1A, root1B, root2},
@@ -2358,21 +2375,47 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		Trigger:        trig,
 		PollInterval:   time.Hour,
 		DebounceWindow: 30 * time.Millisecond,
+		MountDetector: MountDetectorFunc(func(rawPath []byte) (mount.FilesystemInfo, error) {
+			if armRebuildDetect.Load() && string(rawPath) == dir1B {
+				rebuildDetectOnce.Do(func() {
+					close(rebuildDetectEntered)
+					select {
+					case <-rebuildAddEntered:
+					case <-t.Context().Done():
+					}
+				})
+			}
+			return mount.DetectFilesystemBytes(rawPath)
+		}),
 		newFSNotify: func() (fsnotifyHandle, error) {
-			return newFaultInjectingFSNotifyHandle(func(inner fsnotifyHandle, name string) error {
-				if name == inflightSub1B {
-					inflightHoldOnce.Do(func() {
-						close(inflightAddEntered)
-						select {
-						case <-releaseInflightAdd:
-						case <-t.Context().Done():
-						}
-						_ = inner.Add(name)
-						close(inflightAddInstalled)
-					})
+			h, err := newFaultInjectingFSNotifyHandle(func(inner fsnotifyHandle, name string) error {
+				if name == rebuildSub1B && rebuildHoldTriggered.CompareAndSwap(false, true) {
+					close(rebuildAddEntered)
+					select {
+					case <-releaseRebuildAdd:
+					case <-t.Context().Done():
+					}
+					_ = inner.Add(name)
+					close(rebuildAddInstalled)
+				}
+				if name == inflightSub1B && inflightHoldTriggered.CompareAndSwap(false, true) {
+					close(inflightAddEntered)
+					select {
+					case <-releaseInflightAdd:
+					case <-t.Context().Done():
+					}
+					_ = inner.Add(name)
+					close(inflightAddInstalled)
 				}
 				return nil
 			})
+			if err != nil {
+				return nil, err
+			}
+			handleMu.Lock()
+			activeHandle = h
+			handleMu.Unlock()
+			return h, nil
 		},
 	})
 	if err != nil {
@@ -2382,10 +2425,19 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		t.Fatalf("Start: %v", err)
 	}
 	defer w.Stop()
+	defer releaseInflight()
+	defer releaseRebuild()
 
 	waitForOSWatchedRoot(t, w, root1A.ID)
 	waitForOSWatchedRoot(t, w, root1B.ID)
 	waitForOSWatchedRoot(t, w, root2.ID)
+
+	handleMu.Lock()
+	h := activeHandle
+	handleMu.Unlock()
+	if h == nil {
+		t.Fatal("expected active fsnotify handle")
+	}
 
 	wantAll := []string{dir1A, sub1A, dir1B, sub1B, dir2, sub2}
 	slices.Sort(wantAll)
@@ -2393,7 +2445,41 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		t.Fatalf("WatchedPaths = %v, want %v", got, wantAll)
 	}
 
-	// 1. Trigger a runtime subdirectory Add on root1B, hold it in flight while removing
+	// 1. Hold a runtime subdirectory Add on root1B while overflow recovery rebuilds the same
+	// root1B registration. Releasing the stale Add must preserve the rebuilt native watch.
+	armRebuildDetect.Store(true)
+	h.injectError(fsnotify.ErrEventOverflow)
+	select {
+	case <-rebuildDetectEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for overflow recovery mount detection on root-1b")
+	}
+	if err := os.Mkdir(rebuildSub1B, 0o755); err != nil {
+		t.Fatalf("Mkdir(%s): %v", rebuildSub1B, err)
+	}
+	waitForTriggerCount(t, trig, 2)
+	releaseRebuild()
+	select {
+	case <-rebuildAddInstalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for held runtime Add on rebuildSub1B to complete")
+	}
+	// Trigger an event on sub2 so readLoop finishes completeRuntimeWatch for rebuildSub1B
+	// and returns to its event loop before we check WatchedPaths and rebuildSub1B events.
+	writeWatcherFile(t, filepath.Join(sub2, "sync-after-rebuild.cbz"), []byte("sync"), time.Time{})
+	waitForTriggerCount(t, trig, 3)
+
+	if got := w.WatchedPaths(); !slices.Contains(got, rebuildSub1B) {
+		t.Fatalf("WatchedPaths after stale-Add cleanup = %v, want to preserve %s", got, rebuildSub1B)
+	}
+	writeWatcherFile(t, filepath.Join(rebuildSub1B, "after-rebuild.cbz"), []byte("ar"), time.Time{})
+	waitForTriggerCount(t, trig, 4)
+	time.Sleep(55 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 4 {
+		t.Fatalf("after-rebuild write triggered %d total scans, want 4", got)
+	}
+
+	// 2. Trigger a runtime subdirectory Add on root1B, hold it in flight while removing
 	// root1B via NotifySync, then release the held Add and verify no native watch leaks.
 	if err := os.Mkdir(inflightSub1B, 0o755); err != nil {
 		t.Fatalf("Mkdir(%s): %v", inflightSub1B, err)
@@ -2429,20 +2515,21 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Changes in removed root1B (including inside inflightSub1B) must not trigger any scan.
+	// Changes in removed root1B (including rebuildSub1B and inflightSub1B) must not trigger any scan.
 	writeWatcherFile(t, filepath.Join(sub1B, "ignored.cbz"), []byte("ignored"), time.Time{})
+	writeWatcherFile(t, filepath.Join(rebuildSub1B, "ignored-rebuild.cbz"), []byte("ignored"), time.Time{})
 	writeWatcherFile(t, filepath.Join(inflightSub1B, "ignored-inflight.cbz"), []byte("ignored"), time.Time{})
 	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 0 {
-		t.Fatalf("removed root triggered %d scans, want 0", got)
+	if got := len(trig.snapshot()); got != 4 {
+		t.Fatalf("removed root triggered %d scans total, want 4", got)
 	}
 
 	// Remaining root1A in lib-1 still triggers normally.
 	writeWatcherFile(t, filepath.Join(sub1A, "active.cbz"), []byte("active"), time.Time{})
-	reqs := waitForTriggerCount(t, trig, 1)
-	assertAutomaticScanRequest(t, reqs[0], "lib-1")
+	reqs := waitForTriggerCount(t, trig, 5)
+	assertAutomaticScanRequest(t, reqs[4], "lib-1")
 
-	// 2. Remove library lib-2 (root2) -> releases watches for dir2 and sub2.
+	// 3. Remove library lib-2 (root2) -> releases watches for dir2 and sub2.
 	lister.setRoots([]domain.LibraryRoot{root1A})
 	w.NotifySync()
 	waitForRootRemoved(t, w, root2.ID)
@@ -2455,14 +2542,64 @@ func TestWatcher_RemovingLibraryOrRootReleasesWatchesAndShutdownStopsGoroutines(
 
 	writeWatcherFile(t, filepath.Join(sub2, "ignored2.cbz"), []byte("ignored2"), time.Time{})
 	time.Sleep(60 * time.Millisecond)
-	if got := len(trig.snapshot()); got != 1 {
-		t.Fatalf("removed library triggered scan: got %d total, want 1", got)
+	if got := len(trig.snapshot()); got != 5 {
+		t.Fatalf("removed library triggered scan: got %d total, want 5", got)
 	}
 
-	// 3. Stop closes the OS watcher, releases all remaining watches, and leaves no goroutine running.
+	// 4. Stop closes the OS watcher, releases all remaining watches, and leaves no goroutine running.
 	w.Stop()
 	if got := w.WatchedPaths(); len(got) != 0 {
 		t.Fatalf("WatchedPaths after Stop = %v, want empty", got)
 	}
 	assertNoWatcherGoroutinesRunning(t, baselineGoroutines+2)
+}
+
+func TestWatcher_RuntimeDanglingSymlinkPollsWhenTargetAppears(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "runtime-dangling-root")
+	writeWatcherFile(t, filepath.Join(dir, "vol01.cbz"), []byte("v1"), time.Time{})
+	root := makeWatcherTestRoot(t, "lib-dangling", "root-dangling", dir)
+
+	trig := &recordedTrigger{}
+	w, err := NewWatcher(WatcherOptions{
+		StaticRoots:    []domain.LibraryRoot{root},
+		Trigger:        trig,
+		PollInterval:   25 * time.Millisecond,
+		DebounceWindow: 35 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	waitForOSWatchedRoot(t, w, root.ID)
+	if w.rootHasFileSymlinks(root.ID) {
+		t.Fatal("expected zero symlinks at startup")
+	}
+
+	// Create a dangling symlink at runtime pointing outside the root where the target does not yet exist.
+	extDir := t.TempDir()
+	extTarget := filepath.Join(extDir, "runtime-target.cbz")
+	linkPath := filepath.Join(dir, "runtime-dangling.cbz")
+	if err := os.Symlink(extTarget, linkPath); err != nil {
+		t.Fatalf("Symlink(%s -> %s): %v", linkPath, extTarget, err)
+	}
+
+	reqs := waitForTriggerCount(t, trig, 1)
+	assertAutomaticScanRequest(t, reqs[0], "lib-dangling")
+	time.Sleep(80 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 1 {
+		t.Fatalf("dangling link without target triggered %d scans, want 1", got)
+	}
+
+	// Creating the external target outside the root must be detected on the next scheduled poll tick.
+	writeWatcherFile(t, extTarget, []byte("runtime-target-appeared"), time.Time{})
+	reqs = waitForTriggerCount(t, trig, 2)
+	time.Sleep(60 * time.Millisecond)
+	if got := len(trig.snapshot()); got != 2 {
+		t.Fatalf("appearing target for runtime-created dangling symlink triggered %d total scans, want 2", got)
+	}
+	assertAutomaticScanRequest(t, reqs[1], "lib-dangling")
 }

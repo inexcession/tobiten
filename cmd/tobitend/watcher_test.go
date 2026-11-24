@@ -221,7 +221,18 @@ func TestRunDaemon_WatchersStartAfterRecoveryAndStopBeforeStorageCleanup(t *test
 		t.Fatalf("mount probe calls = %d, want 1 (second root must not be probed after shutdown begins)", gotProbes)
 	}
 
-	if pids := queryDaemonLockPIDs(t, db); len(pids) != 0 {
+	// pgx Close sends Terminate and closes the client socket without waiting for PostgreSQL
+	// to finish backend teardown; wait boundedly for server-side lock release.
+	var pids []int32
+	releaseDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(releaseDeadline) {
+		pids = queryDaemonLockPIDs(t, db)
+		if len(pids) == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(pids) != 0 {
 		t.Fatalf("daemon advisory lock remained held after shutdown: pids=%v", pids)
 	}
 

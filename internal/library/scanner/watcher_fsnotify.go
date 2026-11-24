@@ -272,20 +272,16 @@ func (f *fsnotifyOSWatcher) completeInitialWatch(
 	addErr error,
 ) error {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	active := !f.closed && !candidate.removed && f.roots[rootID] == candidate
 	if active && addErr == nil {
-		f.mu.Unlock()
 		return nil
 	}
 	delete(candidate.dirs, path)
 	delete(candidate.fileLinks, path)
 	delete(candidate.watches, path)
-	shouldRemove := !f.isPathWatchedByOtherRootLocked(rootID, path)
-	f.mu.Unlock()
-
-	if shouldRemove && h != nil {
-		_ = h.Remove(path)
-	}
+	f.removeUnwatchedPathLocked(h, candidate, path)
 	if addErr != nil {
 		return addErr
 	}
@@ -301,8 +297,9 @@ func (f *fsnotifyOSWatcher) abortRootRegistration(
 	if h == nil {
 		return
 	}
-	var toRemove []string
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	candidate.removed = true
 	all := make(map[string]struct{}, len(candidate.watches)+len(prevWatches))
 	for p := range candidate.watches {
@@ -314,17 +311,11 @@ func (f *fsnotifyOSWatcher) abortRootRegistration(
 	if f.roots[rootID] == candidate {
 		delete(f.roots, rootID)
 	}
+	toRemove := make([]string, 0, len(all))
 	for p := range all {
-		if !f.isPathWatchedByOtherRootLocked(rootID, p) {
-			toRemove = append(toRemove, p)
-		}
+		toRemove = append(toRemove, p)
 	}
-	f.mu.Unlock()
-
-	slices.Sort(toRemove)
-	for _, p := range toRemove {
-		_ = h.Remove(p)
-	}
+	f.removeUnwatchedPathsLocked(h, candidate, toRemove)
 }
 
 func (f *fsnotifyOSWatcher) finishRootRegistration(
@@ -339,7 +330,6 @@ func (f *fsnotifyOSWatcher) finishRootRegistration(
 		return err
 	}
 
-	var stale []string
 	f.mu.Lock()
 	if f.closed || f.handle != h || candidate.removed || f.roots[rootID] != candidate {
 		f.mu.Unlock()
@@ -351,23 +341,20 @@ func (f *fsnotifyOSWatcher) finishRootRegistration(
 		f.abortRootRegistration(h, rootID, candidate, prevWatches)
 		return err
 	}
+	var stale []string
 	for p := range prevWatches {
-		if _, keep := candidate.watches[p]; !keep && !f.isPathWatchedByOtherRootLocked(rootID, p) {
+		if _, keep := candidate.watches[p]; !keep {
 			stale = append(stale, p)
 		}
 	}
+	f.removeUnwatchedPathsLocked(h, candidate, stale)
 	f.mu.Unlock()
-
-	slices.Sort(stale)
-	for _, p := range stale {
-		_ = h.Remove(p)
-	}
 	return nil
 }
 
-func (f *fsnotifyOSWatcher) isPathWatchedByOtherRootLocked(excludeRootID, path string) bool {
-	for id, entry := range f.roots {
-		if id == excludeRootID {
+func (f *fsnotifyOSWatcher) isPathWatchedLocked(exclude *osRootEntry, path string) bool {
+	for _, entry := range f.roots {
+		if entry == exclude || entry.removed {
 			continue
 		}
 		if _, ok := entry.watches[path]; ok {
@@ -375,6 +362,25 @@ func (f *fsnotifyOSWatcher) isPathWatchedByOtherRootLocked(excludeRootID, path s
 		}
 	}
 	return false
+}
+
+func (f *fsnotifyOSWatcher) removeUnwatchedPathLocked(h fsnotifyHandle, exclude *osRootEntry, path string) {
+	if f.closed || h == nil || f.isPathWatchedLocked(exclude, path) {
+		return
+	}
+	_ = h.Remove(path)
+}
+
+func (f *fsnotifyOSWatcher) removeUnwatchedPathsLocked(h fsnotifyHandle, exclude *osRootEntry, paths []string) {
+	if f.closed || h == nil || len(paths) == 0 {
+		return
+	}
+	slices.Sort(paths)
+	for _, p := range paths {
+		if !f.isPathWatchedLocked(exclude, p) {
+			_ = h.Remove(p)
+		}
+	}
 }
 
 func (f *fsnotifyOSWatcher) watchInitialDir(
@@ -495,30 +501,23 @@ func (f *fsnotifyOSWatcher) resolveDirEntryInfo(absBytes []byte, de os.DirEntry,
 }
 
 func (f *fsnotifyOSWatcher) RemoveRoot(rootID string) error {
-	var (
-		h        fsnotifyHandle
-		toRemove []string
-	)
 	f.mu.Lock()
-	entry, ok := f.roots[rootID]
-	if ok {
-		entry.removed = true
-		delete(f.roots, rootID)
-		h = f.handle
-		for p := range entry.watches {
-			if !f.isPathWatchedByOtherRootLocked(rootID, p) {
-				toRemove = append(toRemove, p)
-			}
-		}
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	if h != nil {
-		slices.Sort(toRemove)
-		for _, p := range toRemove {
-			_ = h.Remove(p)
-		}
+	entry, ok := f.roots[rootID]
+	if !ok {
+		return nil
 	}
+	entry.removed = true
+	delete(f.roots, rootID)
+	if len(entry.watches) == 0 {
+		return nil
+	}
+	toRemove := make([]string, 0, len(entry.watches))
+	for p := range entry.watches {
+		toRemove = append(toRemove, p)
+	}
+	f.removeUnwatchedPathsLocked(f.handle, entry, toRemove)
 	return nil
 }
 
@@ -749,12 +748,10 @@ func (f *fsnotifyOSWatcher) handleChildPathEvent(h fsnotifyHandle, rootID, evPat
 		return
 	}
 
+	f.removeWatchedPrefix(h, rootID, evPath)
 	if isSymlinkPath(evPath) {
 		f.recordDanglingRuntimeSymlink(h, rootID, evPath)
-	} else if wasFileLink {
-		f.removeWatchedFileSymlink(h, rootID, evPath)
 	}
-	f.removeWatchedPrefix(h, rootID, evPath)
 	if op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Chmod) != 0 {
 		f.emitChange(rootID)
 	}
@@ -887,21 +884,20 @@ func (f *fsnotifyOSWatcher) watchRuntimeFileSymlink(h fsnotifyHandle, rootID, li
 }
 
 func (f *fsnotifyOSWatcher) recordDanglingRuntimeSymlink(h fsnotifyHandle, rootID, linkPath string) {
-	shouldRemove := false
 	f.mu.Lock()
-	if !f.closed {
-		if entry, ok := f.roots[rootID]; ok && !entry.removed {
-			entry.fileLinks[linkPath] = struct{}{}
-			if _, hadWatch := entry.watches[linkPath]; hadWatch {
-				delete(entry.watches, linkPath)
-				shouldRemove = !f.isPathWatchedByOtherRootLocked(rootID, linkPath)
-			}
-		}
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	if shouldRemove && h != nil {
-		_ = h.Remove(linkPath)
+	if f.closed {
+		return
+	}
+	entry, ok := f.roots[rootID]
+	if !ok || entry.removed {
+		return
+	}
+	entry.fileLinks[linkPath] = struct{}{}
+	if _, hadWatch := entry.watches[linkPath]; hadWatch {
+		delete(entry.watches, linkPath)
+		f.removeUnwatchedPathLocked(h, entry, linkPath)
 	}
 }
 
@@ -936,6 +932,8 @@ func (f *fsnotifyOSWatcher) completeRuntimeWatch(
 	addErr error,
 ) (bool, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	rootID := ""
 	if entry != nil {
 		rootID = entry.root.ID
@@ -943,7 +941,6 @@ func (f *fsnotifyOSWatcher) completeRuntimeWatch(
 	active := !f.closed && entry != nil && !entry.removed && f.roots[rootID] == entry
 	if active && addErr == nil {
 		entry.watches[path] = struct{}{}
-		f.mu.Unlock()
 		return true, nil
 	}
 	if entry != nil {
@@ -951,12 +948,7 @@ func (f *fsnotifyOSWatcher) completeRuntimeWatch(
 		delete(entry.fileLinks, path)
 		delete(entry.watches, path)
 	}
-	shouldRemove := !f.isPathWatchedByOtherRootLocked(rootID, path)
-	f.mu.Unlock()
-
-	if shouldRemove && h != nil {
-		_ = h.Remove(path)
-	}
+	f.removeUnwatchedPathLocked(h, entry, path)
 	if !active || isTransientDisappearance(addErr) || errors.Is(addErr, fsnotify.ErrClosed) {
 		return false, nil
 	}
@@ -964,25 +956,15 @@ func (f *fsnotifyOSWatcher) completeRuntimeWatch(
 }
 
 func (f *fsnotifyOSWatcher) cleanupFailedRuntimeWatch(h fsnotifyHandle, entry *osRootEntry, path string) {
-	rootID := ""
-	if entry != nil {
-		rootID = entry.root.ID
-	}
-	shouldRemove := false
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if entry != nil {
 		delete(entry.dirs, path)
 		delete(entry.fileLinks, path)
 		delete(entry.watches, path)
 	}
-	if !f.isPathWatchedByOtherRootLocked(rootID, path) {
-		shouldRemove = true
-	}
-	f.mu.Unlock()
-
-	if shouldRemove && h != nil {
-		_ = h.Remove(path)
-	}
+	f.removeUnwatchedPathLocked(h, entry, path)
 }
 
 func (f *fsnotifyOSWatcher) isWatchedDir(rootID, dir string) bool {
@@ -1008,72 +990,67 @@ func (f *fsnotifyOSWatcher) isWatchedFileSymlink(rootID, path string) bool {
 }
 
 func (f *fsnotifyOSWatcher) removeWatchedFileSymlink(h fsnotifyHandle, rootID, path string) {
-	shouldRemove := false
 	f.mu.Lock()
-	if entry, ok := f.roots[rootID]; ok {
-		delete(entry.fileLinks, path)
-		if _, hadWatch := entry.watches[path]; hadWatch {
-			delete(entry.watches, path)
-			shouldRemove = !f.isPathWatchedByOtherRootLocked(rootID, path)
-		}
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	if shouldRemove && h != nil {
-		_ = h.Remove(path)
+	if f.closed {
+		return
+	}
+	entry, ok := f.roots[rootID]
+	if !ok || entry.removed {
+		return
+	}
+	delete(entry.fileLinks, path)
+	if _, hadWatch := entry.watches[path]; hadWatch {
+		delete(entry.watches, path)
+		f.removeUnwatchedPathLocked(h, entry, path)
 	}
 }
 
 func (f *fsnotifyOSWatcher) clearRootWatches(h fsnotifyHandle, rootID string) {
-	var toRemove []string
 	f.mu.Lock()
-	entry, ok := f.roots[rootID]
-	if ok {
-		for p := range entry.watches {
-			if !f.isPathWatchedByOtherRootLocked(rootID, p) {
-				toRemove = append(toRemove, p)
-			}
-		}
-		clear(entry.dirs)
-		clear(entry.watches)
-		clear(entry.fileLinks)
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	for _, p := range toRemove {
-		_ = h.Remove(p)
+	entry, ok := f.roots[rootID]
+	if !ok || entry.removed {
+		return
 	}
+	toRemove := make([]string, 0, len(entry.watches))
+	for p := range entry.watches {
+		toRemove = append(toRemove, p)
+	}
+	clear(entry.dirs)
+	clear(entry.watches)
+	clear(entry.fileLinks)
+	f.removeUnwatchedPathsLocked(h, entry, toRemove)
 }
 
 func (f *fsnotifyOSWatcher) removeWatchedPrefix(h fsnotifyHandle, rootID, prefix string) {
-	var toRemove []string
 	f.mu.Lock()
-	entry, ok := f.roots[rootID]
-	if ok {
-		for dir := range entry.dirs {
-			if dir == prefix || isSubpathOf(dir, prefix) {
-				delete(entry.dirs, dir)
-			}
-		}
-		for link := range entry.fileLinks {
-			if link == prefix || isSubpathOf(link, prefix) {
-				delete(entry.fileLinks, link)
-			}
-		}
-		for p := range entry.watches {
-			if p == prefix || isSubpathOf(p, prefix) {
-				delete(entry.watches, p)
-				if !f.isPathWatchedByOtherRootLocked(rootID, p) {
-					toRemove = append(toRemove, p)
-				}
-			}
-		}
-	}
-	f.mu.Unlock()
+	defer f.mu.Unlock()
 
-	for _, p := range toRemove {
-		_ = h.Remove(p)
+	entry, ok := f.roots[rootID]
+	if !ok || entry.removed {
+		return
 	}
+	for dir := range entry.dirs {
+		if dir == prefix || isSubpathOf(dir, prefix) {
+			delete(entry.dirs, dir)
+		}
+	}
+	for link := range entry.fileLinks {
+		if link == prefix || isSubpathOf(link, prefix) {
+			delete(entry.fileLinks, link)
+		}
+	}
+	var toRemove []string
+	for p := range entry.watches {
+		if p == prefix || isSubpathOf(p, prefix) {
+			delete(entry.watches, p)
+			toRemove = append(toRemove, p)
+		}
+	}
+	f.removeUnwatchedPathsLocked(h, entry, toRemove)
 }
 
 func (f *fsnotifyOSWatcher) emitChange(rootID string) {
