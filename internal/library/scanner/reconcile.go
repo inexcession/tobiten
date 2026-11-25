@@ -77,13 +77,14 @@ type plannedAssetTransition struct {
 }
 
 type reconciliationPlan struct {
-	MoveComponents [][]plannedMove
-	Modifies       []plannedModify
-	Restores       []plannedRestore
-	MtimeRefreshes []plannedModify
-	ToIndex        []observedFile
-	MarkMissing    []plannedAssetTransition
-	RetireMissing  []plannedAssetTransition
+	MoveComponents               [][]plannedMove
+	Modifies                     []plannedModify
+	Restores                     []plannedRestore
+	MtimeRefreshes               []plannedModify
+	ToIndex                      []observedFile
+	MarkMissing                  []plannedAssetTransition
+	RetireMissing                []plannedAssetTransition
+	UnconfirmedRootsWithRemovals map[string]struct{}
 }
 
 func (p reconciliationPlan) hasWrites() bool {
@@ -147,11 +148,11 @@ func (s *Scanner) reconcileLibraryPass(
 		})
 	}
 
-	if unconfirmedRoots := findRootsWithZeroConfirmedKnownAssets(res.Roots, preWalkAssets, obs, plan); len(unconfirmedRoots) > 0 {
+	if len(plan.UnconfirmedRootsWithRemovals) > 0 {
 		if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
 			return err
 		}
-		markRootsIncomplete(res, unconfirmedRoots)
+		markRootsIncomplete(res, plan.UnconfirmedRootsWithRemovals)
 		return nil
 	}
 
@@ -259,6 +260,15 @@ func planReconciliation(
 		grace,
 	)
 
+	unconfirmedRoots := findRootsWithZeroConfirmedKnownAssets(
+		roots,
+		activeAssets,
+		unconfirmedActive,
+		proposedMoves,
+		modifies,
+		markMissing,
+	)
+
 	moves := make([]plannedMove, 0, len(proposedMoves))
 	for _, mv := range proposedMoves {
 		moves = append(moves, mv)
@@ -268,55 +278,66 @@ func planReconciliation(
 	})
 
 	return reconciliationPlan{
-		MoveComponents: partitionMoveComponents(moves),
-		Modifies:       modifies,
-		Restores:       samePathRestores,
-		MtimeRefreshes: mtimeRefreshes,
-		ToIndex:        toIndex,
-		MarkMissing:    markMissing,
-		RetireMissing:  retireMissing,
+		MoveComponents:               partitionMoveComponents(moves),
+		Modifies:                     modifies,
+		Restores:                     samePathRestores,
+		MtimeRefreshes:               mtimeRefreshes,
+		ToIndex:                      toIndex,
+		MarkMissing:                  markMissing,
+		RetireMissing:                retireMissing,
+		UnconfirmedRootsWithRemovals: unconfirmedRoots,
 	}
 }
 
 func findRootsWithZeroConfirmedKnownAssets(
 	roots []RootScanResult,
-	preWalkAssets []domain.MediaAsset,
-	obs *libraryWalkObservations,
-	plan reconciliationPlan,
+	activeAssets []domain.MediaAsset,
+	unconfirmedActive []domain.MediaAsset,
+	proposedMoves map[string]plannedMove,
+	modifies []plannedModify,
+	markMissing []plannedAssetTransition,
 ) map[string]struct{} {
-	activeByRoot := make(map[string]int, len(roots))
-	for _, asset := range preWalkAssets {
-		if asset.MissingSince == nil {
-			activeByRoot[asset.LibraryRootID]++
-		}
-	}
-	if len(activeByRoot) == 0 {
+	if len(markMissing) == 0 {
 		return nil
 	}
-
 	missingByRoot := make(map[string]int, len(roots))
-	for _, item := range plan.MarkMissing {
+	for _, item := range markMissing {
 		missingByRoot[item.RootID]++
 	}
 
-	var unconfirmed map[string]struct{}
-	for _, rootRes := range roots {
-		activeCount := activeByRoot[rootRes.LibraryRootID]
-		if activeCount == 0 || missingByRoot[rootRes.LibraryRootID] < activeCount {
-			continue
-		}
-		if _, hasMarker := obs.seenSkipped[assetLocation{
-			rootID:       rootRes.LibraryRootID,
-			relPathBytes: RootMarkerFilename,
-		}]; hasMarker {
-			continue
-		}
-		if unconfirmed == nil {
-			unconfirmed = make(map[string]struct{})
-		}
-		unconfirmed[rootRes.LibraryRootID] = struct{}{}
+	unconfirmedSet := make(map[string]struct{}, len(unconfirmedActive))
+	for _, asset := range unconfirmedActive {
+		unconfirmedSet[asset.ID] = struct{}{}
 	}
-	return unconfirmed
+
+	confirmedInRoot := make(map[string]int, len(roots))
+	for _, asset := range activeAssets {
+		if _, unconfirmed := unconfirmedSet[asset.ID]; !unconfirmed {
+			confirmedInRoot[asset.LibraryRootID]++
+		}
+	}
+	for _, mod := range modifies {
+		if mod.Existing.MissingSince == nil && mod.RootID == mod.Existing.LibraryRootID {
+			confirmedInRoot[mod.RootID]++
+		}
+	}
+	for _, mv := range proposedMoves {
+		if mv.Asset.MissingSince == nil && mv.TargetRootID == mv.Asset.LibraryRootID {
+			confirmedInRoot[mv.TargetRootID]++
+		}
+	}
+
+	var unconfirmedRoots map[string]struct{}
+	for _, rootRes := range roots {
+		if missingByRoot[rootRes.LibraryRootID] == 0 || confirmedInRoot[rootRes.LibraryRootID] > 0 {
+			continue
+		}
+		if unconfirmedRoots == nil {
+			unconfirmedRoots = make(map[string]struct{})
+		}
+		unconfirmedRoots[rootRes.LibraryRootID] = struct{}{}
+	}
+	return unconfirmedRoots
 }
 
 func markRootsIncomplete(res *ScanResult, unconfirmedRoots map[string]struct{}) {

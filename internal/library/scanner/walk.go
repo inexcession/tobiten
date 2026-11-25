@@ -495,12 +495,6 @@ func (rt *walkRuntime) visitEntry(
 		})
 	}
 	if isHiddenName(nameBytes) {
-		if len(relDir) == 0 && bytes.Equal(nameBytes, []byte(RootMarkerFilename)) && !isDirHint &&
-			(entryType&os.ModeSymlink != 0 || entryType == 0) {
-			if info, resolveErr := rt.resolveEntryInfo(absBytes, de, true); resolveErr == nil && info.IsDir() {
-				isDirHint = true
-			}
-		}
 		return emitSkipped(ctx, resultsCh, SkippedEntry{
 			RelPath: relID,
 			IsDir:   isDirHint,

@@ -135,6 +135,17 @@ func assertAvailableReadsIncludeAsset(
 	}
 }
 
+func findAssetByRelPath(t *testing.T, assets []domain.MediaAsset, relPath string) domain.MediaAsset {
+	t.Helper()
+	for _, a := range assets {
+		if a.RelPathDisplay == relPath {
+			return a
+		}
+	}
+	t.Fatalf("asset %q not found in %+v", relPath, assets)
+	return domain.MediaAsset{}
+}
+
 func TestMissing_SoftDeleteRetainsCatalogueAndExcludesAvailableReads(t *testing.T) {
 	t.Parallel()
 	db, transactor := setupIndexerTestDB(t)
@@ -303,11 +314,16 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 	root1Dir := filepath.Join(base, "root-1")
 	root2Dir := filepath.Join(base, "root-2")
 	file1 := filepath.Join(root1Dir, "book1.cbz")
+	keep1 := filepath.Join(root1Dir, "keep1.cbz")
 	file2 := filepath.Join(root2Dir, "sub/book2.cbz")
 
 	writeDiskFile(t, file1, buildDeterministicZip(t, "",
 		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Safe</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 		zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store},
+	))
+	writeDiskFile(t, keep1, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Safe</Series><Number>3</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("keep-1"), method: zip.Store},
 	))
 	writeDiskFile(t, file2, buildDeterministicZip(t, "",
 		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Safe</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
@@ -331,10 +347,10 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScanner: %v", err)
 	}
-	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 3 {
 		t.Fatalf("initial scan: res=%+v err=%v", res, err)
 	}
-	a1 := listAssetsForRoot(ctx, t, transactor, r1.ID)[0]
+	a1 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "book1.cbz")
 	a2 := listAssetsForRoot(ctx, t, transactor, r2.ID)[0]
 
 	// 1. Delete file1 on root1, but make root2 empty (OFFLINE) -> pre-check stops; a1 stays available.
@@ -394,7 +410,7 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 		t.Fatalf("expected a1 not marked missing on incomplete walk, got %+v", got1)
 	}
 	// Verify other.cbz was NOT indexed either because the walk was incomplete.
-	if len(listAssetsForRoot(ctx, t, transactor, r1.ID)) != 1 {
+	if len(listAssetsForRoot(ctx, t, transactor, r1.ID)) != 2 {
 		t.Fatalf("expected no new asset indexed on incomplete walk")
 	}
 
@@ -402,7 +418,6 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 	if err := os.Remove(otherFile); err != nil {
 		t.Fatalf("remove otherFile: %v", err)
 	}
-	writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
 	var staleOnce sync.Once
 	hookTx := &reconcileHookTransactor{
 		inner: transactor,
@@ -463,11 +478,11 @@ func TestMissing_RevivalWithinGraceCurrentAndHistoricalBothPaths(t *testing.T) {
 			base := t.TempDir()
 			root1Dir := filepath.Join(base, "r1")
 			root2Dir := filepath.Join(base, "r2")
-			writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
 			writeDiskFile(t, filepath.Join(root2Dir, scanner.RootMarkerFilename), []byte{})
 
 			origRel := "Series/v01.cbz"
 			origPath := filepath.Join(root1Dir, origRel)
+			keepPath := filepath.Join(root1Dir, "Series/keep.cbz")
 			v1Bytes := buildDeterministicZip(t, "",
 				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Revive Saga</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 				zipEntry{name: "001.jpg", data: []byte("v1-p1"), method: zip.Store},
@@ -478,6 +493,10 @@ func TestMissing_RevivalWithinGraceCurrentAndHistoricalBothPaths(t *testing.T) {
 				zipEntry{name: "002.jpg", data: []byte("v2-p2"), method: zip.Store},
 			)
 			writeDiskFile(t, origPath, v1Bytes)
+			writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Revive Saga</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("keep-sibling"), method: zip.Store},
+			))
 
 			var lib domain.Library
 			var r1, r2 domain.LibraryRoot
@@ -497,10 +516,10 @@ func TestMissing_RevivalWithinGraceCurrentAndHistoricalBothPaths(t *testing.T) {
 				t.Fatalf("NewScanner: %v", err)
 			}
 
-			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 1 {
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 2 {
 				t.Fatalf("initial scan: res=%+v err=%v", res, err)
 			}
-			orig := listAssetsForRoot(ctx, t, transactor, r1.ID)[0]
+			orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), origRel)
 
 			if tc.historical {
 				clock.Advance(time.Minute)
@@ -603,7 +622,7 @@ func TestMissing_RevivalWithinGraceCurrentAndHistoricalBothPaths(t *testing.T) {
 				t.Fatalf("did not expect asset.moved event on same-path revival, got %v", kinds)
 			}
 
-			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 1)
+			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 2)
 		})
 	}
 }
@@ -618,11 +637,14 @@ func TestMissing_ConfigurableGracePeriodAndRetirement(t *testing.T) {
 		defer cancel()
 
 		rootDir := filepath.Join(t.TempDir(), "root")
-		writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 		filePath := filepath.Join(rootDir, "Vol1.cbz")
 		writeDiskFile(t, filePath, buildDeterministicZip(t, "",
 			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Retire Saga</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 			zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store},
+		))
+		writeDiskFile(t, filepath.Join(rootDir, "Keep.cbz"), buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Retire Saga</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("keep"), method: zip.Store},
 		))
 
 		var lib domain.Library
@@ -642,10 +664,10 @@ func TestMissing_ConfigurableGracePeriodAndRetirement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewScanner: %v", err)
 		}
-		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 1 {
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 2 {
 			t.Fatalf("initial scan: res=%+v err=%v", res, err)
 		}
-		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+		orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "Vol1.cbz")
 
 		// Remove file at tMissing. Note: no user reading_progress seeded — volume still survives grace!
 		tMissing := clock.Advance(time.Hour)
@@ -712,10 +734,12 @@ func TestMissing_ConfigurableGracePeriodAndRetirement(t *testing.T) {
 		defer cancel()
 
 		rootDir := filepath.Join(t.TempDir(), "root")
-		writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 		filePath := filepath.Join(rootDir, "Vol1.cbz")
 		writeDiskFile(t, filePath, buildDeterministicZip(t, "",
 			zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store},
+		))
+		writeDiskFile(t, filepath.Join(rootDir, "Keep.cbz"), buildDeterministicZip(t, "",
+			zipEntry{name: "001.jpg", data: []byte("keep-grace"), method: zip.Store},
 		))
 
 		var lib domain.Library
@@ -737,10 +761,10 @@ func TestMissing_ConfigurableGracePeriodAndRetirement(t *testing.T) {
 			t.Fatalf("NewScanner: %v", err)
 		}
 
-		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 1 {
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 2 {
 			t.Fatalf("initial scan: res=%+v err=%v", res, err)
 		}
-		orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+		orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "Vol1.cbz")
 
 		tMissing := clock.Advance(time.Hour)
 		if err := os.Remove(filePath); err != nil {
@@ -841,9 +865,9 @@ func TestMissing_RevivalAfterGraceClearsMissingAndRetired(t *testing.T) {
 			defer cancel()
 
 			rootDir := filepath.Join(t.TempDir(), "root")
-			writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 			origRel := "Old/vol1.cbz"
 			origPath := filepath.Join(rootDir, origRel)
+			keepPath := filepath.Join(rootDir, "Old/keep.cbz")
 
 			v1Bytes := buildDeterministicZip(t, "",
 				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PostGrace</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
@@ -855,6 +879,10 @@ func TestMissing_RevivalAfterGraceClearsMissingAndRetired(t *testing.T) {
 				zipEntry{name: "002.jpg", data: []byte("v2-2"), method: zip.Store},
 			)
 			writeDiskFile(t, origPath, v1Bytes)
+			writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PostGrace</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("keep-postgrace"), method: zip.Store},
+			))
 
 			var lib domain.Library
 			var root domain.LibraryRoot
@@ -873,10 +901,10 @@ func TestMissing_RevivalAfterGraceClearsMissingAndRetired(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewScanner: %v", err)
 			}
-			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 1 {
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 2 {
 				t.Fatalf("initial scan: res=%+v err=%v", res, err)
 			}
-			orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+			orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), origRel)
 
 			if tc.historical {
 				clock.Advance(time.Minute)
@@ -932,7 +960,7 @@ func TestMissing_RevivalAfterGraceClearsMissingAndRetired(t *testing.T) {
 			catRepo := postgres.NewCatalogueRepository(db.Pool)
 			adminScope := storage.CatalogueReadScope{Principal: adminPrincipalForReconcileTest(), IncludeTrashed: true}
 			assertAvailableReadsIncludeAsset(ctx, t, catRepo, adminScope, orig.ID, orig.VolumeID)
-			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 1)
+			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 2)
 		})
 	}
 }
@@ -952,9 +980,9 @@ func TestMissing_DifferentFileAtMissingOrRetiredPathRecordsModification(t *testi
 			defer cancel()
 
 			rootDir := filepath.Join(t.TempDir(), "root")
-			writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 			relPath := "Series/vol1.cbz"
 			filePath := filepath.Join(rootDir, relPath)
+			keepPath := filepath.Join(rootDir, "Series/keep.cbz")
 
 			v1Bytes := buildDeterministicZip(t, "",
 				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Replace Saga</Series><Number>1</Number><Title>Old Title</Title><Summary>Old Summary</Summary></ComicInfo>`), method: zip.Deflate},
@@ -966,6 +994,10 @@ func TestMissing_DifferentFileAtMissingOrRetiredPathRecordsModification(t *testi
 				zipEntry{name: "002.jpg", data: []byte("v2-2"), method: zip.Store},
 			)
 			writeDiskFile(t, filePath, v1Bytes)
+			writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Replace Saga</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("keep-replace"), method: zip.Store},
+			))
 
 			var lib domain.Library
 			var root domain.LibraryRoot
@@ -984,10 +1016,10 @@ func TestMissing_DifferentFileAtMissingOrRetiredPathRecordsModification(t *testi
 			if err != nil {
 				t.Fatalf("NewScanner: %v", err)
 			}
-			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 1 {
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || res.IndexedCount != 2 {
 				t.Fatalf("initial scan: res=%+v err=%v", res, err)
 			}
-			orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+			orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), relPath)
 			origDigest, _ := orig.CurrentDigest(domain.DigestKindXXH364Partial)
 			userID := seedUserAndReadingProgress(ctx, t, db, transactor, "replace-reader", orig, 1)
 
@@ -1058,7 +1090,7 @@ func TestMissing_DifferentFileAtMissingOrRetiredPathRecordsModification(t *testi
 			catRepo := postgres.NewCatalogueRepository(db.Pool)
 			adminScope := storage.CatalogueReadScope{Principal: adminPrincipalForReconcileTest(), IncludeTrashed: true}
 			assertAvailableReadsIncludeAsset(ctx, t, catRepo, adminScope, orig.ID, orig.VolumeID)
-			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 1)
+			assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 2)
 		})
 	}
 }
@@ -1155,14 +1187,18 @@ func TestMissing_SkippedOriginalPathDoesNotReviveOntoCopyThenRestoresAtOwnPath(t
 	defer cancel()
 
 	rootDir := filepath.Join(t.TempDir(), "root")
-	writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 	origPath := filepath.Join(rootDir, "a.cbz")
+	keepPath := filepath.Join(rootDir, "keep.cbz")
 	copyPath := filepath.Join(rootDir, "copy.cbz")
 	bookBytes := buildDeterministicZip(t, "",
 		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Permission</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 		zipEntry{name: "001.jpg", data: []byte("same-bytes-skip-revival"), method: zip.Store},
 	)
 	writeDiskFile(t, origPath, bookBytes)
+	writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Permission</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("keep-skip"), method: zip.Store},
+	))
 
 	var (
 		lib  domain.Library
@@ -1183,10 +1219,10 @@ func TestMissing_SkippedOriginalPathDoesNotReviveOntoCopyThenRestoresAtOwnPath(t
 	if err != nil {
 		t.Fatalf("NewScanner: %v", err)
 	}
-	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
 		t.Fatalf("initial scan: res=%+v err=%v", res, err)
 	}
-	orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+	orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "a.cbz")
 	userID := seedUserAndReadingProgress(ctx, t, db, transactor, "skip-reader", orig, 4)
 
 	// Mark a.cbz missing cleanly.
@@ -1222,15 +1258,10 @@ func TestMissing_SkippedOriginalPathDoesNotReviveOntoCopyThenRestoresAtOwnPath(t
 	assertReadingProgressPreserved(ctx, t, db, userID, orig.VolumeID, orig.ID, 4)
 
 	assetsAfterCopy := listAssetsForRoot(ctx, t, transactor, root.ID)
-	if len(assetsAfterCopy) != 2 {
-		t.Fatalf("expected 2 assets (missing orig + new copy.cbz), got %+v", assetsAfterCopy)
+	if len(assetsAfterCopy) != 3 {
+		t.Fatalf("expected 3 assets (missing orig + keep.cbz + new copy.cbz), got %+v", assetsAfterCopy)
 	}
-	var copyAsset domain.MediaAsset
-	for _, a := range assetsAfterCopy {
-		if a.ID != orig.ID {
-			copyAsset = a
-		}
-	}
+	copyAsset := findAssetByRelPath(t, assetsAfterCopy, "copy.cbz")
 	if copyAsset.ID == orig.ID || copyAsset.RelPathDisplay != "copy.cbz" || !copyAsset.IsAvailable() || copyAsset.VolumeID != orig.VolumeID {
 		t.Fatalf("expected copy.cbz indexed as separate asset on volume %s, got %+v (orig=%+v)", orig.VolumeID, copyAsset, orig)
 	}
@@ -1273,13 +1304,17 @@ func TestMissing_StaleAbsenceRejectedAfterNewerOnlinePreCheck(t *testing.T) {
 			defer cancel()
 
 			rootDir := filepath.Join(t.TempDir(), "root")
-			writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
 			bookPath := filepath.Join(rootDir, "a.cbz")
+			keepPath := filepath.Join(rootDir, "keep.cbz")
 			bookBytes := buildDeterministicZip(t, "",
 				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Race</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 				zipEntry{name: "001.jpg", data: []byte("race-bytes"), method: zip.Store},
 			)
 			writeDiskFile(t, bookPath, bookBytes)
+			writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Race</Series><Number>99</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("keep-race"), method: zip.Store},
+			))
 
 			var lib domain.Library
 			var root domain.LibraryRoot
@@ -1298,10 +1333,10 @@ func TestMissing_StaleAbsenceRejectedAfterNewerOnlinePreCheck(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewScanner(scB): %v", err)
 			}
-			if res, err := scB.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+			if res, err := scB.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
 				t.Fatalf("initial scan: res=%+v err=%v", res, err)
 			}
-			orig := listAssetsForRoot(ctx, t, transactor, root.ID)[0]
+			orig := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "a.cbz")
 
 			// Delete a.cbz so Scan A walks and sees it absent, then pause right before executeMarkMissing.
 			if err := os.Remove(bookPath); err != nil {
@@ -1361,7 +1396,7 @@ func TestMissing_StaleAbsenceRejectedAfterNewerOnlinePreCheck(t *testing.T) {
 				clock.Advance(time.Minute)
 			}
 			resB, errB := scB.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
-			if errB != nil || !resB.Complete || resB.UnchangedCount != 1 || resB.MissingCount != 0 || resB.IndexedCount != 0 {
+			if errB != nil || !resB.Complete || resB.UnchangedCount != 2 || resB.MissingCount != 0 || resB.IndexedCount != 0 {
 				t.Fatalf("expected Scan B to complete cleanly seeing a.cbz unchanged, got res=%+v err=%v", resB, errB)
 			}
 
@@ -1609,4 +1644,253 @@ func TestMissing_RootWithZeroConfirmedKnownAssetsMarksIncompleteAndNothingMissin
 			t.Fatalf("expected no asset.missing event, got %+v", ev)
 		}
 	}
+}
+
+func TestMissing_MarkerPresentWithZeroConfirmedKnownAssetsMarksIncompleteAndNothingMissing(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		brokenMarker bool
+	}{
+		{name: "valid marker remains while indexed books are unseen"},
+		{name: "broken symlink marker with unrelated file while indexed books are unseen", brokenMarker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db, transactor := setupIndexerTestDB(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			base := t.TempDir()
+			rootDir := filepath.Join(base, "root")
+			if tc.brokenMarker {
+				writeDiskFile(t, filepath.Join(rootDir, "readme.txt"), []byte("keeps root online"))
+				mustSymlink(t, filepath.Join(base, "missing-marker-target"), filepath.Join(rootDir, scanner.RootMarkerFilename))
+			} else {
+				writeDiskFile(t, filepath.Join(rootDir, scanner.RootMarkerFilename), []byte{})
+			}
+
+			book1Path := filepath.Join(rootDir, "nested/vol01.cbz")
+			book2Path := filepath.Join(rootDir, "nested/vol02.cbz")
+			writeDiskFile(t, book1Path, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>MarkerGuard</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("m1"), method: zip.Store},
+			))
+			writeDiskFile(t, book2Path, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>MarkerGuard</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("m2"), method: zip.Store},
+			))
+
+			var (
+				lib  domain.Library
+				root domain.LibraryRoot
+			)
+			if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				var roots []domain.LibraryRoot
+				lib, roots = seedLibraryAndRoots(ctx, t, tx, "MarkerZeroConfirm Lib", nil, []byte(rootDir))
+				root = roots[0]
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed: %v", err)
+			}
+
+			sc, err := scanner.NewScanner(transactor, scanner.Options{})
+			if err != nil {
+				t.Fatalf("NewScanner: %v", err)
+			}
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+				t.Fatalf("initial scan = (%+v, %v)", res, err)
+			}
+
+			if err := os.RemoveAll(filepath.Join(rootDir, "nested")); err != nil {
+				t.Fatalf("RemoveAll(nested): %v", err)
+			}
+
+			res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+			if err != nil {
+				t.Fatalf("ScanLibrary: %v", err)
+			}
+			if res.Complete || res.ApplyRemovals || res.MissingCount != 0 || res.Roots[0].Complete {
+				t.Fatalf("expected incomplete scan with ApplyRemovals=false MissingCount=0, got %+v", res)
+			}
+
+			assets := listAssetsForRoot(ctx, t, transactor, root.ID)
+			if len(assets) != 2 {
+				t.Fatalf("expected 2 assets retained, got %d", len(assets))
+			}
+			for _, asset := range assets {
+				if !asset.IsAvailable() || asset.MissingSince != nil {
+					t.Fatalf("expected asset %s to remain available, got %+v", asset.RelPathDisplay, asset)
+				}
+			}
+			for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+				if ev.Kind == domain.EventAssetMissing {
+					t.Fatalf("expected no asset.missing event, got %+v", ev)
+				}
+			}
+		})
+	}
+}
+
+func TestMissing_CrossRootMatchDoesNotAuthorizeUnobservedSourceRootRemovals(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cross-root match leaves unobserved source root incomplete and emits no missing or move events", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		root1Dir := filepath.Join(base, "r1")
+		root2Dir := filepath.Join(base, "r2")
+		writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
+
+		bytesA := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>CrossRoot</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("cross-root-a"), method: zip.Store},
+		)
+		bytesB := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>CrossRoot</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("cross-root-b"), method: zip.Store},
+		)
+		bytesKeep2 := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>CrossRoot</Series><Number>3</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("cross-root-keep2"), method: zip.Store},
+		)
+
+		pathA := filepath.Join(root1Dir, "a.cbz")
+		pathB := filepath.Join(root1Dir, "b.cbz")
+		writeDiskFile(t, pathA, bytesA)
+		writeDiskFile(t, pathB, bytesB)
+		writeDiskFile(t, filepath.Join(root2Dir, "keep2.cbz"), bytesKeep2)
+
+		var (
+			lib    domain.Library
+			r1, r2 domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "CrossRootUnobserved Lib", nil, []byte(root1Dir), []byte(root2Dir))
+			r1, r2 = roots[0], roots[1]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 3 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "a.cbz")
+		origB := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "b.cbz")
+
+		// Source root loses visibility of both known assets while keeping its marker,
+		// and a matching copy of a.cbz appears in root2.
+		if err := os.Remove(pathA); err != nil {
+			t.Fatalf("Remove(a.cbz): %v", err)
+		}
+		if err := os.Remove(pathB); err != nil {
+			t.Fatalf("Remove(b.cbz): %v", err)
+		}
+		writeDiskFile(t, filepath.Join(root2Dir, "a_copy.cbz"), bytesA)
+
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if err != nil {
+			t.Fatalf("ScanLibrary: %v", err)
+		}
+		if res.Complete || res.ApplyRemovals || res.MissingCount != 0 || res.MovedCount != 0 || res.Roots[0].Complete {
+			t.Fatalf("expected incomplete source root with no moves or removals, got %+v", res)
+		}
+
+		cw := postgres.NewCatalogueWriteRepository(db.Pool)
+		gotA, err := cw.GetAssetByID(ctx, origA.ID)
+		if err != nil || gotA.LibraryRootID != r1.ID || gotA.RelPathDisplay != "a.cbz" || !gotA.IsAvailable() || gotA.MissingSince != nil {
+			t.Fatalf("expected a.cbz protected at r1, got (%+v, %v)", gotA, err)
+		}
+		gotB, err := cw.GetAssetByID(ctx, origB.ID)
+		if err != nil || gotB.LibraryRootID != r1.ID || gotB.RelPathDisplay != "b.cbz" || !gotB.IsAvailable() || gotB.MissingSince != nil {
+			t.Fatalf("expected b.cbz protected at r1, got (%+v, %v)", gotB, err)
+		}
+		if r2Assets := listAssetsForRoot(ctx, t, transactor, r2.ID); len(r2Assets) != 1 || r2Assets[0].RelPathDisplay != "keep2.cbz" {
+			t.Fatalf("expected no assets committed in r2 during incomplete pass, got %+v", r2Assets)
+		}
+		for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+			if ev.Kind == domain.EventAssetMissing || ev.Kind == domain.EventAssetMoved {
+				t.Fatalf("expected no asset.missing or asset.moved event, got %+v", ev)
+			}
+		}
+	})
+
+	t.Run("same-root rename with sibling deletion authorizes removal", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		bytesA := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>SameRootRename</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("same-root-a"), method: zip.Store},
+		)
+		bytesB := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>SameRootRename</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("same-root-b"), method: zip.Store},
+		)
+
+		pathA := filepath.Join(rootDir, "a.cbz")
+		pathB := filepath.Join(rootDir, "b.cbz")
+		writeDiskFile(t, pathA, bytesA)
+		writeDiskFile(t, pathB, bytesB)
+
+		var (
+			lib  domain.Library
+			root domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "SameRootRenameDelete Lib", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "a.cbz")
+		origB := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "b.cbz")
+
+		mustRenameDiskFile(t, pathA, filepath.Join(rootDir, "a_renamed.cbz"))
+		if err := os.Remove(pathB); err != nil {
+			t.Fatalf("Remove(b.cbz): %v", err)
+		}
+
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if err != nil {
+			t.Fatalf("ScanLibrary: %v", err)
+		}
+		if !res.Complete || !res.ApplyRemovals || res.MovedCount != 1 || res.MissingCount != 1 {
+			t.Fatalf("expected Complete=true ApplyRemovals=true MovedCount=1 MissingCount=1, got %+v", res)
+		}
+
+		cw := postgres.NewCatalogueWriteRepository(db.Pool)
+		gotA, err := cw.GetAssetByID(ctx, origA.ID)
+		if err != nil || gotA.RelPathDisplay != "a_renamed.cbz" || !gotA.IsAvailable() {
+			t.Fatalf("expected a.cbz moved to a_renamed.cbz, got (%+v, %v)", gotA, err)
+		}
+		gotB, err := cw.GetAssetByID(ctx, origB.ID)
+		if err != nil || !gotB.IsMissing() {
+			t.Fatalf("expected b.cbz marked missing, got (%+v, %v)", gotB, err)
+		}
+	})
 }
