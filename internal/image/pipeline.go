@@ -33,8 +33,10 @@ const (
 // Default rendition and safety limits.
 const (
 	DefaultCoverMaxWidth     = 400
+	DefaultCoverMaxHeight    = 800
 	DefaultJPEGQuality       = 85
 	DefaultMaxPixels         = int64(100_000_000)
+	DefaultCoverMaxPixels    = int64(25_000_000)
 	DefaultMaxPreflightBytes = int64(1 << 20)
 
 	// MaxJPEGDimension is the maximum width or height representable in a JPEG SOF marker.
@@ -146,12 +148,15 @@ type RenderOptions struct {
 	SourceCodec Codec
 }
 
-// DefaultCoverOptions returns standard cover rendition options (400px max width, JPEG).
+// DefaultCoverOptions returns standard cover rendition options (400x800 max
+// bounds, 25-megapixel cover source limit, JPEG).
 func DefaultCoverOptions() RenderOptions {
 	return RenderOptions{
 		MaxWidth:     DefaultCoverMaxWidth,
+		MaxHeight:    DefaultCoverMaxHeight,
 		OutputFormat: CodecJPEG,
 		Quality:      DefaultJPEGQuality,
+		MaxPixels:    DefaultCoverMaxPixels,
 	}
 }
 

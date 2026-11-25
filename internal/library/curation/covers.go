@@ -40,7 +40,13 @@ const (
 	// DefaultCoverWaitTimeout is the default caller wait timeout for on-demand
 	// cover generation (ADR-0015 §4, M1B-D8).
 	DefaultCoverWaitTimeout = 5 * time.Second
+
+	// defaultMaxCoverPageBytes bounds the compressed-or-uncompressed page stream
+	// read from an archive during cover generation.
+	defaultMaxCoverPageBytes = int64(64 << 20)
 )
+
+var errCoverPageLimitExceeded = errors.New("curation: cover page stream exceeds byte limit")
 
 // Sentinel errors returned by CoverService operations.
 var (
@@ -817,30 +823,9 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 	}
 
 	pageEntry := pages[spec.pageIdx]
-	rc, err := cr.Open(pageEntry.Index)
+	rendered, err := s.renderArchiveCoverPage(genCtx, f, cr, obs0, spec, pageEntry)
 	if err != nil {
-		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
-			return image.CoverEntry{}, chErr
-		}
-		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
-	}
-	defer func() {
-		_ = rc.Close()
-	}()
-
-	renderOpts := spec.rendition
-	if codec := image.NormalizeCodec(container.PageCodec(pageEntry.NameBytes)); codec != "" {
-		renderOpts.SourceCodec = codec
-	}
-
-	rendered, err := s.pipelines.RenderCover(genCtx, rc, renderOpts)
-	if err != nil {
-		if genCtx.Err() == nil {
-			if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
-				return image.CoverEntry{}, chErr
-			}
-		}
-		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
+		return image.CoverEntry{}, err
 	}
 
 	if _, err := verifyOpenedArchive(genCtx, f, spec, &obs0); err != nil {
@@ -852,6 +837,54 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		return image.CoverEntry{}, fmt.Errorf("curation: cache cover %s: %w", spec.assetID, err)
 	}
 	return entry, nil
+}
+
+func (s *CoverService) renderArchiveCoverPage(
+	genCtx context.Context,
+	f ReadAtCloser,
+	cr container.ContainerReader,
+	obs0 archiveObservation,
+	spec archiveCoverSpec,
+	pageEntry container.Entry,
+) (image.Result, error) {
+	rc, err := cr.Open(pageEntry.Index)
+	if err != nil {
+		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+			return image.Result{}, chErr
+		}
+		return image.Result{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
+	}
+	defer func() {
+		_ = rc.Close()
+	}()
+
+	renderOpts := spec.rendition
+	if codec := image.NormalizeCodec(container.PageCodec(pageEntry.NameBytes)); codec != "" {
+		renderOpts.SourceCodec = codec
+	}
+
+	limitedRC := &limitedCoverPageReader{
+		r:         rc,
+		remaining: defaultMaxCoverPageBytes,
+	}
+	rendered, err := s.pipelines.RenderCover(genCtx, limitedRC, renderOpts)
+	if err == nil && !limitedRC.exceeded {
+		return rendered, nil
+	}
+
+	if genCtx.Err() == nil {
+		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
+			return image.Result{}, chErr
+		}
+	}
+	if limitedRC.exceeded || errors.Is(err, errCoverPageLimitExceeded) {
+		return image.Result{}, &CoverUnavailableError{
+			AssetID: spec.assetID,
+			Reason:  "page_too_large",
+			Err:     fmt.Errorf("%w (%d bytes)", errCoverPageLimitExceeded, defaultMaxCoverPageBytes),
+		}
+	}
+	return image.Result{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
 }
 
 type archiveObservation struct {
@@ -947,6 +980,35 @@ func verifyOpenedArchive(
 }
 
 const seriesCoverBatchSize = 8
+
+type limitedCoverPageReader struct {
+	r         io.Reader
+	remaining int64
+	exceeded  bool
+}
+
+func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
+	if lr.remaining <= 0 {
+		var probe [1]byte
+		n, err := lr.r.Read(probe[:])
+		if n > 0 {
+			lr.exceeded = true
+			return 0, errCoverPageLimitExceeded
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if int64(len(dst)) > lr.remaining {
+		dst = dst[:lr.remaining]
+	}
+	n, err := lr.r.Read(dst)
+	if n > 0 {
+		lr.remaining -= int64(n)
+	}
+	return n, err
+}
 
 func classifySourceCoverError(assetID string, err error) error {
 	switch {

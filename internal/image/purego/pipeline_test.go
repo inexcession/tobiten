@@ -12,6 +12,7 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"runtime"
 	"testing"
 
 	"golang.org/x/image/webp"
@@ -394,7 +395,7 @@ func TestRenderCover_DecodeResizeAndDeterministicEncode(t *testing.T) {
 			name:      "tall png above JPEG axis limit fits within 65535",
 			src:       encodeUniformPNG(t, 8, 65536),
 			wantCodec: tobitenimage.CodecPNG,
-			opts:      tobitenimage.DefaultCoverOptions(),
+			opts:      tobitenimage.RenderOptions{MaxWidth: 400, Quality: 85},
 			wantW:     8,
 			wantH:     65535,
 		},
@@ -577,6 +578,33 @@ func TestRenderCover_CorruptAndPixelLimitFailBeforeFullDecode(t *testing.T) {
 		}
 		if r.bodyRead {
 			t.Error("expected jpeg pixel limit check to fail before reading beyond header buffer")
+		}
+	})
+
+	t.Run("default cover pixel limit fails before reading body", func(t *testing.T) {
+		pDefault, err := purego.New(purego.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coverOpts := tobitenimage.DefaultCoverOptions()
+		for _, tc := range []struct {
+			name   string
+			header []byte
+		}{
+			{"png_6000x6000", buildForgedPNGHeader(6000, 6000)},
+			{"webp_6000x6000", buildForgedWebPHeader(6000, 6000)},
+			{"jpeg_6000x6000", buildForgedJPEGHeader(6000, 6000)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				r := &failPastOffsetReader{header: tc.header}
+				_, err := pDefault.RenderCover(context.Background(), r, coverOpts)
+				if !errors.Is(err, tobitenimage.ErrPixelLimitExceeded) {
+					t.Fatalf("err = %v, want ErrPixelLimitExceeded", err)
+				}
+				if r.bodyRead {
+					t.Error("expected cover pixel limit check to reject before reading past header")
+				}
+			})
 		}
 	})
 
@@ -775,4 +803,69 @@ func TestRenderCover_CorruptAndPixelLimitFailBeforeFullDecode(t *testing.T) {
 			t.Fatalf("canceled ctx err = %v, want context.Canceled", err)
 		}
 	})
+}
+
+func encodeTallTwoTonePalettedPNG(t *testing.T, w, h, topRows int) []byte {
+	t.Helper()
+	palette := color.Palette{
+		color.RGBA{R: 220, G: 30, B: 30, A: 255}, // top region: crimson
+		color.RGBA{R: 30, G: 210, B: 30, A: 255}, // lower region: green
+	}
+	img := image.NewPaletted(image.Rect(0, 0, w, h), palette)
+	for y := topRows; y < h; y++ {
+		off := y * img.Stride
+		for x := range w {
+			img.Pix[off+x] = 1
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("png.Encode(tall): %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestRenderCover_TallSourceBoundsScalerAllocation(t *testing.T) {
+	p, err := purego.New(purego.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := tobitenimage.DefaultCoverOptions()
+	src := encodeTallTwoTonePalettedPNG(t, 800, 30_000, 1600)
+
+	// Warm up codec tables and measure total RenderCover heap allocations
+	// (including decode + crop + CatmullRom scaler + JPEG encode) for 800x30,000.
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	res, err := p.RenderCover(context.Background(), bytes.NewReader(src), opts)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("RenderCover(800x30000): %v", err)
+	}
+
+	const maxAllowedAlloc = uint64(64 << 20)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if allocated >= maxAllowedAlloc {
+		t.Fatalf("RenderCover(800x30000) allocated %d bytes, want < %d bytes (64 MiB)", allocated, maxAllowedAlloc)
+	}
+
+	if res.Width <= 0 || res.Height <= 0 || res.Width > opts.MaxWidth || res.Height > opts.MaxHeight {
+		t.Fatalf("output dimensions = %dx%d, want within %dx%d", res.Width, res.Height, opts.MaxWidth, opts.MaxHeight)
+	}
+
+	decoded, err := jpeg.Decode(bytes.NewReader(res.Data))
+	if err != nil {
+		t.Fatalf("jpeg.Decode: %v", err)
+	}
+	b := decoded.Bounds()
+	if b.Dx() != res.Width || b.Dy() != res.Height {
+		t.Fatalf("decoded JPEG dimensions = %dx%d, want %dx%d", b.Dx(), b.Dy(), res.Width, res.Height)
+	}
+
+	// Top-region crop must preserve the crimson top panel rather than blending the lower green strip.
+	r, g, bl, _ := decoded.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+	if r>>8 < 180 || g>>8 > 60 || bl>>8 > 60 {
+		t.Fatalf("center pixel = RGB(%d,%d,%d), expected top crimson region", r>>8, g>>8, bl>>8)
+	}
 }

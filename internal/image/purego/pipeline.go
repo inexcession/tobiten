@@ -15,6 +15,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 
 	"golang.org/x/image/draw"
 	"golang.org/x/image/webp"
@@ -28,6 +29,11 @@ const PipelineName = "purego"
 const (
 	placeholderBaseWidth  = 400
 	placeholderBaseHeight = 600
+
+	// maxScaleIntermediateBytes caps draw.CatmullRom.Scale's temporary buffer
+	// (output width * source height * 32 bytes) well below 64 MiB.
+	maxScaleIntermediateBytes = int64(48 << 20)
+	maxScaleWorkPixels        = maxScaleIntermediateBytes / 32
 )
 
 // Options configures the pure-Go Tier 1 pipeline.
@@ -153,8 +159,7 @@ func (p *Pipeline) renderSupported(
 		return tobitenimage.Result{}, err
 	}
 
-	bounds := img.Bounds()
-	dstW, dstH := tobitenimage.FitCodecDimensions(opts.OutputFormat, bounds.Dx(), bounds.Dy(), opts.MaxWidth, opts.MaxHeight)
+	img, dstW, dstH := fitAndCropForScale(img, opts)
 	dst := resizeOrFlatten(img, dstW, dstH)
 
 	if err := ctx.Err(); err != nil {
@@ -272,6 +277,63 @@ func decodeImage(codec tobitenimage.Codec, r io.Reader) (image.Image, error) {
 	default:
 		return nil, fmt.Errorf("%w: %s", tobitenimage.ErrUnsupportedFormat, codec)
 	}
+}
+
+type subImager interface {
+	SubImage(r image.Rectangle) image.Image
+}
+
+type croppedImage struct {
+	image.Image
+	bounds image.Rectangle
+}
+
+func (c croppedImage) Bounds() image.Rectangle {
+	return c.bounds
+}
+
+func cropTopRows(src image.Image, bounds image.Rectangle, width, height int) image.Image {
+	rect := image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Min.X+width, bounds.Min.Y+height)
+	if si, ok := src.(subImager); ok {
+		return si.SubImage(rect)
+	}
+	return croppedImage{Image: src, bounds: rect}
+}
+
+// fitAndCropForScale bounds output width * source height before kernel scaling
+// so tall sources crop to the top region matching the output aspect instead of
+// allocating a multi-hundred-megabyte intermediate scaling buffer.
+func fitAndCropForScale(img image.Image, opts tobitenimage.RenderOptions) (image.Image, int, int) {
+	b := img.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	dstW, dstH := tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, srcH, opts.MaxWidth, opts.MaxHeight)
+
+	budgetW := dstW
+	if opts.MaxWidth > 0 {
+		budgetW, _ = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, srcH, opts.MaxWidth, 0)
+	}
+	if !tobitenimage.ExceedsPixelLimit(budgetW, srcH, maxScaleWorkPixels) {
+		return img, dstW, dstH
+	}
+
+	cropH := srcH
+	if opts.MaxWidth > 0 && opts.MaxHeight > 0 && opts.MaxHeight <= (math.MaxInt-opts.MaxWidth/2)/max(1, srcW) {
+		aspectH := (srcW*opts.MaxHeight + opts.MaxWidth/2) / opts.MaxWidth
+		if aspectH >= 1 && aspectH < cropH {
+			cropH = aspectH
+		}
+	}
+
+	dstW, dstH = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, cropH, opts.MaxWidth, opts.MaxHeight)
+	if tobitenimage.ExceedsPixelLimit(dstW, cropH, maxScaleWorkPixels) {
+		cropH = max(1, int(maxScaleWorkPixels/int64(max(1, dstW))))
+		dstW, dstH = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, cropH, opts.MaxWidth, opts.MaxHeight)
+	}
+
+	if cropH < srcH {
+		img = cropTopRows(img, b, srcW, cropH)
+	}
+	return img, dstW, dstH
 }
 
 func isOpaque(img image.Image) bool {

@@ -62,6 +62,7 @@ func TestCoverCache_TwoLevelShardedPaths(t *testing.T) {
 		PageIndex:  0,
 		Rendition: tobitenimage.RenderOptions{
 			MaxWidth:          400,
+			MaxHeight:         tobitenimage.DefaultCoverMaxHeight,
 			OutputFormat:      "jpg",
 			Quality:           0,
 			MaxPixels:         999,

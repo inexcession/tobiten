@@ -436,3 +436,24 @@ func TestFitDimensionsAndPixelLimit(t *testing.T) {
 		t.Error("expected 6*2 > 10 to exceed limit")
 	}
 }
+
+func TestDefaultCoverOptions_BoundedHeightAndPixelLimit(t *testing.T) {
+	opts := tobitenimage.DefaultCoverOptions()
+	if opts.MaxWidth != tobitenimage.DefaultCoverMaxWidth || opts.MaxWidth <= 0 {
+		t.Errorf("MaxWidth = %d, want positive DefaultCoverMaxWidth (%d)", opts.MaxWidth, tobitenimage.DefaultCoverMaxWidth)
+	}
+	if opts.MaxHeight != tobitenimage.DefaultCoverMaxHeight || opts.MaxHeight <= 0 {
+		t.Errorf("MaxHeight = %d, want positive DefaultCoverMaxHeight (%d)", opts.MaxHeight, tobitenimage.DefaultCoverMaxHeight)
+	}
+	if opts.MaxPixels != tobitenimage.DefaultCoverMaxPixels || opts.MaxPixels <= 0 || opts.MaxPixels >= tobitenimage.DefaultMaxPixels {
+		t.Errorf("MaxPixels = %d, want positive DefaultCoverMaxPixels (%d) well below DefaultMaxPixels (%d)",
+			opts.MaxPixels, tobitenimage.DefaultCoverMaxPixels, tobitenimage.DefaultMaxPixels)
+	}
+	norm, err := opts.Validate()
+	if err != nil {
+		t.Fatalf("DefaultCoverOptions().Validate() failed: %v", err)
+	}
+	if norm.MaxHeight != opts.MaxHeight || norm.MaxPixels != opts.MaxPixels {
+		t.Errorf("Validate() altered cover defaults: got %+v, want %+v", norm, opts)
+	}
+}

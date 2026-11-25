@@ -4,8 +4,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -2355,4 +2357,147 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 	if got := spy.calls.Load(); got != 3 {
 		t.Fatalf("render calls after next key = %d, want 3", got)
 	}
+}
+
+func writeOversizedPageCBZ(t *testing.T, path string, totalChunkBytes int) {
+	t.Helper()
+	basePNG := makeSolidPNG(t, 10, 10, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+	const ihdrEnd = 8 + 4 + 4 + 13 + 4
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("001.png")
+	if err != nil {
+		t.Fatalf("zip create: %v", err)
+	}
+	if _, err := w.Write(basePNG[:ihdrEnd]); err != nil {
+		t.Fatalf("write PNG header: %v", err)
+	}
+
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(totalChunkBytes))
+	copy(hdr[4:8], "tEXt")
+	if _, err := w.Write(hdr[:]); err != nil {
+		t.Fatalf("write tEXt header: %v", err)
+	}
+
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(hdr[4:8])
+	chunk := bytes.Repeat([]byte{'a'}, 64*1024)
+	remaining := totalChunkBytes
+	for remaining > 0 {
+		n := min(remaining, len(chunk))
+		if _, err := w.Write(chunk[:n]); err != nil {
+			t.Fatalf("write tEXt payload: %v", err)
+		}
+		_, _ = crc.Write(chunk[:n])
+		remaining -= n
+	}
+
+	var crcBuf [4]byte
+	binary.BigEndian.PutUint32(crcBuf[:], crc.Sum32())
+	if _, err := w.Write(crcBuf[:]); err != nil {
+		t.Fatalf("write tEXt crc: %v", err)
+	}
+	if _, err := w.Write(basePNG[ihdrEnd:]); err != nil {
+		t.Fatalf("write PNG body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("file close: %v", err)
+	}
+}
+
+func TestCoverService_OversizedPageStreamUnavailableAndFallsBack(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "oversized-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	writeOversizedPageCBZ(t, filepath.Join(rootDir, "01_oversized.cbz"), (64<<20)+1024)
+	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "02_healthy.cbz")), cbzEntry{name: "001.png", data: green})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+	oversizedAsset := byRel["01_oversized.cbz"]
+	healthyAsset := byRel["02_healthy.cbz"]
+
+	var readerUser domain.User
+	var readerRole domain.Role
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
+		var ok bool
+		readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName)
+		if !ok {
+			return errors.New("missing Reader role")
+		}
+		readerUser = domain.User{ID: "u-oversized-reader", Username: "oversizedreader", CreatedAt: now, UpdatedAt: now}
+		if err := st.Users().CreateUser(t.Context(), &readerUser); err != nil {
+			return err
+		}
+		if err := st.Users().AssignUserRole(t.Context(), readerUser.ID, readerRole.ID); err != nil {
+			return err
+		}
+		ser := domain.Series{
+			ID: "ser-oversized-fallback", LibraryID: lib.ID, Title: "Oversized Fallback", TitleSort: "oversized fallback",
+			Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := st.CatalogueWrites().CreateSeries(t.Context(), &ser); err != nil {
+			return err
+		}
+		p1, p2 := 1.0, 2.0
+		if err := st.SeriesMemberships().SetVolumeMemberships(t.Context(), oversizedAsset.VolumeID, []domain.SeriesMembership{
+			{VolumeID: oversizedAsset.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+		}); err != nil {
+			return err
+		}
+		return st.SeriesMemberships().SetVolumeMemberships(t.Context(), healthyAsset.VolumeID, []domain.SeriesMembership{
+			{VolumeID: healthyAsset.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+		})
+	}); err != nil {
+		t.Fatalf("seed series and reader: %v", err)
+	}
+
+	_, reg := newSpyImagePipeline(t, nil)
+	svc, _ := newTestCoverService(t, tx, reg, 10*time.Second)
+
+	_, err = svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(oversizedAsset, *root))
+	if !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("GetOrGenerateCover(oversized) err = %v, want ErrCoverUnavailable", err)
+	}
+	var unavail *curation.CoverUnavailableError
+	if !errors.As(err, &unavail) || unavail.Reason != "page_too_large" {
+		t.Fatalf("GetOrGenerateCover(oversized) unavail = %+v, want Reason=page_too_large", unavail)
+	}
+
+	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-oversized", nil)
+	seriesCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeSeries)
+	got, err := svc.GetCover(seriesCtx, principal, "ser-oversized-fallback")
+	if err != nil {
+		t.Fatalf("GetCover(series fallback) err = %v, want nil", err)
+	}
+	assertDominantColor(t, got.Data, 30, 210, 30)
 }
