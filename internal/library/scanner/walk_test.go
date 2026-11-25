@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inexcession/tobiten/internal/container"
+	"github.com/inexcession/tobiten/internal/container/cbz"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/library/paths"
 	"github.com/inexcession/tobiten/internal/library/scanner"
@@ -1447,5 +1449,93 @@ func TestWalkRoot_TwoWorkersAbortStopsOutstandingAdmissionCheck(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("WalkRoot hung waiting for outstanding sibling CheckCancel while parent context remained live")
+	}
+}
+
+type panickingPagesReader struct {
+	container.ContainerReader
+	closed *atomic.Int32
+}
+
+func (p *panickingPagesReader) Pages() []container.Entry {
+	panic("boom: pages decoder panic")
+}
+
+func (p *panickingPagesReader) Close() error {
+	p.closed.Add(1)
+	return p.ContainerReader.Close()
+}
+
+func TestWalkRoot_PanickingFormatReaderSkipsFileAndInspectsSiblings(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	alphaCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("alpha"), method: zip.Store})
+	panicOpenCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("panic-open-payload"), method: zip.Store})
+	panicPagesCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("panic-pages-payload"), method: zip.Store})
+	zetaCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("zeta-ok-archive-bytes"), method: zip.Store})
+
+	writeDiskFile(t, filepath.Join(root, "01_alpha.cbz"), alphaCBZ)
+	writeDiskFile(t, filepath.Join(root, "02_panic_open.cbz"), panicOpenCBZ)
+	writeDiskFile(t, filepath.Join(root, "03_panic_pages.cbz"), panicPagesCBZ)
+	writeDiskFile(t, filepath.Join(root, "04_zeta.cbz"), zetaCBZ)
+
+	var readerCloses atomic.Int32
+	baseCBZ := cbz.Format()
+	wrappedCBZ := baseCBZ
+	wrappedCBZ.Open = func(ra io.ReaderAt, size int64) (container.ContainerReader, error) {
+		switch size {
+		case int64(len(panicOpenCBZ)):
+			panic("boom: format open panic")
+		case int64(len(panicPagesCBZ)):
+			cr, err := baseCBZ.Open(ra, size)
+			if err != nil {
+				return nil, err
+			}
+			return &panickingPagesReader{ContainerReader: cr, closed: &readerCloses}, nil
+		default:
+			return baseCBZ.Open(ra, size)
+		}
+	}
+
+	reg := container.NewFormatRegistry()
+	if err := reg.Register(wrappedCBZ); err != nil {
+		t.Fatalf("Register wrapped cbz: %v", err)
+	}
+
+	res, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+		Workers: 1,
+		Formats: reg,
+	})
+	if err != nil {
+		t.Fatalf("WalkRoot error = %v, want nil", err)
+	}
+	if !res.Complete {
+		t.Fatal("WalkRoot Complete = false, want true")
+	}
+	if res.InspectedCount != 2 || res.SkippedCount != 2 {
+		t.Fatalf("counts = (inspected=%d, skipped=%d), want (2, 2)", res.InspectedCount, res.SkippedCount)
+	}
+
+	inspected := inspectedMap(res)
+	if _, ok := inspected["01_alpha.cbz"]; !ok {
+		t.Fatalf("missing sibling 01_alpha.cbz in inspected: %v", inspected)
+	}
+	if _, ok := inspected["04_zeta.cbz"]; !ok {
+		t.Fatalf("missing sibling 04_zeta.cbz in inspected: %v", inspected)
+	}
+
+	skipped := skippedMap(res)
+	for _, name := range []string{"02_panic_open.cbz", "03_panic_pages.cbz"} {
+		got, ok := skipped[name]
+		if !ok {
+			t.Fatalf("missing skipped %q in %v", name, skipped)
+		}
+		if got.Reason != scanner.SkipReasonCorruptArchive || got.Err == nil {
+			t.Fatalf("skipped[%q] = %+v, want Reason=%q and non-nil Err", name, got, scanner.SkipReasonCorruptArchive)
+		}
+	}
+	if closes := readerCloses.Load(); closes != 1 {
+		t.Fatalf("panickingPagesReader.Close calls = %d, want 1", closes)
 	}
 }

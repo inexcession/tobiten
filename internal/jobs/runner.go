@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -818,7 +819,7 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 	}
 	defer cleanupProgress()
 
-	runErr := cfg.Handler.Run(execCtx, exec)
+	runErr := r.runHandlerSafely(execCtx, cfg, job, exec)
 
 	// End progress reporting as soon as the handler returns so a retained Execution
 	// cannot emit late ticks or recreate rate-limit state after ClearJob.
@@ -831,6 +832,24 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 	}
 
 	return r.persistExecutionOutcome(ctx, cfg, job, runErr)
+}
+
+func (r *Runner) runHandlerSafely(ctx context.Context, cfg KindConfig, job *domain.Job, exec *Execution) (runErr error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			if r.logger != nil {
+				r.logger.Error("job handler panicked",
+					slog.String("job_id", job.ID),
+					slog.String("job_kind", string(job.Kind)),
+					slog.Int("attempt", job.Attempts),
+					slog.Any("panic", rec),
+					slog.String("stack", string(debug.Stack())),
+				)
+			}
+			runErr = fmt.Errorf("job handler panicked: %v", rec)
+		}
+	}()
+	return cfg.Handler.Run(ctx, exec)
 }
 
 func (r *Runner) persistExecutionOutcome(ctx context.Context, cfg KindConfig, job *domain.Job, runErr error) error {

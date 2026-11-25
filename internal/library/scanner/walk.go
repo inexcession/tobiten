@@ -621,7 +621,22 @@ func (rt *walkRuntime) runWorker(
 	}
 }
 
-func (rt *walkRuntime) inspectOne(ctx context.Context, task inspectTask) (WalkEntry, bool) {
+func (rt *walkRuntime) inspectOne(ctx context.Context, task inspectTask) (entry WalkEntry, cancelled bool) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			entry = skippedEntry(
+				task.relPath,
+				SkipReasonCorruptArchive,
+				fmt.Errorf("scanner: panic inspecting %s: %v", task.relPath.Display, rec),
+			)
+			cancelled = false
+		}
+	}()
+
+	return rt.inspectFile(ctx, task)
+}
+
+func (rt *walkRuntime) inspectFile(ctx context.Context, task inspectTask) (WalkEntry, bool) {
 	f, err := rt.open(ctx, task.absPath)
 	if err != nil {
 		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {

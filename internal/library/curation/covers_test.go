@@ -2190,3 +2190,135 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 	}
 	assertDominantColor(t, gotShift.Data, 230, 130, 20)
 }
+
+func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySucceeds(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "panic-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	red := makeSolidPNG(t, 80, 120, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+	green := makeSolidPNG(t, 80, 120, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "01_panic.cbz")), cbzEntry{name: "001.png", data: red})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "02_healthy.cbz")), cbzEntry{name: "001.png", data: green})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+	panicAsset := byRel["01_panic.cbz"]
+	healthyAsset := byRel["02_healthy.cbz"]
+
+	var readerUser domain.User
+	var readerRole domain.Role
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
+		var ok bool
+		readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName)
+		if !ok {
+			return errors.New("missing Reader role")
+		}
+		readerUser = domain.User{ID: "u-panic-reader", Username: "panicreader", CreatedAt: now, UpdatedAt: now}
+		if err := st.Users().CreateUser(t.Context(), &readerUser); err != nil {
+			return err
+		}
+		return st.Users().AssignUserRole(t.Context(), readerUser.ID, readerRole.ID)
+	}); err != nil {
+		t.Fatalf("seed reader user: %v", err)
+	}
+
+	renderStarted := make(chan struct{})
+	releasePanic := make(chan struct{})
+	var startOnce sync.Once
+	var shouldPanic atomic.Bool
+	shouldPanic.Store(true)
+
+	spy, reg := newSpyImagePipeline(t, func(ctx context.Context) error {
+		if shouldPanic.Load() {
+			startOnce.Do(func() { close(renderStarted) })
+			select {
+			case <-releasePanic:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			panic("boom: pipeline decoder panic")
+		}
+		return nil
+	})
+
+	svc, _ := newTestCoverService(t, tx, reg, 3*time.Second, func(o *curation.CoverServiceOptions) {
+		o.Workers = 1
+	})
+
+	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-panic", nil)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
+
+	const totalCallers = 4
+	errs := make([]error, totalCallers)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = svc.GetCover(volCtx, principal, panicAsset.VolumeID)
+	}()
+
+	select {
+	case <-renderStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for first cover render to start")
+	}
+
+	for i := 1; i < totalCallers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = svc.GetCover(volCtx, principal, panicAsset.VolumeID)
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(releasePanic)
+	wg.Wait()
+
+	if got := spy.calls.Load(); got != 1 {
+		t.Fatalf("render calls across %d joined callers = %d, want 1", totalCallers, got)
+	}
+	for i, callerErr := range errs {
+		if !errors.Is(callerErr, curation.ErrCoverUnavailable) {
+			t.Fatalf("caller %d err = %v, want errors.Is(_, ErrCoverUnavailable)", i, callerErr)
+		}
+		var unavail *curation.CoverUnavailableError
+		if !errors.As(callerErr, &unavail) {
+			t.Fatalf("caller %d err %T does not match *CoverUnavailableError", i, callerErr)
+		}
+	}
+
+	// In-flight entry was deleted, so a subsequent request for the same key runs anew rather than hanging.
+	if _, err := svc.GetCover(volCtx, principal, panicAsset.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("repeat request after panic err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := spy.calls.Load(); got != 2 {
+		t.Fatalf("render calls after repeat panic request = %d, want 2", got)
+	}
+
+	// Same single worker must remain alive and serve the next request for another key.
+	shouldPanic.Store(false)
+	gotHealthy, err := svc.GetCover(volCtx, principal, healthyAsset.VolumeID)
+	if err != nil {
+		t.Fatalf("next key GetCover after panic err = %v, want nil", err)
+	}
+	assertDominantColor(t, gotHealthy.Data, 30, 210, 30)
+	if got := spy.calls.Load(); got != 3 {
+		t.Fatalf("render calls after next key = %d, want 3", got)
+	}
+}

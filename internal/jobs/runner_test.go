@@ -1,11 +1,14 @@
 package jobs_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1576,4 +1579,212 @@ func TestRunner_SettlesCommittedReconcilerOutcomeWhenHandlerReturnsError(t *test
 			}
 		})
 	}
+}
+
+func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *testing.T) {
+	t.Parallel()
+	db, repo := setupRunnerTestDB(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	t.Run("panic follows retry and failure path with stack logged once per attempt", func(t *testing.T) {
+		t0 := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+		var clockMu sync.Mutex
+		now := t0
+		nowFn := func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		}
+		setClock := func(ts time.Time) {
+			clockMu.Lock()
+			now = ts
+			clockMu.Unlock()
+		}
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		runner := jobs.NewRunner(repo, jobs.RunnerOptions{
+			Logger: logger,
+			Now:    nowFn,
+		})
+
+		var attemptsSeen []int
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindScan,
+			ResumePolicy: domain.JobResumeRestart,
+			Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+				attemptsSeen = append(attemptsSeen, exec.Job().Attempts)
+				panic("boom: decoder panic")
+			}),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+
+		dedupe := "SCAN:panic-retry-" + domain.MustNewID()
+		j := &domain.Job{
+			Kind:        domain.JobKindScan,
+			DedupeKey:   &dedupe,
+			MaxAttempts: 2,
+			CreatedAt:   t0,
+			RunAfter:    t0,
+		}
+		if _, err := repo.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		// Attempt 1 panics -> requeued with backoff and stack logged once.
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext attempt 1 = (%v, %v), want (true, nil)", claimed, err)
+		}
+		got1, err := repo.GetJobByID(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("GetJobByID attempt 1: %v", err)
+		}
+		if got1.State != domain.JobStateQueued || got1.Attempts != 1 {
+			t.Fatalf("attempt 1 state=%s attempts=%d, want QUEUED 1", got1.State, got1.Attempts)
+		}
+		if wantRunAfter := t0.Add(domain.JobRetryBackoff(1)); !got1.RunAfter.Equal(wantRunAfter) {
+			t.Fatalf("attempt 1 RunAfter=%v, want %v", got1.RunAfter, wantRunAfter)
+		}
+		if got1.LastError == nil || !strings.Contains(*got1.LastError, "boom: decoder panic") {
+			t.Fatalf("attempt 1 LastError=%v, want panic message", got1.LastError)
+		}
+		if count := strings.Count(logBuf.String(), `"job handler panicked"`); count != 1 {
+			t.Fatalf("panic log count after attempt 1 = %d, want 1; log=%s", count, logBuf.String())
+		}
+		if !strings.Contains(logBuf.String(), `"stack":`) {
+			t.Fatalf("expected stack field in panic log; log=%s", logBuf.String())
+		}
+
+		// Attempt 2 panics -> exhausts max_attempts and marks FAILED.
+		t1 := t0.Add(domain.JobRetryBackoff(1))
+		setClock(t1)
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext attempt 2 = (%v, %v), want (true, nil)", claimed, err)
+		}
+		got2, err := repo.GetJobByID(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("GetJobByID attempt 2: %v", err)
+		}
+		if got2.State != domain.JobStateFailed || got2.Attempts != 2 || got2.FinishedAt == nil {
+			t.Fatalf("attempt 2 job=%+v, want FAILED attempts=2 finished", got2)
+		}
+		if !slices.Equal(attemptsSeen, []int{1, 2}) {
+			t.Fatalf("attemptsSeen=%v, want [1 2]", attemptsSeen)
+		}
+		if count := strings.Count(logBuf.String(), `"job handler panicked"`); count != 2 {
+			t.Fatalf("panic log count after attempt 2 = %d, want 2", count)
+		}
+
+		var failedEvents int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.failed'`, j.ID).Scan(&failedEvents); err != nil {
+			t.Fatalf("count job.failed: %v", err)
+		}
+		if failedEvents != 1 {
+			t.Fatalf("job.failed events = %d, want 1", failedEvents)
+		}
+	})
+
+	t.Run("pooled single worker survives panic and claims next job", func(t *testing.T) {
+		t0 := time.Date(2026, 11, 25, 10, 10, 0, 0, time.UTC)
+		var fatalErr atomic.Value
+		var logBuf bytes.Buffer
+		runner := jobs.NewRunner(repo, jobs.RunnerOptions{
+			Logger:          slog.New(slog.NewJSONHandler(&logBuf, nil)),
+			Now:             func() time.Time { return t0 },
+			DefaultPoolSize: 1,
+			PollInterval:    10 * time.Millisecond,
+			OnFatal: func(err error) {
+				fatalErr.Store(err)
+			},
+		})
+
+		panicDone := make(chan struct{})
+		healthyDone := make(chan struct{})
+		if err := runner.RegisterKind(jobs.KindConfig{
+			Kind:         domain.JobKindRepack,
+			ResumePolicy: domain.JobResumeRestart,
+			Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
+				var payload struct {
+					ShouldPanic bool `json:"should_panic"`
+				}
+				if err := json.Unmarshal(exec.Job().Payload, &payload); err != nil {
+					return err
+				}
+				if payload.ShouldPanic {
+					defer close(panicDone)
+					panic("worker boom")
+				}
+				close(healthyDone)
+				return nil
+			}),
+		}); err != nil {
+			t.Fatalf("RegisterKind: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if err := runner.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer runner.Stop()
+
+		panicJob := &domain.Job{
+			Kind:        domain.JobKindRepack,
+			Payload:     json.RawMessage(`{"should_panic":true}`),
+			MaxAttempts: 1,
+			CreatedAt:   t0,
+			RunAfter:    t0,
+		}
+		if _, err := repo.Enqueue(ctx, panicJob); err != nil {
+			t.Fatalf("Enqueue panicJob: %v", err)
+		}
+		runner.Notify(domain.JobKindRepack)
+
+		select {
+		case <-panicDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for panicking job")
+		}
+
+		healthyJob := &domain.Job{
+			Kind:        domain.JobKindRepack,
+			Payload:     json.RawMessage(`{"should_panic":false}`),
+			MaxAttempts: 1,
+			CreatedAt:   t0,
+			RunAfter:    t0,
+		}
+		if _, err := repo.Enqueue(ctx, healthyJob); err != nil {
+			t.Fatalf("Enqueue healthyJob: %v", err)
+		}
+		runner.Notify(domain.JobKindRepack)
+
+		select {
+		case <-healthyDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for single worker to claim next job after panic")
+		}
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			gotPanic, err1 := repo.GetJobByID(ctx, panicJob.ID)
+			gotHealthy, err2 := repo.GetJobByID(ctx, healthyJob.ID)
+			if err1 == nil && err2 == nil &&
+				gotPanic.State == domain.JobStateFailed &&
+				gotHealthy.State == domain.JobStateSucceeded {
+				if v := fatalErr.Load(); v != nil {
+					t.Fatalf("unexpected OnFatal error: %v", v)
+				}
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		gotPanic, _ := repo.GetJobByID(ctx, panicJob.ID)
+		gotHealthy, _ := repo.GetJobByID(ctx, healthyJob.ID)
+		t.Fatalf("final states panic=%+v healthy=%+v, want FAILED and SUCCEEDED", gotPanic, gotHealthy)
+	})
 }

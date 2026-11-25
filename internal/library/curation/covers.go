@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -192,6 +193,7 @@ type CoverRequestOptions struct {
 
 type coverTask struct {
 	key        image.CoverKey
+	assetID    string
 	done       chan struct{}
 	entry      image.CoverEntry
 	err        error
@@ -515,7 +517,7 @@ func (s *CoverService) GetOrGenerateCover(
 		return image.CoverEntry{}, err
 	}
 
-	task, err := s.joinOrEnqueue(spec.key, func(genCtx context.Context) (image.CoverEntry, error) {
+	task, err := s.joinOrEnqueue(spec.key, spec.assetID, func(genCtx context.Context) (image.CoverEntry, error) {
 		return s.generateArchiveCover(genCtx, spec)
 	})
 	if err != nil {
@@ -634,6 +636,7 @@ func resolveCoverPageIndex(pageCount, recordedCoverIndex int, suppressedPages []
 
 func (s *CoverService) joinOrEnqueue(
 	key image.CoverKey,
+	assetID string,
 	generateFn func(ctx context.Context) (image.CoverEntry, error),
 ) (*coverTask, error) {
 	s.mu.Lock()
@@ -652,6 +655,7 @@ func (s *CoverService) joinOrEnqueue(
 
 	task := &coverTask{
 		key:        key,
+		assetID:    assetID,
 		done:       make(chan struct{}),
 		generateFn: generateFn,
 	}
@@ -719,7 +723,34 @@ func (s *CoverService) runWorker(genCtx context.Context) {
 		}
 		s.mu.Unlock()
 
-		entry, err := s.executeTask(genCtx, task)
+		s.runTask(genCtx, task)
+	}
+}
+
+func (s *CoverService) runTask(genCtx context.Context, task *coverTask) {
+	var entry image.CoverEntry
+	err := error(&CoverUnavailableError{
+		AssetID: task.assetID,
+		Reason:  "worker_aborted",
+	})
+	defer func() {
+		if rec := recover(); rec != nil {
+			if s.logger != nil {
+				s.logger.Error("cover worker panicked",
+					slog.String("asset_id", task.assetID),
+					slog.String("digest", task.key.Digest),
+					slog.Int("page_index", task.key.PageIndex),
+					slog.Any("panic", rec),
+					slog.String("stack", string(debug.Stack())),
+				)
+			}
+			entry = image.CoverEntry{}
+			err = &CoverUnavailableError{
+				AssetID: task.assetID,
+				Reason:  "worker_panic",
+				Err:     fmt.Errorf("curation: cover worker panicked: %v", rec),
+			}
+		}
 
 		s.mu.Lock()
 		task.entry = entry
@@ -727,7 +758,9 @@ func (s *CoverService) runWorker(genCtx context.Context) {
 		delete(s.inflight, task.key)
 		close(task.done)
 		s.mu.Unlock()
-	}
+	}()
+
+	entry, err = s.executeTask(genCtx, task)
 }
 
 func (s *CoverService) executeTask(genCtx context.Context, task *coverTask) (image.CoverEntry, error) {
