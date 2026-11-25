@@ -300,6 +300,17 @@ func cropTopRows(src image.Image, bounds image.Rectangle, width, height int) ima
 	return croppedImage{Image: src, bounds: rect}
 }
 
+func maxOutputWidth(codec tobitenimage.Codec, srcW, maxW int) int {
+	w := srcW
+	if maxW > 0 && maxW < w {
+		w = maxW
+	}
+	if tobitenimage.NormalizeCodec(string(codec)) == tobitenimage.CodecJPEG && w > tobitenimage.MaxJPEGDimension {
+		w = tobitenimage.MaxJPEGDimension
+	}
+	return max(1, w)
+}
+
 // fitAndCropForScale bounds output width * source height before kernel scaling
 // so tall sources crop to the top region matching the output aspect instead of
 // allocating a multi-hundred-megabyte intermediate scaling buffer.
@@ -308,9 +319,10 @@ func fitAndCropForScale(img image.Image, opts tobitenimage.RenderOptions) (image
 	srcW, srcH := b.Dx(), b.Dy()
 	dstW, dstH := tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, srcH, opts.MaxWidth, opts.MaxHeight)
 
+	maxDstW := maxOutputWidth(opts.OutputFormat, srcW, opts.MaxWidth)
 	budgetW := dstW
 	if opts.MaxWidth > 0 {
-		budgetW, _ = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, srcH, opts.MaxWidth, 0)
+		budgetW = maxDstW
 	}
 	if !tobitenimage.ExceedsPixelLimit(budgetW, srcH, maxScaleWorkPixels) {
 		return img, dstW, dstH
@@ -326,7 +338,14 @@ func fitAndCropForScale(img image.Image, opts tobitenimage.RenderOptions) (image
 
 	dstW, dstH = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, cropH, opts.MaxWidth, opts.MaxHeight)
 	if tobitenimage.ExceedsPixelLimit(dstW, cropH, maxScaleWorkPixels) {
-		cropH = max(1, int(maxScaleWorkPixels/int64(max(1, dstW))))
+		boundedH := max(1, int(maxScaleWorkPixels/int64(maxDstW)))
+		if boundedH < cropH {
+			cropH = boundedH
+			dstW, dstH = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, cropH, opts.MaxWidth, opts.MaxHeight)
+		}
+	}
+	if tobitenimage.ExceedsPixelLimit(dstW, cropH, maxScaleWorkPixels) && cropH > 1 {
+		cropH = 1
 		dstW, dstH = tobitenimage.FitCodecDimensions(opts.OutputFormat, srcW, cropH, opts.MaxWidth, opts.MaxHeight)
 	}
 

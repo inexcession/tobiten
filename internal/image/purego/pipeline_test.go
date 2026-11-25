@@ -869,3 +869,68 @@ func TestRenderCover_TallSourceBoundsScalerAllocation(t *testing.T) {
 		t.Fatalf("center pixel = RGB(%d,%d,%d), expected top crimson region", r>>8, g>>8, bl>>8)
 	}
 }
+
+func TestRenderCover_HeightOnlyFitRespectsScalerBudget(t *testing.T) {
+	p, err := purego.New(purego.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("wide height-only source crops within final-width scaler budget", func(t *testing.T) {
+		src := encodeTallTwoTonePalettedPNG(t, 6000, 1000, 300)
+		opts := tobitenimage.RenderOptions{MaxHeight: 400, Quality: 85}
+
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := p.RenderCover(context.Background(), bytes.NewReader(src), opts)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			t.Fatalf("RenderCover(6000x1000, MaxHeight=400): %v", err)
+		}
+
+		const maxAllowedAlloc = uint64(64 << 20)
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= maxAllowedAlloc {
+			t.Fatalf("RenderCover(6000x1000, MaxHeight=400) allocated %d bytes, want < %d bytes", allocated, maxAllowedAlloc)
+		}
+		if res.Width != 6000 || res.Height <= 0 || res.Height > opts.MaxHeight {
+			t.Fatalf("output dimensions = %dx%d, want 6000 x <=%d", res.Width, res.Height, opts.MaxHeight)
+		}
+
+		decoded, err := jpeg.Decode(bytes.NewReader(res.Data))
+		if err != nil {
+			t.Fatalf("jpeg.Decode: %v", err)
+		}
+		b := decoded.Bounds()
+		r, g, bl, _ := decoded.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+		if r>>8 < 180 || g>>8 > 60 || bl>>8 > 60 {
+			t.Fatalf("center pixel = RGB(%d,%d,%d), expected top crimson region", r>>8, g>>8, bl>>8)
+		}
+	})
+
+	t.Run("ordinary height-only fits preserve aspect and avoid upscaling", func(t *testing.T) {
+		downRes, err := p.RenderCover(
+			context.Background(),
+			bytes.NewReader(encodeUniformPNG(t, 600, 1000)),
+			tobitenimage.RenderOptions{MaxHeight: 500, Quality: 85},
+		)
+		if err != nil {
+			t.Fatalf("RenderCover(600x1000, MaxHeight=500): %v", err)
+		}
+		if downRes.Width != 300 || downRes.Height != 500 {
+			t.Fatalf("downscaled dimensions = %dx%d, want 300x500", downRes.Width, downRes.Height)
+		}
+
+		noUpscaleRes, err := p.RenderCover(
+			context.Background(),
+			bytes.NewReader(encodeUniformPNG(t, 300, 400)),
+			tobitenimage.RenderOptions{MaxHeight: 800, Quality: 85},
+		)
+		if err != nil {
+			t.Fatalf("RenderCover(300x400, MaxHeight=800): %v", err)
+		}
+		if noUpscaleRes.Width != 300 || noUpscaleRes.Height != 400 {
+			t.Fatalf("no-upscale dimensions = %dx%d, want 300x400", noUpscaleRes.Width, noUpscaleRes.Height)
+		}
+	})
+}

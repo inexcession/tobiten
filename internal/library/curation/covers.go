@@ -988,6 +988,12 @@ type limitedCoverPageReader struct {
 }
 
 func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
+	if lr.exceeded {
+		return 0, errCoverPageLimitExceeded
+	}
+	if len(dst) == 0 {
+		return 0, nil
+	}
 	if lr.remaining <= 0 {
 		var probe [1]byte
 		n, err := lr.r.Read(probe[:])
@@ -995,10 +1001,7 @@ func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
 			lr.exceeded = true
 			return 0, errCoverPageLimitExceeded
 		}
-		if err != nil {
-			return 0, err
-		}
-		return 0, io.EOF
+		return 0, err
 	}
 	if int64(len(dst)) > lr.remaining {
 		dst = dst[:lr.remaining]

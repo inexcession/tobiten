@@ -2501,3 +2501,264 @@ func TestCoverService_OversizedPageStreamUnavailableAndFallsBack(t *testing.T) {
 	}
 	assertDominantColor(t, got.Data, 30, 210, 30)
 }
+
+type countingPageStream struct {
+	prefix               []byte
+	totalBytes           int64
+	pos                  int64
+	bytesRead            atomic.Int64
+	readCalls            atomic.Int32
+	injectNoProgressAtEO bool
+	injectedNoProgress   bool
+}
+
+func (s *countingPageStream) Read(p []byte) (int, error) {
+	s.readCalls.Add(1)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if s.pos >= s.totalBytes {
+		if s.injectNoProgressAtEO && !s.injectedNoProgress {
+			s.injectedNoProgress = true
+			return 0, nil
+		}
+		return 0, io.EOF
+	}
+	avail := s.totalBytes - s.pos
+	if int64(len(p)) > avail {
+		p = p[:avail]
+	}
+	for i := range p {
+		off := s.pos + int64(i)
+		if off < int64(len(s.prefix)) {
+			p[i] = s.prefix[off]
+		} else {
+			p[i] = 'a'
+		}
+	}
+	s.pos += int64(len(p))
+	s.bytesRead.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func (s *countingPageStream) Close() error { return nil }
+
+type streamOverrideReader struct {
+	container.ContainerReader
+	openFn func() io.ReadCloser
+}
+
+func (r *streamOverrideReader) Open(_ int) (io.ReadCloser, error) {
+	return r.openFn(), nil
+}
+
+type countingStreamPipeline struct {
+	renderFn func(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error)
+}
+
+func (p *countingStreamPipeline) Name() string { return "counting-stream" }
+func (p *countingStreamPipeline) DecodeFormats() []tobitenimage.Codec {
+	return []tobitenimage.Codec{tobitenimage.CodecPNG}
+}
+func (p *countingStreamPipeline) EncodeFormats() []tobitenimage.Codec {
+	return []tobitenimage.Codec{tobitenimage.CodecJPEG}
+}
+func (p *countingStreamPipeline) RenderCover(ctx context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+	return p.renderFn(ctx, src, opts)
+}
+
+func TestCoverService_PageLimiterBoundaryAndRepeatedReadsAfterOverrun(t *testing.T) {
+	t.Parallel()
+	const pageLimit = int64(64 << 20)
+
+	rootDir := filepath.Join(t.TempDir(), "limiter-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	pngData := makeSolidPNG(t, 16, 16, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "exact.cbz")), cbzEntry{name: "001.png", data: pngData})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "overrun.cbz")), cbzEntry{name: "001.png", data: pngData})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+
+	pngPrefix := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+	t.Run("exact boundary accepts empty reads, no-progress (0, nil), and EOF", func(t *testing.T) {
+		stream := &countingPageStream{
+			prefix:               pngPrefix,
+			totalBytes:           pageLimit,
+			injectNoProgressAtEO: true,
+		}
+		baseCBZ := cbz.Format()
+		formats := container.NewFormatRegistry()
+		if err := formats.Register(container.Format{
+			Name:     "cbz",
+			Priority: 10,
+			Sniff:    baseCBZ.Sniff,
+			Open: func(ra io.ReaderAt, size int64) (container.ContainerReader, error) {
+				cr, err := baseCBZ.Open(ra, size)
+				if err != nil {
+					return nil, err
+				}
+				return &streamOverrideReader{
+					ContainerReader: cr,
+					openFn:          func() io.ReadCloser { return stream },
+				}, nil
+			},
+		}); err != nil {
+			t.Fatalf("register format: %v", err)
+		}
+
+		reg := tobitenimage.NewRegistry()
+		if err := reg.Register(&countingStreamPipeline{
+			renderFn: func(_ context.Context, src io.Reader, opts tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+				buf := make([]byte, 64*1024)
+				var total int64
+				for total < pageLimit {
+					toRead := min(int64(len(buf)), pageLimit-total)
+					n, readErr := src.Read(buf[:toRead])
+					total += int64(n)
+					if readErr != nil {
+						return tobitenimage.Result{}, fmt.Errorf("unexpected read error before boundary at %d: %w", total, readErr)
+					}
+				}
+				// Empty read at exact boundary must not probe upstream.
+				callsBeforeEmpty := stream.readCalls.Load()
+				nEmpty, errEmpty := src.Read(nil)
+				if nEmpty != 0 || errEmpty != nil {
+					return tobitenimage.Result{}, fmt.Errorf("empty read at boundary = (%d, %v), want (0, nil)", nEmpty, errEmpty)
+				}
+				if gotCalls := stream.readCalls.Load(); gotCalls != callsBeforeEmpty {
+					return tobitenimage.Result{}, fmt.Errorf("empty read probed upstream (%d -> %d calls)", callsBeforeEmpty, gotCalls)
+				}
+				// First non-empty read at exact boundary surfaces upstream (0, nil).
+				nZero, errZero := src.Read(buf[:1])
+				if nZero != 0 || errZero != nil {
+					return tobitenimage.Result{}, fmt.Errorf("upstream (0, nil) became (%d, %v)", nZero, errZero)
+				}
+				// Next read surfaces io.EOF.
+				nEOF, errEOF := src.Read(buf[:1])
+				if nEOF != 0 || !errors.Is(errEOF, io.EOF) {
+					return tobitenimage.Result{}, fmt.Errorf("EOF read = (%d, %v), want (0, io.EOF)", nEOF, errEOF)
+				}
+				return tobitenimage.Result{
+					Data:        []byte("exact-boundary-jpeg"),
+					Format:      opts.OutputFormat,
+					ContentType: opts.OutputFormat.ContentType(),
+					SourceCodec: tobitenimage.CodecPNG,
+				}, nil
+			},
+		}); err != nil {
+			t.Fatalf("register pipeline: %v", err)
+		}
+
+		svc, _ := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.Formats = formats
+		})
+		entry, err := svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(byRel["exact.cbz"], *root))
+		if err != nil {
+			t.Fatalf("GetOrGenerateCover(exact boundary) err = %v", err)
+		}
+		if string(entry.Data) != "exact-boundary-jpeg" {
+			t.Fatalf("entry.Data = %q, want exact-boundary-jpeg", entry.Data)
+		}
+		if got := stream.bytesRead.Load(); got != pageLimit {
+			t.Fatalf("underlying bytesRead = %d, want %d", got, pageLimit)
+		}
+	})
+
+	t.Run("repeated reads after overrun latch error without reading further bytes", func(t *testing.T) {
+		stream := &countingPageStream{
+			prefix:     pngPrefix,
+			totalBytes: pageLimit + 1024,
+		}
+		baseCBZ := cbz.Format()
+		formats := container.NewFormatRegistry()
+		if err := formats.Register(container.Format{
+			Name:     "cbz",
+			Priority: 10,
+			Sniff:    baseCBZ.Sniff,
+			Open: func(ra io.ReaderAt, size int64) (container.ContainerReader, error) {
+				cr, err := baseCBZ.Open(ra, size)
+				if err != nil {
+					return nil, err
+				}
+				return &streamOverrideReader{
+					ContainerReader: cr,
+					openFn:          func() io.ReadCloser { return stream },
+				}, nil
+			},
+		}); err != nil {
+			t.Fatalf("register format: %v", err)
+		}
+
+		var bytesAtOverrun int64
+		var callsAtOverrun int32
+		var bytesAfterRepeated int64
+		var callsAfterRepeated int32
+
+		reg := tobitenimage.NewRegistry()
+		if err := reg.Register(&countingStreamPipeline{
+			renderFn: func(_ context.Context, src io.Reader, _ tobitenimage.RenderOptions) (tobitenimage.Result, error) {
+				buf := make([]byte, 64*1024)
+				var firstErr error
+				for {
+					_, readErr := src.Read(buf)
+					if readErr != nil {
+						firstErr = readErr
+						break
+					}
+				}
+				bytesAtOverrun = stream.bytesRead.Load()
+				callsAtOverrun = stream.readCalls.Load()
+
+				for i := range 5 {
+					n, repErr := src.Read(buf)
+					if n != 0 || repErr == nil {
+						return tobitenimage.Result{}, fmt.Errorf("repeat read %d = (%d, %v), want (0, latched error)", i, n, repErr)
+					}
+				}
+				if n, repErr := src.Read(nil); n != 0 || repErr == nil {
+					return tobitenimage.Result{}, fmt.Errorf("empty read after overrun = (%d, %v), want (0, latched error)", n, repErr)
+				}
+				bytesAfterRepeated = stream.bytesRead.Load()
+				callsAfterRepeated = stream.readCalls.Load()
+				return tobitenimage.Result{}, firstErr
+			},
+		}); err != nil {
+			t.Fatalf("register pipeline: %v", err)
+		}
+
+		svc, _ := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.Formats = formats
+		})
+		_, err := svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(byRel["overrun.cbz"], *root))
+		if !errors.Is(err, curation.ErrCoverUnavailable) {
+			t.Fatalf("GetOrGenerateCover(overrun) err = %v, want ErrCoverUnavailable", err)
+		}
+		var unavail *curation.CoverUnavailableError
+		if !errors.As(err, &unavail) || unavail.Reason != "page_too_large" {
+			t.Fatalf("unavail = %+v, want Reason=page_too_large", unavail)
+		}
+		if bytesAtOverrun != pageLimit+1 {
+			t.Fatalf("bytesAtOverrun = %d, want %d", bytesAtOverrun, pageLimit+1)
+		}
+		if bytesAfterRepeated != bytesAtOverrun || callsAfterRepeated != callsAtOverrun {
+			t.Fatalf("repeated reads after overrun touched underlying stream: bytes %d->%d, calls %d->%d",
+				bytesAtOverrun, bytesAfterRepeated, callsAtOverrun, callsAfterRepeated)
+		}
+	})
+}
