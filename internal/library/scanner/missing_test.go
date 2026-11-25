@@ -2203,3 +2203,182 @@ func TestMissing_BrokenDirectorySymlinkScopesSubtreeAndReconcilesSiblings(t *tes
 		}
 	}
 }
+
+func TestMissing_BrokenDirectorySymlinkProtectsMissingAndExpiredAssets(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	extDir := filepath.Join(base, "external-series")
+
+	keepBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>KeepMissingTest</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("keep-book"), method: zip.Store},
+	)
+	linkedBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>LinkedMissingTest</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("linked-missing-book"), method: zip.Store},
+	)
+
+	writeDiskFile(t, filepath.Join(rootDir, "keep.cbz"), keepBytes)
+	linkedTargetFile := filepath.Join(extDir, "vol01.cbz")
+	writeDiskFile(t, linkedTargetFile, linkedBytes)
+	mustSymlink(t, extDir, filepath.Join(rootDir, "series_link"))
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "BrokenLinkMissing Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	t0 := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(t0)
+	sc, err := scanner.NewScanner(transactor, scanner.Options{Now: clock.Now})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+	origLinked := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "series_link/vol01.cbz")
+
+	// Mark series_link/vol01.cbz missing while extDir still exists.
+	clock.Advance(time.Hour)
+	if err := os.Remove(linkedTargetFile); err != nil {
+		t.Fatalf("Remove(linkedTargetFile): %v", err)
+	}
+	if resMiss, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !resMiss.Complete || resMiss.MissingCount != 1 {
+		t.Fatalf("missing scan = (%+v, %v)", resMiss, err)
+	}
+
+	// Advance past the 7-day grace period, break series_link, and add an identical copy elsewhere.
+	clock.Advance(8 * 24 * time.Hour)
+	if err := os.RemoveAll(extDir); err != nil {
+		t.Fatalf("RemoveAll(extDir): %v", err)
+	}
+	writeDiskFile(t, filepath.Join(rootDir, "copy_of_vol01.cbz"), linkedBytes)
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary after grace + broken link: %v", err)
+	}
+	if res.Complete || !res.ApplyRemovals || res.RetiredCount != 0 || res.MovedCount != 0 || res.IndexedCount != 1 {
+		t.Fatalf("unexpected broken-link missing-protection result: %+v", res)
+	}
+	if len(res.IncompletePrefixes) != 1 ||
+		res.IncompletePrefixes[0].RelPath.Display != "series_link" ||
+		res.IncompletePrefixes[0].Reason != scanner.SkipReasonBrokenSymlink {
+		t.Fatalf("IncompletePrefixes = %+v, want [series_link broken_symlink]", res.IncompletePrefixes)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	gotLinked, err := cw.GetAssetByID(ctx, origLinked.ID)
+	if err != nil || gotLinked.MissingSince == nil || gotLinked.RetiredAt != nil || gotLinked.RelPathDisplay != "series_link/vol01.cbz" {
+		t.Fatalf("expected series_link/vol01.cbz to stay missing (unretired, unmoved), got (%+v, %v)", gotLinked, err)
+	}
+	copyAsset := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "copy_of_vol01.cbz")
+	if copyAsset.ID == origLinked.ID || !copyAsset.IsAvailable() {
+		t.Fatalf("expected copy_of_vol01.cbz indexed as distinct active asset, got %+v (orig=%s)", copyAsset, origLinked.ID)
+	}
+
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMoved || ev.Kind == domain.EventAssetRestored {
+			t.Fatalf("unexpected move/restore event for protected missing asset: %+v", ev)
+		}
+	}
+}
+
+func TestMissing_LoopingDirectorySymlinkProtectsActiveAssetAndKeepsCopySeparate(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	extDir := filepath.Join(base, "external-series")
+
+	keepBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>LoopKeep</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("loop-keep"), method: zip.Store},
+	)
+	linkedBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>LoopLinked</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("loop-linked"), method: zip.Store},
+	)
+
+	writeDiskFile(t, filepath.Join(rootDir, "keep.cbz"), keepBytes)
+	writeDiskFile(t, filepath.Join(extDir, "vol01.cbz"), linkedBytes)
+	seriesLink := filepath.Join(rootDir, "series_link")
+	mustSymlink(t, extDir, seriesLink)
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "LoopDirLink Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+	origLinked := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "series_link/vol01.cbz")
+
+	// Replace series_link with an ELOOP cycle and place a matching copy outside it.
+	if err := os.Remove(seriesLink); err != nil {
+		t.Fatalf("Remove(seriesLink): %v", err)
+	}
+	loopB := filepath.Join(extDir, "loop_b")
+	mustSymlink(t, loopB, seriesLink)
+	mustSymlink(t, seriesLink, loopB)
+	writeDiskFile(t, filepath.Join(rootDir, "copy_of_vol01.cbz"), linkedBytes)
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary with ELOOP dir link: %v", err)
+	}
+	if res.Complete || !res.ApplyRemovals || res.IndexedCount != 1 || res.MovedCount != 0 || res.MissingCount != 0 {
+		t.Fatalf("unexpected ELOOP scan result: %+v", res)
+	}
+	if len(res.IncompletePrefixes) != 1 ||
+		res.IncompletePrefixes[0].RelPath.Display != "series_link" ||
+		res.IncompletePrefixes[0].Reason != scanner.SkipReasonSymlinkCycle {
+		t.Fatalf("IncompletePrefixes = %+v, want [series_link symlink_cycle]", res.IncompletePrefixes)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	gotLinked, err := cw.GetAssetByID(ctx, origLinked.ID)
+	if err != nil || !gotLinked.IsAvailable() || gotLinked.MissingSince != nil || gotLinked.RelPathDisplay != "series_link/vol01.cbz" {
+		t.Fatalf("expected series_link/vol01.cbz active at original path, got (%+v, %v)", gotLinked, err)
+	}
+	copyAsset := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "copy_of_vol01.cbz")
+	if copyAsset.ID == origLinked.ID {
+		t.Fatalf("expected copy_of_vol01.cbz indexed as distinct asset from %s", origLinked.ID)
+	}
+
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMoved || ev.Kind == domain.EventAssetMissing {
+			t.Fatalf("unexpected move/missing event for ELOOP-protected asset: %+v", ev)
+		}
+	}
+}

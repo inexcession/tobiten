@@ -1665,4 +1665,75 @@ func TestWalkRoot_BrokenDirectorySymlinkWithAndWithoutKnownAssets(t *testing.T) 
 			}
 		}
 	})
+
+	t.Run("broken directory symlink with only missing asset in KnownPaths marks walk incomplete", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		ext := t.TempDir()
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(root, "keep.cbz"), cbzBytes)
+		mustSymlink(t, filepath.Join(ext, "missing_dir"), filepath.Join(root, "series_link"))
+
+		res, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+			KnownPaths: []string{"series_link/vol01.cbz"},
+		})
+		if err != nil {
+			t.Fatalf("WalkRoot error = %v, want nil", err)
+		}
+		if res.Complete {
+			t.Fatal("WalkRoot Complete = true, want false when broken directory symlink prefixes KnownPaths entry")
+		}
+		if len(res.IncompletePrefixes) != 1 ||
+			string(res.IncompletePrefixes[0].RelPath.Bytes) != "series_link" ||
+			res.IncompletePrefixes[0].Reason != scanner.SkipReasonBrokenSymlink {
+			t.Fatalf("IncompletePrefixes = %+v, want [series_link broken_symlink]", res.IncompletePrefixes)
+		}
+	})
+
+	t.Run("looping directory symlink marks walk incomplete only with known descendants", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(root, "keep.cbz"), cbzBytes)
+
+		// ELOOP cycle: loop_a <-> loop_b
+		mustSymlink(t, filepath.Join(root, "loop_b"), filepath.Join(root, "loop_a"))
+		mustSymlink(t, filepath.Join(root, "loop_a"), filepath.Join(root, "loop_b"))
+		// Ancestor cycle: ancestor_link -> root
+		mustSymlink(t, ".", filepath.Join(root, "ancestor_link"))
+
+		// Without known descendants under the loops: ordinary cycle skip, walk stays complete.
+		resPlain, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{})
+		if err != nil {
+			t.Fatalf("WalkRoot(no known loops) error = %v, want nil", err)
+		}
+		if !resPlain.Complete || len(resPlain.IncompletePrefixes) != 0 {
+			t.Fatalf("expected Complete=true and no IncompletePrefixes without known loop descendants, got Complete=%v prefixes=%+v",
+				resPlain.Complete, resPlain.IncompletePrefixes)
+		}
+		skippedPlain := skippedMap(resPlain)
+		for _, rel := range []string{"loop_a", "loop_b", "ancestor_link"} {
+			if got, ok := skippedPlain[rel]; !ok || got.Reason != scanner.SkipReasonSymlinkCycle {
+				t.Fatalf("skipped[%q] = (%+v, %v), want Reason=%q", rel, got, ok, scanner.SkipReasonSymlinkCycle)
+			}
+		}
+
+		// With known descendants under ELOOP and ancestor loop: both record IncompletePrefixes.
+		resKnown, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+			KnownPaths: []string{"loop_a/vol01.cbz", "ancestor_link/vol02.cbz"},
+		})
+		if err != nil {
+			t.Fatalf("WalkRoot(known loops) error = %v, want nil", err)
+		}
+		if resKnown.Complete {
+			t.Fatal("WalkRoot Complete = true, want false when loop prefixes known descendants")
+		}
+		if len(resKnown.IncompletePrefixes) != 2 ||
+			string(resKnown.IncompletePrefixes[0].RelPath.Bytes) != "ancestor_link" ||
+			resKnown.IncompletePrefixes[0].Reason != scanner.SkipReasonSymlinkCycle ||
+			string(resKnown.IncompletePrefixes[1].RelPath.Bytes) != "loop_a" ||
+			resKnown.IncompletePrefixes[1].Reason != scanner.SkipReasonSymlinkCycle {
+			t.Fatalf("IncompletePrefixes = %+v, want [ancestor_link, loop_a] with symlink_cycle", resKnown.IncompletePrefixes)
+		}
+	})
 }

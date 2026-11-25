@@ -148,7 +148,7 @@ func (s *Scanner) reconcileLibraryPass(
 		})
 	}
 
-	if len(plan.UnconfirmedRootsWithRemovals) > 0 {
+	if len(plan.UnconfirmedRootsWithRemovals) > 0 && !hasAnyIncompletePrefixes(res.Roots) {
 		if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
 			return false, err
 		}
@@ -156,6 +156,49 @@ func (s *Scanner) reconcileLibraryPass(
 		return true, nil
 	}
 
+	if err := s.executePreRemovalWrites(ctx, libraryID, checkedRoots, plan, checkCancel, res); err != nil {
+		return false, err
+	}
+
+	if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
+		return false, err
+	}
+	var writeErrs []error
+	markMissing := filterTransitionsExcludingRoots(plan.MarkMissing, plan.UnconfirmedRootsWithRemovals)
+	retireMissing := filterTransitionsExcludingRoots(plan.RetireMissing, plan.UnconfirmedRootsWithRemovals)
+	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, markMissing, reconcileNow, checkCancel, res); err != nil {
+		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
+			return false, err
+		}
+		writeErrs = append(writeErrs, err)
+	}
+	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, retireMissing, gracePeriod, reconcileNow, checkCancel, res); err != nil {
+		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
+			return false, errors.Join(append(writeErrs, err)...)
+		}
+		writeErrs = append(writeErrs, err)
+	}
+	if len(writeErrs) > 0 {
+		if err := checkScanCancel(ctx, checkCancel); err != nil {
+			return false, errors.Join(append(writeErrs, err)...)
+		}
+		return false, errors.Join(writeErrs...)
+	}
+	if len(plan.UnconfirmedRootsWithRemovals) > 0 {
+		markRootsIncomplete(res, plan.UnconfirmedRootsWithRemovals)
+		return true, checkScanCancel(ctx, checkCancel)
+	}
+	return false, checkScanCancel(ctx, checkCancel)
+}
+
+func (s *Scanner) executePreRemovalWrites(
+	ctx context.Context,
+	libraryID string,
+	checkedRoots []RootCheckResult,
+	plan reconciliationPlan,
+	checkCancel func(context.Context) error,
+	res *ScanResult,
+) error {
 	var writeErrs []error
 	for _, step := range []func() error{
 		func() error {
@@ -173,43 +216,21 @@ func (s *Scanner) reconcileLibraryPass(
 	} {
 		if err := step(); err != nil {
 			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-				return false, errors.Join(append(writeErrs, err)...)
+				return errors.Join(append(writeErrs, err)...)
 			}
 			writeErrs = append(writeErrs, err)
 		}
 	}
 	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, checkCancel, res); err != nil {
-		return false, errors.Join(append(writeErrs, err)...)
+		return errors.Join(append(writeErrs, err)...)
 	}
 	if len(writeErrs) > 0 {
 		if err := checkScanCancel(ctx, checkCancel); err != nil {
-			return false, errors.Join(append(writeErrs, err)...)
+			return errors.Join(append(writeErrs, err)...)
 		}
-		return false, errors.Join(writeErrs...)
+		return errors.Join(writeErrs...)
 	}
-
-	if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
-		return false, err
-	}
-	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, checkCancel, res); err != nil {
-		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-			return false, err
-		}
-		writeErrs = append(writeErrs, err)
-	}
-	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, plan.RetireMissing, gracePeriod, reconcileNow, checkCancel, res); err != nil {
-		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-			return false, errors.Join(append(writeErrs, err)...)
-		}
-		writeErrs = append(writeErrs, err)
-	}
-	if len(writeErrs) > 0 {
-		if err := checkScanCancel(ctx, checkCancel); err != nil {
-			return false, errors.Join(append(writeErrs, err)...)
-		}
-		return false, errors.Join(writeErrs...)
-	}
-	return false, checkScanCancel(ctx, checkCancel)
+	return nil
 }
 
 func planReconciliation(
@@ -351,6 +372,29 @@ func findRootsWithZeroConfirmedKnownAssets(
 		unconfirmedRoots[rootRes.LibraryRootID] = struct{}{}
 	}
 	return unconfirmedRoots
+}
+
+func hasAnyIncompletePrefixes(roots []RootScanResult) bool {
+	for _, r := range roots {
+		if len(r.IncompletePrefixes) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func filterTransitionsExcludingRoots(items []plannedAssetTransition, excludedRoots map[string]struct{}) []plannedAssetTransition {
+	if len(items) == 0 || len(excludedRoots) == 0 {
+		return items
+	}
+	out := make([]plannedAssetTransition, 0, len(items))
+	for _, item := range items {
+		if _, excluded := excludedRoots[item.RootID]; excluded {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func markRootsIncomplete(res *ScanResult, unconfirmedRoots map[string]struct{}) {

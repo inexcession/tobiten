@@ -616,7 +616,7 @@ func (s *Scanner) scanOneRoot(
 		var local int64
 		scannedCount = &local
 	}
-	knownByPath, knownForWalk := buildKnownMaps(assets)
+	knownByPath, knownForWalk, knownPaths := buildKnownMaps(assets)
 	state := &rootScanState{
 		ctx:          ctx,
 		rootID:       root.ID,
@@ -647,6 +647,7 @@ func (s *Scanner) scanOneRoot(
 	walkOpts := WalkOptions{
 		Workers:     opts.Workers,
 		Known:       knownForWalk,
+		KnownPaths:  knownPaths,
 		Formats:     opts.Formats,
 		OnEntry:     state.handleEntry,
 		CheckCancel: walkCheckCancel,
@@ -661,12 +662,14 @@ func (s *Scanner) scanOneRoot(
 	return state.result
 }
 
-func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, map[string]KnownFile) {
+func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, map[string]KnownFile, []string) {
 	knownByPath := make(map[string]domain.MediaAsset, len(assets))
 	knownForWalk := make(map[string]KnownFile, len(assets))
+	knownPaths := make([]string, 0, len(assets))
 	for _, asset := range assets {
 		key := string(asset.RelPathBytes)
 		knownByPath[key] = asset
+		knownPaths = append(knownPaths, key)
 		if asset.MissingSince == nil {
 			knownForWalk[key] = KnownFile{
 				Size:  asset.FileSize,
@@ -674,7 +677,7 @@ func buildKnownMaps(assets []domain.MediaAsset) (map[string]domain.MediaAsset, m
 			}
 		}
 	}
-	return knownByPath, knownForWalk
+	return knownByPath, knownForWalk, knownPaths
 }
 
 type rootScanState struct {

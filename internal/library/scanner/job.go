@@ -233,7 +233,7 @@ func (m *Module) handleScanJob(ctx context.Context, exec *jobs.Execution) error 
 		}
 		return err
 	}
-	if !res.Offline && !res.Complete && !res.ApplyRemovals {
+	if !res.Offline && !res.Complete && !res.ApplyRemovals && len(res.IncompletePrefixes) == 0 {
 		return fmt.Errorf("%w: library %q", ErrIncompleteWalk, payload.LibraryID)
 	}
 	return nil

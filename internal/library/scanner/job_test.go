@@ -697,6 +697,200 @@ func TestScanModuleRunner_UnreadableSubtreeIndexesSiblingsProtectsAssetsAndSucce
 	}
 }
 
+func TestScanModuleRunner_UnreadableSubtreeWithZeroConfirmedAssetsInRootIndexesSafeFilesAndSucceeds(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	root1Dir := filepath.Join(base, "r1")
+	root2Dir := filepath.Join(base, "r2")
+	blockedDir := filepath.Join(root1Dir, "Blocked")
+	unobservedPath := filepath.Join(root1Dir, "Outside/unobserved.cbz")
+	deletedR2Path := filepath.Join(root2Dir, "Healthy/deleted_r2.cbz")
+
+	makeBook := func(series, num, payload string) []byte {
+		return buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>` + series + `</Series><Number>` + num + `</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte(payload), method: zip.Store},
+		)
+	}
+	writeDiskFile(t, filepath.Join(blockedDir, "v01.cbz"), makeBook("R1Blocked", "1", "r1-blocked"))
+	writeDiskFile(t, unobservedPath, makeBook("R1Outside", "1", "r1-outside"))
+	writeDiskFile(t, filepath.Join(root2Dir, "Healthy/stay.cbz"), makeBook("R2Stay", "1", "r2-stay"))
+	writeDiskFile(t, deletedR2Path, makeBook("R2Deleted", "1", "r2-deleted"))
+
+	var (
+		lib    domain.Library
+		r1, r2 domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Combined ZeroConfirm Subtree Lib", nil, []byte(root1Dir), []byte(root2Dir))
+		r1, r2 = roots[0], roots[1]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	var blockSubdir atomic.Bool
+	var staleReCheck atomic.Bool
+	var r2Reads atomic.Int32
+	logHandler := &scanLogHandler{}
+	sc, err := scanner.NewScanner(transactor, scanner.Options{
+		Logger: slog.New(logHandler),
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			if blockSubdir.Load() && string(rawDir) == blockedDir {
+				return nil, syscall.EACCES
+			}
+			if staleReCheck.Load() && string(rawDir) == root2Dir && r2Reads.Add(1) >= 3 {
+				return nil, nil
+			}
+			return os.ReadDir(string(rawDir))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	mod, err := scanner.NewModule(sc, scanner.ModuleOptions{Workers: 2})
+	if err != nil {
+		t.Fatalf("NewModule: %v", err)
+	}
+	reg := module.NewRegistry()
+	if err := reg.Register(mod); err != nil {
+		t.Fatalf("reg.Register: %v", err)
+	}
+	jobRepo := postgres.NewJobRepository(db.Pool)
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{})
+	if err := runner.RegisterModuleKinds(reg); err != nil {
+		t.Fatalf("RegisterModuleKinds: %v", err)
+	}
+	if err := runner.RegisterModuleHandlers(reg); err != nil {
+		t.Fatalf("RegisterModuleHandlers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+	// Baseline scan indexes all 4 assets across both roots.
+	if _, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{}); err != nil {
+		t.Fatalf("TriggerScan baseline: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext baseline = (%v, %v)", claimed, err)
+	}
+
+	r1Before := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, r1.ID) {
+		r1Before[a.RelPathDisplay] = a
+	}
+	r2Before := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, r2.ID) {
+		r2Before[a.RelPathDisplay] = a
+	}
+
+	// Mutate disk:
+	// - r1/Blocked returns EACCES
+	// - r1/Outside/unobserved.cbz vanishes (0 confirmed known assets in r1!)
+	// - r1/NewInR1/added_r1.cbz is added
+	// - r2/Healthy/deleted_r2.cbz vanishes (r2 has confirmed stay.cbz)
+	// - r2/NewInR2/added_r2.cbz is added
+	blockSubdir.Store(true)
+	if err := os.Remove(unobservedPath); err != nil {
+		t.Fatalf("Remove(unobserved): %v", err)
+	}
+	if err := os.Remove(deletedR2Path); err != nil {
+		t.Fatalf("Remove(deletedR2): %v", err)
+	}
+	writeDiskFile(t, filepath.Join(root1Dir, "NewInR1/added_r1.cbz"), makeBook("R1New", "1", "r1-new"))
+	writeDiskFile(t, filepath.Join(root2Dir, "NewInR2/added_r2.cbz"), makeBook("R2New", "1", "r2-new"))
+
+	// Run the durable SCAN job: r1 has zero confirmed known assets + 1 unreadable subtree + 1 unobserved removal + 1 new file.
+	jobID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 3})
+	if err != nil {
+		t.Fatalf("TriggerScan combined: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext combined = (%v, %v)", claimed, err)
+	}
+	gotJob, err := jobRepo.GetJobByID(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if gotJob.State != domain.JobStateSucceeded || gotJob.Attempts != 1 {
+		t.Fatalf("combined job = (state=%s, attempts=%d), want (SUCCEEDED, 1)", gotJob.State, gotJob.Attempts)
+	}
+
+	r1After := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, r1.ID) {
+		r1After[a.RelPathDisplay] = a
+	}
+	if len(r1After) != 3 {
+		t.Fatalf("r1 assets = %d, want 3 (Blocked/v01 + Outside/unobserved + NewInR1/added_r1)", len(r1After))
+	}
+	for _, protectedRel := range []string{"Blocked/v01.cbz", "Outside/unobserved.cbz"} {
+		got, ok := r1After[protectedRel]
+		if !ok || got.ID != r1Before[protectedRel].ID || got.MissingSince != nil {
+			t.Fatalf("r1 protected asset %q = (%+v, %v), want active original %s", protectedRel, got, ok, r1Before[protectedRel].ID)
+		}
+	}
+	if got, ok := r1After["NewInR1/added_r1.cbz"]; !ok || !got.IsAvailable() {
+		t.Fatalf("expected NewInR1/added_r1.cbz persisted and available, got (%+v, %v)", got, ok)
+	}
+
+	r2After := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, r2.ID) {
+		r2After[a.RelPathDisplay] = a
+	}
+	if len(r2After) != 3 {
+		t.Fatalf("r2 assets = %d, want 3 (stay + deleted_r2 + added_r2)", len(r2After))
+	}
+	if gotDel := r2After["Healthy/deleted_r2.cbz"]; gotDel.MissingSince == nil {
+		t.Fatalf("expected r2 Healthy/deleted_r2.cbz marked missing, got %+v", gotDel)
+	}
+	if gotNewR2, ok := r2After["NewInR2/added_r2.cbz"]; !ok || !gotNewR2.IsAvailable() {
+		t.Fatalf("expected r2 NewInR2/added_r2.cbz indexed, got (%+v, %v)", gotNewR2, ok)
+	}
+
+	var missingR1, missingR2 int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind = 'asset.missing' AND aggregate_id IN ($1, $2)`,
+		r1Before["Blocked/v01.cbz"].ID, r1Before["Outside/unobserved.cbz"].ID).Scan(&missingR1); err != nil {
+		t.Fatalf("count r1 missing events: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind = 'asset.missing' AND aggregate_id = $1`,
+		r2Before["Healthy/deleted_r2.cbz"].ID).Scan(&missingR2); err != nil {
+		t.Fatalf("count r2 missing events: %v", err)
+	}
+	if missingR1 != 0 || missingR2 != 1 {
+		t.Fatalf("asset.missing counts = (r1=%d, r2=%d), want (0, 1)", missingR1, missingR2)
+	}
+
+	// Verify stale-root re-check is still enforced before removals in a combined scoped-failure pass.
+	if err := os.Remove(filepath.Join(root2Dir, "NewInR2/added_r2.cbz")); err != nil {
+		t.Fatalf("Remove(added_r2): %v", err)
+	}
+	staleReCheck.Store(true)
+	resStale, errStale := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if !errors.Is(errStale, scanner.ErrStalePreCheck) {
+		t.Fatalf("expected ErrStalePreCheck on stale re-check in combined case, got (%+v, %v)", resStale, errStale)
+	}
+	staleReCheck.Store(false)
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	if gotNewR2, err := cw.GetAssetByID(ctx, r2After["NewInR2/added_r2.cbz"].ID); err != nil || gotNewR2.MissingSince != nil {
+		t.Fatalf("expected added_r2.cbz not marked missing when re-check failed, got (%+v, %v)", gotNewR2, err)
+	}
+
+	logHandler.mu.Lock()
+	defer logHandler.mu.Unlock()
+	if len(logHandler.records) < 1 || logHandler.records[0].Level != slog.LevelWarn ||
+		logHandler.records[0].Attrs["prefix"] != "Blocked" ||
+		logHandler.records[0].Attrs["library_root_id"] != r1.ID {
+		t.Fatalf("expected Warn diagnostic for r1 Blocked, got %+v", logHandler.records)
+	}
+}
+
 func TestScanModuleRunner_NonLibraryNotFoundRetries(t *testing.T) {
 	t.Parallel()
 	db, transactor := setupIndexerTestDB(t)

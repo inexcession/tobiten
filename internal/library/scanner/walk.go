@@ -158,6 +158,11 @@ type WalkOptions struct {
 	// recorded size and mtime values for skipping unchanged CBZ files without opening them.
 	Known map[string]KnownFile
 
+	// KnownPaths optionally lists all known root-relative path bytes (string(relBytes)),
+	// including missing or retired assets, for detecting incomplete directory prefixes
+	// (such as dangling or looping directory symlinks). Keys from Known are always included.
+	KnownPaths []string
+
 	// Formats selects the ContainerReader registry used to inspect archives.
 	// When nil, a default registry with cbz.Format() is created.
 	Formats *container.FormatRegistry
@@ -239,17 +244,24 @@ func (rt *walkRuntime) snapshotIncompletePrefixes() []IncompletePrefix {
 	return out
 }
 
-func buildKnownPrefixes(known map[string]KnownFile) map[string]struct{} {
-	if len(known) == 0 {
+func addKnownPathPrefixes(prefixes map[string]struct{}, relPath string) {
+	for i := range len(relPath) {
+		if relPath[i] == '/' && i > 0 {
+			prefixes[relPath[:i]] = struct{}{}
+		}
+	}
+}
+
+func buildKnownPrefixes(known map[string]KnownFile, knownPaths []string) map[string]struct{} {
+	if len(known) == 0 && len(knownPaths) == 0 {
 		return nil
 	}
 	prefixes := make(map[string]struct{})
 	for relPath := range known {
-		for i := range len(relPath) {
-			if relPath[i] == '/' && i > 0 {
-				prefixes[relPath[:i]] = struct{}{}
-			}
-		}
+		addKnownPathPrefixes(prefixes, relPath)
+	}
+	for _, relPath := range knownPaths {
+		addKnownPathPrefixes(prefixes, relPath)
 	}
 	return prefixes
 }
@@ -266,7 +278,7 @@ func shouldMarkSubtreeIncomplete(reason SkipReason, hasKnownBeneath bool) bool {
 	if reason == SkipReasonUnreadable {
 		return true
 	}
-	return reason == SkipReasonBrokenSymlink && hasKnownBeneath
+	return (reason == SkipReasonBrokenSymlink || reason == SkipReasonSymlinkCycle) && hasKnownBeneath
 }
 
 // WalkRoot sequentially walks rootBytes (reading one directory at a time in
@@ -352,7 +364,7 @@ func newWalkRuntime(rootBytes []byte, opts WalkOptions) (*walkRuntime, error) {
 		readDir:       readDirFn,
 		stat:          statFn,
 		open:          openFn,
-		knownPrefixes: buildKnownPrefixes(opts.Known),
+		knownPrefixes: buildKnownPrefixes(opts.Known, opts.KnownPaths),
 	}, nil
 }
 
@@ -598,6 +610,9 @@ func (rt *walkRuntime) dispatchResolved(
 ) error {
 	if info.IsDir() {
 		if hasSameFile(ancestry, info) {
+			if rt.hasKnownAssetUnderPrefix(relID.Bytes) {
+				rt.recordIncompletePrefix(relID, SkipReasonSymlinkCycle, nil)
+			}
 			return emitSkipped(ctx, resultsCh, SkippedEntry{
 				RelPath: relID,
 				IsDir:   true,
