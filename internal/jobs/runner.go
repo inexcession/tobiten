@@ -834,6 +834,8 @@ func (r *Runner) executeClaimedJob(ctx context.Context, cfg KindConfig, job *dom
 	return r.persistExecutionOutcome(ctx, cfg, job, runErr)
 }
 
+var errJobHandlerPanicked = errors.New("job handler panicked")
+
 func (r *Runner) runHandlerSafely(ctx context.Context, cfg KindConfig, job *domain.Job, exec *Execution) (runErr error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -846,7 +848,7 @@ func (r *Runner) runHandlerSafely(ctx context.Context, cfg KindConfig, job *doma
 					slog.String("stack", string(debug.Stack())),
 				)
 			}
-			runErr = fmt.Errorf("job handler panicked: %v", rec)
+			runErr = errJobHandlerPanicked
 		}
 	}()
 	return cfg.Handler.Run(ctx, exec)

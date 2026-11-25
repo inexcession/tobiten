@@ -2191,6 +2191,21 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 	assertDominantColor(t, gotShift.Data, 230, 130, 20)
 }
 
+type waitNotifyContext struct {
+	context.Context
+	once   sync.Once
+	onWait func()
+}
+
+func (c *waitNotifyContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		if c.onWait != nil {
+			c.onWait()
+		}
+	})
+	return c.Context.Done()
+}
+
 func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySucceeds(t *testing.T) {
 	t.Parallel()
 	rootDir := filepath.Join(t.TempDir(), "panic-root")
@@ -2263,6 +2278,7 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 
 	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-panic", nil)
 	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
+	panicSrc := curation.CoverAssetSourceFromDomain(panicAsset, *root)
 
 	const totalCallers = 4
 	errs := make([]error, totalCallers)
@@ -2276,17 +2292,35 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 	select {
 	case <-renderStarted:
 	case <-time.After(3 * time.Second):
+		close(releasePanic)
 		t.Fatal("timed out waiting for first cover render to start")
 	}
 
+	var joinedCount atomic.Int32
+	allJoined := make(chan struct{})
 	for i := 1; i < totalCallers; i++ {
 		wg.Add(1)
-		go func(idx int) {
+		waitCtx := &waitNotifyContext{
+			Context: t.Context(),
+			onWait: func() {
+				if joinedCount.Add(1) == totalCallers-1 {
+					close(allJoined)
+				}
+			},
+		}
+		go func(idx int, ctx context.Context) {
 			defer wg.Done()
-			_, errs[idx] = svc.GetCover(volCtx, principal, panicAsset.VolumeID)
-		}(i)
+			_, errs[idx] = svc.GetOrGenerateCover(ctx, panicSrc)
+		}(i, waitCtx)
 	}
-	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-allJoined:
+	case <-time.After(3 * time.Second):
+		close(releasePanic)
+		wg.Wait()
+		t.Fatalf("timed out waiting for joined callers to reach task wait (joined=%d/%d)", joinedCount.Load(), totalCallers-1)
+	}
 	close(releasePanic)
 	wg.Wait()
 

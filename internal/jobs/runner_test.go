@@ -1615,7 +1615,8 @@ func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *tes
 			ResumePolicy: domain.JobResumeRestart,
 			Handler: jobs.HandlerFunc(func(_ context.Context, exec *jobs.Execution) error {
 				attemptsSeen = append(attemptsSeen, exec.Job().Attempts)
-				panic("boom: decoder panic")
+				// Include NUL and invalid UTF-8 bytes to verify DB outcome persistence stays safe.
+				panic("boom: decoder panic\x00\xff\xfe")
 			}),
 		}); err != nil {
 			t.Fatalf("RegisterKind: %v", err)
@@ -1636,7 +1637,7 @@ func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *tes
 			t.Fatalf("Enqueue: %v", err)
 		}
 
-		// Attempt 1 panics -> requeued with backoff and stack logged once.
+		// Attempt 1 panics -> requeued with backoff and fixed DB-safe error; diagnostic and stack logged once.
 		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
 			t.Fatalf("ClaimAndRunNext attempt 1 = (%v, %v), want (true, nil)", claimed, err)
 		}
@@ -1650,14 +1651,14 @@ func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *tes
 		if wantRunAfter := t0.Add(domain.JobRetryBackoff(1)); !got1.RunAfter.Equal(wantRunAfter) {
 			t.Fatalf("attempt 1 RunAfter=%v, want %v", got1.RunAfter, wantRunAfter)
 		}
-		if got1.LastError == nil || !strings.Contains(*got1.LastError, "boom: decoder panic") {
-			t.Fatalf("attempt 1 LastError=%v, want panic message", got1.LastError)
+		if got1.LastError == nil || *got1.LastError != "job handler panicked" {
+			t.Fatalf("attempt 1 LastError=%v, want fixed %q", got1.LastError, "job handler panicked")
 		}
 		if count := strings.Count(logBuf.String(), `"job handler panicked"`); count != 1 {
 			t.Fatalf("panic log count after attempt 1 = %d, want 1; log=%s", count, logBuf.String())
 		}
-		if !strings.Contains(logBuf.String(), `"stack":`) {
-			t.Fatalf("expected stack field in panic log; log=%s", logBuf.String())
+		if !strings.Contains(logBuf.String(), "boom: decoder panic") || !strings.Contains(logBuf.String(), `"stack":`) {
+			t.Fatalf("expected panic diagnostic and stack field in panic log; log=%s", logBuf.String())
 		}
 
 		// Attempt 2 panics -> exhausts max_attempts and marks FAILED.
@@ -1672,6 +1673,9 @@ func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *tes
 		}
 		if got2.State != domain.JobStateFailed || got2.Attempts != 2 || got2.FinishedAt == nil {
 			t.Fatalf("attempt 2 job=%+v, want FAILED attempts=2 finished", got2)
+		}
+		if got2.LastError == nil || *got2.LastError != "job handler panicked" {
+			t.Fatalf("attempt 2 LastError=%v, want fixed %q", got2.LastError, "job handler panicked")
 		}
 		if !slices.Equal(attemptsSeen, []int{1, 2}) {
 			t.Fatalf("attemptsSeen=%v, want [1 2]", attemptsSeen)
@@ -1717,7 +1721,7 @@ func TestRunner_HandlerPanicRetriesExhaustsAttemptsAndWorkerClaimsNextJob(t *tes
 				}
 				if payload.ShouldPanic {
 					defer close(panicDone)
-					panic("worker boom")
+					panic("worker boom\x00\xff")
 				}
 				close(healthyDone)
 				return nil
