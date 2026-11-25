@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -21,6 +23,38 @@ import (
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/testdb"
 )
+
+type scanLogRecord struct {
+	Level   slog.Level
+	Message string
+	Attrs   map[string]any
+}
+
+type scanLogHandler struct {
+	mu      sync.Mutex
+	records []scanLogRecord
+}
+
+func (h *scanLogHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *scanLogHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]any)
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	h.mu.Lock()
+	h.records = append(h.records, scanLogRecord{
+		Level:   r.Level,
+		Message: r.Message,
+		Attrs:   attrs,
+	})
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *scanLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *scanLogHandler) WithGroup(_ string) slog.Handler      { return h }
 
 type singleWriterWitnessTransactor struct {
 	inner     storage.Transactor
@@ -835,7 +869,7 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		}
 	})
 
-	t.Run("unreadable subtree in one root marks overall pass incomplete and defers all additions", func(t *testing.T) {
+	t.Run("unreadable subtree in one root indexes siblings and reports incomplete prefix", func(t *testing.T) {
 		t.Parallel()
 		_, transactor := setupIndexerTestDB(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -859,14 +893,19 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 			t.Fatalf("seed failed: %v", err)
 		}
 
-		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		logHandler := &scanLogHandler{}
+		sc, err := scanner.NewScanner(transactor, scanner.Options{
+			Logger: slog.New(logHandler),
+		})
 		if err != nil {
 			t.Fatalf("NewScanner: %v", err)
 		}
+		var blockSubdir atomic.Bool
+		blockSubdir.Store(true)
 		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
 			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-				if filepath.Base(string(rawDir)) == "locked_dir" {
-					return nil, os.ErrPermission
+				if blockSubdir.Load() && filepath.Base(string(rawDir)) == "locked_dir" {
+					return nil, syscall.EACCES
 				}
 				return os.ReadDir(string(rawDir))
 			},
@@ -874,18 +913,50 @@ func TestScanner_FailuresSkippedAndWalkCompleteness(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ScanLibrary: %v", err)
 		}
-		if res.Complete || res.ApplyRemovals {
-			t.Fatalf("expected Complete=false and ApplyRemovals=false when root1 had an unreadable subtree, got %+v", res)
+		if res.Complete || !res.ApplyRemovals {
+			t.Fatalf("expected Complete=false and ApplyRemovals=true when root1 had an unreadable subtree, got %+v", res)
 		}
 		if res.Roots[0].Complete || !res.Roots[1].Complete {
 			t.Fatalf("expected root0 Complete=false and root1 Complete=true, got %v / %v", res.Roots[0].Complete, res.Roots[1].Complete)
 		}
-		if res.IndexedCount != 0 || res.SkippedCount != 1 {
-			t.Fatalf("expected 0 indexed and 1 skipped dir when walk is incomplete, got %+v", res)
+		if res.IndexedCount != 2 || res.SkippedCount != 1 {
+			t.Fatalf("expected 2 indexed and 1 skipped dir when subtree is unreadable, got %+v", res)
 		}
-		if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 ||
-			len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {
-			t.Fatal("expected zero committed assets across all roots when walk is incomplete")
+		if len(res.Roots[0].IncompletePrefixes) != 1 ||
+			res.Roots[0].IncompletePrefixes[0].RelPath.Display != "locked_dir" ||
+			res.Roots[0].IncompletePrefixes[0].Reason != scanner.SkipReasonUnreadable {
+			t.Fatalf("Roots[0].IncompletePrefixes = %+v, want [locked_dir unreadable]", res.Roots[0].IncompletePrefixes)
+		}
+		if len(res.IncompletePrefixes) != 1 ||
+			res.IncompletePrefixes[0].LibraryRootID != roots[0].ID ||
+			res.IncompletePrefixes[0].RelPath.Display != "locked_dir" {
+			t.Fatalf("res.IncompletePrefixes = %+v, want [(%s, locked_dir)]", res.IncompletePrefixes, roots[0].ID)
+		}
+		if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 1 ||
+			len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 1 {
+			t.Fatal("expected alpha.cbz and beta.cbz committed despite unreadable locked_dir")
+		}
+
+		logHandler.mu.Lock()
+		records := slices.Clone(logHandler.records)
+		logHandler.mu.Unlock()
+		if len(records) != 1 || records[0].Level != slog.LevelWarn ||
+			records[0].Attrs["prefix"] != "locked_dir" ||
+			records[0].Attrs["library_root_id"] != roots[0].ID {
+			t.Fatalf("expected 1 Warn diagnostic for locked_dir, got %+v", records)
+		}
+
+		// Once locked_dir becomes readable, the remaining hidden.cbz indexes cleanly.
+		blockSubdir.Store(false)
+		res2, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+		if err != nil {
+			t.Fatalf("recovery ScanLibrary: %v", err)
+		}
+		if !res2.Complete || !res2.ApplyRemovals || res2.IndexedCount != 1 || res2.UnchangedCount != 2 || len(res2.IncompletePrefixes) != 0 {
+			t.Fatalf("unexpected recovery result: %+v", res2)
+		}
+		if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 2 {
+			t.Fatal("expected both root1 assets after recovery")
 		}
 	})
 
@@ -1101,5 +1172,135 @@ func TestScanner_ValidationErrors(t *testing.T) {
 	cancelNow()
 	if _, err := sc.ScanLibrary(canceledCtx, "lib-1", scanner.ScanOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled ctx err = %v, want context.Canceled", err)
+	}
+}
+
+func TestScanner_UnreadableSubtreeProtectsAssetsFromMissingAndMovesWhileIndexingOthers(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "root")
+	keep1Bytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Locked</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("locked-keep-1"), method: zip.Store},
+	)
+	keep2Bytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Locked</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("locked-keep-2"), method: zip.Store},
+	)
+	siblingDeleteBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>SiblingDelete</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("sibling-delete"), method: zip.Store},
+	)
+	healthyStayBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Healthy</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("healthy-stay"), method: zip.Store},
+	)
+	brandNewBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Healthy</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("healthy-new"), method: zip.Store},
+	)
+
+	writeDiskFile(t, filepath.Join(rootDir, "locked_dir/keep1.cbz"), keep1Bytes)
+	writeDiskFile(t, filepath.Join(rootDir, "locked_dir/nested/keep2.cbz"), keep2Bytes)
+	deleteMePath := filepath.Join(rootDir, "locked_dir_sibling/delete_me.cbz")
+	writeDiskFile(t, deleteMePath, siblingDeleteBytes)
+	writeDiskFile(t, filepath.Join(rootDir, "healthy/stay.cbz"), healthyStayBytes)
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Scoped Subtree Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	logHandler := &scanLogHandler{}
+	sc, err := scanner.NewScanner(transactor, scanner.Options{
+		Logger: slog.New(logHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 4 {
+		t.Fatalf("baseline scan = (%+v, %v)", res, err)
+	}
+
+	baselineByPath := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+		baselineByPath[a.RelPathDisplay] = a
+	}
+
+	// Delete locked_dir_sibling/delete_me.cbz (must not be shielded by locked_dir prefix),
+	// add healthy/brand_new.cbz, and add a file with identical bytes to locked_dir/keep1.cbz.
+	if err := os.Remove(deleteMePath); err != nil {
+		t.Fatalf("Remove(deleteMePath): %v", err)
+	}
+	writeDiskFile(t, filepath.Join(rootDir, "healthy/brand_new.cbz"), brandNewBytes)
+	writeDiskFile(t, filepath.Join(rootDir, "copies/copy_of_keep1.cbz"), keep1Bytes)
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			if string(rawDir) == filepath.Join(rootDir, "locked_dir") {
+				return nil, syscall.EACCES
+			}
+			return os.ReadDir(string(rawDir))
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScanLibrary with EACCES subdir: %v", err)
+	}
+	if res.Complete || !res.ApplyRemovals {
+		t.Fatalf("expected Complete=false ApplyRemovals=true, got %+v", res)
+	}
+	if res.IndexedCount != 2 || res.MovedCount != 0 || res.MissingCount != 1 {
+		t.Fatalf("counts = (indexed=%d, moved=%d, missing=%d), want (2, 0, 1): %+v",
+			res.IndexedCount, res.MovedCount, res.MissingCount, res)
+	}
+	if len(res.IncompletePrefixes) != 1 || res.IncompletePrefixes[0].RelPath.Display != "locked_dir" {
+		t.Fatalf("IncompletePrefixes = %+v, want [locked_dir]", res.IncompletePrefixes)
+	}
+
+	afterByPath := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+		afterByPath[a.RelPathDisplay] = a
+	}
+	if len(afterByPath) != 6 {
+		t.Fatalf("assets count = %d, want 6 (4 baseline + 2 new)", len(afterByPath))
+	}
+	for _, protectedRel := range []string{"locked_dir/keep1.cbz", "locked_dir/nested/keep2.cbz"} {
+		got, ok := afterByPath[protectedRel]
+		if !ok || got.ID != baselineByPath[protectedRel].ID || got.MissingSince != nil {
+			t.Fatalf("protected asset %q = (%+v, %v), want active with original ID %s",
+				protectedRel, got, ok, baselineByPath[protectedRel].ID)
+		}
+	}
+	if gotDeleted := afterByPath["locked_dir_sibling/delete_me.cbz"]; gotDeleted.MissingSince == nil {
+		t.Fatalf("expected locked_dir_sibling/delete_me.cbz marked missing, got %+v", gotDeleted)
+	}
+	if gotCopy, ok := afterByPath["copies/copy_of_keep1.cbz"]; !ok || gotCopy.ID == baselineByPath["locked_dir/keep1.cbz"].ID {
+		t.Fatalf("expected copies/copy_of_keep1.cbz indexed as distinct new asset, got (%+v, %v)", gotCopy, ok)
+	}
+	if _, ok := afterByPath["healthy/brand_new.cbz"]; !ok {
+		t.Fatal("expected healthy/brand_new.cbz indexed")
+	}
+
+	events := listOutboxEventsForLibrary(ctx, t, db)
+	if slices.Contains(events, string(domain.EventAssetMoved)) {
+		t.Fatalf("unexpected asset.moved event: %v", events)
+	}
+
+	logHandler.mu.Lock()
+	records := slices.Clone(logHandler.records)
+	logHandler.mu.Unlock()
+	if len(records) != 1 || records[0].Level != slog.LevelWarn || records[0].Attrs["prefix"] != "locked_dir" {
+		t.Fatalf("expected 1 Warn diagnostic for locked_dir, got %+v", records)
 	}
 }

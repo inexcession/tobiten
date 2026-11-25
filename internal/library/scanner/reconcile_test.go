@@ -1014,17 +1014,18 @@ func TestReconcile_IncompleteWalkReconcilesNothing(t *testing.T) {
 	mustRenameDiskFile(t, filepath.Join(rootDir, "swap2.cbz"), filepath.Join(rootDir, "swap1.cbz"))
 	mustRenameDiskFile(t, tmp, filepath.Join(rootDir, "swap2.cbz"))
 
-	// Scan with unreadable locked_dir -> incomplete walk must reconcile nothing!
+	// Scan with unreadable root directory after pre-check -> incomplete walk must reconcile nothing!
+	var rootReads atomic.Int32
 	resInc, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
 		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-			if filepath.Base(string(rawDir)) == "locked_dir" {
+			if string(rawDir) == rootDir && rootReads.Add(1) >= 2 {
 				return nil, os.ErrPermission
 			}
 			return os.ReadDir(string(rawDir))
 		},
 	})
-	if err != nil {
-		t.Fatalf("incomplete scan unexpected error: %v", err)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("incomplete root scan expected os.ErrPermission, got (%+v, %v)", resInc, err)
 	}
 	if resInc.Complete || resInc.ApplyRemovals || resInc.MovedCount != 0 || resInc.ModifiedCount != 0 || resInc.IndexedCount != 0 {
 		t.Fatalf("incomplete walk reconciled unexpectedly: %+v", resInc)
@@ -1451,19 +1452,20 @@ func TestReconcile_IncompleteWalkDefersNewDigestAdditionsAcrossRoots(t *testing.
 		t.Fatalf("NewScanner: %v", err)
 	}
 
+	var root2Reads atomic.Int32
 	res1, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
 		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-			if filepath.Base(string(rawDir)) == "locked_dir" {
+			if string(rawDir) == root2 && root2Reads.Add(1) >= 2 {
 				return nil, os.ErrPermission
 			}
 			return os.ReadDir(string(rawDir))
 		},
 	})
-	if err != nil {
-		t.Fatalf("ScanLibrary incomplete walk: %v", err)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("ScanLibrary incomplete root walk expected os.ErrPermission, got (%+v, %v)", res1, err)
 	}
-	if res1.Complete || res1.ApplyRemovals || res1.IndexedCount != 0 || res1.SkippedCount != 1 {
-		t.Fatalf("expected Complete=false ApplyRemovals=false IndexedCount=0 SkippedCount=1, got %+v", res1)
+	if res1.Complete || res1.ApplyRemovals || res1.IndexedCount != 0 {
+		t.Fatalf("expected Complete=false ApplyRemovals=false IndexedCount=0, got %+v", res1)
 	}
 	if len(listAssetsForRoot(ctx, t, transactor, roots[0].ID)) != 0 ||
 		len(listAssetsForRoot(ctx, t, transactor, roots[1].ID)) != 0 {

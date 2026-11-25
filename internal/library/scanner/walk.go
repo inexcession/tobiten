@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -121,17 +120,26 @@ type WalkEntry struct {
 	Skipped   *SkippedEntry
 }
 
+// IncompletePrefix describes a relative directory or unresolved directory link
+// prefix whose subtree could not be walked completely (ADR-0003 §6, R6-D1).
+type IncompletePrefix struct {
+	RelPath domain.PathIdentity
+	Reason  SkipReason
+	Err     error
+}
+
 // WalkResult summarizes a WalkRoot invocation. Complete is true only if every
 // reachable directory in the root was read and all scheduled inspections
 // completed without lost subtree coverage, cancellation, or callback errors.
 type WalkResult struct {
-	Complete       bool
-	Files          []InspectedFile
-	Unchanged      []UnchangedFile
-	Skipped        []SkippedEntry
-	InspectedCount int
-	UnchangedCount int
-	SkippedCount   int
+	Complete           bool
+	Files              []InspectedFile
+	Unchanged          []UnchangedFile
+	Skipped            []SkippedEntry
+	IncompletePrefixes []IncompletePrefix
+	InspectedCount     int
+	UnchangedCount     int
+	SkippedCount       int
 }
 
 // ReadAtCloser is the read-only random-access file handle used to inspect an archive.
@@ -187,19 +195,48 @@ type statReadAtCloser interface {
 }
 
 type walkRuntime struct {
-	opts              WalkOptions
-	root              []byte
-	workers           int
-	formats           *container.FormatRegistry
-	readDir           func([]byte) ([]os.DirEntry, error)
-	stat              func([]byte) (os.FileInfo, error)
-	open              func(context.Context, []byte) (ReadAtCloser, error)
-	knownPrefixes     map[string]struct{}
-	subtreeIncomplete atomic.Bool
+	opts               WalkOptions
+	root               []byte
+	workers            int
+	formats            *container.FormatRegistry
+	readDir            func([]byte) ([]os.DirEntry, error)
+	stat               func([]byte) (os.FileInfo, error)
+	open               func(context.Context, []byte) (ReadAtCloser, error)
+	knownPrefixes      map[string]struct{}
+	incompleteMu       sync.Mutex
+	incompletePrefixes []IncompletePrefix
+	incompleteSeen     map[string]struct{}
 }
 
-func (rt *walkRuntime) markSubtreeIncomplete() {
-	rt.subtreeIncomplete.Store(true)
+func (rt *walkRuntime) recordIncompletePrefix(relPath domain.PathIdentity, reason SkipReason, err error) {
+	key := string(relPath.Bytes)
+	rt.incompleteMu.Lock()
+	defer rt.incompleteMu.Unlock()
+	if rt.incompleteSeen == nil {
+		rt.incompleteSeen = make(map[string]struct{})
+	}
+	if _, exists := rt.incompleteSeen[key]; exists {
+		return
+	}
+	rt.incompleteSeen[key] = struct{}{}
+	rt.incompletePrefixes = append(rt.incompletePrefixes, IncompletePrefix{
+		RelPath: relPath,
+		Reason:  reason,
+		Err:     err,
+	})
+}
+
+func (rt *walkRuntime) snapshotIncompletePrefixes() []IncompletePrefix {
+	rt.incompleteMu.Lock()
+	defer rt.incompleteMu.Unlock()
+	if len(rt.incompletePrefixes) == 0 {
+		return nil
+	}
+	out := slices.Clone(rt.incompletePrefixes)
+	slices.SortFunc(out, func(a, b IncompletePrefix) int {
+		return bytes.Compare(a.RelPath.Bytes, b.RelPath.Bytes)
+	})
+	return out
 }
 
 func buildKnownPrefixes(known map[string]KnownFile) map[string]struct{} {
@@ -360,12 +397,13 @@ func (rt *walkRuntime) execute(ctx context.Context, rootInfo os.FileInfo) (WalkR
 	}()
 
 	res := rt.collectResults(walkCtx, cancel, resultsCh)
+	res.IncompletePrefixes = rt.snapshotIncompletePrefixes()
 	if cause := context.Cause(walkCtx); cause != nil {
 		res.Complete = false
 		return res, cause
 	}
 
-	res.Complete = !rt.subtreeIncomplete.Load()
+	res.Complete = len(res.IncompletePrefixes) == 0
 	return res, nil
 }
 
@@ -439,11 +477,11 @@ func (rt *walkRuntime) walkDir(
 		if isRoot {
 			return fmt.Errorf("scanner: read root directory: %w", err)
 		}
-		rt.markSubtreeIncomplete()
 		relID, idErr := domain.NewRelativePathIdentity(relDir)
 		if idErr != nil {
 			return idErr
 		}
+		rt.recordIncompletePrefix(relID, SkipReasonUnreadable, err)
 		return emitSkipped(ctx, resultsCh, SkippedEntry{
 			RelPath: relID,
 			IsDir:   true,
@@ -528,7 +566,7 @@ func (rt *walkRuntime) visitEntry(
 			reason = classifyStatError(resolveErr)
 		}
 		if (isDirHint || needsFollow) && shouldMarkSubtreeIncomplete(reason, rt.hasKnownAssetUnderPrefix(relID.Bytes)) {
-			rt.markSubtreeIncomplete()
+			rt.recordIncompletePrefix(relID, reason, resolveErr)
 		}
 		return emitSkipped(ctx, resultsCh, SkippedEntry{
 			RelPath: relID,
@@ -688,7 +726,7 @@ func (rt *walkRuntime) inspectFile(ctx context.Context, task inspectTask) (WalkE
 		}
 		if !openedInfo.Mode().IsRegular() {
 			if openedInfo.IsDir() {
-				rt.markSubtreeIncomplete()
+				rt.recordIncompletePrefix(task.relPath, SkipReasonNonRegular, nil)
 			}
 			return WalkEntry{
 				Kind: EntrySkipped,

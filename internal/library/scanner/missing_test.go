@@ -372,8 +372,8 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 		t.Fatalf("expected a1 not marked missing when library OFFLINE, got %+v", got1)
 	}
 
-	// 2. Restore file2 in an unreadable subdirectory -> root2 passes pre-check via marker,
-	//    but walk reports incomplete on unreadable subtree -> incomplete walk marks nothing missing.
+	// 2. Restore file2, add other.cbz in root1, but fail root2 ReadDir after pre-check
+	//    -> incomplete root walk marks nothing missing and defers all additions.
 	writeDiskFile(t, filepath.Join(root2Dir, scanner.RootMarkerFilename), []byte{})
 	writeDiskFile(t, file2, buildDeterministicZip(t, "",
 		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Safe</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
@@ -384,7 +384,6 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 			t.Fatalf("Chtimes(file2): %v", err)
 		}
 	}
-	subDir := filepath.Join(root2Dir, "sub")
 
 	// Also add a qualifying file in root1 so root1 stays ONLINE even though file1 is missing.
 	otherFile := filepath.Join(root1Dir, "other.cbz")
@@ -392,16 +391,17 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 		zipEntry{name: "001.jpg", data: []byte("other"), method: zip.Store},
 	))
 
+	var root2Reads atomic.Int32
 	resInc, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
 		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-			if string(rawDir) == subDir {
+			if string(rawDir) == root2Dir && root2Reads.Add(1) >= 2 {
 				return nil, os.ErrPermission
 			}
 			return os.ReadDir(string(rawDir))
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error on incomplete subtree walk: %v", err)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected root ReadDir error on incomplete root walk, got res=%+v err=%v", resInc, err)
 	}
 	if resInc.Complete || resInc.ApplyRemovals {
 		t.Fatalf("expected incomplete walk with ApplyRemovals=false, got %+v", resInc)
@@ -409,7 +409,7 @@ func TestMissing_OfflineOrIncompleteWalkMarksNothingMissing(t *testing.T) {
 	if got1, _ := cw.GetAssetByID(ctx, a1.ID); got1.MissingSince != nil {
 		t.Fatalf("expected a1 not marked missing on incomplete walk, got %+v", got1)
 	}
-	// Verify other.cbz was NOT indexed either because the walk was incomplete.
+	// Verify other.cbz was NOT indexed either because the root walk failed.
 	if len(listAssetsForRoot(ctx, t, transactor, r1.ID)) != 2 {
 		t.Fatalf("expected no new asset indexed on incomplete walk")
 	}
@@ -1572,8 +1572,13 @@ func TestMissing_BrokenDirectorySymlinkWithKnownAssetsMarksNothingMissing(t *tes
 	if err != nil {
 		t.Fatalf("ScanLibrary after broken symlink: %v", err)
 	}
-	if res.Complete || res.ApplyRemovals || res.MissingCount != 0 {
-		t.Fatalf("expected Complete=false ApplyRemovals=false MissingCount=0, got %+v", res)
+	if res.Complete || !res.ApplyRemovals || res.MissingCount != 0 {
+		t.Fatalf("expected Complete=false ApplyRemovals=true MissingCount=0, got %+v", res)
+	}
+	if len(res.IncompletePrefixes) != 1 ||
+		res.IncompletePrefixes[0].RelPath.Display != "series_link" ||
+		res.IncompletePrefixes[0].Reason != scanner.SkipReasonBrokenSymlink {
+		t.Fatalf("IncompletePrefixes = %+v, want [series_link broken_symlink]", res.IncompletePrefixes)
 	}
 
 	for _, asset := range listAssetsForRoot(ctx, t, transactor, root.ID) {
@@ -2093,5 +2098,108 @@ func TestMissing_SameRootRestoreAuthorizesSiblingRemoval(t *testing.T) {
 					restoredA, missingB, events)
 			}
 		})
+	}
+}
+
+func TestMissing_BrokenDirectorySymlinkScopesSubtreeAndReconcilesSiblings(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	extDir := filepath.Join(base, "external-series")
+
+	keepBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Keep</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("keep-book"), method: zip.Store},
+	)
+	linkedBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Linked</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("linked-book"), method: zip.Store},
+	)
+	deletedBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Keep</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("deleted-outside"), method: zip.Store},
+	)
+	newBytes := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Keep</Series><Number>3</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("new-outside"), method: zip.Store},
+	)
+
+	writeDiskFile(t, filepath.Join(rootDir, "keep.cbz"), keepBytes)
+	deletedPath := filepath.Join(rootDir, "deleted.cbz")
+	writeDiskFile(t, deletedPath, deletedBytes)
+	writeDiskFile(t, filepath.Join(extDir, "vol01.cbz"), linkedBytes)
+	mustSymlink(t, extDir, filepath.Join(rootDir, "series_link"))
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "ScopedBrokenDirLink Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 3 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+	origLinked := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "series_link/vol01.cbz")
+	origDeleted := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "deleted.cbz")
+
+	// Break the directory symlink target, delete deleted.cbz, add new.cbz, and add a copy of linkedBytes.
+	if err := os.RemoveAll(extDir); err != nil {
+		t.Fatalf("RemoveAll(extDir): %v", err)
+	}
+	if err := os.Remove(deletedPath); err != nil {
+		t.Fatalf("Remove(deleted.cbz): %v", err)
+	}
+	writeDiskFile(t, filepath.Join(rootDir, "new.cbz"), newBytes)
+	writeDiskFile(t, filepath.Join(rootDir, "copy_of_linked.cbz"), linkedBytes)
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+	if res.Complete || !res.ApplyRemovals || res.IndexedCount != 2 || res.MovedCount != 0 || res.MissingCount != 1 {
+		t.Fatalf("unexpected scoped broken-link scan result: %+v", res)
+	}
+	if len(res.IncompletePrefixes) != 1 || res.IncompletePrefixes[0].RelPath.Display != "series_link" {
+		t.Fatalf("IncompletePrefixes = %+v, want [series_link]", res.IncompletePrefixes)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	gotLinked, err := cw.GetAssetByID(ctx, origLinked.ID)
+	if err != nil || !gotLinked.IsAvailable() || gotLinked.MissingSince != nil {
+		t.Fatalf("expected series_link/vol01.cbz active, got (%+v, %v)", gotLinked, err)
+	}
+	gotDeleted, err := cw.GetAssetByID(ctx, origDeleted.ID)
+	if err != nil || !gotDeleted.IsMissing() {
+		t.Fatalf("expected deleted.cbz marked missing, got (%+v, %v)", gotDeleted, err)
+	}
+
+	copyAsset := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "copy_of_linked.cbz")
+	if copyAsset.ID == origLinked.ID {
+		t.Fatalf("expected copy_of_linked.cbz indexed as distinct asset from %s", origLinked.ID)
+	}
+	_ = findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "new.cbz")
+
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMoved {
+			t.Fatalf("unexpected asset.moved event: %+v", ev)
+		}
+		if ev.Kind == domain.EventAssetMissing && ev.AggregateID == origLinked.ID {
+			t.Fatalf("unexpected asset.missing event for protected linked asset: %+v", ev)
+		}
 	}
 }

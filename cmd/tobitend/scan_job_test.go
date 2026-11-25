@@ -755,12 +755,13 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 		writeTestFile(t, filepath.Join(rootDir, "Good/v02.cbz"), buildTestCBZ(t, "GoodSaga", "Two", "2"))
 		lib, root := seedTestLibrary(ctx, t, db.Pool, "Incomplete Daemon Lib", rootDir)
 
-		var blockSubdir atomic.Bool
-		blockSubdir.Store(true)
+		var blockRoot atomic.Bool
+		blockRoot.Store(true)
+		var rootReads atomic.Int32
 		newDaemonScanner = func(pool *pgxpool.Pool, _ *config.Config) (*scanner.Scanner, error) {
 			return scanner.NewScanner(postgres.NewTransactor(pool), scanner.Options{
 				ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-					if blockSubdir.Load() && string(rawDir) == blockedDir {
+					if blockRoot.Load() && string(rawDir) == rootDir && rootReads.Add(1) >= 2 {
 						return nil, os.ErrPermission
 					}
 					return os.ReadDir(string(rawDir))
@@ -798,7 +799,7 @@ func TestRunDaemonScanJob_RetryBackoffMaxAttemptsAndUnknownLibrary(t *testing.T)
 				return fmt.Errorf("assets after incomplete walk = %d, want 0", assetCountBefore)
 			}
 
-			blockSubdir.Store(false)
+			blockRoot.Store(false)
 			gotSucc := waitDaemonJobState(serveCtx, t, jobRepo, jobID, domain.JobStateSucceeded)
 			if gotSucc.Attempts != 2 {
 				return fmt.Errorf("recovered walk Attempts = %d, want 2", gotSucc.Attempts)

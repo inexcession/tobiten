@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/inexcession/tobiten/internal/container"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/events"
+	"github.com/inexcession/tobiten/internal/logging"
 	"github.com/inexcession/tobiten/internal/storage"
 )
 
@@ -41,8 +43,8 @@ var (
 	ErrLibraryNotFound = errors.New("scanner: library not found")
 
 	// ErrIncompleteWalk is returned by the SCAN job handler when an ONLINE library's
-	// walk finishes incomplete (for example, due to an unreadable subtree) so the
-	// job retries with backoff instead of succeeding without indexing.
+	// scan aborts without applying removals (for example, when a root with pending
+	// removals had zero confirmed known assets) so the job retries with backoff.
 	ErrIncompleteWalk = errors.New("scanner: incomplete walk of online library")
 )
 
@@ -57,6 +59,7 @@ func wrapLibraryNotFound(err error) error {
 type Options struct {
 	Outbox *events.Outbox
 	Now    func() time.Time
+	Logger *slog.Logger
 	// MissingGracePeriod optionally overrides the MissingGraceDaysSettingKey
 	// system_settings value when non-nil (ADR-0019 §6).
 	MissingGracePeriod *time.Duration
@@ -134,41 +137,52 @@ type ChangedFile struct {
 	Inspected InspectedFile
 }
 
+// RootIncompletePrefix pairs an incomplete subtree prefix with its owning library root.
+type RootIncompletePrefix struct {
+	LibraryRootID string
+	RootPath      domain.PathIdentity
+	RelPath       domain.PathIdentity
+	Reason        SkipReason
+	Err           error
+}
+
 // RootScanResult summarizes the walk and indexing pass for one library root.
 type RootScanResult struct {
-	LibraryRootID  string
-	RootPath       domain.PathIdentity
-	Complete       bool
-	Err            error
-	IndexedCount   int
-	MovedCount     int
-	ModifiedCount  int
-	RestoredCount  int
-	MissingCount   int
-	RetiredCount   int
-	UnchangedCount int
-	Changed        []ChangedFile
-	Skipped        []SkippedEntry
-	SkippedCount   int
+	LibraryRootID      string
+	RootPath           domain.PathIdentity
+	Complete           bool
+	Err                error
+	IndexedCount       int
+	MovedCount         int
+	ModifiedCount      int
+	RestoredCount      int
+	MissingCount       int
+	RetiredCount       int
+	UnchangedCount     int
+	Changed            []ChangedFile
+	Skipped            []SkippedEntry
+	SkippedCount       int
+	IncompletePrefixes []IncompletePrefix
 }
 
 // ScanResult summarizes a multi-root library scan pass.
 type ScanResult struct {
-	LibraryID      string
-	PreCheck       PreCheckResult
-	Offline        bool
-	ApplyRemovals  bool
-	Complete       bool
-	Roots          []RootScanResult
-	IndexedCount   int
-	MovedCount     int
-	ModifiedCount  int
-	RestoredCount  int
-	MissingCount   int
-	RetiredCount   int
-	UnchangedCount int
-	ChangedCount   int
-	SkippedCount   int
+	LibraryID          string
+	PreCheck           PreCheckResult
+	Offline            bool
+	ApplyRemovals      bool
+	Complete           bool
+	Roots              []RootScanResult
+	IncompletePrefixes []RootIncompletePrefix
+	IndexedCount       int
+	MovedCount         int
+	ModifiedCount      int
+	RestoredCount      int
+	MissingCount       int
+	RetiredCount       int
+	UnchangedCount     int
+	ChangedCount       int
+	SkippedCount       int
 }
 
 // Scanner walks every root of a library, skips unchanged known files without
@@ -179,6 +193,7 @@ type Scanner struct {
 	indexer            *Indexer
 	outbox             *events.Outbox
 	now                func() time.Time
+	logger             *slog.Logger
 	missingGracePeriod *time.Duration
 	open               func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 	readDir            func(rawDir []byte) ([]os.DirEntry, error)
@@ -214,6 +229,7 @@ func NewScanner(tx storage.Transactor, opts Options) (*Scanner, error) {
 		indexer:            idx,
 		outbox:             outbox,
 		now:                nowFn,
+		logger:             opts.Logger,
 		missingGracePeriod: graceOverride,
 		open:               opts.Open,
 		readDir:            opts.ReadDir,
@@ -341,11 +357,14 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 	if abortErr != nil {
 		return res, abortErr
 	}
-	if res.Complete && len(rootErrs) == 0 && ctx.Err() == nil {
-		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, preCheckOpts, opts.CheckCancel, &res); err != nil {
+	var unconfirmedAbort bool
+	if len(rootErrs) == 0 && ctx.Err() == nil {
+		var recErr error
+		unconfirmedAbort, recErr = s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, preCheckOpts, opts.CheckCancel, &res)
+		if recErr != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
-			return res, err
+			return res, recErr
 		}
 	}
 	if err := checkScanCancel(ctx, opts.CheckCancel); err != nil {
@@ -353,15 +372,48 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		res.ApplyRemovals = false
 		return res, err
 	}
-	res.ApplyRemovals = res.Complete && len(rootErrs) == 0 && ctx.Err() == nil && preCheck.ApplyRemovals
+	res.ApplyRemovals = len(rootErrs) == 0 && !unconfirmedAbort && ctx.Err() == nil && preCheck.ApplyRemovals
 	if len(rootErrs) > 0 {
 		return res, errors.Join(rootErrs...)
 	}
+	s.logIncompletePrefixes(res)
 	return res, nil
+}
+
+func (s *Scanner) logIncompletePrefixes(res ScanResult) {
+	if len(res.IncompletePrefixes) == 0 {
+		return
+	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	for _, prefix := range res.IncompletePrefixes {
+		attrs := []any{
+			slog.String("library_id", res.LibraryID),
+			slog.String("library_root_id", prefix.LibraryRootID),
+			slog.String("root_path", prefix.RootPath.Display),
+			slog.String("prefix", prefix.RelPath.Display),
+			slog.String("reason", string(prefix.Reason)),
+		}
+		if prefix.Err != nil {
+			attrs = append(attrs, logging.Err(prefix.Err))
+		}
+		logger.Warn("scanner skipped unreadable subtree; keeping known assets active", attrs...)
+	}
 }
 
 func (r *ScanResult) recordRoot(rootRes RootScanResult) {
 	r.Roots = append(r.Roots, rootRes)
+	for _, prefix := range rootRes.IncompletePrefixes {
+		r.IncompletePrefixes = append(r.IncompletePrefixes, RootIncompletePrefix{
+			LibraryRootID: rootRes.LibraryRootID,
+			RootPath:      rootRes.RootPath,
+			RelPath:       prefix.RelPath,
+			Reason:        prefix.Reason,
+			Err:           prefix.Err,
+		})
+	}
 	r.IndexedCount += rootRes.IndexedCount
 	r.MovedCount += rootRes.MovedCount
 	r.ModifiedCount += rootRes.ModifiedCount
@@ -604,6 +656,7 @@ func (s *Scanner) scanOneRoot(
 	}
 	walkRes, walkErr := WalkRoot(ctx, root.Path.Bytes, walkOpts)
 	state.result.Err = walkErr
+	state.result.IncompletePrefixes = walkRes.IncompletePrefixes
 	state.result.Complete = walkErr == nil && walkRes.Complete && ctx.Err() == nil
 	return state.result
 }

@@ -132,28 +132,28 @@ func (s *Scanner) reconcileLibraryPass(
 	probeOpts PreCheckOptions,
 	checkCancel func(context.Context) error,
 	res *ScanResult,
-) error {
+) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := checkScanCancel(ctx, checkCancel); err != nil {
-		return err
+		return false, err
 	}
 
 	reconcileNow := s.now().UTC().Truncate(time.Microsecond)
 	plan := planReconciliation(res.Roots, preWalkAssets, obs, reconcileNow, gracePeriod)
 	if !plan.hasWrites() {
-		return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
+		return false, s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 			return lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots)
 		})
 	}
 
 	if len(plan.UnconfirmedRootsWithRemovals) > 0 {
 		if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
-			return err
+			return false, err
 		}
 		markRootsIncomplete(res, plan.UnconfirmedRootsWithRemovals)
-		return nil
+		return true, nil
 	}
 
 	var writeErrs []error
@@ -173,43 +173,43 @@ func (s *Scanner) reconcileLibraryPass(
 	} {
 		if err := step(); err != nil {
 			if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-				return errors.Join(append(writeErrs, err)...)
+				return false, errors.Join(append(writeErrs, err)...)
 			}
 			writeErrs = append(writeErrs, err)
 		}
 	}
 	if err := s.executeDeferredIndexes(ctx, libraryID, checkedRoots, plan.ToIndex, checkCancel, res); err != nil {
-		return errors.Join(append(writeErrs, err)...)
+		return false, errors.Join(append(writeErrs, err)...)
 	}
 	if len(writeErrs) > 0 {
 		if err := checkScanCancel(ctx, checkCancel); err != nil {
-			return errors.Join(append(writeErrs, err)...)
+			return false, errors.Join(append(writeErrs, err)...)
 		}
-		return errors.Join(writeErrs...)
+		return false, errors.Join(writeErrs...)
 	}
 
 	if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, checkCancel, res); err != nil {
 		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-			return err
+			return false, err
 		}
 		writeErrs = append(writeErrs, err)
 	}
 	if err := s.executeRetireMissing(ctx, libraryID, checkedRoots, plan.RetireMissing, gracePeriod, reconcileNow, checkCancel, res); err != nil {
 		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
-			return errors.Join(append(writeErrs, err)...)
+			return false, errors.Join(append(writeErrs, err)...)
 		}
 		writeErrs = append(writeErrs, err)
 	}
 	if len(writeErrs) > 0 {
 		if err := checkScanCancel(ctx, checkCancel); err != nil {
-			return errors.Join(append(writeErrs, err)...)
+			return false, errors.Join(append(writeErrs, err)...)
 		}
-		return errors.Join(writeErrs...)
+		return false, errors.Join(writeErrs...)
 	}
-	return checkScanCancel(ctx, checkCancel)
+	return false, checkScanCancel(ctx, checkCancel)
 }
 
 func planReconciliation(
@@ -235,9 +235,10 @@ func planReconciliation(
 		}
 	}
 
+	incompletePrefixesByRoot := indexIncompletePrefixesByRoot(roots)
 	confirmedInPlace, mtimeRefreshes, samePathRestores, candidates := collectReconciliationObservations(roots, obs)
-	unconfirmedActive := collectUnconfirmedAssets(activeAssets, obs, confirmedInPlace)
-	unconfirmedMissing := collectUnconfirmedAssets(missingAssets, obs, confirmedInPlace)
+	unconfirmedActive := collectUnconfirmedAssets(activeAssets, obs, confirmedInPlace, incompletePrefixesByRoot)
+	unconfirmedMissing := collectUnconfirmedAssets(missingAssets, obs, confirmedInPlace, incompletePrefixesByRoot)
 	unconfirmed := make([]domain.MediaAsset, 0, len(unconfirmedActive)+len(unconfirmedMissing))
 	unconfirmed = append(unconfirmed, unconfirmedActive...)
 	unconfirmed = append(unconfirmed, unconfirmedMissing...)
@@ -480,10 +481,45 @@ func collectMissingAndRetiredTransitions(
 	return markMissing, retireMissing
 }
 
+func indexIncompletePrefixesByRoot(roots []RootScanResult) map[string][][]byte {
+	var byRoot map[string][][]byte
+	for _, r := range roots {
+		if len(r.IncompletePrefixes) == 0 {
+			continue
+		}
+		if byRoot == nil {
+			byRoot = make(map[string][][]byte, len(roots))
+		}
+		prefixes := make([][]byte, 0, len(r.IncompletePrefixes))
+		for _, p := range r.IncompletePrefixes {
+			if len(p.RelPath.Bytes) > 0 {
+				prefixes = append(prefixes, p.RelPath.Bytes)
+			}
+		}
+		if len(prefixes) > 0 {
+			byRoot[r.LibraryRootID] = prefixes
+		}
+	}
+	return byRoot
+}
+
+func isUnderAnyIncompletePrefix(relPathBytes []byte, prefixes [][]byte) bool {
+	for _, prefix := range prefixes {
+		if bytes.Equal(relPathBytes, prefix) {
+			return true
+		}
+		if len(relPathBytes) > len(prefix)+1 && bytes.HasPrefix(relPathBytes, prefix) && relPathBytes[len(prefix)] == '/' {
+			return true
+		}
+	}
+	return false
+}
+
 func collectUnconfirmedAssets(
 	activeAssets []domain.MediaAsset,
 	obs *libraryWalkObservations,
 	confirmedInPlace map[string]struct{},
+	incompletePrefixesByRoot map[string][][]byte,
 ) []domain.MediaAsset {
 	unconfirmed := make([]domain.MediaAsset, 0)
 	for _, asset := range activeAssets {
@@ -498,6 +534,9 @@ func collectUnconfirmedAssets(
 			continue
 		}
 		if _, ok := obs.seenSkipped[loc]; ok {
+			continue
+		}
+		if isUnderAnyIncompletePrefix(asset.RelPathBytes, incompletePrefixesByRoot[asset.LibraryRootID]) {
 			continue
 		}
 		unconfirmed = append(unconfirmed, asset)

@@ -1058,6 +1058,12 @@ func TestWalkRoot_UnreadableSubtreeMarksIncompleteAndContinuesSiblings(t *testin
 			if res.Complete {
 				t.Fatal("WalkRoot reported Complete=true despite unreadable subtree")
 			}
+			if len(res.IncompletePrefixes) != 1 ||
+				string(res.IncompletePrefixes[0].RelPath.Bytes) != tc.wantSkip ||
+				res.IncompletePrefixes[0].Reason != scanner.SkipReasonUnreadable ||
+				res.IncompletePrefixes[0].Err == nil {
+				t.Fatalf("IncompletePrefixes = %+v, want [%q unreadable with err]", res.IncompletePrefixes, tc.wantSkip)
+			}
 			inspected := inspectedMap(res)
 			if _, ok := inspected["alpha.cbz"]; !ok {
 				t.Errorf("missing sibling alpha.cbz in inspected: %v", inspected)
@@ -1093,6 +1099,12 @@ func TestWalkRoot_UnreadableSubtreeMarksIncompleteAndContinuesSiblings(t *testin
 			}
 			if cbRes.Complete {
 				t.Fatal("callback WalkRoot reported Complete=true despite unreadable subtree")
+			}
+			if len(cbRes.IncompletePrefixes) != 1 ||
+				string(cbRes.IncompletePrefixes[0].RelPath.Bytes) != tc.wantSkip ||
+				cbRes.IncompletePrefixes[0].Reason != scanner.SkipReasonUnreadable ||
+				cbRes.IncompletePrefixes[0].Err == nil {
+				t.Fatalf("callback IncompletePrefixes = %+v, want [%q unreadable with err]", cbRes.IncompletePrefixes, tc.wantSkip)
 			}
 			sort.Strings(streamedInspected)
 			if !slices.Equal(streamedInspected, []string{"alpha.cbz", "zeta/sibling.cbz"}) {
@@ -1600,6 +1612,12 @@ func TestWalkRoot_BrokenDirectorySymlinkWithAndWithoutKnownAssets(t *testing.T) 
 				if res.Complete {
 					t.Fatal("WalkRoot Complete = true, want false when broken directory symlink prefixes known asset")
 				}
+				if len(res.IncompletePrefixes) != 1 ||
+					string(res.IncompletePrefixes[0].RelPath.Bytes) != tc.relLink ||
+					res.IncompletePrefixes[0].Reason != scanner.SkipReasonBrokenSymlink ||
+					res.IncompletePrefixes[0].Err == nil {
+					t.Fatalf("IncompletePrefixes = %+v, want [%q broken_symlink with err]", res.IncompletePrefixes, tc.relLink)
+				}
 				skipped := skippedMap(res)
 				got, ok := skipped[tc.relLink]
 				if !ok || got.Reason != scanner.SkipReasonBrokenSymlink {
@@ -1635,6 +1653,9 @@ func TestWalkRoot_BrokenDirectorySymlinkWithAndWithoutKnownAssets(t *testing.T) 
 		}
 		if !res.Complete {
 			t.Fatal("WalkRoot Complete = false, want true when broken symlink has no known asset beneath")
+		}
+		if len(res.IncompletePrefixes) != 0 {
+			t.Fatalf("IncompletePrefixes = %+v, want empty", res.IncompletePrefixes)
 		}
 		skipped := skippedMap(res)
 		for _, rel := range []string{"links/dangling_dir", "links/dangling_file.cbz"} {

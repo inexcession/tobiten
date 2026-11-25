@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -282,15 +284,14 @@ func TestScanModuleRunner_CatalogueProgressMissingAndPermanentFailures(t *testin
 func TestScanModuleRunner_IncompleteWalkRetriesAndOfflineStops(t *testing.T) {
 	t.Parallel()
 
-	t.Run("incomplete ONLINE walk enters retry path and succeeds after recovery", func(t *testing.T) {
+	t.Run("unreadable root after pre-check retries and succeeds after recovery", func(t *testing.T) {
 		t.Parallel()
 		db, transactor := setupIndexerTestDB(t)
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
 
 		rootDir := filepath.Join(t.TempDir(), "root")
-		blockedDir := filepath.Join(rootDir, "Blocked")
-		writeDiskFile(t, filepath.Join(blockedDir, "v01.cbz"), buildDeterministicZip(t, "",
+		writeDiskFile(t, filepath.Join(rootDir, "Blocked/v01.cbz"), buildDeterministicZip(t, "",
 			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Blocked Saga</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
 			zipEntry{name: "001.jpg", data: []byte("page-1"), method: zip.Store},
 		))
@@ -310,11 +311,12 @@ func TestScanModuleRunner_IncompleteWalkRetriesAndOfflineStops(t *testing.T) {
 			t.Fatalf("seedLibraryAndRoots: %v", err)
 		}
 
-		var blockSubdir atomic.Bool
-		blockSubdir.Store(true)
+		var blockRoot atomic.Bool
+		blockRoot.Store(true)
+		var rootReads atomic.Int32
 		sc, err := scanner.NewScanner(transactor, scanner.Options{
 			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
-				if blockSubdir.Load() && string(rawDir) == blockedDir {
+				if blockRoot.Load() && string(rawDir) == rootDir && rootReads.Add(1) >= 2 {
 					return nil, os.ErrPermission
 				}
 				return os.ReadDir(string(rawDir))
@@ -357,24 +359,24 @@ func TestScanModuleRunner_IncompleteWalkRetriesAndOfflineStops(t *testing.T) {
 			t.Fatalf("GetJobByID after attempt 1: %v", err)
 		}
 		if afterAttempt1.State != domain.JobStateQueued || afterAttempt1.Attempts != 1 {
-			t.Fatalf("job after incomplete walk = (state=%s, attempts=%d), want (QUEUED, 1)", afterAttempt1.State, afterAttempt1.Attempts)
+			t.Fatalf("job after unreadable root = (state=%s, attempts=%d), want (QUEUED, 1)", afterAttempt1.State, afterAttempt1.Attempts)
 		}
 		if !afterAttempt1.RunAfter.After(afterAttempt1.UpdatedAt) {
 			t.Fatalf("expected backoff RunAfter > UpdatedAt, got run_after=%v updated_at=%v", afterAttempt1.RunAfter, afterAttempt1.UpdatedAt)
 		}
 		if gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID); len(gotAssets) != 0 {
-			t.Fatalf("assets after incomplete walk = %d, want 0", len(gotAssets))
+			t.Fatalf("assets after unreadable root = %d, want 0", len(gotAssets))
 		}
 		var failedEvents int
 		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND kind = 'job.failed'`, jobID).Scan(&failedEvents); err != nil {
 			t.Fatalf("count job.failed: %v", err)
 		}
 		if failedEvents != 0 {
-			t.Fatalf("job.failed count after retryable incomplete walk = %d, want 0", failedEvents)
+			t.Fatalf("job.failed count after retryable unreadable root = %d, want 0", failedEvents)
 		}
 
-		// Recover subtree readability and make the retry immediately claimable.
-		blockSubdir.Store(false)
+		// Recover root readability and make the retry immediately claimable.
+		blockRoot.Store(false)
 		if _, err := db.Exec(ctx, `UPDATE jobs SET run_after = now() - interval '1 second' WHERE id = $1`, jobID); err != nil {
 			t.Fatalf("backdate run_after: %v", err)
 		}
@@ -390,6 +392,105 @@ func TestScanModuleRunner_IncompleteWalkRetriesAndOfflineStops(t *testing.T) {
 		}
 		if gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID); len(gotAssets) != 2 {
 			t.Fatalf("assets after recovered walk = %d, want 2", len(gotAssets))
+		}
+	})
+
+	t.Run("cancelled walk aborts without committing and retries on recovery", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		rootDir := filepath.Join(t.TempDir(), "root")
+		writeDiskFile(t, filepath.Join(rootDir, "Healthy/v01.cbz"), buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>CancelRetry</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("page-1"), method: zip.Store},
+		))
+
+		var lib domain.Library
+		var root domain.LibraryRoot
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Cancelled Walk Retry Lib", nil, []byte(rootDir))
+			root = roots[0]
+			return nil
+		}); err != nil {
+			t.Fatalf("seedLibraryAndRoots: %v", err)
+		}
+
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		var cancelOnce atomic.Bool
+		cancelOnce.Store(true)
+		sc, err := scanner.NewScanner(transactor, scanner.Options{
+			Open: func(openCtx context.Context, rawPath []byte) (scanner.ReadAtCloser, error) {
+				if cancelOnce.CompareAndSwap(true, false) {
+					cancelAttempt()
+					return nil, openCtx.Err()
+				}
+				return os.Open(string(rawPath))
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		mod, err := scanner.NewModule(sc, scanner.ModuleOptions{Workers: 1})
+		if err != nil {
+			t.Fatalf("NewModule: %v", err)
+		}
+		reg := module.NewRegistry()
+		if err := reg.Register(mod); err != nil {
+			t.Fatalf("reg.Register: %v", err)
+		}
+		jobRepo := postgres.NewJobRepository(db.Pool)
+		runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{})
+		if err := runner.RegisterModuleKinds(reg); err != nil {
+			t.Fatalf("RegisterModuleKinds: %v", err)
+		}
+		if err := runner.RegisterModuleHandlers(reg); err != nil {
+			t.Fatalf("RegisterModuleHandlers: %v", err)
+		}
+		if _, err := runner.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+		jobID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 2})
+		if err != nil {
+			t.Fatalf("TriggerScan: %v", err)
+		}
+		if claimed, err := runner.ClaimAndRunNext(attemptCtx, domain.JobKindScan); !claimed || !errors.Is(err, context.Canceled) {
+			t.Fatalf("ClaimAndRunNext #1 = (%v, %v), want (true, context.Canceled)", claimed, err)
+		}
+		if gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID); len(gotAssets) != 0 {
+			t.Fatalf("assets after cancelled walk = %d, want 0", len(gotAssets))
+		}
+		report, err := runner.Recover(ctx)
+		if err != nil {
+			t.Fatalf("Recover after cancel: %v", err)
+		}
+		if report.RequeuedRestart != 1 {
+			t.Fatalf("Recover report = %+v, want RequeuedRestart=1", report)
+		}
+		afterAttempt1, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID after attempt 1: %v", err)
+		}
+		if afterAttempt1.State != domain.JobStateQueued || afterAttempt1.Attempts != 1 {
+			t.Fatalf("job after cancelled walk = (state=%s, attempts=%d), want (QUEUED, 1)", afterAttempt1.State, afterAttempt1.Attempts)
+		}
+
+		if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+			t.Fatalf("ClaimAndRunNext #2 = (%v, %v)", claimed, err)
+		}
+		afterAttempt2, err := jobRepo.GetJobByID(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJobByID after attempt 2: %v", err)
+		}
+		if afterAttempt2.State != domain.JobStateSucceeded || afterAttempt2.Attempts != 2 {
+			t.Fatalf("job after retry = (state=%s, attempts=%d), want (SUCCEEDED, 2)", afterAttempt2.State, afterAttempt2.Attempts)
+		}
+		if gotAssets := listAssetsForRoot(ctx, t, transactor, root.ID); len(gotAssets) != 1 {
+			t.Fatalf("assets after recovered walk = %d, want 1", len(gotAssets))
 		}
 	})
 
@@ -448,6 +549,152 @@ func TestScanModuleRunner_IncompleteWalkRetriesAndOfflineStops(t *testing.T) {
 			t.Fatalf("offline library job = (state=%s, attempts=%d), want (SUCCEEDED, 1)", got.State, got.Attempts)
 		}
 	})
+}
+
+func TestScanModuleRunner_UnreadableSubtreeIndexesSiblingsProtectsAssetsAndSucceeds(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "root")
+	blockedDir := filepath.Join(rootDir, "Blocked")
+	blockedCBZ := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Blocked Saga</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("blocked-page-1"), method: zip.Store},
+	)
+	healthy1CBZ := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Healthy Saga</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("healthy-page-1"), method: zip.Store},
+	)
+	healthy2CBZ := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Healthy Saga</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("healthy-page-2"), method: zip.Store},
+	)
+	writeDiskFile(t, filepath.Join(blockedDir, "v01.cbz"), blockedCBZ)
+	writeDiskFile(t, filepath.Join(rootDir, "Healthy/v02.cbz"), healthy1CBZ)
+
+	var lib domain.Library
+	var root domain.LibraryRoot
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "Scoped Subdir Job Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seedLibraryAndRoots: %v", err)
+	}
+
+	var blockSubdir atomic.Bool
+	logHandler := &scanLogHandler{}
+	sc, err := scanner.NewScanner(transactor, scanner.Options{
+		Logger: slog.New(logHandler),
+		ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+			if blockSubdir.Load() && string(rawDir) == blockedDir {
+				return nil, syscall.EACCES
+			}
+			return os.ReadDir(string(rawDir))
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	mod, err := scanner.NewModule(sc, scanner.ModuleOptions{Workers: 2})
+	if err != nil {
+		t.Fatalf("NewModule: %v", err)
+	}
+	reg := module.NewRegistry()
+	if err := reg.Register(mod); err != nil {
+		t.Fatalf("reg.Register: %v", err)
+	}
+	jobRepo := postgres.NewJobRepository(db.Pool)
+	runner := jobs.NewRunner(jobRepo, jobs.RunnerOptions{})
+	if err := runner.RegisterModuleKinds(reg); err != nil {
+		t.Fatalf("RegisterModuleKinds: %v", err)
+	}
+	if err := runner.RegisterModuleHandlers(reg); err != nil {
+		t.Fatalf("RegisterModuleHandlers: %v", err)
+	}
+	if _, err := runner.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	jobService := jobs.NewService(jobRepo, jobs.ServiceOptions{})
+
+	// Baseline scan indexes Blocked/v01.cbz and Healthy/v02.cbz.
+	baseJobID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{})
+	if err != nil {
+		t.Fatalf("TriggerScan baseline: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext baseline = (%v, %v)", claimed, err)
+	}
+	if baseJob, err := jobRepo.GetJobByID(ctx, baseJobID); err != nil || baseJob.State != domain.JobStateSucceeded {
+		t.Fatalf("baseline job = (%+v, %v), want SUCCEEDED", baseJob, err)
+	}
+
+	var origBlockedID string
+	for _, a := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+		if a.RelPathDisplay == "Blocked/v01.cbz" {
+			origBlockedID = a.ID
+		}
+	}
+	if origBlockedID == "" {
+		t.Fatal("missing baseline Blocked/v01.cbz asset")
+	}
+
+	// Make Blocked unreadable, add Healthy/v03.cbz, and add a copy of Blocked/v01.cbz elsewhere.
+	blockSubdir.Store(true)
+	writeDiskFile(t, filepath.Join(rootDir, "Healthy/v03.cbz"), healthy2CBZ)
+	writeDiskFile(t, filepath.Join(rootDir, "Copies/v01_copy.cbz"), blockedCBZ)
+
+	jobID, err := scanner.TriggerScan(ctx, jobService, lib.ID, scanner.TriggerScanOptions{MaxAttempts: 3})
+	if err != nil {
+		t.Fatalf("TriggerScan: %v", err)
+	}
+	if claimed, err := runner.ClaimAndRunNext(ctx, domain.JobKindScan); err != nil || !claimed {
+		t.Fatalf("ClaimAndRunNext = (%v, %v)", claimed, err)
+	}
+
+	gotJob, err := jobRepo.GetJobByID(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if gotJob.State != domain.JobStateSucceeded || gotJob.Attempts != 1 {
+		t.Fatalf("job = (state=%s, attempts=%d), want (SUCCEEDED, 1)", gotJob.State, gotJob.Attempts)
+	}
+
+	byPath := make(map[string]domain.MediaAsset)
+	for _, a := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+		byPath[a.RelPathDisplay] = a
+	}
+	if len(byPath) != 4 {
+		t.Fatalf("assets = %d, want 4", len(byPath))
+	}
+	if gotBlocked, ok := byPath["Blocked/v01.cbz"]; !ok || gotBlocked.ID != origBlockedID || gotBlocked.MissingSince != nil {
+		t.Fatalf("Blocked/v01.cbz = (%+v, %v), want active with ID %s", gotBlocked, ok, origBlockedID)
+	}
+	if gotCopy, ok := byPath["Copies/v01_copy.cbz"]; !ok || gotCopy.ID == origBlockedID {
+		t.Fatalf("Copies/v01_copy.cbz = (%+v, %v), want new asset distinct from %s", gotCopy, ok, origBlockedID)
+	}
+	if _, ok := byPath["Healthy/v03.cbz"]; !ok {
+		t.Fatal("expected Healthy/v03.cbz indexed")
+	}
+
+	var unexpectedEvents int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM domain_events WHERE kind IN ('asset.missing', 'asset.moved')`).Scan(&unexpectedEvents); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if unexpectedEvents != 0 {
+		t.Fatalf("unexpected asset.missing/asset.moved events = %d, want 0", unexpectedEvents)
+	}
+
+	logHandler.mu.Lock()
+	defer logHandler.mu.Unlock()
+	if len(logHandler.records) != 1 || logHandler.records[0].Level != slog.LevelWarn ||
+		logHandler.records[0].Attrs["prefix"] != "Blocked" ||
+		logHandler.records[0].Attrs["library_root_id"] != root.ID {
+		t.Fatalf("expected 1 Warn diagnostic for Blocked, got %+v", logHandler.records)
+	}
 }
 
 func TestScanModuleRunner_NonLibraryNotFoundRetries(t *testing.T) {
