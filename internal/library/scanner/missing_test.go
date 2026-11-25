@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1389,5 +1390,223 @@ func TestMissing_StaleAbsenceRejectedAfterNewerOnlinePreCheck(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMissing_EmptyRootAfterPreCheckReturnsStalePreCheckAndMarksNothingMissing(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name               string
+		emptyStartingAtHit int32
+		deleteOneOnDisk    bool
+	}{
+		{
+			name:               "empty immediately after pre-check (walk and re-check)",
+			emptyStartingAtHit: 2,
+		},
+		{
+			name:               "empty right before executeMarkMissing",
+			emptyStartingAtHit: 3,
+			deleteOneOnDisk:    true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db, transactor := setupIndexerTestDB(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			rootDir := filepath.Join(t.TempDir(), "root")
+			book1Path := filepath.Join(rootDir, "book1.cbz")
+			book2Path := filepath.Join(rootDir, "book2.cbz")
+			writeDiskFile(t, book1Path, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>EmptyAfterPreCheck</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("b1"), method: zip.Store},
+			))
+			writeDiskFile(t, book2Path, buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>EmptyAfterPreCheck</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("b2"), method: zip.Store},
+			))
+
+			var (
+				lib  domain.Library
+				root domain.LibraryRoot
+			)
+			if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				var roots []domain.LibraryRoot
+				lib, roots = seedLibraryAndRoots(ctx, t, tx, "EmptyAfterPreCheck Lib", nil, []byte(rootDir))
+				root = roots[0]
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed: %v", err)
+			}
+
+			sc, err := scanner.NewScanner(transactor, scanner.Options{})
+			if err != nil {
+				t.Fatalf("NewScanner: %v", err)
+			}
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+				t.Fatalf("initial scan = (%+v, %v)", res, err)
+			}
+
+			if tc.deleteOneOnDisk {
+				if err := os.Remove(book1Path); err != nil {
+					t.Fatalf("Remove(book1.cbz): %v", err)
+				}
+			}
+
+			var rootReads atomic.Int32
+			res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+				ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+					if string(rawDir) == rootDir && rootReads.Add(1) >= tc.emptyStartingAtHit {
+						return nil, nil
+					}
+					return os.ReadDir(string(rawDir))
+				},
+			})
+			if !errors.Is(err, scanner.ErrStalePreCheck) {
+				t.Fatalf("expected ErrStalePreCheck, got res=%+v err=%v", res, err)
+			}
+			if res.Complete || res.ApplyRemovals || res.MissingCount != 0 {
+				t.Fatalf("expected Complete=false ApplyRemovals=false MissingCount=0, got %+v", res)
+			}
+
+			for _, asset := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+				if !asset.IsAvailable() || asset.MissingSince != nil {
+					t.Fatalf("expected asset %s to remain available, got %+v", asset.RelPathDisplay, asset)
+				}
+			}
+			for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+				if ev.Kind == domain.EventAssetMissing {
+					t.Fatalf("expected no asset.missing event, got %+v", ev)
+				}
+			}
+		})
+	}
+}
+
+func TestMissing_BrokenDirectorySymlinkWithKnownAssetsMarksNothingMissing(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	extDir := filepath.Join(base, "external-series")
+	keepPath := filepath.Join(rootDir, "keep.cbz")
+	targetBookPath := filepath.Join(extDir, "vol01.cbz")
+
+	writeDiskFile(t, keepPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Keep</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("keep"), method: zip.Store},
+	))
+	writeDiskFile(t, targetBookPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>Linked</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("linked"), method: zip.Store},
+	))
+	mustSymlink(t, extDir, filepath.Join(rootDir, "series_link"))
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "BrokenDirLink Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+
+	if err := os.RemoveAll(extDir); err != nil {
+		t.Fatalf("RemoveAll(extDir): %v", err)
+	}
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary after broken symlink: %v", err)
+	}
+	if res.Complete || res.ApplyRemovals || res.MissingCount != 0 {
+		t.Fatalf("expected Complete=false ApplyRemovals=false MissingCount=0, got %+v", res)
+	}
+
+	for _, asset := range listAssetsForRoot(ctx, t, transactor, root.ID) {
+		if !asset.IsAvailable() || asset.MissingSince != nil {
+			t.Fatalf("expected asset %s to remain available, got %+v", asset.RelPathDisplay, asset)
+		}
+	}
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMissing {
+			t.Fatalf("expected no asset.missing event, got %+v", ev)
+		}
+	}
+}
+
+func TestMissing_RootWithZeroConfirmedKnownAssetsMarksIncompleteAndNothingMissing(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	rootDir := filepath.Join(t.TempDir(), "root")
+	writeDiskFile(t, filepath.Join(rootDir, "readme.txt"), []byte("keeps root online"))
+	bookPath := filepath.Join(rootDir, "nested/vol01.cbz")
+	writeDiskFile(t, bookPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>NestedMount</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("nested-book"), method: zip.Store},
+	))
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "ZeroConfirmed Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 1 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+
+	if err := os.Remove(bookPath); err != nil {
+		t.Fatalf("Remove(bookPath): %v", err)
+	}
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary with zero confirmed known assets: %v", err)
+	}
+	if res.Complete || res.ApplyRemovals || res.MissingCount != 0 || res.Roots[0].Complete {
+		t.Fatalf("expected incomplete scan with ApplyRemovals=false MissingCount=0, got %+v", res)
+	}
+
+	assets := listAssetsForRoot(ctx, t, transactor, root.ID)
+	if len(assets) != 1 || !assets[0].IsAvailable() || assets[0].MissingSince != nil {
+		t.Fatalf("expected asset to remain available, got %+v", assets)
+	}
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMissing {
+			t.Fatalf("expected no asset.missing event, got %+v", ev)
+		}
 	}
 }

@@ -304,11 +304,12 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 	if readDirFn == nil {
 		readDirFn = s.readDir
 	}
-	preCheck, err := s.PreCheckLibrary(ctx, libraryID, PreCheckOptions{
+	preCheckOpts := PreCheckOptions{
 		Stat:    opts.Stat,
 		OpenDir: opts.OpenDir,
 		ReadDir: readDirFn,
-	})
+	}
+	preCheck, err := s.PreCheckLibrary(ctx, libraryID, preCheckOpts)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -341,7 +342,7 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string, opts ScanOp
 		return res, abortErr
 	}
 	if res.Complete && len(rootErrs) == 0 && ctx.Err() == nil {
-		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, opts.CheckCancel, &res); err != nil {
+		if err := s.reconcileLibraryPass(ctx, preCheck.LibraryID, preCheck.Roots, preWalkAssets, obs, gracePeriod, preCheckOpts, opts.CheckCancel, &res); err != nil {
 			res.Complete = false
 			res.ApplyRemovals = false
 			return res, err

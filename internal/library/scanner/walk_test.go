@@ -1539,3 +1539,109 @@ func TestWalkRoot_PanickingFormatReaderSkipsFileAndInspectsSiblings(t *testing.T
 		t.Fatalf("panickingPagesReader.Close calls = %d, want 1", closes)
 	}
 }
+
+func TestWalkRoot_BrokenDirectorySymlinkWithAndWithoutKnownAssets(t *testing.T) {
+	t.Parallel()
+
+	t.Run("broken directory symlink prefixing known asset marks walk incomplete", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name     string
+			enotdir  bool
+			relLink  string
+			knownRel string
+		}{
+			{
+				name:     "ENOENT target removed",
+				relLink:  "series_link",
+				knownRel: "series_link/vol01.cbz",
+			},
+			{
+				name:     "ENOTDIR parent replaced by regular file",
+				enotdir:  true,
+				relLink:  "nested/series_link",
+				knownRel: "nested/series_link/sub/vol01.cbz",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				root := t.TempDir()
+				ext := t.TempDir()
+				cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("p1"), method: zip.Store})
+				writeDiskFile(t, filepath.Join(root, "keep.cbz"), cbzBytes)
+
+				var targetPath string
+				if tc.enotdir {
+					parentPath := filepath.Join(ext, "parent")
+					targetPath = filepath.Join(parentPath, "dir")
+					writeDiskFile(t, filepath.Join(targetPath, "sub/vol01.cbz"), cbzBytes)
+					mustSymlink(t, targetPath, filepath.Join(root, tc.relLink))
+					if err := os.RemoveAll(parentPath); err != nil {
+						t.Fatalf("RemoveAll(parentPath): %v", err)
+					}
+					writeDiskFile(t, parentPath, []byte("not-a-dir"))
+				} else {
+					targetPath = filepath.Join(ext, "dir")
+					writeDiskFile(t, filepath.Join(targetPath, "vol01.cbz"), cbzBytes)
+					mustSymlink(t, targetPath, filepath.Join(root, tc.relLink))
+					if err := os.RemoveAll(targetPath); err != nil {
+						t.Fatalf("RemoveAll(targetPath): %v", err)
+					}
+				}
+
+				res, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+					Known: map[string]scanner.KnownFile{
+						tc.knownRel: {Size: int64(len(cbzBytes))},
+					},
+				})
+				if err != nil {
+					t.Fatalf("WalkRoot error = %v, want nil", err)
+				}
+				if res.Complete {
+					t.Fatal("WalkRoot Complete = true, want false when broken directory symlink prefixes known asset")
+				}
+				skipped := skippedMap(res)
+				got, ok := skipped[tc.relLink]
+				if !ok || got.Reason != scanner.SkipReasonBrokenSymlink {
+					t.Fatalf("skipped[%q] = (%+v, %v), want Reason=%q", tc.relLink, got, ok, scanner.SkipReasonBrokenSymlink)
+				}
+			})
+		}
+	})
+
+	t.Run("broken symlink with no known asset beneath is skipped and walk stays complete", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		ext := t.TempDir()
+		cbzBytes := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("keep"), method: zip.Store})
+		writeDiskFile(t, filepath.Join(root, "keep.cbz"), cbzBytes)
+		mustSymlink(t, filepath.Join(ext, "missing_dir"), filepath.Join(root, "links/dangling_dir"))
+		mustSymlink(t, filepath.Join(ext, "missing.cbz"), filepath.Join(root, "links/dangling_file.cbz"))
+
+		info, err := os.Stat(filepath.Join(root, "keep.cbz"))
+		if err != nil {
+			t.Fatalf("Stat(keep.cbz): %v", err)
+		}
+		mtime := info.ModTime().UTC().Truncate(time.Microsecond)
+
+		res, err := scanner.WalkRoot(t.Context(), []byte(root), scanner.WalkOptions{
+			Known: map[string]scanner.KnownFile{
+				"keep.cbz":                 {Size: info.Size(), Mtime: &mtime},
+				"links/dangling_other.cbz": {Size: info.Size(), Mtime: &mtime},
+			},
+		})
+		if err != nil {
+			t.Fatalf("WalkRoot error = %v, want nil", err)
+		}
+		if !res.Complete {
+			t.Fatal("WalkRoot Complete = false, want true when broken symlink has no known asset beneath")
+		}
+		skipped := skippedMap(res)
+		for _, rel := range []string{"links/dangling_dir", "links/dangling_file.cbz"} {
+			got, ok := skipped[rel]
+			if !ok || got.Reason != scanner.SkipReasonBrokenSymlink {
+				t.Fatalf("skipped[%q] = (%+v, %v), want Reason=%q", rel, got, ok, scanner.SkipReasonBrokenSymlink)
+			}
+		}
+	})
+}

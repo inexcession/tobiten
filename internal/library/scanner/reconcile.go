@@ -128,6 +128,7 @@ func (s *Scanner) reconcileLibraryPass(
 	preWalkAssets []domain.MediaAsset,
 	obs *libraryWalkObservations,
 	gracePeriod time.Duration,
+	probeOpts PreCheckOptions,
 	checkCancel func(context.Context) error,
 	res *ScanResult,
 ) error {
@@ -144,6 +145,14 @@ func (s *Scanner) reconcileLibraryPass(
 		return s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
 			return lockAndVerifyRootSnapshot(ctx, tx, libraryID, checkedRoots)
 		})
+	}
+
+	if unconfirmedRoots := findRootsWithZeroConfirmedKnownAssets(res.Roots, preWalkAssets, obs, plan); len(unconfirmedRoots) > 0 {
+		if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
+			return err
+		}
+		markRootsIncomplete(res, unconfirmedRoots)
+		return nil
 	}
 
 	var writeErrs []error
@@ -178,6 +187,9 @@ func (s *Scanner) reconcileLibraryPass(
 		return errors.Join(writeErrs...)
 	}
 
+	if err := s.verifyCheckedRootsAvailable(ctx, checkedRoots, probeOpts); err != nil {
+		return err
+	}
 	if err := s.executeMarkMissing(ctx, libraryID, checkedRoots, plan.MarkMissing, reconcileNow, checkCancel, res); err != nil {
 		if errors.Is(err, ErrStalePreCheck) || isScanAbortErr(ctx, err) {
 			return err
@@ -264,6 +276,57 @@ func planReconciliation(
 		MarkMissing:    markMissing,
 		RetireMissing:  retireMissing,
 	}
+}
+
+func findRootsWithZeroConfirmedKnownAssets(
+	roots []RootScanResult,
+	preWalkAssets []domain.MediaAsset,
+	obs *libraryWalkObservations,
+	plan reconciliationPlan,
+) map[string]struct{} {
+	activeByRoot := make(map[string]int, len(roots))
+	for _, asset := range preWalkAssets {
+		if asset.MissingSince == nil {
+			activeByRoot[asset.LibraryRootID]++
+		}
+	}
+	if len(activeByRoot) == 0 {
+		return nil
+	}
+
+	missingByRoot := make(map[string]int, len(roots))
+	for _, item := range plan.MarkMissing {
+		missingByRoot[item.RootID]++
+	}
+
+	var unconfirmed map[string]struct{}
+	for _, rootRes := range roots {
+		activeCount := activeByRoot[rootRes.LibraryRootID]
+		if activeCount == 0 || missingByRoot[rootRes.LibraryRootID] < activeCount {
+			continue
+		}
+		if _, hasMarker := obs.seenSkipped[assetLocation{
+			rootID:       rootRes.LibraryRootID,
+			relPathBytes: RootMarkerFilename,
+		}]; hasMarker {
+			continue
+		}
+		if unconfirmed == nil {
+			unconfirmed = make(map[string]struct{})
+		}
+		unconfirmed[rootRes.LibraryRootID] = struct{}{}
+	}
+	return unconfirmed
+}
+
+func markRootsIncomplete(res *ScanResult, unconfirmedRoots map[string]struct{}) {
+	for i := range res.Roots {
+		if _, ok := unconfirmedRoots[res.Roots[i].LibraryRootID]; ok {
+			res.Roots[i].Complete = false
+		}
+	}
+	res.Complete = false
+	res.ApplyRemovals = false
 }
 
 func collectReconciliationObservations(

@@ -194,11 +194,42 @@ type walkRuntime struct {
 	readDir           func([]byte) ([]os.DirEntry, error)
 	stat              func([]byte) (os.FileInfo, error)
 	open              func(context.Context, []byte) (ReadAtCloser, error)
+	knownPrefixes     map[string]struct{}
 	subtreeIncomplete atomic.Bool
 }
 
 func (rt *walkRuntime) markSubtreeIncomplete() {
 	rt.subtreeIncomplete.Store(true)
+}
+
+func buildKnownPrefixes(known map[string]KnownFile) map[string]struct{} {
+	if len(known) == 0 {
+		return nil
+	}
+	prefixes := make(map[string]struct{})
+	for relPath := range known {
+		for i := range len(relPath) {
+			if relPath[i] == '/' && i > 0 {
+				prefixes[relPath[:i]] = struct{}{}
+			}
+		}
+	}
+	return prefixes
+}
+
+func (rt *walkRuntime) hasKnownAssetUnderPrefix(relBytes []byte) bool {
+	if len(rt.knownPrefixes) == 0 || len(relBytes) == 0 {
+		return false
+	}
+	_, ok := rt.knownPrefixes[string(relBytes)]
+	return ok
+}
+
+func shouldMarkSubtreeIncomplete(reason SkipReason, hasKnownBeneath bool) bool {
+	if reason == SkipReasonUnreadable {
+		return true
+	}
+	return reason == SkipReasonBrokenSymlink && hasKnownBeneath
 }
 
 // WalkRoot sequentially walks rootBytes (reading one directory at a time in
@@ -277,13 +308,14 @@ func newWalkRuntime(rootBytes []byte, opts WalkOptions) (*walkRuntime, error) {
 	}
 
 	return &walkRuntime{
-		opts:    opts,
-		root:    trimTrailingSlashes(rootBytes),
-		workers: workers,
-		formats: formats,
-		readDir: readDirFn,
-		stat:    statFn,
-		open:    openFn,
+		opts:          opts,
+		root:          trimTrailingSlashes(rootBytes),
+		workers:       workers,
+		formats:       formats,
+		readDir:       readDirFn,
+		stat:          statFn,
+		open:          openFn,
+		knownPrefixes: buildKnownPrefixes(opts.Known),
 	}, nil
 }
 
@@ -463,6 +495,12 @@ func (rt *walkRuntime) visitEntry(
 		})
 	}
 	if isHiddenName(nameBytes) {
+		if len(relDir) == 0 && bytes.Equal(nameBytes, []byte(RootMarkerFilename)) && !isDirHint &&
+			(entryType&os.ModeSymlink != 0 || entryType == 0) {
+			if info, resolveErr := rt.resolveEntryInfo(absBytes, de, true); resolveErr == nil && info.IsDir() {
+				isDirHint = true
+			}
+		}
 		return emitSkipped(ctx, resultsCh, SkippedEntry{
 			RelPath: relID,
 			IsDir:   isDirHint,
@@ -495,7 +533,7 @@ func (rt *walkRuntime) visitEntry(
 		if needsFollow {
 			reason = classifyStatError(resolveErr)
 		}
-		if (isDirHint || needsFollow) && reason == SkipReasonUnreadable {
+		if (isDirHint || needsFollow) && shouldMarkSubtreeIncomplete(reason, rt.hasKnownAssetUnderPrefix(relID.Bytes)) {
 			rt.markSubtreeIncomplete()
 		}
 		return emitSkipped(ctx, resultsCh, SkippedEntry{

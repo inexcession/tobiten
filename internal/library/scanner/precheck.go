@@ -409,6 +409,29 @@ func openRawDirStream(rawDir []byte) (DirStream, error) {
 	return f, nil
 }
 
+func (s *Scanner) verifyCheckedRootsAvailable(
+	ctx context.Context,
+	checkedRoots []RootCheckResult,
+	opts PreCheckOptions,
+) error {
+	if opts.ReadDir == nil {
+		opts.ReadDir = s.readDir
+	}
+	probe := newRootProbeHooks(opts)
+	for _, root := range checkedRoots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := probeRootAvailability(ctx, root.RootPath.Bytes, probe); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return ErrStalePreCheck
+		}
+	}
+	return nil
+}
+
 func probeAllRoots(ctx context.Context, roots []domain.LibraryRoot, probe rootProbeHooks) ([]checkedRootProbe, error) {
 	outcomes := make([]checkedRootProbe, 0, len(roots))
 	for _, root := range roots {
