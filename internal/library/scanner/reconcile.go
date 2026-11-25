@@ -267,17 +267,14 @@ func planReconciliation(
 
 	proposedMoves, matchedObs := matchMovesFixedPoint(unconfirmed, candidates, existingByLoc)
 	modifies, histRestores, toIndex := classifyUnmatchedCandidates(candidates, matchedObs, existingByLoc, proposedMoves)
-	samePathRestores = append(samePathRestores, histRestores...)
-	slices.SortFunc(samePathRestores, func(a, b plannedRestore) int {
-		return cmp.Compare(a.Existing.ID, b.Existing.ID)
-	})
+	restores := mergeSamePathRestores(samePathRestores, histRestores)
 
 	markMissing, retireMissing := collectMissingAndRetiredTransitions(
 		unconfirmedActive,
 		unconfirmedMissing,
 		proposedMoves,
 		modifies,
-		samePathRestores,
+		restores,
 		now,
 		grace,
 	)
@@ -289,31 +286,77 @@ func planReconciliation(
 		confirmedInPlace,
 		proposedMoves,
 		modifies,
-		samePathRestores,
+		restores,
 		markMissing,
 	)
 
-	moves := make([]plannedMove, 0, len(proposedMoves))
-	for _, mv := range proposedMoves {
-		if _, guarded := unconfirmedRoots[mv.Asset.LibraryRootID]; guarded {
-			continue
-		}
-		moves = append(moves, mv)
+	executableMoves, moveComponents := filterGuardedMoveComponents(proposedMoves, unconfirmedRoots)
+	if len(unconfirmedRoots) > 0 {
+		modifies, histRestores, toIndex = classifyUnmatchedCandidates(candidates, matchedObs, existingByLoc, executableMoves)
+		restores = mergeSamePathRestores(samePathRestores, histRestores)
 	}
-	slices.SortFunc(moves, func(a, b plannedMove) int {
-		return cmp.Compare(a.Asset.ID, b.Asset.ID)
-	})
 
 	return reconciliationPlan{
-		MoveComponents:               partitionMoveComponents(moves),
+		MoveComponents:               moveComponents,
 		Modifies:                     modifies,
-		Restores:                     samePathRestores,
+		Restores:                     restores,
 		MtimeRefreshes:               mtimeRefreshes,
 		ToIndex:                      toIndex,
 		MarkMissing:                  markMissing,
 		RetireMissing:                retireMissing,
 		UnconfirmedRootsWithRemovals: unconfirmedRoots,
 	}
+}
+
+func mergeSamePathRestores(base, hist []plannedRestore) []plannedRestore {
+	merged := make([]plannedRestore, 0, len(base)+len(hist))
+	merged = append(merged, base...)
+	merged = append(merged, hist...)
+	slices.SortFunc(merged, func(a, b plannedRestore) int {
+		return cmp.Compare(a.Existing.ID, b.Existing.ID)
+	})
+	return merged
+}
+
+func filterGuardedMoveComponents(
+	proposedMoves map[string]plannedMove,
+	unconfirmedRoots map[string]struct{},
+) (map[string]plannedMove, [][]plannedMove) {
+	if len(proposedMoves) == 0 {
+		return nil, nil
+	}
+	moves := make([]plannedMove, 0, len(proposedMoves))
+	for _, mv := range proposedMoves {
+		moves = append(moves, mv)
+	}
+	slices.SortFunc(moves, func(a, b plannedMove) int {
+		return cmp.Compare(a.Asset.ID, b.Asset.ID)
+	})
+	components := partitionMoveComponents(moves)
+	if len(unconfirmedRoots) == 0 {
+		return proposedMoves, components
+	}
+	executableMoves := make(map[string]plannedMove, len(proposedMoves))
+	executableComponents := make([][]plannedMove, 0, len(components))
+	for _, comp := range components {
+		if componentTouchesGuardedRoot(comp, unconfirmedRoots) {
+			continue
+		}
+		executableComponents = append(executableComponents, comp)
+		for _, mv := range comp {
+			executableMoves[mv.Asset.ID] = mv
+		}
+	}
+	return executableMoves, executableComponents
+}
+
+func componentTouchesGuardedRoot(comp []plannedMove, unconfirmedRoots map[string]struct{}) bool {
+	for _, mv := range comp {
+		if _, guarded := unconfirmedRoots[mv.Asset.LibraryRootID]; guarded {
+			return true
+		}
+	}
+	return false
 }
 
 func findRootsWithZeroConfirmedKnownAssets(

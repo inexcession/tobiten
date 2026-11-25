@@ -649,6 +649,270 @@ func TestReconcile_PathExchangeAndRenameChain(t *testing.T) {
 		}
 		assertUnchangedRescanZeroOpens(ctx, t, sc, lib.ID, 4)
 	})
+
+	t.Run("guarded cross-root exchange keeps both assets in place and preserves independent writes", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		root1Dir := filepath.Join(base, "r1")
+		root2Dir := filepath.Join(base, "r2")
+		writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
+
+		bytesA := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-swap-A"), method: zip.Store})
+		bytesB := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-swap-B-longer"), method: zip.Store})
+		bytesUnseen := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-unseen"), method: zip.Store})
+		bytesKeep2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-keep2"), method: zip.Store})
+		bytesDel2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-del2"), method: zip.Store})
+		bytesLocked2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-locked2"), method: zip.Store})
+		bytesNew2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("guarded-new2"), method: zip.Store})
+
+		pathA := filepath.Join(root1Dir, "a.cbz")
+		pathUnseen := filepath.Join(root1Dir, "unseen.cbz")
+		pathB := filepath.Join(root2Dir, "b.cbz")
+		pathDel2 := filepath.Join(root2Dir, "del2.cbz")
+		lockedDir := filepath.Join(root2Dir, "locked_dir")
+		writeDiskFile(t, pathA, bytesA)
+		writeDiskFile(t, pathUnseen, bytesUnseen)
+		writeDiskFile(t, pathB, bytesB)
+		writeDiskFile(t, filepath.Join(root2Dir, "keep2.cbz"), bytesKeep2)
+		writeDiskFile(t, pathDel2, bytesDel2)
+		writeDiskFile(t, filepath.Join(lockedDir, "hidden.cbz"), bytesLocked2)
+
+		var (
+			lib    domain.Library
+			r1, r2 domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Guarded Swap Lib", nil, []byte(root1Dir), []byte(root2Dir))
+			r1, r2 = roots[0], roots[1]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 6 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+
+		origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "a.cbz")
+		origUnseen := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "unseen.cbz")
+		origB := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "b.cbz")
+		origDel2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "del2.cbz")
+		origLocked2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "locked_dir/hidden.cbz")
+
+		// Exchange r1/a.cbz <-> r2/b.cbz, remove r1/unseen.cbz (r1 has 0 confirmed known assets),
+		// remove r2/del2.cbz, add r2/new2.cbz, and make r2/locked_dir unreadable.
+		tmp := filepath.Join(t.TempDir(), "swap.cbz")
+		mustRenameDiskFile(t, pathA, tmp)
+		mustRenameDiskFile(t, pathB, pathA)
+		mustRenameDiskFile(t, tmp, pathB)
+		if err := os.Remove(pathUnseen); err != nil {
+			t.Fatalf("Remove(unseen.cbz): %v", err)
+		}
+		if err := os.Remove(pathDel2); err != nil {
+			t.Fatalf("Remove(del2.cbz): %v", err)
+		}
+		writeDiskFile(t, filepath.Join(root2Dir, "new2.cbz"), bytesNew2)
+
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+				if string(rawDir) == lockedDir {
+					return nil, syscall.EACCES
+				}
+				return os.ReadDir(string(rawDir))
+			},
+		})
+		if err != nil {
+			t.Fatalf("ScanLibrary guarded exchange failed: %v", err)
+		}
+		if res.Complete || res.ApplyRemovals || res.MovedCount != 0 || res.IndexedCount != 1 || res.MissingCount != 1 {
+			t.Fatalf("unexpected guarded exchange result: %+v", res)
+		}
+
+		cw := postgres.NewCatalogueWriteRepository(db.Pool)
+		gotA, err := cw.GetAssetByID(ctx, origA.ID)
+		if err != nil || gotA.LibraryRootID != r1.ID || gotA.RelPathDisplay != "a.cbz" || !gotA.IsAvailable() {
+			t.Fatalf("expected a.cbz untouched at r1, got (%+v, %v)", gotA, err)
+		}
+		gotUnseen, err := cw.GetAssetByID(ctx, origUnseen.ID)
+		if err != nil || gotUnseen.LibraryRootID != r1.ID || gotUnseen.RelPathDisplay != "unseen.cbz" || !gotUnseen.IsAvailable() {
+			t.Fatalf("expected unseen.cbz protected at r1, got (%+v, %v)", gotUnseen, err)
+		}
+		gotB, err := cw.GetAssetByID(ctx, origB.ID)
+		if err != nil || gotB.LibraryRootID != r2.ID || gotB.RelPathDisplay != "b.cbz" || !gotB.IsAvailable() {
+			t.Fatalf("expected b.cbz untouched at r2, got (%+v, %v)", gotB, err)
+		}
+		gotLocked2, err := cw.GetAssetByID(ctx, origLocked2.ID)
+		if err != nil || !gotLocked2.IsAvailable() {
+			t.Fatalf("expected locked_dir/hidden.cbz active, got (%+v, %v)", gotLocked2, err)
+		}
+		gotDel2, err := cw.GetAssetByID(ctx, origDel2.ID)
+		if err != nil || !gotDel2.IsMissing() {
+			t.Fatalf("expected del2.cbz marked missing, got (%+v, %v)", gotDel2, err)
+		}
+		if new2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "new2.cbz"); !new2.IsAvailable() {
+			t.Fatalf("expected new2.cbz indexed in r2, got %+v", new2)
+		}
+
+		var del2MissingEvents int
+		for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+			if ev.Kind == domain.EventAssetMoved {
+				t.Fatalf("unexpected asset.moved event: %+v", ev)
+			}
+			if ev.Kind == domain.EventAssetMissing {
+				if ev.AggregateID != origDel2.ID {
+					t.Fatalf("unexpected asset.missing event for protected asset: %+v", ev)
+				}
+				del2MissingEvents++
+			}
+		}
+		if del2MissingEvents != 1 {
+			t.Fatalf("expected 1 asset.missing event for del2.cbz, got %d", del2MissingEvents)
+		}
+	})
+
+	t.Run("replacement at path of guarded outgoing move updates in place without path conflict while keeping chain atomic", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		root1Dir := filepath.Join(base, "r1")
+		root2Dir := filepath.Join(base, "r2")
+		writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
+
+		bytesA := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-guarded-A"), method: zip.Store})
+		bytesReplacement := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-replacement-new-content"), method: zip.Store})
+		bytesUnseen := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-unseen"), method: zip.Store})
+		bytesKeep2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-keep2"), method: zip.Store})
+		bytesChainMid := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-mid-B"), method: zip.Store})
+		bytesDel2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-del2"), method: zip.Store})
+		bytesLocked2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-locked2"), method: zip.Store})
+		bytesNew2 := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("chain-independent-new2"), method: zip.Store})
+
+		pathA := filepath.Join(root1Dir, "a.cbz")
+		pathUnseen := filepath.Join(root1Dir, "unseen.cbz")
+		pathChainMid := filepath.Join(root2Dir, "chain_mid.cbz")
+		pathChainEnd := filepath.Join(root2Dir, "chain_end.cbz")
+		pathDel2 := filepath.Join(root2Dir, "del2.cbz")
+		lockedDir := filepath.Join(root2Dir, "locked_dir")
+
+		writeDiskFile(t, pathA, bytesA)
+		writeDiskFile(t, pathUnseen, bytesUnseen)
+		writeDiskFile(t, filepath.Join(root2Dir, "keep2.cbz"), bytesKeep2)
+		writeDiskFile(t, pathChainMid, bytesChainMid)
+		writeDiskFile(t, pathDel2, bytesDel2)
+		writeDiskFile(t, filepath.Join(lockedDir, "hidden.cbz"), bytesLocked2)
+
+		var (
+			lib    domain.Library
+			r1, r2 domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "Guarded Chain Replacement Lib", nil, []byte(root1Dir), []byte(root2Dir))
+			r1, r2 = roots[0], roots[1]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 6 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+
+		origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "a.cbz")
+		origUnseen := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "unseen.cbz")
+		origChainMid := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "chain_mid.cbz")
+		origDel2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "del2.cbz")
+		origLocked2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "locked_dir/hidden.cbz")
+
+		// Chain: r1/a.cbz -> r2/chain_mid.cbz -> r2/chain_end.cbz, while replacing r1/a.cbz
+		// with new bytes, removing r1/unseen.cbz (r1 guarded), deleting r2/del2.cbz,
+		// adding r2/independent_new.cbz, and making r2/locked_dir unreadable.
+		mustRenameDiskFile(t, pathChainMid, pathChainEnd)
+		mustRenameDiskFile(t, pathA, pathChainMid)
+		writeDiskFile(t, pathA, bytesReplacement)
+		if err := os.Remove(pathUnseen); err != nil {
+			t.Fatalf("Remove(unseen.cbz): %v", err)
+		}
+		if err := os.Remove(pathDel2); err != nil {
+			t.Fatalf("Remove(del2.cbz): %v", err)
+		}
+		writeDiskFile(t, filepath.Join(root2Dir, "independent_new.cbz"), bytesNew2)
+
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+				if string(rawDir) == lockedDir {
+					return nil, syscall.EACCES
+				}
+				return os.ReadDir(string(rawDir))
+			},
+		})
+		if err != nil {
+			t.Fatalf("ScanLibrary guarded chain+replacement failed: %v", err)
+		}
+		if res.Complete || res.ApplyRemovals || res.MovedCount != 0 || res.ModifiedCount != 1 || res.IndexedCount != 1 || res.MissingCount != 1 {
+			t.Fatalf("unexpected guarded chain+replacement result: %+v", res)
+		}
+
+		cw := postgres.NewCatalogueWriteRepository(db.Pool)
+		gotA, err := cw.GetAssetByID(ctx, origA.ID)
+		if err != nil || gotA.LibraryRootID != r1.ID || gotA.RelPathDisplay != "a.cbz" || !gotA.IsAvailable() {
+			t.Fatalf("expected a.cbz kept at r1/a.cbz, got (%+v, %v)", gotA, err)
+		}
+		gotUnseen, err := cw.GetAssetByID(ctx, origUnseen.ID)
+		if err != nil || gotUnseen.LibraryRootID != r1.ID || gotUnseen.RelPathDisplay != "unseen.cbz" || !gotUnseen.IsAvailable() {
+			t.Fatalf("expected unseen.cbz protected at r1, got (%+v, %v)", gotUnseen, err)
+		}
+		gotChainMid, err := cw.GetAssetByID(ctx, origChainMid.ID)
+		if err != nil || gotChainMid.LibraryRootID != r2.ID || gotChainMid.RelPathDisplay != "chain_mid.cbz" || !gotChainMid.IsAvailable() {
+			t.Fatalf("expected chain_mid.cbz kept in place atomically, got (%+v, %v)", gotChainMid, err)
+		}
+		gotLocked2, err := cw.GetAssetByID(ctx, origLocked2.ID)
+		if err != nil || !gotLocked2.IsAvailable() {
+			t.Fatalf("expected locked_dir/hidden.cbz active, got (%+v, %v)", gotLocked2, err)
+		}
+		gotDel2, err := cw.GetAssetByID(ctx, origDel2.ID)
+		if err != nil || !gotDel2.IsMissing() {
+			t.Fatalf("expected del2.cbz marked missing, got (%+v, %v)", gotDel2, err)
+		}
+		if new2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "independent_new.cbz"); !new2.IsAvailable() {
+			t.Fatalf("expected independent_new.cbz indexed in r2, got %+v", new2)
+		}
+
+		var modifiedA, del2Missing int
+		for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+			if ev.Kind == domain.EventAssetMoved {
+				t.Fatalf("unexpected asset.moved event: %+v", ev)
+			}
+			if ev.Kind == domain.EventAssetModified && ev.AggregateID == origA.ID {
+				modifiedA++
+			}
+			if ev.Kind == domain.EventAssetMissing {
+				if ev.AggregateID != origDel2.ID {
+					t.Fatalf("unexpected asset.missing event for protected asset: %+v", ev)
+				}
+				del2Missing++
+			}
+		}
+		if modifiedA != 1 || del2Missing != 1 {
+			t.Fatalf("events = (modifiedA=%d, del2Missing=%d), want (1, 1)", modifiedA, del2Missing)
+		}
+	})
 }
 
 func TestReconcile_ExternalModifyPreservesLockedFieldsAndTouchRefreshesMtime(t *testing.T) {
