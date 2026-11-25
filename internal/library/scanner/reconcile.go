@@ -295,6 +295,9 @@ func planReconciliation(
 
 	moves := make([]plannedMove, 0, len(proposedMoves))
 	for _, mv := range proposedMoves {
+		if _, guarded := unconfirmedRoots[mv.Asset.LibraryRootID]; guarded {
+			continue
+		}
 		moves = append(moves, mv)
 	}
 	slices.SortFunc(moves, func(a, b plannedMove) int {

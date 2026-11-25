@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1828,6 +1829,166 @@ func TestMissing_CrossRootMatchDoesNotAuthorizeUnobservedSourceRootRemovals(t *t
 			if ev.Kind == domain.EventAssetMissing || ev.Kind == domain.EventAssetMoved {
 				t.Fatalf("expected no asset.missing or asset.moved event, got %+v", ev)
 			}
+		}
+	})
+
+	t.Run("partial walk with unrelated unreadable subtree still blocks cross-root move and preserves independent writes", func(t *testing.T) {
+		t.Parallel()
+		db, transactor := setupIndexerTestDB(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		base := t.TempDir()
+		root1Dir := filepath.Join(base, "r1")
+		root2Dir := filepath.Join(base, "r2")
+		writeDiskFile(t, filepath.Join(root1Dir, scanner.RootMarkerFilename), []byte{})
+
+		bytesA := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-a"), method: zip.Store},
+		)
+		bytesB := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-b"), method: zip.Store},
+		)
+		bytesKeep2 := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>3</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-keep2"), method: zip.Store},
+		)
+		bytesDeleted2 := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>4</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-del2"), method: zip.Store},
+		)
+		bytesLocked2 := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>5</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-locked2"), method: zip.Store},
+		)
+		bytesNew2 := buildDeterministicZip(t, "",
+			zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>PartialCrossRoot</Series><Number>6</Number></ComicInfo>`), method: zip.Deflate},
+			zipEntry{name: "001.jpg", data: []byte("partial-cross-root-new2"), method: zip.Store},
+		)
+
+		pathA := filepath.Join(root1Dir, "a.cbz")
+		pathB := filepath.Join(root1Dir, "b.cbz")
+		deleted2Path := filepath.Join(root2Dir, "deleted2.cbz")
+		lockedDir := filepath.Join(root2Dir, "locked_dir")
+		writeDiskFile(t, pathA, bytesA)
+		writeDiskFile(t, pathB, bytesB)
+		writeDiskFile(t, filepath.Join(root2Dir, "keep2.cbz"), bytesKeep2)
+		writeDiskFile(t, deleted2Path, bytesDeleted2)
+		writeDiskFile(t, filepath.Join(lockedDir, "hidden.cbz"), bytesLocked2)
+
+		var (
+			lib    domain.Library
+			r1, r2 domain.LibraryRoot
+		)
+		if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+			var roots []domain.LibraryRoot
+			lib, roots = seedLibraryAndRoots(ctx, t, tx, "PartialCrossRootUnobserved Lib", nil, []byte(root1Dir), []byte(root2Dir))
+			r1, r2 = roots[0], roots[1]
+			return nil
+		}); err != nil {
+			t.Fatalf("seed failed: %v", err)
+		}
+
+		sc, err := scanner.NewScanner(transactor, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 5 {
+			t.Fatalf("initial scan = (%+v, %v)", res, err)
+		}
+		origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "a.cbz")
+		origB := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r1.ID), "b.cbz")
+		origDel2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "deleted2.cbz")
+		origLocked2 := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, r2.ID), "locked_dir/hidden.cbz")
+
+		// Source root r1 loses visibility of both known assets while keeping its marker;
+		// r2 gains a matching copy of a.cbz, an independent new book, a genuine deletion,
+		// and an unrelated unreadable subdirectory.
+		if err := os.Remove(pathA); err != nil {
+			t.Fatalf("Remove(a.cbz): %v", err)
+		}
+		if err := os.Remove(pathB); err != nil {
+			t.Fatalf("Remove(b.cbz): %v", err)
+		}
+		if err := os.Remove(deleted2Path); err != nil {
+			t.Fatalf("Remove(deleted2.cbz): %v", err)
+		}
+		writeDiskFile(t, filepath.Join(root2Dir, "a_copy.cbz"), bytesA)
+		writeDiskFile(t, filepath.Join(root2Dir, "independent_new.cbz"), bytesNew2)
+
+		res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{
+			ReadDir: func(rawDir []byte) ([]os.DirEntry, error) {
+				if string(rawDir) == lockedDir {
+					return nil, syscall.EACCES
+				}
+				return os.ReadDir(string(rawDir))
+			},
+		})
+		if err != nil {
+			t.Fatalf("ScanLibrary: %v", err)
+		}
+		if res.Complete || res.ApplyRemovals || res.MovedCount != 0 || res.IndexedCount != 1 || res.MissingCount != 1 {
+			t.Fatalf("unexpected partial cross-root result: %+v", res)
+		}
+		if res.Roots[0].Complete || res.Roots[1].Complete {
+			t.Fatalf("expected both roots Complete=false, got (%v, %v)", res.Roots[0].Complete, res.Roots[1].Complete)
+		}
+		if len(res.IncompletePrefixes) != 1 ||
+			res.IncompletePrefixes[0].LibraryRootID != r2.ID ||
+			res.IncompletePrefixes[0].RelPath.Display != "locked_dir" {
+			t.Fatalf("IncompletePrefixes = %+v, want [(%s, locked_dir)]", res.IncompletePrefixes, r2.ID)
+		}
+
+		cw := postgres.NewCatalogueWriteRepository(db.Pool)
+		gotA, err := cw.GetAssetByID(ctx, origA.ID)
+		if err != nil || gotA.LibraryRootID != r1.ID || gotA.RelPathDisplay != "a.cbz" || !gotA.IsAvailable() || gotA.MissingSince != nil {
+			t.Fatalf("expected a.cbz protected at r1, got (%+v, %v)", gotA, err)
+		}
+		gotB, err := cw.GetAssetByID(ctx, origB.ID)
+		if err != nil || gotB.LibraryRootID != r1.ID || gotB.RelPathDisplay != "b.cbz" || !gotB.IsAvailable() || gotB.MissingSince != nil {
+			t.Fatalf("expected b.cbz protected at r1, got (%+v, %v)", gotB, err)
+		}
+		gotLocked2, err := cw.GetAssetByID(ctx, origLocked2.ID)
+		if err != nil || !gotLocked2.IsAvailable() || gotLocked2.MissingSince != nil {
+			t.Fatalf("expected r2 locked_dir/hidden.cbz protected, got (%+v, %v)", gotLocked2, err)
+		}
+		gotDel2, err := cw.GetAssetByID(ctx, origDel2.ID)
+		if err != nil || !gotDel2.IsMissing() {
+			t.Fatalf("expected r2 deleted2.cbz marked missing, got (%+v, %v)", gotDel2, err)
+		}
+
+		r2ByPath := make(map[string]domain.MediaAsset)
+		for _, a := range listAssetsForRoot(ctx, t, transactor, r2.ID) {
+			r2ByPath[a.RelPathDisplay] = a
+		}
+		if len(r2ByPath) != 4 {
+			t.Fatalf("r2 assets = %d, want 4 (keep2 + locked_dir/hidden + deleted2 + independent_new)", len(r2ByPath))
+		}
+		if _, leakedCopy := r2ByPath["a_copy.cbz"]; leakedCopy {
+			t.Fatalf("unexpected a_copy.cbz committed in r2 while source root guarded: %+v", r2ByPath)
+		}
+		if newAsset, ok := r2ByPath["independent_new.cbz"]; !ok || !newAsset.IsAvailable() {
+			t.Fatalf("expected independent_new.cbz persisted in r2, got (%+v, %v)", newAsset, ok)
+		}
+
+		var r2DelMissingCount int
+		for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+			if ev.Kind == domain.EventAssetMoved {
+				t.Fatalf("unexpected asset.moved event: %+v", ev)
+			}
+			if ev.Kind == domain.EventAssetMissing {
+				if ev.AggregateID == origA.ID || ev.AggregateID == origB.ID {
+					t.Fatalf("unexpected asset.missing event for guarded r1 asset: %+v", ev)
+				}
+				if ev.AggregateID == origDel2.ID {
+					r2DelMissingCount++
+				}
+			}
+		}
+		if r2DelMissingCount != 1 {
+			t.Fatalf("expected 1 asset.missing event for deleted2.cbz, got %d", r2DelMissingCount)
 		}
 	})
 
