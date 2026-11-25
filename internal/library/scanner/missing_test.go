@@ -1894,3 +1894,204 @@ func TestMissing_CrossRootMatchDoesNotAuthorizeUnobservedSourceRootRemovals(t *t
 		}
 	})
 }
+
+func TestMissing_SkippedBrokenFileLinkDoesNotAuthorizeUnseenSiblingRemoval(t *testing.T) {
+	t.Parallel()
+	db, transactor := setupIndexerTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	extDir := filepath.Join(base, "ext")
+	writeDiskFile(t, filepath.Join(rootDir, "readme.txt"), []byte("keeps root online"))
+
+	targetPath := filepath.Join(extDir, "target.cbz")
+	linkPath := filepath.Join(rootDir, "dangling.cbz")
+	siblingPath := filepath.Join(rootDir, "sibling.cbz")
+	writeDiskFile(t, targetPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>DanglingFile</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("linked-file"), method: zip.Store},
+	))
+	mustSymlink(t, targetPath, linkPath)
+	writeDiskFile(t, siblingPath, buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>DanglingFile</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("sibling-file"), method: zip.Store},
+	))
+
+	var (
+		lib  domain.Library
+		root domain.LibraryRoot
+	)
+	if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+		var roots []domain.LibraryRoot
+		lib, roots = seedLibraryAndRoots(ctx, t, tx, "SkippedBrokenFileLink Lib", nil, []byte(rootDir))
+		root = roots[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	sc, err := scanner.NewScanner(transactor, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+		t.Fatalf("initial scan = (%+v, %v)", res, err)
+	}
+	origLink := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "dangling.cbz")
+	origSibling := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "sibling.cbz")
+
+	// Break the file symlink (skipped without failing walk) and hide/remove the sibling.
+	if err := os.Remove(targetPath); err != nil {
+		t.Fatalf("Remove(target.cbz): %v", err)
+	}
+	if err := os.Remove(siblingPath); err != nil {
+		t.Fatalf("Remove(sibling.cbz): %v", err)
+	}
+
+	res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+	if res.Complete || res.ApplyRemovals || res.MissingCount != 0 || res.Roots[0].Complete {
+		t.Fatalf("expected incomplete scan with ApplyRemovals=false MissingCount=0, got %+v", res)
+	}
+	if !slices.ContainsFunc(res.Roots[0].Skipped, func(s scanner.SkippedEntry) bool {
+		return s.RelPath.Display == "dangling.cbz" && s.Reason == scanner.SkipReasonBrokenSymlink
+	}) {
+		t.Fatalf("expected dangling.cbz recorded as broken_symlink skip, got %+v", res.Roots[0].Skipped)
+	}
+
+	cw := postgres.NewCatalogueWriteRepository(db.Pool)
+	for _, orig := range []domain.MediaAsset{origLink, origSibling} {
+		got, err := cw.GetAssetByID(ctx, orig.ID)
+		if err != nil || !got.IsAvailable() || got.MissingSince != nil {
+			t.Fatalf("expected asset %s to remain available, got (%+v, %v)", orig.RelPathDisplay, got, err)
+		}
+	}
+	for _, ev := range loadOutboxEventsDetailed(ctx, t, db) {
+		if ev.Kind == domain.EventAssetMissing {
+			t.Fatalf("expected no asset.missing event, got %+v", ev)
+		}
+	}
+}
+
+func TestMissing_SameRootRestoreAuthorizesSiblingRemoval(t *testing.T) {
+	t.Parallel()
+
+	for _, historical := range []bool{false, true} {
+		name := "current digest reappearance"
+		if historical {
+			name = "historical digest reappearance"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db, transactor := setupIndexerTestDB(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			rootDir := filepath.Join(t.TempDir(), "root")
+			v1Bytes := buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>RestoreAuthorizes</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("restore-v1"), method: zip.Store},
+			)
+			v2Bytes := buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>RestoreAuthorizes</Series><Number>1</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("restore-v2"), method: zip.Store},
+				zipEntry{name: "002.jpg", data: []byte("restore-v2-p2"), method: zip.Store},
+			)
+			siblingBytes := buildDeterministicZip(t, "",
+				zipEntry{name: "ComicInfo.xml", data: []byte(`<ComicInfo><Series>RestoreAuthorizes</Series><Number>2</Number></ComicInfo>`), method: zip.Deflate},
+				zipEntry{name: "001.jpg", data: []byte("restore-sibling"), method: zip.Store},
+			)
+
+			pathA := filepath.Join(rootDir, "a.cbz")
+			pathB := filepath.Join(rootDir, "b.cbz")
+			writeDiskFile(t, pathA, v1Bytes)
+			writeDiskFile(t, pathB, siblingBytes)
+
+			var (
+				lib  domain.Library
+				root domain.LibraryRoot
+			)
+			if err := transactor.WithTx(ctx, func(tx storage.Tx) error {
+				var roots []domain.LibraryRoot
+				lib, roots = seedLibraryAndRoots(ctx, t, tx, "RestoreAuthorizes Lib", nil, []byte(rootDir))
+				root = roots[0]
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed: %v", err)
+			}
+
+			t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+			clock := newFakeClock(t0)
+			sc, err := scanner.NewScanner(transactor, scanner.Options{Now: clock.Now})
+			if err != nil {
+				t.Fatalf("NewScanner: %v", err)
+			}
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.IndexedCount != 2 {
+				t.Fatalf("initial scan = (%+v, %v)", res, err)
+			}
+			origA := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "a.cbz")
+			origB := findAssetByRelPath(t, listAssetsForRoot(ctx, t, transactor, root.ID), "b.cbz")
+
+			if historical {
+				clock.Advance(time.Minute)
+				writeDiskFile(t, pathA, v2Bytes)
+				if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.ModifiedCount != 1 {
+					t.Fatalf("modify scan = (%+v, %v)", res, err)
+				}
+			}
+
+			// Mark a.cbz missing while b.cbz keeps the root confirmed.
+			clock.Advance(time.Hour)
+			if err := os.Remove(pathA); err != nil {
+				t.Fatalf("Remove(a.cbz): %v", err)
+			}
+			if res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil || !res.Complete || res.MissingCount != 1 {
+				t.Fatalf("mark a missing scan = (%+v, %v)", res, err)
+			}
+
+			// Now a.cbz reappears at its own path (only observed known asset in root) while b.cbz is deleted.
+			clock.Advance(time.Hour)
+			writeDiskFile(t, pathA, v1Bytes)
+			if err := os.Remove(pathB); err != nil {
+				t.Fatalf("Remove(b.cbz): %v", err)
+			}
+
+			res, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+			if err != nil {
+				t.Fatalf("restore+delete scan: %v", err)
+			}
+			if !res.Complete || !res.ApplyRemovals || res.RestoredCount != 1 || res.MissingCount != 1 {
+				t.Fatalf("expected Complete=true ApplyRemovals=true RestoredCount=1 MissingCount=1, got %+v", res)
+			}
+
+			cw := postgres.NewCatalogueWriteRepository(db.Pool)
+			gotA, err := cw.GetAssetByID(ctx, origA.ID)
+			if err != nil || !gotA.IsAvailable() || gotA.MissingSince != nil || gotA.RetiredAt != nil {
+				t.Fatalf("expected a.cbz restored and available, got (%+v, %v)", gotA, err)
+			}
+			gotB, err := cw.GetAssetByID(ctx, origB.ID)
+			if err != nil || !gotB.IsMissing() || gotB.IsAvailable() {
+				t.Fatalf("expected b.cbz marked missing, got (%+v, %v)", gotB, err)
+			}
+
+			events := loadOutboxEventsDetailed(ctx, t, db)
+			var restoredA, missingB int
+			for _, ev := range events {
+				if ev.Kind == domain.EventAssetRestored && ev.AggregateID == origA.ID {
+					restoredA++
+				}
+				if ev.Kind == domain.EventAssetMissing && ev.AggregateID == origB.ID {
+					missingB++
+				}
+			}
+			if restoredA != 1 || missingB != 1 {
+				t.Fatalf("expected 1 asset.restored for a.cbz and 1 asset.missing for b.cbz, got restored=%d missing=%d (events=%+v)",
+					restoredA, missingB, events)
+			}
+		})
+	}
+}

@@ -262,10 +262,12 @@ func planReconciliation(
 
 	unconfirmedRoots := findRootsWithZeroConfirmedKnownAssets(
 		roots,
-		activeAssets,
-		unconfirmedActive,
+		preWalkAssets,
+		obs,
+		confirmedInPlace,
 		proposedMoves,
 		modifies,
+		samePathRestores,
 		markMissing,
 	)
 
@@ -291,10 +293,12 @@ func planReconciliation(
 
 func findRootsWithZeroConfirmedKnownAssets(
 	roots []RootScanResult,
-	activeAssets []domain.MediaAsset,
-	unconfirmedActive []domain.MediaAsset,
+	preWalkAssets []domain.MediaAsset,
+	obs *libraryWalkObservations,
+	confirmedInPlace map[string]struct{},
 	proposedMoves map[string]plannedMove,
 	modifies []plannedModify,
+	samePathRestores []plannedRestore,
 	markMissing []plannedAssetTransition,
 ) map[string]struct{} {
 	if len(markMissing) == 0 {
@@ -305,24 +309,32 @@ func findRootsWithZeroConfirmedKnownAssets(
 		missingByRoot[item.RootID]++
 	}
 
-	unconfirmedSet := make(map[string]struct{}, len(unconfirmedActive))
-	for _, asset := range unconfirmedActive {
-		unconfirmedSet[asset.ID] = struct{}{}
-	}
-
 	confirmedInRoot := make(map[string]int, len(roots))
-	for _, asset := range activeAssets {
-		if _, unconfirmed := unconfirmedSet[asset.ID]; !unconfirmed {
+	for _, asset := range preWalkAssets {
+		if _, ok := confirmedInPlace[asset.ID]; ok {
+			confirmedInRoot[asset.LibraryRootID]++
+			continue
+		}
+		loc := assetLocation{
+			rootID:       asset.LibraryRootID,
+			relPathBytes: string(asset.RelPathBytes),
+		}
+		if _, ok := obs.seenUnchanged[loc]; ok {
 			confirmedInRoot[asset.LibraryRootID]++
 		}
 	}
+	for _, r := range samePathRestores {
+		if r.RootID == r.Existing.LibraryRootID {
+			confirmedInRoot[r.RootID]++
+		}
+	}
 	for _, mod := range modifies {
-		if mod.Existing.MissingSince == nil && mod.RootID == mod.Existing.LibraryRootID {
+		if mod.RootID == mod.Existing.LibraryRootID {
 			confirmedInRoot[mod.RootID]++
 		}
 	}
 	for _, mv := range proposedMoves {
-		if mv.Asset.MissingSince == nil && mv.TargetRootID == mv.Asset.LibraryRootID {
+		if mv.TargetRootID == mv.Asset.LibraryRootID {
 			confirmedInRoot[mv.TargetRootID]++
 		}
 	}
