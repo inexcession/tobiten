@@ -137,6 +137,12 @@ func TestDocumentSyntaxCases(t *testing.T) {
 		{"inner prefix undone after rebind", `<ComicInfo xmlns:x="urn:1"><Child xmlns:x="urn:2"><y:A xmlns:y="urn:y"/></Child><y:B/></ComicInfo>`, false},
 		{"default namespace rebound and restored", `<ComicInfo><Outer xmlns="urn:1"><Inner xmlns=""><Leaf/></Inner></Outer><Title>ok</Title></ComicInfo>`, true},
 		{"reserved prefix", `<ComicInfo xmlns:xml="urn:wrong"/>`, false},
+		{"reserved xmlns URI default", `<ComicInfo><Unused xmlns="http://www.w3.org/2000/xmlns/"><Any/></Unused><Title>ok</Title></ComicInfo>`, false},
+		{"reserved xmlns URI prefixed", `<ComicInfo xmlns:x="http://www.w3.org/2000/xmlns/"><Title>ok</Title></ComicInfo>`, false},
+		{"ordinary xmlns-like URI default", `<ComicInfo><Unused xmlns="http://www.w3.org/xmlns/"><Any/></Unused><Title>ok</Title></ComicInfo>`, true},
+		{"ordinary xmlns-like URI prefixed", `<ComicInfo xmlns:x="http://www.w3.org/xmlns/"><x:extension x:key="v"/><Title>ok</Title></ComicInfo>`, true},
+		{"duplicate prefixed declaration", `<ComicInfo xmlns:x="urn:1" xmlns:x="urn:2"/>`, false},
+		{"duplicate default declaration", `<ComicInfo><Unused xmlns="urn:1" xmlns="urn:2"/></ComicInfo>`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -12,7 +12,7 @@ import (
 
 const (
 	xmlNamespace    = "http://www.w3.org/XML/1998/namespace"
-	xmlnsNamespace  = "http://www.w3.org/xmlns/"
+	xmlnsNamespace  = "http://www.w3.org/2000/xmlns/"
 	maxElementDepth = 64
 )
 
@@ -24,7 +24,6 @@ type namespaceBinding struct {
 
 type namespaceTracker struct {
 	scope    map[string]string
-	declared map[string]bool
 	bindings []namespaceBinding
 	frames   [maxElementDepth]int
 	depth    int
@@ -127,9 +126,7 @@ func (ns *namespaceTracker) popEnd(name xml.Name) error {
 }
 
 func (ns *namespaceTracker) applyDeclarations(attrs []xml.Attr) error {
-	if len(ns.declared) > 0 {
-		clear(ns.declared)
-	}
+	var declared map[string]bool
 	for _, a := range attrs {
 		prefix := ""
 		switch {
@@ -142,13 +139,12 @@ func (ns *namespaceTracker) applyDeclarations(attrs []xml.Attr) error {
 		default:
 			continue
 		}
-		if ns.declared == nil {
-			ns.declared = make(map[string]bool)
-		}
-		if ns.declared[prefix] {
+		if declared == nil {
+			declared = make(map[string]bool)
+		} else if declared[prefix] {
 			return errors.New("comicinfo: duplicate namespace declaration")
 		}
-		ns.declared[prefix] = true
+		declared[prefix] = true
 		if prefix == "xmlns" || strings.Contains(prefix, ":") || a.Value == xmlnsNamespace || (prefix != "" && a.Value == "") || (prefix == "xml" && a.Value != xmlNamespace) || (prefix != "xml" && a.Value == xmlNamespace) {
 			return errors.New("comicinfo: invalid namespace declaration")
 		}
