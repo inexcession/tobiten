@@ -1,8 +1,11 @@
 package comicinfo
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -130,6 +133,9 @@ func TestDocumentSyntaxCases(t *testing.T) {
 		{"undeclared attribute", `<ComicInfo><Extra u:a="x"/></ComicInfo>`, false},
 		{"scope ends", `<ComicInfo><Extra xmlns:x="urn:x"/><x:Extra/></ComicInfo>`, false},
 		{"prefix cleared", `<ComicInfo xmlns:x="urn:x"><Extra xmlns:x=""><x:E/></Extra></ComicInfo>`, false},
+		{"prefix rebound and restored", `<ComicInfo xmlns:x="urn:1"><Child xmlns:x="urn:2"><x:A/></Child><x:B/></ComicInfo>`, true},
+		{"inner prefix undone after rebind", `<ComicInfo xmlns:x="urn:1"><Child xmlns:x="urn:2"><y:A xmlns:y="urn:y"/></Child><y:B/></ComicInfo>`, false},
+		{"default namespace rebound and restored", `<ComicInfo><Outer xmlns="urn:1"><Inner xmlns=""><Leaf/></Inner></Outer><Title>ok</Title></ComicInfo>`, true},
 		{"reserved prefix", `<ComicInfo xmlns:xml="urn:wrong"/>`, false},
 	}
 	for _, tc := range cases {
@@ -230,5 +236,93 @@ func TestCharactersAndProcessingInstructions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParse_DepthLimitBoundary(t *testing.T) {
+	makeNested := func(depth int) string {
+		var b strings.Builder
+		b.WriteString("<ComicInfo>")
+		for i := range depth - 1 {
+			fmt.Fprintf(&b, "<e%d>", i)
+		}
+		b.WriteString("text")
+		for i := depth - 2; i >= 0; i-- {
+			fmt.Fprintf(&b, "</e%d>", i)
+		}
+		b.WriteString("</ComicInfo>")
+		return b.String()
+	}
+
+	docAtLimit := makeNested(64)
+	docOverLimit := makeNested(65)
+	for _, mode := range []Mode{Strict, Lenient} {
+		if _, diags, err := parse(t, docAtLimit, mode); err != nil || len(diags) != 0 {
+			t.Fatalf("depth 64 mode %v: diags=%v err=%v", mode, diags, err)
+		}
+		got, diags, err := parse(t, docOverLimit, mode)
+		if err == nil || !reflect.DeepEqual(got, Metadata{}) || diags != nil {
+			t.Fatalf("depth 65 mode %v: expected error and empty result, got metadata=%+v diags=%v err=%v", mode, got, diags, err)
+		}
+	}
+}
+
+func TestParse_DeepNamespaceNestingIsBounded(t *testing.T) {
+	const nestingDepth = 4000
+	var b strings.Builder
+	b.WriteString("<ComicInfo>")
+	for i := range nestingDepth {
+		fmt.Fprintf(&b, `<n%d:e xmlns:n%d="urn:%d">`, i, i, i)
+	}
+	for i := nestingDepth - 1; i >= 0; i-- {
+		fmt.Fprintf(&b, `</n%d:e>`, i)
+	}
+	b.WriteString("</ComicInfo>")
+	doc := []byte(b.String())
+
+	for _, mode := range []Mode{Strict, Lenient} {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		got, diags, err := Parse(bytes.NewReader(doc), mode)
+		runtime.ReadMemStats(&after)
+
+		if err == nil || !reflect.DeepEqual(got, Metadata{}) || diags != nil {
+			t.Fatalf("mode %v: expected error and empty result, got metadata=%+v diags=%v err=%v", mode, got, diags, err)
+		}
+		allocBytes := after.TotalAlloc - before.TotalAlloc
+		const maxAlloc = 8 * 1024 * 1024
+		if allocBytes >= maxAlloc {
+			t.Fatalf("mode %v: allocated %d bytes, want < %d bytes", mode, allocBytes, maxAlloc)
+		}
+	}
+}
+
+func TestParse_FragmentedTextIsLinear(t *testing.T) {
+	const fragments = 80000
+	var b strings.Builder
+	b.WriteString("<ComicInfo><Summary>")
+	for range fragments {
+		b.WriteString("x<!---->")
+	}
+	b.WriteString("</Summary></ComicInfo>")
+	doc := []byte(b.String())
+	wantSummary := strings.Repeat("x", fragments)
+
+	for _, mode := range []Mode{Strict, Lenient} {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		got, diags, err := Parse(bytes.NewReader(doc), mode)
+		runtime.ReadMemStats(&after)
+
+		if err != nil || len(diags) != 0 || got.Summary != wantSummary {
+			t.Fatalf("mode %v: parse failed: len(summary)=%d diags=%v err=%v", mode, len(got.Summary), diags, err)
+		}
+		allocBytes := after.TotalAlloc - before.TotalAlloc
+		const maxAlloc = 16 * 1024 * 1024
+		if allocBytes >= maxAlloc {
+			t.Fatalf("mode %v: allocated %d bytes, want < %d bytes", mode, allocBytes, maxAlloc)
+		}
 	}
 }

@@ -10,8 +10,31 @@ import (
 	"unicode/utf8"
 )
 
-const xmlNamespace = "http://www.w3.org/XML/1998/namespace"
-const xmlnsNamespace = "http://www.w3.org/2000/xmlns/"
+const (
+	xmlNamespace    = "http://www.w3.org/XML/1998/namespace"
+	xmlnsNamespace  = "http://www.w3.org/xmlns/"
+	maxElementDepth = 64
+)
+
+type namespaceBinding struct {
+	prefix string
+	prev   string
+	had    bool
+}
+
+type namespaceTracker struct {
+	scope    map[string]string
+	declared map[string]bool
+	bindings []namespaceBinding
+	frames   [maxElementDepth]int
+	depth    int
+}
+
+func newNamespaceTracker() *namespaceTracker {
+	return &namespaceTracker{
+		scope: map[string]string{"xml": xmlNamespace},
+	}
+}
 
 // RawToken preserves prefixes and the source offsets lost by Token. Check XML
 // characters, processing instructions, character references, namespace scope,
@@ -21,8 +44,7 @@ func validateDocumentSyntax(data []byte) error {
 		return err
 	}
 	d := xml.NewDecoder(bytes.NewReader(data))
-	scopes := []map[string]string{{"xml": xmlNamespace}}
-	depth := 0
+	ns := newNamespaceTracker()
 	for {
 		start := d.InputOffset()
 		tok, err := d.RawToken()
@@ -34,7 +56,7 @@ func validateDocumentSyntax(data []byte) error {
 		}
 		switch t := tok.(type) {
 		case xml.CharData:
-			if err := validateCharData(data[start:d.InputOffset()], depth); err != nil {
+			if err := validateCharData(data[start:d.InputOffset()], ns.depth); err != nil {
 				return err
 			}
 		case xml.ProcInst:
@@ -42,75 +64,99 @@ func validateDocumentSyntax(data []byte) error {
 				return err
 			}
 		case xml.StartElement:
+			if ns.depth >= maxElementDepth {
+				return errors.New("comicinfo: element nesting depth exceeded")
+			}
 			if err := validateStartTag(data[start:d.InputOffset()]); err != nil {
 				return err
 			}
-			scope, err := validateStart(t, scopes[len(scopes)-1])
-			if err != nil {
+			if err := ns.pushStart(t); err != nil {
 				return err
 			}
-			scopes = append(scopes, scope)
-			depth++
 		case xml.EndElement:
-			if depth == 0 {
-				return errors.New("comicinfo: unexpected end")
-			}
-			if err := checkPrefix(t.Name, scopes[len(scopes)-1]); err != nil {
+			if err := ns.popEnd(t.Name); err != nil {
 				return err
 			}
-			scopes = scopes[:len(scopes)-1]
-			depth--
 		}
 	}
 }
 
-func validateStart(t xml.StartElement, parent map[string]string) (map[string]string, error) {
-	scope, err := namespaceScope(parent, t.Attr)
-	if err != nil {
-		return nil, err
+func (ns *namespaceTracker) pushStart(t xml.StartElement) error {
+	if ns.depth >= maxElementDepth {
+		return errors.New("comicinfo: element nesting depth exceeded")
 	}
-	if err := checkPrefix(t.Name, scope); err != nil {
-		return nil, err
+	frameStart := len(ns.bindings)
+	if err := ns.applyDeclarations(t.Attr); err != nil {
+		return err
+	}
+	if err := checkPrefix(t.Name, ns.scope); err != nil {
+		return err
 	}
 	for _, a := range t.Attr {
 		if a.Name.Space == "xmlns" || (a.Name.Space == "" && a.Name.Local == "xmlns") {
 			continue
 		}
-		if err := checkPrefix(a.Name, scope); err != nil {
-			return nil, err
+		if err := checkPrefix(a.Name, ns.scope); err != nil {
+			return err
 		}
 	}
-	return scope, nil
+	ns.frames[ns.depth] = frameStart
+	ns.depth++
+	return nil
 }
 
-func namespaceScope(parent map[string]string, attrs []xml.Attr) (map[string]string, error) {
-	scope := make(map[string]string, len(parent))
-	for k, v := range parent {
-		scope[k] = v
+func (ns *namespaceTracker) popEnd(name xml.Name) error {
+	if ns.depth == 0 {
+		return errors.New("comicinfo: unexpected end")
 	}
-	declared := make(map[string]bool)
+	if err := checkPrefix(name, ns.scope); err != nil {
+		return err
+	}
+	ns.depth--
+	frameStart := ns.frames[ns.depth]
+	for i := len(ns.bindings) - 1; i >= frameStart; i-- {
+		b := ns.bindings[i]
+		if b.had {
+			ns.scope[b.prefix] = b.prev
+		} else {
+			delete(ns.scope, b.prefix)
+		}
+	}
+	ns.bindings = ns.bindings[:frameStart]
+	return nil
+}
+
+func (ns *namespaceTracker) applyDeclarations(attrs []xml.Attr) error {
+	if len(ns.declared) > 0 {
+		clear(ns.declared)
+	}
 	for _, a := range attrs {
 		prefix := ""
 		switch {
 		case a.Name.Space == "xmlns":
 			prefix = a.Name.Local
 			if !validNCName(prefix) {
-				return nil, errors.New("comicinfo: invalid namespace prefix")
+				return errors.New("comicinfo: invalid namespace prefix")
 			}
 		case a.Name.Space == "" && a.Name.Local == "xmlns":
 		default:
 			continue
 		}
-		if declared[prefix] {
-			return nil, errors.New("comicinfo: duplicate namespace declaration")
+		if ns.declared == nil {
+			ns.declared = make(map[string]bool)
 		}
-		declared[prefix] = true
+		if ns.declared[prefix] {
+			return errors.New("comicinfo: duplicate namespace declaration")
+		}
+		ns.declared[prefix] = true
 		if prefix == "xmlns" || strings.Contains(prefix, ":") || a.Value == xmlnsNamespace || (prefix != "" && a.Value == "") || (prefix == "xml" && a.Value != xmlNamespace) || (prefix != "xml" && a.Value == xmlNamespace) {
-			return nil, errors.New("comicinfo: invalid namespace declaration")
+			return errors.New("comicinfo: invalid namespace declaration")
 		}
-		scope[prefix] = a.Value
+		prev, had := ns.scope[prefix]
+		ns.bindings = append(ns.bindings, namespaceBinding{prefix: prefix, prev: prev, had: had})
+		ns.scope[prefix] = a.Value
 	}
-	return scope, nil
+	return nil
 }
 
 func checkPrefix(name xml.Name, scope map[string]string) error {

@@ -37,7 +37,7 @@ type Diagnostic struct{ Field, Reason string }
 type element struct {
 	name     xml.Name
 	attrs    []xml.Attr
-	text     string
+	text     strings.Builder
 	children []*element
 }
 
@@ -142,11 +142,11 @@ func (b *documentBuilder) add(tok xml.Token, start int64) error {
 		b.stack = b.stack[:len(b.stack)-1]
 	case xml.CharData:
 		if len(b.stack) == 0 {
-			if strings.Trim(string(t), " \t\r\n") != "" {
+			if len(bytes.Trim(t, " \t\r\n")) != 0 {
 				return errors.New("comicinfo: content outside root")
 			}
 		} else {
-			b.stack[len(b.stack)-1].text += string(t)
+			b.stack[len(b.stack)-1].text.Write(t)
 		}
 	}
 	return nil
@@ -221,7 +221,7 @@ func (p *parser) field(n *element) {
 		p.problem(name, "expected text")
 		return
 	}
-	value := strings.TrimSpace(n.text)
+	value := strings.TrimSpace(n.text.String())
 	if value == "" {
 		return
 	}

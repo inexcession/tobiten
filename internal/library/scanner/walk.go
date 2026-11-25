@@ -26,7 +26,7 @@ import (
 // inspections within one root scan when Workers is zero (ADR-0003 §3, M1B-D2).
 const DefaultInspectionWorkers = 2
 
-const maxComicInfoBytes = 16 * 1024 * 1024
+const maxComicInfoBytes = 1 * 1024 * 1024
 
 var (
 	// ErrInvalidWorkerCount is returned when WalkOptions.Workers is negative.

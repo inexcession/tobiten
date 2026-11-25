@@ -458,6 +458,69 @@ func TestWalkRoot_CBZAndComicInfoInspectionFields(t *testing.T) {
 	}
 }
 
+func TestWalkRoot_OversizedComicInfoSkippedAndFileInspected(t *testing.T) {
+	const oneMiB = 1 * 1024 * 1024
+	buildSizedComicInfo := func(series string, totalBytes int) []byte {
+		prefix := `<ComicInfo><Series>` + series + `</Series><Summary>`
+		suffix := `</Summary></ComicInfo>`
+		padLen := totalBytes - len(prefix) - len(suffix)
+		if padLen < 0 {
+			t.Fatalf("totalBytes %d too small for envelope", totalBytes)
+		}
+		var b bytes.Buffer
+		b.Grow(totalBytes)
+		b.WriteString(prefix)
+		b.Write(bytes.Repeat([]byte{'a'}, padLen))
+		b.WriteString(suffix)
+		return b.Bytes()
+	}
+
+	root := t.TempDir()
+	overLimitCBZ := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: buildSizedComicInfo("OverLimit", oneMiB+1), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("page1"), method: zip.Store},
+		zipEntry{name: "002.jpg", data: []byte("page2"), method: zip.Store},
+	)
+	atLimitCBZ := buildDeterministicZip(t, "",
+		zipEntry{name: "ComicInfo.xml", data: buildSizedComicInfo("AtLimit", oneMiB), method: zip.Deflate},
+		zipEntry{name: "001.jpg", data: []byte("page1"), method: zip.Store},
+	)
+
+	writeDiskFile(t, filepath.Join(root, "oversized.cbz"), overLimitCBZ)
+	writeDiskFile(t, filepath.Join(root, "at_limit.cbz"), atLimitCBZ)
+
+	res, err := scanner.WalkRoot(context.Background(), []byte(root), scanner.WalkOptions{})
+	if err != nil || !res.Complete {
+		t.Fatalf("WalkRoot = (%+v, %v)", res, err)
+	}
+	if res.SkippedCount != 0 || res.InspectedCount != 2 {
+		t.Fatalf("unexpected counts: inspected=%d skipped=%d (%+v)", res.InspectedCount, res.SkippedCount, res.Skipped)
+	}
+
+	byPath := inspectedMap(res)
+	oversized, ok := byPath["oversized.cbz"]
+	if !ok {
+		t.Fatalf("oversized.cbz missing from inspected files: %+v", byPath)
+	}
+	if oversized.PageCount != 2 || oversized.CoverPageIndex != 0 || len(oversized.SuppressedPages) != 0 {
+		t.Fatalf("oversized.cbz pages unexpected: %+v", oversized)
+	}
+	if oversized.ComicInfo != nil || len(oversized.ComicInfoDiagnostics) != 0 {
+		t.Fatalf("oversized.cbz unexpectedly populated ComicInfo: meta=%+v diags=%+v", oversized.ComicInfo, oversized.ComicInfoDiagnostics)
+	}
+	if oversized.ComicInfoErr == nil || oversized.ComicInfoErr.Error() != "comicinfo: XML exceeds 1048576 bytes" {
+		t.Fatalf("oversized.cbz ComicInfoErr = %v, want comicinfo: XML exceeds 1048576 bytes", oversized.ComicInfoErr)
+	}
+
+	atLimit, ok := byPath["at_limit.cbz"]
+	if !ok {
+		t.Fatalf("at_limit.cbz missing from inspected files: %+v", byPath)
+	}
+	if atLimit.PageCount != 1 || atLimit.ComicInfoErr != nil || atLimit.ComicInfo == nil || atLimit.ComicInfo.Series != "AtLimit" {
+		t.Fatalf("at_limit.cbz unexpected result: %+v (err=%v)", atLimit, atLimit.ComicInfoErr)
+	}
+}
+
 func TestWalkRoot_SkipsHiddenTempNonCBZCorruptAndUnreadableEntries(t *testing.T) {
 	root := t.TempDir()
 	goodCBZ := buildDeterministicZip(t, "", zipEntry{name: "001.jpg", data: []byte("good"), method: zip.Store})
