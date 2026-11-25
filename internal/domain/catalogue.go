@@ -368,12 +368,15 @@ type Volume struct {
 	ReleaseDate        *time.Time          `json:"release_date,omitempty"`
 	PageCount          int                 `json:"page_count"`
 	PreferredAssetID   *string             `json:"preferred_asset_id,omitempty"`
-	ExternalIDs        map[string]any      `json:"external_ids"`
-	LockedFields       FieldLocks          `json:"locked_fields"`
-	Memberships        []SeriesMembership  `json:"memberships,omitempty"`
-	Assets             []MediaAsset        `json:"assets,omitempty"`
-	CreatedAt          time.Time           `json:"created_at"`
-	UpdatedAt          time.Time           `json:"updated_at"`
+	// LocatorAssetID holds the requesting user's reading-progress locator asset ID
+	// populated by read queries for ADR-0018 S5 preference resolution; never serialized.
+	LocatorAssetID string             `json:"-"`
+	ExternalIDs    map[string]any     `json:"external_ids"`
+	LockedFields   FieldLocks         `json:"locked_fields"`
+	Memberships    []SeriesMembership `json:"memberships,omitempty"`
+	Assets         []MediaAsset       `json:"assets,omitempty"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
 }
 
 // Validate checks Volume invariants aligned with the database schema and ADR-0008.

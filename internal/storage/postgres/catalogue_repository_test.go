@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/inexcession/tobiten/internal/app"
 	"github.com/inexcession/tobiten/internal/domain"
 	"github.com/inexcession/tobiten/internal/storage"
 	"github.com/inexcession/tobiten/internal/storage/postgres"
@@ -1687,4 +1688,167 @@ func TestCatalogueRepository_SeriesCoverKeysetContinuationWithNullsAndDeletes(t 
 	if !slices.Equal(remaining, wantRemaining) {
 		t.Fatalf("remaining after snapshot delete = %v, want %v", remaining, wantRemaining)
 	}
+}
+
+func TestCatalogueRepository_AssetPreferenceAndPageCountAgreement(t *testing.T) {
+	ctx := context.Background()
+	cat := setupSeededCatalogue(t)
+	tx := postgres.NewTransactor(cat.tdb.Pool)
+	repo := postgres.NewCatalogueRepository(cat.tdb.Pool)
+
+	mustSetUserPolicies(ctx, t, cat, cat.readerUser.ID, []domain.UserLabelPolicy{
+		{UserID: cat.readerUser.ID, LabelID: cat.lblNSFW, Effect: domain.PolicyEffectRestrict},
+	})
+	reader := domain.NewPrincipal(*cat.readerUser, []domain.Role{cat.readerRole}, domain.CredentialKindPassword, "c-reader", nil)
+	admin := domain.NewPrincipal(*cat.adminUser, []domain.Role{cat.adminRole}, domain.CredentialKindPassword, "c-admin", nil)
+	readerScope := storage.CatalogueReadScope{Principal: reader}
+	adminScope := storage.CatalogueReadScope{Principal: admin}
+
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
+	const (
+		serID    = "ser-pref-agree"
+		volID    = "vol-pref-agree"
+		oldAsset = "a-pref-old"
+		newAsset = "a-pref-new"
+	)
+
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		ser := domain.Series{
+			ID: serID, LibraryID: cat.libraryID, Title: "Pref Agree", TitleSort: "pref agree",
+			Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: t0, UpdatedAt: t0,
+		}
+		if err := st.CatalogueWrites().CreateSeries(ctx, &ser); err != nil {
+			return err
+		}
+		vol := domain.Volume{
+			ID: volID, LibraryID: cat.libraryID, Kind: domain.VolumeKindVolume,
+			PageCount: 18, CreatedAt: t0, UpdatedAt: t0,
+		}
+		if err := st.CatalogueWrites().CreateVolume(ctx, &vol); err != nil {
+			return err
+		}
+		if err := st.SeriesMemberships().SetVolumeMemberships(ctx, volID, []domain.SeriesMembership{{
+			VolumeID: volID, SeriesID: serID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+			Source: domain.MembershipSourceManual,
+		}}); err != nil {
+			return err
+		}
+		for _, a := range []domain.MediaAsset{
+			{
+				ID: oldAsset, VolumeID: volID, LibraryRootID: cat.rootID,
+				RelPathBytes: []byte("pref-old.cbz"), RelPathDisplay: "pref-old.cbz", RelPathMatch: "pref-old.cbz",
+				FileSize: 128, Format: domain.MediaFormatCBZ, PageCount: 18, CreatedAt: t0, UpdatedAt: t0,
+			},
+			{
+				ID: newAsset, VolumeID: volID, LibraryRootID: cat.rootID,
+				RelPathBytes: []byte("pref-new.cbz"), RelPathDisplay: "pref-new.cbz", RelPathMatch: "pref-new.cbz",
+				FileSize: 256, Format: domain.MediaFormatCBZ, PageCount: 42, CreatedAt: t1, UpdatedAt: t1,
+			},
+		} {
+			asset := a
+			if err := st.CatalogueWrites().CreateAsset(ctx, &asset); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed preference agreement volume: %v", err)
+	}
+
+	if _, err := cat.tdb.Exec(ctx, `
+		INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
+		VALUES ($1, $2, jsonb_build_object('type', 'page', 'page', 3, 'page_count', 42, 'asset_id', $3::text), 0.1, 'REST', FALSE)`,
+		cat.readerUser.ID, volID, newAsset,
+	); err != nil {
+		t.Fatalf("seed reading_progress on newer variant: %v", err)
+	}
+
+	assertAgreement := func(t *testing.T, label string, scope storage.CatalogueReadScope, wantAssetID string, wantPageCount int, wantRanked []string, wantLocatorID string) {
+		t.Helper()
+
+		gotVol, err := repo.GetVolumeByID(ctx, scope, volID)
+		if err != nil {
+			t.Fatalf("%s GetVolumeByID: %v", label, err)
+		}
+		if gotVol.LocatorAssetID != wantLocatorID {
+			t.Fatalf("%s GetVolumeByID LocatorAssetID = %q, want %q", label, gotVol.LocatorAssetID, wantLocatorID)
+		}
+		if gotVol.PageCount != wantPageCount {
+			t.Fatalf("%s GetVolumeByID domain PageCount = %d, want %d", label, gotVol.PageCount, wantPageCount)
+		}
+		if dto := app.VolumeFromDomain(*gotVol); dto.PageCount != wantPageCount {
+			t.Fatalf("%s GetVolumeByID VolumeFromDomain PageCount = %d, want %d", label, dto.PageCount, wantPageCount)
+		}
+
+		paged, err := repo.ListVolumesPaged(ctx, scope, storage.VolumeReadFilter{SeriesID: serID})
+		if err != nil {
+			t.Fatalf("%s ListVolumesPaged: %v", label, err)
+		}
+		if len(paged.Items) != 1 || paged.Items[0].ID != volID {
+			t.Fatalf("%s ListVolumesPaged items = %+v, want [%s]", label, paged.Items, volID)
+		}
+		if paged.Items[0].LocatorAssetID != wantLocatorID {
+			t.Fatalf("%s ListVolumesPaged LocatorAssetID = %q, want %q", label, paged.Items[0].LocatorAssetID, wantLocatorID)
+		}
+		if paged.Items[0].PageCount != wantPageCount {
+			t.Fatalf("%s ListVolumesPaged domain PageCount = %d, want %d", label, paged.Items[0].PageCount, wantPageCount)
+		}
+		if dto := app.VolumeFromDomain(paged.Items[0]); dto.PageCount != wantPageCount {
+			t.Fatalf("%s ListVolumesPaged VolumeFromDomain PageCount = %d, want %d", label, dto.PageCount, wantPageCount)
+		}
+
+		listed, err := repo.ListVolumes(ctx, scope, storage.VolumeReadFilter{SeriesID: serID})
+		if err != nil {
+			t.Fatalf("%s ListVolumes: %v", label, err)
+		}
+		if len(listed) != 1 || listed[0].PageCount != wantPageCount || app.VolumeFromDomain(listed[0]).PageCount != wantPageCount {
+			t.Fatalf("%s ListVolumes unexpected page counts: %+v", label, listed)
+		}
+
+		files, err := repo.ListAuthorizedVolumeAssetFiles(ctx, scope, volID)
+		if err != nil {
+			t.Fatalf("%s ListAuthorizedVolumeAssetFiles: %v", label, err)
+		}
+		gotRanked := make([]string, len(files))
+		for i, f := range files {
+			gotRanked[i] = f.AssetID
+		}
+		if !slices.Equal(gotRanked, wantRanked) {
+			t.Fatalf("%s ListAuthorizedVolumeAssetFiles = %v, want %v", label, gotRanked, wantRanked)
+		}
+
+		pref, err := repo.SelectPreferredAssetFileForVolume(ctx, scope, volID)
+		if err != nil {
+			t.Fatalf("%s SelectPreferredAssetFileForVolume: %v", label, err)
+		}
+		if pref.AssetID != wantAssetID || pref.PageCount != wantPageCount {
+			t.Fatalf("%s SelectPreferredAssetFileForVolume = (%s, %d), want (%s, %d)",
+				label, pref.AssetID, pref.PageCount, wantAssetID, wantPageCount)
+		}
+	}
+
+	// 1. Both variants permitted, locator on newer variant: everything agrees on newAsset (42 pages).
+	assertAgreement(t, "locator on newer permitted variant", readerScope, newAsset, 42, []string{newAsset, oldAsset}, newAsset)
+
+	// 2. Restrict the locator asset for reader: falls back to oldest permitted variant (oldAsset, 18 pages),
+	//    while admin (without RESTRICT nsfw, with own locator on newAsset) still selects newAsset.
+	cat.mustAssignRawLabel(ctx, t, cat.lblNSFW, domain.ItemTypeAsset, newAsset)
+	if _, err := cat.tdb.Exec(ctx, `
+		INSERT INTO reading_progress (user_id, volume_id, locator, total_progression, source, completed)
+		VALUES ($1, $2, jsonb_build_object('type', 'page', 'page', 7, 'page_count', 42, 'asset_id', $3::text), 0.2, 'REST', FALSE)`,
+		cat.adminUser.ID, volID, newAsset,
+	); err != nil {
+		t.Fatalf("seed admin reading_progress on newer variant: %v", err)
+	}
+
+	assertAgreement(t, "restricted locator asset falls back to oldest permitted", readerScope, oldAsset, 18, []string{oldAsset}, "")
+	assertAgreement(t, "admin still resolves unrestricted locator asset", adminScope, newAsset, 42, []string{newAsset, oldAsset}, newAsset)
+
+	// 3. Explicit preferred_asset_id overrides admin's locator on newAsset; if preferred_asset_id is restricted
+	//    for reader while locator is permitted, reader falls back to locator (and here both are oldAsset/newAsset).
+	if _, err := cat.tdb.Exec(ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, oldAsset, volID); err != nil {
+		t.Fatalf("set preferred_asset_id = oldAsset: %v", err)
+	}
+	assertAgreement(t, "explicit preferred_asset_id overrides locator for admin", adminScope, oldAsset, 18, []string{oldAsset, newAsset}, newAsset)
 }

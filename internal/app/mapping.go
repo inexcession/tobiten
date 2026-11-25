@@ -132,7 +132,7 @@ func VolumeFromDomain(v domain.Volume) Volume {
 	}
 
 	pageCount := 0
-	if chosen, ok := v.SelectPreferredAsset("", func(a domain.MediaAsset) bool {
+	if chosen, ok := v.SelectPreferredAsset(v.LocatorAssetID, func(a domain.MediaAsset) bool {
 		return a.IsAvailable()
 	}); ok && chosen != nil {
 		pageCount = chosen.PageCount

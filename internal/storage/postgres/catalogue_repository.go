@@ -73,17 +73,6 @@ const (
 		       rp.device, rp.source, rp.completed, rp.updated_at
 		FROM reading_progress rp`
 
-	selectAuthorizedAssetCandidatesColumns = `
-		SELECT a.id, a.volume_id, r.library_id, a.library_root_id,
-		       r.path_bytes, r.path_display, r.state,
-		       a.rel_path_bytes, a.rel_path_display, a.rel_path_match,
-		       a.file_size, a.file_mtime, a.format, COALESCE(d.kind, ''), COALESCE(d.value, ''),
-		       a.page_count, a.cover_page_index, a.suppressed_pages, a.diagnostics,
-		       a.missing_since, a.retired_at, a.created_at, a.updated_at
-		FROM media_assets a
-		JOIN library_roots r ON r.id = a.library_root_id
-		LEFT JOIN asset_digests d ON d.asset_id = a.id AND d.kind = 'XXH3_64_PARTIAL' AND d.is_current = TRUE`
-
 	selectSeriesMembershipColumns = `
 		SELECT sm.volume_id, sm.series_id, sm.is_primary, sm.kind, sm.position,
 		       sm.source, sm.locked_fields
@@ -528,7 +517,8 @@ func (r *CatalogueRepository) CountSeries(ctx context.Context, scope storage.Cat
 }
 
 // GetVolumeByID retrieves a single volume if visible under the principal's label predicate,
-// populating its authorized Memberships and Assets and clearing PreferredAssetID when unauthorized.
+// populating its authorized Memberships, available Assets, authorized LocatorAssetID, and
+// resolved PageCount while clearing PreferredAssetID when unauthorized.
 func (r *CatalogueRepository) GetVolumeByID(ctx context.Context, scope storage.CatalogueReadScope, id string) (*domain.Volume, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -539,7 +529,7 @@ func (r *CatalogueRepository) GetVolumeByID(ctx context.Context, scope storage.C
 		return nil, err
 	}
 	vols := []domain.Volume{*vol}
-	if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, vols); err != nil {
+	if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), vols); err != nil {
 		return nil, err
 	}
 	return &vols[0], nil
@@ -555,7 +545,8 @@ func (r *CatalogueRepository) getVolumeWithPredicate(ctx context.Context, pred *
 }
 
 // ListVolumes returns volumes visible under the principal's label predicate matching filter,
-// populating each volume's authorized Memberships and Assets and clearing PreferredAssetID when unauthorized.
+// populating each volume's authorized Memberships, available Assets, authorized LocatorAssetID,
+// and resolved PageCount while clearing PreferredAssetID when unauthorized.
 func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter) ([]domain.Volume, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -571,7 +562,7 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 		return nil, err
 	}
 	if len(out) > 0 {
-		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, out); err != nil {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), out); err != nil {
 			return nil, err
 		}
 	}
@@ -579,8 +570,8 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 }
 
 // ListVolumesPaged returns one server-paginated slice of visible volumes together with
-// total_count computed in one guarded snapshot statement, populating authorized Memberships
-// and Assets and capping page size at MaxCataloguePageLimit.
+// total_count computed in one guarded snapshot statement, populating authorized Memberships,
+// available Assets, authorized LocatorAssetID, and resolved PageCount while capping page size at MaxCataloguePageLimit.
 func (r *CatalogueRepository) ListVolumesPaged(ctx context.Context, scope storage.CatalogueReadScope, filter storage.VolumeReadFilter) (*storage.VolumePageResult, error) {
 	pred, err := r.loadPredicate(ctx, scope)
 	if err != nil {
@@ -608,7 +599,7 @@ func (r *CatalogueRepository) ListVolumesPaged(ctx context.Context, scope storag
 		return nil, err
 	}
 	if len(out) > 0 {
-		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, out); err != nil {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), out); err != nil {
 			return nil, err
 		}
 	}
@@ -633,7 +624,7 @@ func normalizeCataloguePageFilter(limit, offset int) (int, error) {
 	return limit, nil
 }
 
-func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, volumes []domain.Volume) error {
+func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, userID string, volumes []domain.Volume) error {
 	if len(volumes) == 0 {
 		return nil
 	}
@@ -650,6 +641,10 @@ func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx contex
 	if err != nil {
 		return err
 	}
+	locatorByVol, err := r.listLocatorAssetIDsByVolumeIDsWithPredicate(ctx, pred, userID, volumeIDs)
+	if err != nil {
+		return err
+	}
 
 	for i := range volumes {
 		v := &volumes[i]
@@ -663,6 +658,18 @@ func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx contex
 		}
 		if v.PreferredAssetID != nil && !hasAuthorizedAssetID(v.Assets, *v.PreferredAssetID) {
 			v.PreferredAssetID = nil
+		}
+		if locID := locatorByVol[v.ID]; locID != "" && hasAuthorizedAssetID(v.Assets, locID) {
+			v.LocatorAssetID = locID
+		} else {
+			v.LocatorAssetID = ""
+		}
+		if chosen, ok := v.SelectPreferredAsset(v.LocatorAssetID, func(a domain.MediaAsset) bool {
+			return a.IsAvailable()
+		}); ok && chosen != nil {
+			v.PageCount = chosen.PageCount
+		} else {
+			v.PageCount = 0
 		}
 	}
 	return nil
@@ -713,8 +720,23 @@ func (r *CatalogueRepository) listAuthorizedAssetsByVolumeIDs(
 	pred *LabelPredicate,
 	volumeIDs []string,
 ) (map[string][]domain.MediaAsset, error) {
-	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
-		selectFrom: selectAssetColumns,
+	return listAuthorizedAssetItemsByVolumeIDs(
+		ctx, &r.guard, pred, selectAssetColumns, volumeIDs, scanAssetRow,
+		func(a *domain.MediaAsset) string { return a.VolumeID },
+	)
+}
+
+func listAuthorizedAssetItemsByVolumeIDs[T any](
+	ctx context.Context,
+	guard *guardedCatalogueDB,
+	pred *LabelPredicate,
+	selectFrom string,
+	volumeIDs []string,
+	scan func(pgx.Row) (*T, error),
+	volumeIDOf func(*T) string,
+) (map[string][]T, error) {
+	rows, err := guard.query(ctx, pred, guardedQuerySpec{
+		selectFrom: selectFrom,
 		whereParts: []string{"a.volume_id = ANY($1::text[])", "a.missing_since IS NULL", "a.retired_at IS NULL"},
 		args:       []any{volumeIDs},
 		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
@@ -725,13 +747,14 @@ func (r *CatalogueRepository) listAuthorizedAssetsByVolumeIDs(
 	}
 	defer rows.Close()
 
-	byVol := make(map[string][]domain.MediaAsset, len(volumeIDs))
+	byVol := make(map[string][]T, len(volumeIDs))
 	for rows.Next() {
-		item, err := scanAssetRow(rows)
+		item, err := scan(rows)
 		if err != nil {
 			return nil, err
 		}
-		byVol[item.VolumeID] = append(byVol[item.VolumeID], *item)
+		vid := volumeIDOf(item)
+		byVol[vid] = append(byVol[vid], *item)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, mapPgError(err)
@@ -804,45 +827,15 @@ func (r *CatalogueRepository) GetAuthorizedAssetFile(ctx context.Context, scope 
 // strictly constrained by the principal's label predicate. Trashed items (marked_for_deletion) are always
 // excluded from preferred readable selection even when scope.IncludeTrashed is set on an admin trash view.
 func (r *CatalogueRepository) SelectPreferredAssetFileForVolume(ctx context.Context, scope storage.CatalogueReadScope, volumeID string) (*storage.AuthorizedAssetFile, error) {
-	readableScope := scope
-	readableScope.IncludeTrashed = false
-	pred, err := r.loadPredicate(ctx, readableScope)
+	files, err := r.ListAuthorizedVolumeAssetFiles(ctx, scope, volumeID)
 	if err != nil {
 		return nil, err
 	}
-	vol, err := r.getVolumeWithPredicate(ctx, pred, volumeID)
-	if err != nil {
-		return nil, err
-	}
-	candidates, filesByID, err := r.listAuthorizedAssetCandidatesWithPredicate(ctx, pred, volumeID)
-	if err != nil {
-		return nil, err
-	}
-	if len(candidates) == 0 {
+	if len(files) == 0 {
 		return nil, storage.ErrNotFound
 	}
-
-	locatorAssetID := ""
-	if userID := principalUserID(scope); userID != "" {
-		prog, err := r.getReadingProgressWithPredicate(ctx, pred, userID, volumeID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
-		if err == nil && prog != nil {
-			locatorAssetID = prog.Locator.AssetID
-		}
-	}
-
-	vol.Assets = candidates
-	chosen, ok := vol.SelectPreferredAsset(locatorAssetID, func(a domain.MediaAsset) bool {
-		_, permitted := filesByID[a.ID]
-		return permitted
-	})
-	if !ok || chosen == nil {
-		return nil, storage.ErrNotFound
-	}
-	file := filesByID[chosen.ID]
-	return &file, nil
+	chosen := files[0]
+	return &chosen, nil
 }
 
 // ListAuthorizedVolumeAssetFiles resolves all visible, available, non-trashed asset file
@@ -1075,30 +1068,10 @@ func (r *CatalogueRepository) listAuthorizedAssetCandidatesByVolumeIDsWithPredic
 	pred *LabelPredicate,
 	volumeIDs []string,
 ) (map[string][]storage.AuthorizedAssetFile, error) {
-	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
-		selectFrom: selectAuthorizedAssetCandidatesColumns,
-		whereParts: []string{"a.volume_id = ANY($1::text[])", "a.missing_since IS NULL", "a.retired_at IS NULL"},
-		args:       []any{volumeIDs},
-		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
-		orderBy:    " ORDER BY a.volume_id ASC, a.created_at ASC, a.id ASC",
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	byVol := make(map[string][]storage.AuthorizedAssetFile, len(volumeIDs))
-	for rows.Next() {
-		_, file, err := scanAuthorizedAssetCandidateRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		byVol[file.VolumeID] = append(byVol[file.VolumeID], file)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, mapPgError(err)
-	}
-	return byVol, nil
+	return listAuthorizedAssetItemsByVolumeIDs(
+		ctx, &r.guard, pred, selectAuthorizedAssetFileColumns, volumeIDs, scanAuthorizedAssetFileRow,
+		func(f *storage.AuthorizedAssetFile) string { return f.VolumeID },
+	)
 }
 
 func (r *CatalogueRepository) listLocatorAssetIDsByVolumeIDsWithPredicate(
@@ -1169,39 +1142,6 @@ func rankAuthorizedVolumeAssetFiles(
 		}
 	}
 	return ranked
-}
-
-func (r *CatalogueRepository) listAuthorizedAssetCandidatesWithPredicate(
-	ctx context.Context,
-	pred *LabelPredicate,
-	volumeID string,
-) ([]domain.MediaAsset, map[string]storage.AuthorizedAssetFile, error) {
-	rows, err := r.guard.query(ctx, pred, guardedQuerySpec{
-		selectFrom: selectAuthorizedAssetCandidatesColumns,
-		whereParts: []string{"a.volume_id = $1", "a.missing_since IS NULL", "a.retired_at IS NULL"},
-		args:       []any{volumeID},
-		predicates: []predicateClause{{alias: "a", fragmentFn: (*LabelPredicate).AssetFragment}},
-		orderBy:    " ORDER BY a.created_at ASC, a.id ASC",
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
-
-	var assets []domain.MediaAsset
-	filesByID := make(map[string]storage.AuthorizedAssetFile)
-	for rows.Next() {
-		asset, file, err := scanAuthorizedAssetCandidateRow(rows)
-		if err != nil {
-			return nil, nil, err
-		}
-		assets = append(assets, asset)
-		filesByID[asset.ID] = file
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, mapPgError(err)
-	}
-	return assets, filesByID, nil
 }
 
 // GetReadingProgress retrieves the requesting user's reading progress for volumeID
@@ -1879,80 +1819,6 @@ func scanAuthorizedAssetFileRow(row pgx.Row) (*storage.AuthorizedAssetFile, erro
 	f.CoverPageIndex = int(coverPageIndex)
 	f.SuppressedPages = int32SliceToInt(suppressed)
 	return &f, nil
-}
-
-func scanAuthorizedAssetCandidateRow(row pgx.Row) (domain.MediaAsset, storage.AuthorizedAssetFile, error) {
-	var (
-		a                domain.MediaAsset
-		f                storage.AuthorizedAssetFile
-		format           string
-		digestKind       string
-		digest           string
-		pageCount        int32
-		coverPageIndex   int32
-		suppressed       []int32
-		diagnosticsBytes []byte
-	)
-	err := row.Scan(
-		&a.ID,
-		&a.VolumeID,
-		&f.LibraryID,
-		&a.LibraryRootID,
-		&f.RootPathBytes,
-		&f.RootPathDisplay,
-		&f.RootState,
-		&a.RelPathBytes,
-		&a.RelPathDisplay,
-		&a.RelPathMatch,
-		&a.FileSize,
-		&a.FileMtime,
-		&format,
-		&digestKind,
-		&digest,
-		&pageCount,
-		&coverPageIndex,
-		&suppressed,
-		&diagnosticsBytes,
-		&a.MissingSince,
-		&a.RetiredAt,
-		&a.CreatedAt,
-		&a.UpdatedAt,
-	)
-	if err != nil {
-		return domain.MediaAsset{}, storage.AuthorizedAssetFile{}, mapPgError(err)
-	}
-	a.Format = domain.MediaFormat(format)
-	a.PageCount = int(pageCount)
-	a.CoverPageIndex = int(coverPageIndex)
-	a.SuppressedPages = int32SliceToInt(suppressed)
-	a.Diagnostics, err = decodeAssetDiagnostics(diagnosticsBytes)
-	if err != nil {
-		return domain.MediaAsset{}, storage.AuthorizedAssetFile{}, fmt.Errorf("decoding asset diagnostics: %w", err)
-	}
-	if digestKind != "" && digest != "" {
-		a.Digests = []domain.AssetDigest{{
-			AssetID:   a.ID,
-			Kind:      domain.DigestKind(digestKind),
-			Value:     digest,
-			IsCurrent: true,
-		}}
-	}
-
-	f.AssetID = a.ID
-	f.VolumeID = a.VolumeID
-	f.LibraryRootID = a.LibraryRootID
-	f.RelPathBytes = a.RelPathBytes
-	f.RelPathDisplay = a.RelPathDisplay
-	f.FileSize = a.FileSize
-	f.Format = a.Format
-	f.DigestKind = domain.DigestKind(digestKind)
-	f.Digest = digest
-	f.PageCount = a.PageCount
-	f.CoverPageIndex = a.CoverPageIndex
-	f.SuppressedPages = a.SuppressedPages
-	f.MissingSince = a.MissingSince
-	f.RetiredAt = a.RetiredAt
-	return a, f, nil
 }
 
 func scanReadingProgressRow(row pgx.Row) (*domain.ReadingProgress, error) {

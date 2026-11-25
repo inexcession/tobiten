@@ -258,3 +258,52 @@ func TestReadingProgressAndJobInfoMappings(t *testing.T) {
 		t.Fatalf("JobInfoFromDomain mismatch: %+v", jobInfo)
 	}
 }
+
+func TestVolumeFromDomain_LocatorAssetPreferenceAndJSONShape(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
+	t2 := t1.Add(time.Hour)
+
+	oldest := domain.MediaAsset{ID: "asset-oldest", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("v1.cbz"), Format: domain.MediaFormatCBZ, PageCount: 18, CreatedAt: t0}
+	locator := domain.MediaAsset{ID: "asset-locator", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("v2.cbz"), Format: domain.MediaFormatCBZ, PageCount: 42, CreatedAt: t1}
+	manual := domain.MediaAsset{ID: "asset-manual", VolumeID: "vol-1", LibraryRootID: "r1", RelPathBytes: []byte("v3.cbz"), Format: domain.MediaFormatCBZ, PageCount: 55, CreatedAt: t2}
+
+	vol := domain.Volume{
+		ID:             "vol-1",
+		LibraryID:      "lib-1",
+		Kind:           domain.VolumeKindVolume,
+		PageCount:      18,
+		LocatorAssetID: locator.ID,
+		Assets:         []domain.MediaAsset{oldest, locator, manual},
+		CreatedAt:      t0,
+		UpdatedAt:      t2,
+	}
+
+	dto := VolumeFromDomain(vol)
+	if dto.PageCount != 42 {
+		t.Fatalf("VolumeFromDomain locator PageCount = %d, want 42", dto.PageCount)
+	}
+
+	// Explicit PreferredAssetID still takes precedence over LocatorAssetID.
+	vol.PreferredAssetID = &manual.ID
+	dtoManual := VolumeFromDomain(vol)
+	if dtoManual.PageCount != 55 {
+		t.Fatalf("VolumeFromDomain manual PreferredAssetID PageCount = %d, want 55", dtoManual.PageCount)
+	}
+
+	// Fallback to oldest available when neither PreferredAssetID nor LocatorAssetID matches an available asset.
+	vol.PreferredAssetID = nil
+	vol.LocatorAssetID = "asset-unavailable"
+	dtoFallback := VolumeFromDomain(vol)
+	if dtoFallback.PageCount != 18 {
+		t.Fatalf("VolumeFromDomain fallback PageCount = %d, want 18", dtoFallback.PageCount)
+	}
+
+	raw, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("json.Marshal(Volume): %v", err)
+	}
+	if strings.Contains(string(raw), "locator_asset_id") || strings.Contains(string(raw), "LocatorAssetID") {
+		t.Fatalf("Volume DTO JSON shape unexpectedly contains locator_asset_id: %s", raw)
+	}
+}
