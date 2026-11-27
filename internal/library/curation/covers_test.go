@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -279,7 +280,7 @@ func listRootAssets(t *testing.T, tx storage.Transactor, rootID string) []domain
 
 func newTestCoverService(
 	t *testing.T,
-	tx storage.Transactor,
+	readTx storage.ReadTransactor,
 	reg *tobitenimage.Registry,
 	waitTimeout time.Duration,
 	configure ...func(*curation.CoverServiceOptions),
@@ -290,7 +291,7 @@ func newTestCoverService(
 		t.Fatalf("NewCoverCache: %v", err)
 	}
 	opts := curation.CoverServiceOptions{
-		Tx:          tx,
+		ReadTx:      readTx,
 		Cache:       cache,
 		Pipelines:   reg,
 		Workers:     2,
@@ -310,6 +311,89 @@ func newTestCoverService(
 	}
 	t.Cleanup(svc.Stop)
 	return svc, cache
+}
+
+func seedReaderPrincipal(t *testing.T, tx storage.Transactor) *domain.Principal {
+	t.Helper()
+	readerRole, ok := domain.BuiltInRoleByName(domain.RoleReaderName)
+	if !ok {
+		t.Fatal("missing Reader role")
+	}
+	userID, err := domain.NewID()
+	if err != nil {
+		t.Fatalf("domain.NewID: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	user := domain.User{
+		ID:        userID,
+		Username:  "reader-" + userID,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
+		if err := st.Users().CreateUser(t.Context(), &user); err != nil {
+			return err
+		}
+		return st.Users().AssignUserRole(t.Context(), user.ID, readerRole.ID)
+	}); err != nil {
+		t.Fatalf("seed reader principal: %v", err)
+	}
+	return domain.NewPrincipal(user, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-"+userID, nil)
+}
+
+func assertCachedCoverPageIndex(t *testing.T, cache *tobitenimage.CoverCache, asset domain.MediaAsset, wantPage int) {
+	t.Helper()
+	digest, ok := asset.CurrentDigest(domain.DigestKindXXH364Partial)
+	if !ok {
+		t.Fatalf("asset %s missing XXH3_64_PARTIAL digest", asset.ID)
+	}
+	key := tobitenimage.ArchiveCoverKey(digest.Value, wantPage, tobitenimage.DefaultCoverOptions())
+	if _, err := cache.Stat(t.Context(), key); err != nil {
+		t.Fatalf("Stat cover cache for asset %s page %d: %v", asset.ID, wantPage, err)
+	}
+}
+
+func TestCoverService_ExportedMethodsRequirePrincipal(t *testing.T) {
+	t.Parallel()
+	svcType := reflect.TypeFor[*curation.CoverService]()
+	principalType := reflect.TypeFor[*domain.Principal]()
+	lifecycleMethods := map[string]bool{
+		"Start":       true,
+		"Stop":        true,
+		"WaitTimeout": true,
+	}
+
+	var checked int
+	for i := range svcType.NumMethod() {
+		m := svcType.Method(i)
+		if lifecycleMethods[m.Name] {
+			for argIdx := 1; argIdx < m.Type.NumIn(); argIdx++ {
+				if m.Type.In(argIdx).Kind() == reflect.String {
+					t.Fatalf("lifecycle method CoverService.%s unexpectedly accepts string parameter %d", m.Name, argIdx)
+				}
+			}
+			continue
+		}
+		checked++
+		hasPrincipal := false
+		for argIdx := 1; argIdx < m.Type.NumIn(); argIdx++ {
+			if m.Type.In(argIdx) == principalType {
+				hasPrincipal = true
+				break
+			}
+		}
+		if !hasPrincipal {
+			t.Fatalf("exported method CoverService.%s does not accept *domain.Principal", m.Name)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("expected at least one exported service method on *curation.CoverService")
+	}
+	for _, forbidden := range []string{"GetOrGenerateAssetCover", "GetOrGenerateCover", "Workers"} {
+		if _, ok := svcType.MethodByName(forbidden); ok {
+			t.Fatalf("CoverService must not export %s", forbidden)
+		}
+	}
 }
 
 func TestCoverService_CoverPageSelectionNeverSuppressed(t *testing.T) {
@@ -366,43 +450,39 @@ func TestCoverService_CoverPageSelectionNeverSuppressed(t *testing.T) {
 	}
 
 	_, reg := newSpyImagePipeline(t, nil)
-	svc, _ := newTestCoverService(t, tx, reg, 5*time.Second)
+	svc, cache := newTestCoverService(t, tx, reg, 5*time.Second)
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
 	fcAsset := byRel["frontcover.cbz"]
 	if fcAsset.CoverPageIndex != 2 {
 		t.Fatalf("frontcover CoverPageIndex = %d, want 2", fcAsset.CoverPageIndex)
 	}
-	fcEntry, err := svc.GetOrGenerateAssetCover(t.Context(), fcAsset.ID)
+	fcRendition, err := svc.GetCover(volCtx, principal, fcAsset.VolumeID)
 	if err != nil {
-		t.Fatalf("GetOrGenerateAssetCover(frontcover): %v", err)
+		t.Fatalf("GetCover(frontcover): %v", err)
 	}
-	if fcEntry.Key.PageIndex != 2 {
-		t.Fatalf("frontcover Key.PageIndex = %d, want 2", fcEntry.Key.PageIndex)
-	}
-	assertDominantColor(t, fcEntry.Data, 30, 40, 220)
+	assertCachedCoverPageIndex(t, cache, fcAsset, 2)
+	assertDominantColor(t, fcRendition.Data, 30, 40, 220)
 
 	supAsset := byRel["suppressed_first.cbz"]
 	if supAsset.CoverPageIndex != 1 {
 		t.Fatalf("suppressed_first CoverPageIndex = %d, want 1", supAsset.CoverPageIndex)
 	}
-	supEntry, err := svc.GetOrGenerateAssetCover(t.Context(), supAsset.ID)
+	supRendition, err := svc.GetCover(volCtx, principal, supAsset.VolumeID)
 	if err != nil {
-		t.Fatalf("GetOrGenerateAssetCover(suppressed_first): %v", err)
+		t.Fatalf("GetCover(suppressed_first): %v", err)
 	}
-	if supEntry.Key.PageIndex != 1 {
-		t.Fatalf("suppressed_first Key.PageIndex = %d, want 1", supEntry.Key.PageIndex)
-	}
-	assertDominantColor(t, supEntry.Data, 30, 210, 30)
+	assertCachedCoverPageIndex(t, cache, supAsset, 1)
+	assertDominantColor(t, supRendition.Data, 30, 210, 30)
 
 	plainAsset := byRel["plain.cbz"]
-	plainEntry, err := svc.GetOrGenerateAssetCover(t.Context(), plainAsset.ID)
+	plainRendition, err := svc.GetCover(volCtx, principal, plainAsset.VolumeID)
 	if err != nil {
-		t.Fatalf("GetOrGenerateAssetCover(plain): %v", err)
+		t.Fatalf("GetCover(plain): %v", err)
 	}
-	if plainEntry.Key.PageIndex != 0 {
-		t.Fatalf("plain Key.PageIndex = %d, want 0", plainEntry.Key.PageIndex)
-	}
-	assertDominantColor(t, plainEntry.Data, 220, 30, 30)
+	assertCachedCoverPageIndex(t, cache, plainAsset, 0)
+	assertDominantColor(t, plainRendition.Data, 220, 30, 30)
 
 	// If a DB asset later has its recorded cover page marked suppressed (e.g. via HidePage),
 	// CoverService must never serve the suppressed page and instead fall back or fail unavailable.
@@ -417,14 +497,12 @@ func TestCoverService_CoverPageSelectionNeverSuppressed(t *testing.T) {
 		t.Fatalf("update suppressed_pages: %v", err)
 	}
 
-	fallbackEntry, err := svc.GetOrGenerateAssetCover(t.Context(), plainAsset.ID)
+	fallbackRendition, err := svc.GetCover(volCtx, principal, plainAsset.VolumeID)
 	if err != nil {
-		t.Fatalf("GetOrGenerateAssetCover(plain after suppressing page 0): %v", err)
+		t.Fatalf("GetCover(plain after suppressing page 0): %v", err)
 	}
-	if fallbackEntry.Key.PageIndex != 1 {
-		t.Fatalf("fallback Key.PageIndex = %d, want 1", fallbackEntry.Key.PageIndex)
-	}
-	assertDominantColor(t, fallbackEntry.Data, 30, 210, 30)
+	assertCachedCoverPageIndex(t, cache, plainAsset, 1)
+	assertDominantColor(t, fallbackRendition.Data, 30, 210, 30)
 
 	// Suppressing all remaining pages returns a typed unavailable error.
 	if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
@@ -437,7 +515,7 @@ func TestCoverService_CoverPageSelectionNeverSuppressed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("suppress all pages: %v", err)
 	}
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), plainAsset.ID); !errors.Is(err, curation.ErrCoverUnavailable) {
+	if _, err := svc.GetCover(volCtx, principal, plainAsset.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("all-suppressed error = %v, want ErrCoverUnavailable", err)
 	}
 }
@@ -511,25 +589,27 @@ func TestCoverService_RawBytePathsNFCNFDAndInvalidUTF8(t *testing.T) {
 
 	_, reg := newSpyImagePipeline(t, nil)
 	svc, _ := newTestCoverService(t, tx, reg, 5*time.Second)
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
-	nfcEntry, err := svc.GetOrGenerateAssetCover(t.Context(), findByBytes(nfcRel).ID)
+	nfcRendition, err := svc.GetCover(volCtx, principal, findByBytes(nfcRel).VolumeID)
 	if err != nil {
 		t.Fatalf("NFC cover error: %v", err)
 	}
-	assertDominantColor(t, nfcEntry.Data, 220, 30, 30)
+	assertDominantColor(t, nfcRendition.Data, 220, 30, 30)
 
-	nfdEntry, err := svc.GetOrGenerateAssetCover(t.Context(), findByBytes(nfdRel).ID)
+	nfdRendition, err := svc.GetCover(volCtx, principal, findByBytes(nfdRel).VolumeID)
 	if err != nil {
 		t.Fatalf("NFD cover error: %v", err)
 	}
-	assertDominantColor(t, nfdEntry.Data, 30, 210, 30)
+	assertDominantColor(t, nfdRendition.Data, 30, 210, 30)
 
 	if invalidCreated {
-		invEntry, err := svc.GetOrGenerateAssetCover(t.Context(), findByBytes(invalidRel).ID)
+		invRendition, err := svc.GetCover(volCtx, principal, findByBytes(invalidRel).VolumeID)
 		if err != nil {
 			t.Fatalf("invalid UTF-8 cover error: %v", err)
 		}
-		assertDominantColor(t, invEntry.Data, 30, 40, 220)
+		assertDominantColor(t, invRendition.Data, 30, 40, 220)
 	}
 }
 
@@ -561,6 +641,9 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 		t.Fatalf("indexed assets = %d, want %d", len(assets), numBooks)
 	}
 
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
+
 	t.Run("bounded workers cap concurrent generation", func(t *testing.T) {
 		gate := make(chan struct{})
 		twoStarted := make(chan struct{})
@@ -585,7 +668,7 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				_, errs[idx] = svc.GetOrGenerateAssetCover(t.Context(), assets[idx].ID)
+				_, errs[idx] = svc.GetCover(volCtx, principal, assets[idx].VolumeID)
 			}(i)
 		}
 
@@ -631,7 +714,7 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 				return ctx.Err()
 			}
 		})
-		svc, cache := newTestCoverService(t, tx, reg, 40*time.Millisecond)
+		svc, cache := newTestCoverService(t, &armingReadTx{inner: tx}, reg, 500*time.Millisecond)
 		target := assets[0]
 		curDigest, ok := target.CurrentDigest(domain.DigestKindXXH364Partial)
 		if !ok {
@@ -639,10 +722,10 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 		}
 		cacheKey := tobitenimage.ArchiveCoverKey(curDigest.Value, target.CoverPageIndex, tobitenimage.DefaultCoverOptions())
 
-		// Caller A triggers generation and times out past 40ms.
+		// Caller A triggers generation and times out while generation stays active.
 		timeoutErrCh := make(chan error, 1)
 		go func() {
-			_, err := svc.GetOrGenerateAssetCover(t.Context(), target.ID)
+			_, err := svc.GetCover(volCtx, principal, target.VolumeID)
 			timeoutErrCh <- err
 		}()
 
@@ -650,23 +733,6 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 		case <-renderStarted:
 		case <-time.After(3 * time.Second):
 			t.Fatal("render never started")
-		}
-
-		// Launch 6 concurrent callers sharing the exact same in-flight key with longer wait.
-		const sharedCallers = 6
-		sharedResults := make([]tobitenimage.CoverEntry, sharedCallers)
-		sharedErrs := make([]error, sharedCallers)
-		var wg sync.WaitGroup
-		for i := range sharedCallers {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				sharedResults[idx], sharedErrs[idx] = svc.GetOrGenerateAssetCover(
-					t.Context(),
-					target.ID,
-					curation.CoverRequestOptions{WaitTimeout: 3 * time.Second},
-				)
-			}(i)
 		}
 
 		// Caller A must receive a typed timeout error while generation stays active.
@@ -692,6 +758,37 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 			t.Fatalf("expected ErrCacheMiss before generation finishes, got %v", err)
 		}
 
+		// Launch 6 concurrent callers joining the exact same in-flight task started by caller A.
+		const sharedCallers = 6
+		sharedResults := make([]*app.CoverRendition, sharedCallers)
+		sharedErrs := make([]error, sharedCallers)
+		var joinedCount atomic.Int32
+		allJoined := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range sharedCallers {
+			wg.Add(1)
+			waitCtx := &waitNotifyContext{
+				Context: volCtx,
+				onWait: func() {
+					if joinedCount.Add(1) == sharedCallers {
+						close(allJoined)
+					}
+				},
+			}
+			go func(idx int, ctx context.Context) {
+				defer wg.Done()
+				sharedResults[idx], sharedErrs[idx] = svc.GetCover(ctx, principal, target.VolumeID)
+			}(i, waitCtx)
+		}
+
+		select {
+		case <-allJoined:
+		case <-time.After(3 * time.Second):
+			close(gate)
+			wg.Wait()
+			t.Fatalf("timed out waiting for shared callers to join task wait (%d/%d)", joinedCount.Load(), sharedCallers)
+		}
+
 		// Release generation; all shared callers receive the single generated cover and it is cached.
 		close(gate)
 		wg.Wait()
@@ -712,12 +809,12 @@ func TestCoverService_BoundedPoolSharedWaitAndTimeoutContinuation(t *testing.T) 
 		}
 
 		// Subsequent retry by caller A hits cache with zero extra renders.
-		retryEntry, err := svc.GetOrGenerateAssetCover(t.Context(), target.ID)
+		retryRendition, err := svc.GetCover(volCtx, principal, target.VolumeID)
 		if err != nil {
 			t.Fatalf("retry after cache completion err: %v", err)
 		}
-		if !bytes.Equal(retryEntry.Data, sharedResults[0].Data) {
-			t.Fatal("retry entry bytes differed from shared result")
+		if !bytes.Equal(retryRendition.Data, sharedResults[0].Data) {
+			t.Fatal("retry rendition bytes differed from shared result")
 		}
 		if got := spy.calls.Load(); got != 1 {
 			t.Fatalf("render calls after cache hit = %d, want 1", got)
@@ -999,10 +1096,12 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	svc, cache := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
 		o.Formats = formats
 	})
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
-	entry1, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
+	entry1, err := svc.GetCover(volCtx, principal, vol1.VolumeID)
 	if err != nil {
-		t.Fatalf("initial GetOrGenerateAssetCover: %v", err)
+		t.Fatalf("initial GetCover: %v", err)
 	}
 	assertDominantColor(t, entry1.Data, 220, 30, 30)
 	if spy.calls.Load() != 1 {
@@ -1024,9 +1123,9 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatalf("MovedCount = %d, want 1", scanMove.MovedCount)
 	}
 
-	entryMoved, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
+	entryMoved, err := svc.GetCover(volCtx, principal, vol1.VolumeID)
 	if err != nil {
-		t.Fatalf("moved GetOrGenerateAssetCover: %v", err)
+		t.Fatalf("moved GetCover: %v", err)
 	}
 	if !bytes.Equal(entryMoved.Data, entry1.Data) {
 		t.Fatal("moved file cover differed from cached entry")
@@ -1065,16 +1164,13 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatalf("expected new digest after external modify, old=%s new=%+v", digest1.Value, digest2)
 	}
 
-	entryMod, err := svc.GetOrGenerateAssetCover(t.Context(), vol1.ID)
+	entryMod, err := svc.GetCover(volCtx, principal, vol1.VolumeID)
 	if err != nil {
-		t.Fatalf("modified GetOrGenerateAssetCover: %v", err)
+		t.Fatalf("modified GetCover: %v", err)
 	}
 	assertDominantColor(t, entryMod.Data, 30, 210, 30)
 	if spy.calls.Load() != 2 {
 		t.Fatalf("render calls after external modify = %d, want 2", spy.calls.Load())
-	}
-	if entryMod.Key.Digest != digest2.Value {
-		t.Fatalf("modified entry digest = %s, want %s", entryMod.Key.Digest, digest2.Value)
 	}
 	if _, err := cache.Stat(t.Context(), tobitenimage.ArchiveCoverKey(digest2.Value, 0, tobitenimage.DefaultCoverOptions())); err != nil {
 		t.Fatalf("Stat new digest cache entry: %v", err)
@@ -1084,7 +1180,7 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	if err := os.WriteFile(coldPath, coldGreenCBZ, 0o644); err != nil {
 		t.Fatalf("overwrite cold cbz before cold request: %v", err)
 	}
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), cold.ID); !errors.Is(err, curation.ErrCoverUnavailable) {
+	if _, err := svc.GetCover(volCtx, principal, cold.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("cold modified before rescan err = %v, want ErrCoverUnavailable", err)
 	} else {
 		var unavailErr *curation.CoverUnavailableError
@@ -1117,7 +1213,7 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 
 	midGenErrCh := make(chan error, 1)
 	go func() {
-		_, gErr := svc.GetOrGenerateAssetCover(t.Context(), cold.ID)
+		_, gErr := svc.GetCover(volCtx, principal, cold.VolumeID)
 		midGenErrCh <- gErr
 	}()
 
@@ -1172,14 +1268,11 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 		t.Fatalf("expected new digest for cold cbz after rescan, old=%s new=%+v", coldDigest1.Value, coldDigest2)
 	}
 
-	entryColdMod, err := svc.GetOrGenerateAssetCover(t.Context(), cold.ID)
+	entryColdMod, err := svc.GetCover(volCtx, principal, cold.VolumeID)
 	if err != nil {
-		t.Fatalf("cold post-scan GetOrGenerateAssetCover: %v", err)
+		t.Fatalf("cold post-scan GetCover: %v", err)
 	}
 	assertDominantColor(t, entryColdMod.Data, 30, 210, 30)
-	if entryColdMod.Key.Digest != coldDigest2.Value {
-		t.Fatalf("cold regenerated digest = %s, want %s", entryColdMod.Key.Digest, coldDigest2.Value)
-	}
 	if _, err := cache.Stat(t.Context(), tobitenimage.ArchiveCoverKey(coldDigest2.Value, 0, tobitenimage.DefaultCoverOptions())); err != nil {
 		t.Fatalf("Stat regenerated cold digest entry: %v", err)
 	}
@@ -1206,7 +1299,7 @@ func TestCoverService_MoveReusesCacheAndExternalModifyRegenerates(t *testing.T) 
 	defer setBeforeOpen(nil)
 	defer spy.setAfterRender(nil)
 
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), reverted.ID); !errors.Is(err, curation.ErrCoverUnavailable) {
+	if _, err := svc.GetCover(volCtx, principal, reverted.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("reverted same-size edit err = %v, want ErrCoverUnavailable", err)
 	} else {
 		var unavailErr *curation.CoverUnavailableError
@@ -1252,14 +1345,16 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 
 	_, reg := newSpyImagePipeline(t, nil)
 	svc, _ := newTestCoverService(t, tx, reg, 5*time.Second)
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
-	// Unknown asset returns app.ErrNotFound.
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), "nonexistent-asset"); !errors.Is(err, app.ErrNotFound) {
-		t.Fatalf("unknown asset error = %v, want app.ErrNotFound", err)
+	// Unknown volume returns app.ErrNotFound.
+	if _, err := svc.GetCover(volCtx, principal, "nonexistent-volume"); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("unknown volume error = %v, want app.ErrNotFound", err)
 	}
 
 	// Prime cache for a.cbz before it goes missing/retired.
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), byName["a.cbz"].ID); err != nil {
+	if _, err := svc.GetCover(volCtx, principal, byName["a.cbz"].VolumeID); err != nil {
 		t.Fatalf("prime a.cbz cover: %v", err)
 	}
 
@@ -1267,7 +1362,7 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 	if err := os.Remove(fileB); err != nil {
 		t.Fatalf("remove b.cbz: %v", err)
 	}
-	_, err = svc.GetOrGenerateAssetCover(t.Context(), byName["b.cbz"].ID)
+	_, err = svc.GetCover(volCtx, principal, byName["b.cbz"].VolumeID)
 	if !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("unscanned missing file error = %v, want ErrCoverUnavailable", err)
 	}
@@ -1276,7 +1371,7 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 		t.Fatalf("unavailErr = %+v, want Reason=file_missing", unavailErr)
 	}
 
-	// Delete a.cbz and rescan so a.cbz is marked missing -> ErrCoverUnavailable ("missing").
+	// Delete a.cbz and rescan so a.cbz is marked missing -> app.ErrNotFound (R6-D3).
 	if err := os.Remove(fileA); err != nil {
 		t.Fatalf("remove a.cbz: %v", err)
 	}
@@ -1285,15 +1380,11 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 		t.Fatalf("rescan with missing a.cbz: %v", err)
 	}
 
-	_, err = svc.GetOrGenerateAssetCover(t.Context(), byName["a.cbz"].ID)
-	if !errors.Is(err, curation.ErrCoverUnavailable) {
-		t.Fatalf("missing asset error = %v, want ErrCoverUnavailable", err)
-	}
-	if !errors.As(err, &unavailErr) || unavailErr.Reason != "missing" {
-		t.Fatalf("missing unavailErr = %+v, want Reason=missing", unavailErr)
+	if _, err := svc.GetCover(volCtx, principal, byName["a.cbz"].VolumeID); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("missing asset error = %v, want app.ErrNotFound", err)
 	}
 
-	// Retire a.cbz via grace-period expiry -> ErrCoverUnavailable ("retired").
+	// Retire a.cbz via grace-period expiry -> app.ErrNotFound (R6-D3).
 	past := time.Now().Add(-10 * 24 * time.Hour)
 	if err := tx.WithTx(t.Context(), func(st storage.Tx) error {
 		a, getErr := st.CatalogueWrites().GetAssetByIDForUpdate(t.Context(), byName["a.cbz"].ID)
@@ -1308,16 +1399,12 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 	if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
 		t.Fatalf("retire ScanLibrary: %v", err)
 	}
-	_, err = svc.GetOrGenerateAssetCover(t.Context(), byName["a.cbz"].ID)
-	if !errors.Is(err, curation.ErrCoverUnavailable) {
-		t.Fatalf("retired asset error = %v, want ErrCoverUnavailable", err)
-	}
-	if !errors.As(err, &unavailErr) || unavailErr.Reason != "retired" {
-		t.Fatalf("retired unavailErr = %+v, want Reason=retired", unavailErr)
+	if _, err := svc.GetCover(volCtx, principal, byName["a.cbz"].VolumeID); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("retired asset error = %v, want app.ErrNotFound", err)
 	}
 
-	// Prime cache for b.cbz, then make the root directory OFFLINE -> ErrCoverUnavailable ("root_offline").
-	if _, err := svc.GetOrGenerateAssetCover(t.Context(), byName["b.cbz"].ID); err != nil {
+	// Prime cache for b.cbz, then make the root directory OFFLINE -> ErrServiceBusy + ErrCoverUnavailable ("root_offline").
+	if _, err := svc.GetCover(volCtx, principal, byName["b.cbz"].VolumeID); err != nil {
 		t.Fatalf("prime b.cbz cover: %v", err)
 	}
 	if err := os.RemoveAll(rootDir); err != nil {
@@ -1331,9 +1418,9 @@ func TestCoverService_UnavailableAndNotFoundErrors(t *testing.T) {
 		t.Fatalf("expected library OFFLINE after root removal, got %+v", scanOffline)
 	}
 
-	_, err = svc.GetOrGenerateAssetCover(t.Context(), byName["b.cbz"].ID)
-	if !errors.Is(err, curation.ErrCoverUnavailable) {
-		t.Fatalf("offline root asset error = %v, want ErrCoverUnavailable", err)
+	_, err = svc.GetCover(volCtx, principal, byName["b.cbz"].VolumeID)
+	if !errors.Is(err, app.ErrServiceBusy) || !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("offline root asset error = %v, want ErrServiceBusy + ErrCoverUnavailable", err)
 	}
 	if !errors.As(err, &unavailErr) || unavailErr.Reason != "root_offline" {
 		t.Fatalf("offline unavailErr = %+v, want Reason=root_offline", unavailErr)
@@ -1361,41 +1448,39 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 		t.Fatalf("negative wait timeout err = %v, want ErrInvalidCoverWaitTimeout", err)
 	}
 
-	rootDir := t.TempDir()
-	cbzPath := filepath.Join(rootDir, "restart.cbz")
+	rootDir := filepath.Join(t.TempDir(), "lifecycle-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
 	red := makeSolidPNG(t, 64, 96, color.RGBA{R: 220, G: 30, B: 30, A: 255})
-	cbzBytes := buildCBZ(t, cbzEntry{name: "001.png", data: red})
-	if err := os.WriteFile(cbzPath, cbzBytes, 0o644); err != nil {
-		t.Fatalf("write restart cbz: %v", err)
-	}
-	restartDigest, err := scanner.PartialFingerprint(bytes.NewReader(cbzBytes), int64(len(cbzBytes)))
-	if err != nil {
-		t.Fatalf("PartialFingerprint: %v", err)
-	}
+	writeCBZ(t, []byte(filepath.Join(rootDir, "restart.cbz")), cbzEntry{name: "001.png", data: red})
 
-	src := curation.CoverAssetSource{
-		AssetID:        "a-1",
-		LibraryRootID:  "r-1",
-		RootPathBytes:  []byte(rootDir),
-		RootState:      domain.LibraryRootStateOnline,
-		RelPathBytes:   []byte("restart.cbz"),
-		Format:         domain.MediaFormatCBZ,
-		DigestKind:     domain.DigestKindXXH364Partial,
-		Digest:         restartDigest,
-		PageCount:      1,
-		CoverPageIndex: 0,
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
 	}
+	if _, err := sc.ScanLibrary(t.Context(), lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+	assets := listRootAssets(t, tx, root.ID)
+	if len(assets) != 1 {
+		t.Fatalf("assets = %d, want 1", len(assets))
+	}
+	volID := assets[0].VolumeID
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
 	// Not started yet -> ErrCoverPoolNotRunning.
-	svc1, err := curation.NewCoverService(curation.CoverServiceOptions{Cache: cache, Pipelines: reg})
+	svc1, err := curation.NewCoverService(curation.CoverServiceOptions{ReadTx: tx, Cache: cache, Pipelines: reg})
 	if err != nil {
 		t.Fatalf("NewCoverService: %v", err)
 	}
-	if _, err := svc1.GetOrGenerateCover(t.Context(), src); !errors.Is(err, curation.ErrCoverPoolNotRunning) {
+	if _, err := svc1.GetCover(volCtx, principal, volID); !errors.Is(err, curation.ErrCoverPoolNotRunning) {
 		t.Fatalf("before Start err = %v, want ErrCoverPoolNotRunning", err)
 	}
 
-	// Interrupt mid-generation by cancelling daemon lifecycle context / stopping svc1.
+	// Interrupt mid-generation by cancelling daemon lifecycle context / stopping svcInterrupted.
 	renderEntered := make(chan struct{})
 	gate := make(chan struct{})
 	_, blockingReg := newSpyImagePipeline(t, func(ctx context.Context) error {
@@ -1408,6 +1493,7 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 		}
 	})
 	svcInterrupted, err := curation.NewCoverService(curation.CoverServiceOptions{
+		ReadTx:    tx,
 		Cache:     cache,
 		Pipelines: blockingReg,
 		Workers:   1,
@@ -1420,7 +1506,7 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		_, gErr := svcInterrupted.GetOrGenerateCover(t.Context(), src)
+		_, gErr := svcInterrupted.GetCover(volCtx, principal, volID)
 		errCh <- gErr
 	}()
 	select {
@@ -1432,12 +1518,13 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	if gotErr := <-errCh; gotErr == nil {
 		t.Fatal("expected error after Stop interrupted generation")
 	}
-	if _, err := svcInterrupted.GetOrGenerateCover(t.Context(), src); !errors.Is(err, curation.ErrCoverPoolClosed) {
+	if _, err := svcInterrupted.GetCover(volCtx, principal, volID); !errors.Is(err, curation.ErrCoverPoolClosed) {
 		t.Fatalf("after Stop err = %v, want ErrCoverPoolClosed", err)
 	}
 
 	// Simulated daemon restart with a new CoverService instance regenerates cleanly.
 	svcRestarted, err := curation.NewCoverService(curation.CoverServiceOptions{
+		ReadTx:    tx,
 		Cache:     cache,
 		Pipelines: reg,
 	})
@@ -1449,11 +1536,11 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	}
 	defer svcRestarted.Stop()
 
-	entry, err := svcRestarted.GetOrGenerateCover(t.Context(), src)
+	rendition, err := svcRestarted.GetCover(volCtx, principal, volID)
 	if err != nil {
-		t.Fatalf("restarted GetOrGenerateCover: %v", err)
+		t.Fatalf("restarted GetCover: %v", err)
 	}
-	assertDominantColor(t, entry.Data, 220, 30, 30)
+	assertDominantColor(t, rendition.Data, 220, 30, 30)
 }
 
 func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
@@ -2193,18 +2280,37 @@ func TestCoverService_GetCover_LongSeriesBoundedWorkAndBatchedFallback(t *testin
 	assertDominantColor(t, gotShift.Data, 230, 130, 20)
 }
 
+type armingReadTx struct {
+	inner storage.ReadTransactor
+}
+
+func (a *armingReadTx) WithRepeatableReadTx(ctx context.Context, fn func(tx storage.ReadTx) error) error {
+	err := a.inner.WithRepeatableReadTx(ctx, fn)
+	if w, ok := ctx.(*waitNotifyContext); ok {
+		w.arm()
+	}
+	return err
+}
+
 type waitNotifyContext struct {
 	context.Context
+	armed  atomic.Bool
 	once   sync.Once
 	onWait func()
 }
 
+func (c *waitNotifyContext) arm() {
+	c.armed.Store(true)
+}
+
 func (c *waitNotifyContext) Done() <-chan struct{} {
-	c.once.Do(func() {
-		if c.onWait != nil {
-			c.onWait()
-		}
-	})
+	if c.armed.Load() {
+		c.once.Do(func() {
+			if c.onWait != nil {
+				c.onWait()
+			}
+		})
+	}
 	return c.Context.Done()
 }
 
@@ -2274,13 +2380,12 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 		return nil
 	})
 
-	svc, _ := newTestCoverService(t, tx, reg, 3*time.Second, func(o *curation.CoverServiceOptions) {
+	svc, _ := newTestCoverService(t, &armingReadTx{inner: tx}, reg, 3*time.Second, func(o *curation.CoverServiceOptions) {
 		o.Workers = 1
 	})
 
 	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-panic", nil)
 	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
-	panicSrc := curation.CoverAssetSourceFromDomain(panicAsset, *root)
 
 	const totalCallers = 4
 	errs := make([]error, totalCallers)
@@ -2303,7 +2408,7 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 	for i := 1; i < totalCallers; i++ {
 		wg.Add(1)
 		waitCtx := &waitNotifyContext{
-			Context: t.Context(),
+			Context: volCtx,
 			onWait: func() {
 				if joinedCount.Add(1) == totalCallers-1 {
 					close(allJoined)
@@ -2312,7 +2417,7 @@ func TestCoverService_PipelinePanicCompletesTaskForJoinedCallersAndNextKeySuccee
 		}
 		go func(idx int, ctx context.Context) {
 			defer wg.Done()
-			_, errs[idx] = svc.GetOrGenerateCover(ctx, panicSrc)
+			_, errs[idx] = svc.GetCover(ctx, principal, panicAsset.VolumeID)
 		}(i, waitCtx)
 	}
 
@@ -2484,16 +2589,17 @@ func TestCoverService_OversizedPageStreamUnavailableAndFallsBack(t *testing.T) {
 	_, reg := newSpyImagePipeline(t, nil)
 	svc, _ := newTestCoverService(t, tx, reg, 10*time.Second)
 
-	_, err = svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(oversizedAsset, *root))
+	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-oversized", nil)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
+	_, err = svc.GetCover(volCtx, principal, oversizedAsset.VolumeID)
 	if !errors.Is(err, curation.ErrCoverUnavailable) {
-		t.Fatalf("GetOrGenerateCover(oversized) err = %v, want ErrCoverUnavailable", err)
+		t.Fatalf("GetCover(oversized) err = %v, want ErrCoverUnavailable", err)
 	}
 	var unavail *curation.CoverUnavailableError
 	if !errors.As(err, &unavail) || unavail.Reason != "page_too_large" {
-		t.Fatalf("GetOrGenerateCover(oversized) unavail = %+v, want Reason=page_too_large", unavail)
+		t.Fatalf("GetCover(oversized) unavail = %+v, want Reason=page_too_large", unavail)
 	}
 
-	principal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-oversized", nil)
 	seriesCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeSeries)
 	got, err := svc.GetCover(seriesCtx, principal, "ser-oversized-fallback")
 	if err != nil {
@@ -2593,6 +2699,8 @@ func TestCoverService_PageLimiterBoundaryAndRepeatedReadsAfterOverrun(t *testing
 	for _, a := range assets {
 		byRel[a.RelPathDisplay] = a
 	}
+	principal := seedReaderPrincipal(t, tx)
+	volCtx := app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume)
 
 	pngPrefix := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
 
@@ -2668,12 +2776,12 @@ func TestCoverService_PageLimiterBoundaryAndRepeatedReadsAfterOverrun(t *testing
 		svc, _ := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
 			o.Formats = formats
 		})
-		entry, err := svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(byRel["exact.cbz"], *root))
+		rendition, err := svc.GetCover(volCtx, principal, byRel["exact.cbz"].VolumeID)
 		if err != nil {
-			t.Fatalf("GetOrGenerateCover(exact boundary) err = %v", err)
+			t.Fatalf("GetCover(exact boundary) err = %v", err)
 		}
-		if string(entry.Data) != "exact-boundary-jpeg" {
-			t.Fatalf("entry.Data = %q, want exact-boundary-jpeg", entry.Data)
+		if string(rendition.Data) != "exact-boundary-jpeg" {
+			t.Fatalf("rendition.Data = %q, want exact-boundary-jpeg", rendition.Data)
 		}
 		if got := stream.bytesRead.Load(); got != pageLimit {
 			t.Fatalf("underlying bytesRead = %d, want %d", got, pageLimit)
@@ -2745,9 +2853,9 @@ func TestCoverService_PageLimiterBoundaryAndRepeatedReadsAfterOverrun(t *testing
 		svc, _ := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
 			o.Formats = formats
 		})
-		_, err := svc.GetOrGenerateCover(t.Context(), curation.CoverAssetSourceFromDomain(byRel["overrun.cbz"], *root))
+		_, err := svc.GetCover(volCtx, principal, byRel["overrun.cbz"].VolumeID)
 		if !errors.Is(err, curation.ErrCoverUnavailable) {
-			t.Fatalf("GetOrGenerateCover(overrun) err = %v, want ErrCoverUnavailable", err)
+			t.Fatalf("GetCover(overrun) err = %v, want ErrCoverUnavailable", err)
 		}
 		var unavail *curation.CoverUnavailableError
 		if !errors.As(err, &unavail) || unavail.Reason != "page_too_large" {

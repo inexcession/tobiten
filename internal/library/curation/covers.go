@@ -69,7 +69,7 @@ var (
 	ErrMissingCoverCache = errors.New("curation: cover cache is required")
 	// ErrMissingImageRegistry means CoverServiceOptions.Pipelines is nil.
 	ErrMissingImageRegistry = errors.New("curation: image pipeline registry is required")
-	// ErrMissingTransactor means CoverServiceOptions.Tx is nil when querying assets.
+	// ErrMissingTransactor means CoverServiceOptions.ReadTx is nil when querying covers.
 	ErrMissingTransactor = errors.New("curation: storage transactor is required")
 )
 
@@ -128,9 +128,9 @@ type statReadAtCloser interface {
 	Stat() (os.FileInfo, error)
 }
 
-// CoverAssetSource describes a media asset and its library root needed to look
+// coverAssetSource describes a media asset and its library root needed to look
 // up or generate a cover rendition without holding a database transaction open.
-type CoverAssetSource struct {
+type coverAssetSource struct {
 	AssetID         string
 	LibraryRootID   string
 	RootPathBytes   []byte
@@ -147,54 +147,16 @@ type CoverAssetSource struct {
 	RetiredAt       *time.Time
 }
 
-// CoverAssetSourceFromDomain projects a domain MediaAsset and its LibraryRoot
-// into a CoverAssetSource, cloning byte and page slices.
-func CoverAssetSourceFromDomain(asset domain.MediaAsset, root domain.LibraryRoot) CoverAssetSource {
-	var (
-		digestKind domain.DigestKind
-		digestVal  string
-	)
-	if cur, ok := asset.CurrentDigest(domain.DigestKindXXH364Partial); ok {
-		digestKind = cur.Kind
-		digestVal = cur.Value
-	}
-	return CoverAssetSource{
-		AssetID:         asset.ID,
-		LibraryRootID:   asset.LibraryRootID,
-		RootPathBytes:   slices.Clone(root.Path.Bytes),
-		RootState:       root.State,
-		RelPathBytes:    slices.Clone(asset.RelPathBytes),
-		FileSize:        asset.FileSize,
-		Format:          asset.Format,
-		DigestKind:      digestKind,
-		Digest:          digestVal,
-		PageCount:       asset.PageCount,
-		CoverPageIndex:  asset.CoverPageIndex,
-		SuppressedPages: slices.Clone(asset.SuppressedPages),
-		MissingSince:    asset.MissingSince,
-		RetiredAt:       asset.RetiredAt,
-	}
-}
-
 // CoverServiceOptions configures a CoverService and its daemon-owned bounded
 // cover generation worker pool (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverServiceOptions struct {
-	Tx               storage.Transactor
-	ReadTx           storage.ReadTransactor
-	Cache            *image.CoverCache
-	Pipelines        *image.Registry
-	Formats          *container.FormatRegistry
-	Workers          int
-	WaitTimeout      time.Duration
-	DefaultRendition image.RenderOptions
-	Logger           *slog.Logger
-	OpenFile         func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
-}
-
-// CoverRequestOptions configures an individual cover lookup/generation call.
-type CoverRequestOptions struct {
-	Rendition   *image.RenderOptions
+	ReadTx      storage.ReadTransactor
+	Cache       *image.CoverCache
+	Pipelines   *image.Registry
+	Formats     *container.FormatRegistry
+	Workers     int
 	WaitTimeout time.Duration
+	OpenFile    func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 }
 
 type coverTask struct {
@@ -222,22 +184,18 @@ var _ app.CurationService = (*CoverService)(nil)
 // on a daemon-owned bounded in-process worker pool deduplicated by full CoverKey
 // (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverService struct {
-	tx               storage.Transactor
-	readTx           storage.ReadTransactor
-	cache            *image.CoverCache
-	pipelines        *image.Registry
-	formats          *container.FormatRegistry
-	workers          int
-	waitTimeout      time.Duration
-	defaultRendition image.RenderOptions
-	logger           *slog.Logger
-	openFile         func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+	readTx      storage.ReadTransactor
+	cache       *image.CoverCache
+	pipelines   *image.Registry
+	formats     *container.FormatRegistry
+	workers     int
+	waitTimeout time.Duration
+	openFile    func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 
 	mu        sync.Mutex
 	cond      *sync.Cond
 	running   bool
 	closed    bool
-	genCtx    context.Context
 	genCancel context.CancelFunc
 	stopAfter func() bool
 	inflight  map[image.CoverKey]*coverTask
@@ -269,11 +227,6 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 		waitTimeout = DefaultCoverWaitTimeout
 	}
 
-	rendition, err := normalizeDefaultRendition(opts.DefaultRendition)
-	if err != nil {
-		return nil, err
-	}
-
 	formats := opts.Formats
 	if formats == nil {
 		formats = container.NewFormatRegistry()
@@ -282,43 +235,23 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 		}
 	}
 
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
 	openFn := opts.OpenFile
 	if openFn == nil {
 		openFn = defaultOpenRawArchive
 	}
 
-	readTx := opts.ReadTx
-	if readTx == nil {
-		readTx, _ = opts.Tx.(storage.ReadTransactor)
-	}
-
 	svc := &CoverService{
-		tx:               opts.Tx,
-		readTx:           readTx,
-		cache:            opts.Cache,
-		pipelines:        opts.Pipelines,
-		formats:          formats,
-		workers:          workers,
-		waitTimeout:      waitTimeout,
-		defaultRendition: rendition,
-		logger:           logger,
-		openFile:         openFn,
-		inflight:         make(map[image.CoverKey]*coverTask),
+		readTx:      opts.ReadTx,
+		cache:       opts.Cache,
+		pipelines:   opts.Pipelines,
+		formats:     formats,
+		workers:     workers,
+		waitTimeout: waitTimeout,
+		openFile:    openFn,
+		inflight:    make(map[image.CoverKey]*coverTask),
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	return svc, nil
-}
-
-func normalizeDefaultRendition(raw image.RenderOptions) (image.RenderOptions, error) {
-	if raw == (image.RenderOptions{}) {
-		return image.DefaultCoverOptions(), nil
-	}
-	return raw.Validate()
 }
 
 func defaultOpenRawArchive(ctx context.Context, rawPath []byte) (ReadAtCloser, error) {
@@ -329,11 +262,6 @@ func defaultOpenRawArchive(ctx context.Context, rawPath []byte) (ReadAtCloser, e
 		return nil, paths.ErrInvalidRawPath
 	}
 	return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
-}
-
-// Workers returns the configured bounded worker count.
-func (s *CoverService) Workers() int {
-	return s.workers
 }
 
 // WaitTimeout returns the configured default caller wait timeout.
@@ -362,7 +290,6 @@ func (s *CoverService) Start(ctx context.Context) error {
 	}
 
 	genCtx, genCancel := context.WithCancel(ctx)
-	s.genCtx = genCtx
 	s.genCancel = genCancel
 	s.closed = false
 	s.running = true
@@ -423,74 +350,12 @@ func (s *CoverService) closeQueueLocked() {
 	s.cond.Broadcast()
 }
 
-// GetOrGenerateAssetCover loads assetID and its library root from PostgreSQL,
-// checks availability, and returns the cached or newly generated cover rendition.
-func (s *CoverService) GetOrGenerateAssetCover(
+// getOrGenerateCover validates src availability, checks CoverCache, and on a
+// miss awaits shared bounded-pool generation by full CoverKey within waitTimeout.
+func (s *CoverService) getOrGenerateCover(
 	ctx context.Context,
-	assetID string,
-	opts ...CoverRequestOptions,
-) (image.CoverEntry, error) {
-	if s == nil {
-		return image.CoverEntry{}, ErrCoverPoolNotRunning
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return image.CoverEntry{}, err
-	}
-	if strings.TrimSpace(assetID) == "" {
-		return image.CoverEntry{}, fmt.Errorf("%w: %w", app.ErrInvalidInput, domain.ErrEmptyAssetID)
-	}
-	if err := s.ensurePoolOpen(); err != nil {
-		return image.CoverEntry{}, err
-	}
-
-	src, err := s.loadAssetSource(ctx, assetID)
-	if err != nil {
-		return image.CoverEntry{}, err
-	}
-	return s.GetOrGenerateCover(ctx, src, opts...)
-}
-
-func (s *CoverService) loadAssetSource(ctx context.Context, assetID string) (CoverAssetSource, error) {
-	if s.tx == nil {
-		return CoverAssetSource{}, ErrMissingTransactor
-	}
-	var src CoverAssetSource
-	err := s.tx.WithReadCommittedTx(ctx, func(tx storage.Tx) error {
-		cw := tx.CatalogueWrites()
-		libRepo := tx.Libraries()
-		if cw == nil || libRepo == nil {
-			return errors.New("curation: catalogue write and library repositories are required")
-		}
-		asset, err := cw.GetAssetByID(ctx, assetID)
-		if err != nil {
-			return err
-		}
-		root, err := libRepo.GetLibraryRootByID(ctx, asset.LibraryRootID)
-		if err != nil {
-			return err
-		}
-		src = CoverAssetSourceFromDomain(*asset, *root)
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return CoverAssetSource{}, fmt.Errorf("%w: asset %q", app.ErrNotFound, assetID)
-		}
-		return CoverAssetSource{}, err
-	}
-	return src, nil
-}
-
-// GetOrGenerateCover validates src availability, checks CoverCache, and on a
-// miss awaits shared bounded-pool generation by full CoverKey within the
-// configured wait timeout.
-func (s *CoverService) GetOrGenerateCover(
-	ctx context.Context,
-	src CoverAssetSource,
-	opts ...CoverRequestOptions,
+	src coverAssetSource,
+	waitTimeout time.Duration,
 ) (image.CoverEntry, error) {
 	if s == nil {
 		return image.CoverEntry{}, ErrCoverPoolNotRunning
@@ -504,13 +369,14 @@ func (s *CoverService) GetOrGenerateCover(
 	if err := s.ensurePoolOpen(); err != nil {
 		return image.CoverEntry{}, err
 	}
-
-	rendition, waitTimeout, err := s.resolveRequestOptions(opts)
-	if err != nil {
-		return image.CoverEntry{}, err
+	if waitTimeout < 0 {
+		return image.CoverEntry{}, ErrInvalidCoverWaitTimeout
+	}
+	if waitTimeout == 0 {
+		waitTimeout = s.waitTimeout
 	}
 
-	spec, err := prepareArchiveCoverSpec(src, rendition)
+	spec, err := prepareArchiveCoverSpec(src, image.DefaultCoverOptions())
 	if err != nil {
 		return image.CoverEntry{}, err
 	}
@@ -545,30 +411,7 @@ func (s *CoverService) ensurePoolOpen() error {
 	return nil
 }
 
-func (s *CoverService) resolveRequestOptions(opts []CoverRequestOptions) (image.RenderOptions, time.Duration, error) {
-	rendition := s.defaultRendition
-	waitTimeout := s.waitTimeout
-	if len(opts) == 0 {
-		return rendition, waitTimeout, nil
-	}
-	req := opts[0]
-	if req.WaitTimeout < 0 {
-		return image.RenderOptions{}, 0, ErrInvalidCoverWaitTimeout
-	}
-	if req.WaitTimeout > 0 {
-		waitTimeout = req.WaitTimeout
-	}
-	if req.Rendition != nil {
-		validated, err := req.Rendition.Validate()
-		if err != nil {
-			return image.RenderOptions{}, 0, err
-		}
-		rendition = validated
-	}
-	return rendition, waitTimeout, nil
-}
-
-func prepareArchiveCoverSpec(src CoverAssetSource, rendition image.RenderOptions) (archiveCoverSpec, error) {
+func prepareArchiveCoverSpec(src coverAssetSource, rendition image.RenderOptions) (archiveCoverSpec, error) {
 	if src.RetiredAt != nil {
 		return archiveCoverSpec{}, &CoverUnavailableError{AssetID: src.AssetID, Reason: "retired"}
 	}
@@ -741,15 +584,13 @@ func (s *CoverService) runTask(genCtx context.Context, task *coverTask) {
 	})
 	defer func() {
 		if rec := recover(); rec != nil {
-			if s.logger != nil {
-				s.logger.Error("cover worker panicked",
-					slog.String("asset_id", task.assetID),
-					slog.String("digest", task.key.Digest),
-					slog.Int("page_index", task.key.PageIndex),
-					slog.Any("panic", rec),
-					slog.String("stack", string(debug.Stack())),
-				)
-			}
+			slog.Error("cover worker panicked",
+				slog.String("asset_id", task.assetID),
+				slog.String("digest", task.key.Digest),
+				slog.Int("page_index", task.key.PageIndex),
+				slog.Any("panic", rec),
+				slog.String("stack", string(debug.Stack())),
+			)
 			entry = image.CoverEntry{}
 			err = &CoverUnavailableError{
 				AssetID: task.assetID,
@@ -1070,6 +911,9 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 	if s.readTx == nil {
 		return nil, ErrMissingTransactor
 	}
+	if err := s.ensurePoolOpen(); err != nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, err)
+	}
 
 	scope := storage.CatalogueReadScope{
 		Principal:      principal,
@@ -1221,7 +1065,7 @@ func (s *CoverService) tryVolumeAssetCandidates(
 			})
 		}
 		src := coverAssetSourceFromAuthorizedFile(&files[i])
-		entry, genErr := s.GetOrGenerateCover(ctx, src, CoverRequestOptions{WaitTimeout: remaining})
+		entry, genErr := s.getOrGenerateCover(ctx, src, remaining)
 		if genErr == nil {
 			return &app.CoverRendition{
 				TargetID:    targetID,
@@ -1246,11 +1090,11 @@ func (s *CoverService) tryVolumeAssetCandidates(
 	return nil, sawOffline, lastUnavail, nil
 }
 
-func coverAssetSourceFromAuthorizedFile(file *storage.AuthorizedAssetFile) CoverAssetSource {
+func coverAssetSourceFromAuthorizedFile(file *storage.AuthorizedAssetFile) coverAssetSource {
 	if file == nil {
-		return CoverAssetSource{}
+		return coverAssetSource{}
 	}
-	return CoverAssetSource{
+	return coverAssetSource{
 		AssetID:         file.AssetID,
 		LibraryRootID:   file.LibraryRootID,
 		RootPathBytes:   slices.Clone(file.RootPathBytes),

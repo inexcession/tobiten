@@ -160,22 +160,38 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 		}
 
 		var assets []domain.MediaAsset
+		var adminUser domain.User
 		if err := tx.WithTx(serveCtx, func(st storage.Tx) error {
-			assets, err = st.CatalogueWrites().ListAssetsByRoot(serveCtx, rootID)
-			return err
+			var listErr error
+			assets, listErr = st.CatalogueWrites().ListAssetsByRoot(serveCtx, rootID)
+			if listErr != nil {
+				return listErr
+			}
+			u, getErr := st.Users().GetUserByUsername(serveCtx, "alice")
+			if getErr != nil {
+				return getErr
+			}
+			adminUser = *u
+			return nil
 		}); err != nil {
 			return err
 		}
 		if len(assets) != 1 {
 			t.Fatalf("assets = %d, want 1", len(assets))
 		}
+		adminRole, ok := domain.BuiltInRoleByName(domain.RoleAdminName)
+		if !ok {
+			return errors.New("missing Admin role")
+		}
+		principal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-daemon-cover", nil)
+		volCtx := app.ContextWithCoverTargetKind(serveCtx, domain.ItemTypeVolume)
 
-		entry, err := capturedCover.GetOrGenerateAssetCover(serveCtx, assets[0].ID)
+		rendition, err := capturedCover.GetCover(volCtx, principal, assets[0].VolumeID)
 		if err != nil {
 			return err
 		}
-		if entry.ContentType != tobitenimage.CodecJPEG.ContentType() || len(entry.Data) == 0 {
-			t.Fatalf("unexpected cover entry: contentType=%q len=%d", entry.ContentType, len(entry.Data))
+		if rendition.ContentType != tobitenimage.CodecJPEG.ContentType() || len(rendition.Data) == 0 {
+			t.Fatalf("unexpected cover rendition: contentType=%q len=%d", rendition.ContentType, len(rendition.Data))
 		}
 		return nil
 	})
@@ -184,7 +200,12 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 	}
 
 	// After runDaemon exits, the daemon-owned pool must be stopped.
-	if _, err := capturedCover.GetOrGenerateAssetCover(t.Context(), "any-asset"); !errors.Is(err, curation.ErrCoverPoolClosed) {
+	adminRole, ok := domain.BuiltInRoleByName(domain.RoleAdminName)
+	if !ok {
+		t.Fatal("missing Admin role")
+	}
+	principal := domain.NewPrincipal(domain.User{ID: "u-stopped", Username: "alice"}, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-stopped", nil)
+	if _, err := capturedCover.GetCover(app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume), principal, "any-volume"); !errors.Is(err, curation.ErrCoverPoolClosed) {
 		t.Fatalf("after runDaemon exit err = %v, want ErrCoverPoolClosed", err)
 	}
 }

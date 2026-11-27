@@ -747,7 +747,7 @@ func newDaemonServices(
 	return ds, nil
 }
 
-func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation.CoverService, *tobitenimage.CoverCache, error) {
+func newDaemonCoverService(tx storage.ReadTransactor, cfg *config.Config) (*curation.CoverService, *tobitenimage.CoverCache, error) {
 	coversDir := filepath.Join(config.DefaultDataDir, "covers")
 	waitTimeout := config.DefaultThumbnailWaitTimeout
 	if cfg != nil {
@@ -777,12 +777,11 @@ func newDaemonCoverService(tx storage.Transactor, cfg *config.Config) (*curation
 	}
 
 	coverSvc, err := curation.NewCoverService(curation.CoverServiceOptions{
-		Tx:          tx,
+		ReadTx:      tx,
 		Cache:       coverCache,
 		Pipelines:   imgReg,
 		Formats:     formats,
 		WaitTimeout: waitTimeout,
-		Logger:      slog.Default(),
 	})
 	if err != nil {
 		return nil, nil, err
