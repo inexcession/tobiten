@@ -911,9 +911,6 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 	if s.readTx == nil {
 		return nil, ErrMissingTransactor
 	}
-	if err := s.ensurePoolOpen(); err != nil {
-		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, err)
-	}
 
 	scope := storage.CatalogueReadScope{
 		Principal:      principal,

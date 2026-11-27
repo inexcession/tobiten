@@ -186,6 +186,10 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 		principal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-daemon-cover", nil)
 		volCtx := app.ContextWithCoverTargetKind(serveCtx, domain.ItemTypeVolume)
 
+		if !errors.Is(capturedCover.Start(serveCtx), curation.ErrCoverPoolAlreadyRunning) {
+			return errors.New("expected daemon-owned cover pool to be running during serve")
+		}
+
 		rendition, err := capturedCover.GetCover(volCtx, principal, assets[0].VolumeID)
 		if err != nil {
 			return err
@@ -199,13 +203,10 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 		t.Fatalf("runDaemon: %v", err)
 	}
 
-	// After runDaemon exits, the daemon-owned pool must be stopped.
-	adminRole, ok := domain.BuiltInRoleByName(domain.RoleAdminName)
-	if !ok {
-		t.Fatal("missing Admin role")
+	// After runDaemon exits, the daemon-owned pool must already be stopped
+	// (the daemon DB pool is closed, so verify lifecycle directly via Start/Stop).
+	if err := capturedCover.Start(t.Context()); err != nil {
+		t.Fatalf("after runDaemon exit Start err = %v, want nil (pool stopped during shutdown)", err)
 	}
-	principal := domain.NewPrincipal(domain.User{ID: "u-stopped", Username: "alice"}, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-stopped", nil)
-	if _, err := capturedCover.GetCover(app.ContextWithCoverTargetKind(t.Context(), domain.ItemTypeVolume), principal, "any-volume"); !errors.Is(err, curation.ErrCoverPoolClosed) {
-		t.Fatalf("after runDaemon exit err = %v, want ErrCoverPoolClosed", err)
-	}
+	capturedCover.Stop()
 }

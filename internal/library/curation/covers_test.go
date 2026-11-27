@@ -1543,6 +1543,165 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	assertDominantColor(t, rendition.Data, 220, 30, 30)
 }
 
+func TestCoverService_StoppedPoolPreservesNotFoundForHiddenAndAbsentTargets(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "stopped-pool-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	red := makeSolidPNG(t, 64, 96, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+	green := makeSolidPNG(t, 64, 96, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "visible.cbz")), cbzEntry{name: "001.png", data: red})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "restricted.cbz")), cbzEntry{name: "001.png", data: green})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	ctx := t.Context()
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+	visAsset := byRel["visible.cbz"]
+	restrAsset := byRel["restricted.cbz"]
+
+	var adminUser, readerUser domain.User
+	var adminRole, readerRole domain.Role
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		var ok bool
+		if adminRole, ok = domain.BuiltInRoleByName(domain.RoleAdminName); !ok {
+			return errors.New("missing Admin role")
+		}
+		if readerRole, ok = domain.BuiltInRoleByName(domain.RoleReaderName); !ok {
+			return errors.New("missing Reader role")
+		}
+		adminUser = domain.User{ID: "u-stop-admin", Username: "stopadmin", CreatedAt: now, UpdatedAt: now}
+		readerUser = domain.User{ID: "u-stop-reader", Username: "stopreader", CreatedAt: now, UpdatedAt: now}
+		for _, u := range []struct {
+			user *domain.User
+			role string
+		}{
+			{&adminUser, adminRole.ID},
+			{&readerUser, readerRole.ID},
+		} {
+			if err := st.Users().CreateUser(ctx, u.user); err != nil {
+				return err
+			}
+			if err := st.Users().AssignUserRole(ctx, u.user.ID, u.role); err != nil {
+				return err
+			}
+		}
+
+		cw := st.CatalogueWrites()
+		for _, s := range []domain.Series{
+			{ID: "ser-stop-vis", LibraryID: lib.ID, Title: "Visible", TitleSort: "visible", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-stop-restr", LibraryID: lib.ID, Title: "Restricted", TitleSort: "restricted", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+		} {
+			ser := s
+			if err := cw.CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+		}
+		p1 := 1.0
+		if err := st.SeriesMemberships().SetVolumeMemberships(ctx, visAsset.VolumeID, []domain.SeriesMembership{{
+			VolumeID: visAsset.VolumeID, SeriesID: "ser-stop-vis", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual,
+		}}); err != nil {
+			return err
+		}
+		if err := st.SeriesMemberships().SetVolumeMemberships(ctx, restrAsset.VolumeID, []domain.SeriesMembership{{
+			VolumeID: restrAsset.VolumeID, SeriesID: "ser-stop-restr", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual,
+		}}); err != nil {
+			return err
+		}
+
+		labels := st.Labels()
+		lbl := domain.Label{ID: "lbl-stop-nsfw", Name: "NSFW-Stop", Scope: domain.LabelScopeServer}
+		if err := labels.CreateLabel(ctx, &lbl); err != nil {
+			return err
+		}
+		if err := labels.SetUserLabelPolicy(ctx, &domain.UserLabelPolicy{UserID: readerUser.ID, LabelID: lbl.ID, Effect: domain.PolicyEffectRestrict}); err != nil {
+			return err
+		}
+		for _, il := range []domain.ItemLabel{
+			{LabelID: lbl.ID, ItemType: domain.ItemTypeSeries, ItemID: "ser-stop-restr"},
+			{LabelID: lbl.ID, ItemType: domain.ItemTypeVolume, ItemID: restrAsset.VolumeID},
+		} {
+			item := il
+			if err := labels.AssignItemLabel(ctx, &item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stopped-pool fixture: %v", err)
+	}
+
+	adminPrincipal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-stop-adm", nil)
+	readerPrincipal := domain.NewPrincipal(readerUser, []domain.Role{readerRole}, domain.CredentialKindPassword, "c-stop-rdr", nil)
+
+	_, reg := newSpyImagePipeline(t, nil)
+	cache, err := tobitenimage.NewCoverCache(filepath.Join(t.TempDir(), "covers"))
+	if err != nil {
+		t.Fatalf("NewCoverCache: %v", err)
+	}
+	svc, err := curation.NewCoverService(curation.CoverServiceOptions{
+		ReadTx:    tx,
+		Cache:     cache,
+		Pipelines: reg,
+	})
+	if err != nil {
+		t.Fatalf("NewCoverService: %v", err)
+	}
+
+	assertOutcomes := func(phase string, wantPoolErr error) {
+		t.Helper()
+		for _, tc := range []struct {
+			name      string
+			principal *domain.Principal
+			kind      domain.ItemType
+			targetID  string
+			wantErrs  []error
+		}{
+			{"absent volume", readerPrincipal, domain.ItemTypeVolume, "vol-does-not-exist", []error{app.ErrNotFound}},
+			{"absent series", readerPrincipal, domain.ItemTypeSeries, "ser-does-not-exist", []error{app.ErrNotFound}},
+			{"hidden volume for reader", readerPrincipal, domain.ItemTypeVolume, restrAsset.VolumeID, []error{app.ErrNotFound}},
+			{"hidden series for reader", readerPrincipal, domain.ItemTypeSeries, "ser-stop-restr", []error{app.ErrNotFound}},
+			{"visible volume for reader", readerPrincipal, domain.ItemTypeVolume, visAsset.VolumeID, []error{app.ErrServiceBusy, wantPoolErr}},
+			{"visible series for reader", readerPrincipal, domain.ItemTypeSeries, "ser-stop-vis", []error{app.ErrServiceBusy, wantPoolErr}},
+			{"restricted volume visible to admin", adminPrincipal, domain.ItemTypeVolume, restrAsset.VolumeID, []error{app.ErrServiceBusy, wantPoolErr}},
+			{"restricted series visible to admin", adminPrincipal, domain.ItemTypeSeries, "ser-stop-restr", []error{app.ErrServiceBusy, wantPoolErr}},
+		} {
+			_, gotErr := svc.GetCover(app.ContextWithCoverTargetKind(ctx, tc.kind), tc.principal, tc.targetID)
+			for _, wantErr := range tc.wantErrs {
+				if !errors.Is(gotErr, wantErr) {
+					t.Fatalf("%s (%s): GetCover = %v, want errors.Is(_, %v)", phase, tc.name, gotErr, wantErr)
+				}
+			}
+			if errors.Is(tc.wantErrs[0], app.ErrNotFound) && errors.Is(gotErr, app.ErrServiceBusy) {
+				t.Fatalf("%s (%s): GetCover leaked ErrServiceBusy: %v", phase, tc.name, gotErr)
+			}
+		}
+	}
+
+	// Before Start: hidden and absent targets return ErrNotFound; visible targets return ErrServiceBusy + ErrCoverPoolNotRunning.
+	assertOutcomes("before Start", curation.ErrCoverPoolNotRunning)
+
+	// After Start and Stop: hidden and absent targets still return ErrNotFound; visible targets return ErrServiceBusy + ErrCoverPoolClosed.
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("svc.Start: %v", err)
+	}
+	svc.Stop()
+	assertOutcomes("after Stop", curation.ErrCoverPoolClosed)
+}
+
 func TestCoverService_GetCover_LabelEnforcementAndSeriesFallback(t *testing.T) {
 	t.Parallel()
 
