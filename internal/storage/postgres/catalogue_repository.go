@@ -529,7 +529,7 @@ func (r *CatalogueRepository) GetVolumeByID(ctx context.Context, scope storage.C
 		return nil, err
 	}
 	vols := []domain.Volume{*vol}
-	if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), vols); err != nil {
+	if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, scope, vols); err != nil {
 		return nil, err
 	}
 	return &vols[0], nil
@@ -562,7 +562,7 @@ func (r *CatalogueRepository) ListVolumes(ctx context.Context, scope storage.Cat
 		return nil, err
 	}
 	if len(out) > 0 {
-		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), out); err != nil {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, scope, out); err != nil {
 			return nil, err
 		}
 	}
@@ -599,7 +599,7 @@ func (r *CatalogueRepository) ListVolumesPaged(ctx context.Context, scope storag
 		return nil, err
 	}
 	if len(out) > 0 {
-		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, principalUserID(scope), out); err != nil {
+		if err := r.populateVolumeAssociationsWithPredicate(ctx, pred, scope, out); err != nil {
 			return nil, err
 		}
 	}
@@ -624,7 +624,7 @@ func normalizeCataloguePageFilter(limit, offset int) (int, error) {
 	return limit, nil
 }
 
-func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, userID string, volumes []domain.Volume) error {
+func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx context.Context, pred *LabelPredicate, scope storage.CatalogueReadScope, volumes []domain.Volume) error {
 	if len(volumes) == 0 {
 		return nil
 	}
@@ -641,38 +641,84 @@ func (r *CatalogueRepository) populateVolumeAssociationsWithPredicate(ctx contex
 	if err != nil {
 		return err
 	}
-	locatorByVol, err := r.listLocatorAssetIDsByVolumeIDsWithPredicate(ctx, pred, userID, volumeIDs)
+	readableAssetsByVol := assetsByVol
+	if pred.IncludesTrashed() {
+		readableAssetsByVol, err = r.listReadableAssetsByVolumeIDs(ctx, scope, volumeIDs)
+		if err != nil {
+			return err
+		}
+	}
+	locatorByVol, err := r.listLocatorAssetIDsByVolumeIDsWithPredicate(ctx, pred, principalUserID(scope), volumeIDs)
 	if err != nil {
 		return err
 	}
 
 	for i := range volumes {
 		v := &volumes[i]
-		v.Memberships = membershipsByVol[v.ID]
-		if v.Memberships == nil {
-			v.Memberships = []domain.SeriesMembership{}
-		}
-		v.Assets = assetsByVol[v.ID]
-		if v.Assets == nil {
-			v.Assets = []domain.MediaAsset{}
-		}
-		if v.PreferredAssetID != nil && !hasAuthorizedAssetID(v.Assets, *v.PreferredAssetID) {
-			v.PreferredAssetID = nil
-		}
-		if locID := locatorByVol[v.ID]; locID != "" && hasAuthorizedAssetID(v.Assets, locID) {
-			v.LocatorAssetID = locID
-		} else {
-			v.LocatorAssetID = ""
-		}
-		if chosen, ok := v.SelectPreferredAsset(v.LocatorAssetID, func(a domain.MediaAsset) bool {
-			return a.IsAvailable()
-		}); ok && chosen != nil {
-			v.PageCount = chosen.PageCount
-		} else {
-			v.PageCount = 0
-		}
+		populateSingleVolumeAssociations(
+			v,
+			membershipsByVol[v.ID],
+			assetsByVol[v.ID],
+			readableAssetsByVol[v.ID],
+			locatorByVol[v.ID],
+			pred.IncludesTrashed(),
+		)
 	}
 	return nil
+}
+
+func (r *CatalogueRepository) listReadableAssetsByVolumeIDs(
+	ctx context.Context,
+	scope storage.CatalogueReadScope,
+	volumeIDs []string,
+) (map[string][]domain.MediaAsset, error) {
+	readableScope := scope
+	readableScope.IncludeTrashed = false
+	readablePred, err := r.loadPredicate(ctx, readableScope)
+	if err != nil {
+		return nil, err
+	}
+	return r.listAuthorizedAssetsByVolumeIDs(ctx, readablePred, volumeIDs)
+}
+
+func populateSingleVolumeAssociations(
+	v *domain.Volume,
+	memberships []domain.SeriesMembership,
+	assets []domain.MediaAsset,
+	readableAssets []domain.MediaAsset,
+	locatorAssetID string,
+	markTrashed bool,
+) {
+	if memberships == nil {
+		memberships = []domain.SeriesMembership{}
+	}
+	if assets == nil {
+		assets = []domain.MediaAsset{}
+	}
+	if markTrashed {
+		for j := range assets {
+			if !hasAuthorizedAssetID(readableAssets, assets[j].ID) {
+				assets[j].Trashed = true
+			}
+		}
+	}
+	v.Memberships = memberships
+	v.Assets = assets
+	if v.PreferredAssetID != nil && !hasAuthorizedAssetID(v.Assets, *v.PreferredAssetID) {
+		v.PreferredAssetID = nil
+	}
+	if locatorAssetID != "" && hasAuthorizedAssetID(v.Assets, locatorAssetID) {
+		v.LocatorAssetID = locatorAssetID
+	} else {
+		v.LocatorAssetID = ""
+	}
+	if chosen, ok := v.SelectPreferredAsset(v.LocatorAssetID, func(a domain.MediaAsset) bool {
+		return a.IsAvailable() && !a.Trashed
+	}); ok && chosen != nil {
+		v.PageCount = chosen.PageCount
+	} else {
+		v.PageCount = 0
+	}
 }
 
 func hasAuthorizedAssetID(assets []domain.MediaAsset, assetID string) bool {

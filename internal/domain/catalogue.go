@@ -709,8 +709,11 @@ type MediaAsset struct {
 	Digests         []AssetDigest    `json:"digests,omitempty"`
 	MissingSince    *time.Time       `json:"missing_since,omitempty"`
 	RetiredAt       *time.Time       `json:"retired_at,omitempty"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	// Trashed marks manifestations excluded by marked_for_deletion when loaded in an
+	// IncludeTrashed admin scope so readable page-count selection skips them; never serialized.
+	Trashed   bool      `json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Validate checks MediaAsset invariants aligned with the database schema and ADR-0003.

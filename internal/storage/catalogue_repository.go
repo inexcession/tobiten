@@ -162,7 +162,7 @@ type SeriesCoverCandidate struct {
 //     Memberships, available Assets (excluding missing/retired manifestations), and the
 //     requesting user's authorized LocatorAssetID; clear PreferredAssetID when the referenced
 //     asset is not authorized or not available for scope; and set PageCount from the
-//     selected eligible asset per ADR-0018 S5 (or 0 when none).
+//     selected eligible non-trashed asset per ADR-0018 S5 (or 0 when none).
 //   - GetAssetByID, ListAssetsByVolume, CountAssetsByVolume, GetAuthorizedAssetFile,
 //     ListAuthorizedVolumeAssetFiles, and SelectPreferredAssetFileForVolume operate on
 //     available manifestations only (missing_since IS NULL AND retired_at IS NULL).

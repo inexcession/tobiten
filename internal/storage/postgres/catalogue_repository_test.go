@@ -1851,4 +1851,106 @@ func TestCatalogueRepository_AssetPreferenceAndPageCountAgreement(t *testing.T) 
 		t.Fatalf("set preferred_asset_id = oldAsset: %v", err)
 	}
 	assertAgreement(t, "explicit preferred_asset_id overrides locator for admin", adminScope, oldAsset, 18, []string{oldAsset, newAsset}, newAsset)
+
+	// 4. Admin trash scope (IncludeTrashed=true) with a clean 18-page variant (oldAsset) and a trashed 42-page variant (newAsset):
+	//    preserve both assets in the admin trash view while resolving page_count from the readable variant (18)
+	//    both under a trashed manual preference and under the admin's own trashed locator.
+	if _, err := cat.tdb.Exec(ctx, `DELETE FROM item_labels WHERE label_id = $1 AND item_type = 'ASSET' AND item_id = $2`, cat.lblNSFW, newAsset); err != nil {
+		t.Fatalf("clear nsfw label on newAsset: %v", err)
+	}
+	cat.mustAssignRawLabel(ctx, t, cat.lblTrash, domain.ItemTypeAsset, newAsset)
+	adminTrashScope := storage.CatalogueReadScope{Principal: admin, IncludeTrashed: true}
+
+	assertTrashAgreement := func(label string, wantPrefID *string) {
+		t.Helper()
+		for _, tc := range []struct {
+			name       string
+			scope      storage.CatalogueReadScope
+			wantAssets int
+			wantPref   *string
+			wantLocID  string
+		}{
+			{
+				name:       "admin trash scope",
+				scope:      adminTrashScope,
+				wantAssets: 2,
+				wantPref:   wantPrefID,
+				wantLocID:  newAsset,
+			},
+			{
+				name:       "admin ordinary scope control",
+				scope:      adminScope,
+				wantAssets: 1,
+				wantPref:   nil,
+				wantLocID:  "",
+			},
+		} {
+			gotVol, err := repo.GetVolumeByID(ctx, tc.scope, volID)
+			if err != nil {
+				t.Fatalf("%s (%s) GetVolumeByID: %v", label, tc.name, err)
+			}
+			if len(gotVol.Assets) != tc.wantAssets {
+				t.Fatalf("%s (%s) GetVolumeByID len(Assets) = %d, want %d", label, tc.name, len(gotVol.Assets), tc.wantAssets)
+			}
+			if (gotVol.PreferredAssetID == nil) != (tc.wantPref == nil) ||
+				(gotVol.PreferredAssetID != nil && *gotVol.PreferredAssetID != *tc.wantPref) {
+				t.Fatalf("%s (%s) GetVolumeByID PreferredAssetID = %v, want %v", label, tc.name, gotVol.PreferredAssetID, tc.wantPref)
+			}
+			if gotVol.LocatorAssetID != tc.wantLocID {
+				t.Fatalf("%s (%s) GetVolumeByID LocatorAssetID = %q, want %q", label, tc.name, gotVol.LocatorAssetID, tc.wantLocID)
+			}
+			if gotVol.PageCount != 18 || app.VolumeFromDomain(*gotVol).PageCount != 18 {
+				t.Fatalf("%s (%s) GetVolumeByID page counts = (domain=%d, dto=%d), want (18, 18)",
+					label, tc.name, gotVol.PageCount, app.VolumeFromDomain(*gotVol).PageCount)
+			}
+
+			paged, err := repo.ListVolumesPaged(ctx, tc.scope, storage.VolumeReadFilter{SeriesID: serID})
+			if err != nil {
+				t.Fatalf("%s (%s) ListVolumesPaged: %v", label, tc.name, err)
+			}
+			if len(paged.Items) != 1 || len(paged.Items[0].Assets) != tc.wantAssets ||
+				paged.Items[0].PageCount != 18 || app.VolumeFromDomain(paged.Items[0]).PageCount != 18 {
+				t.Fatalf("%s (%s) ListVolumesPaged = %+v, want 1 item with %d assets and page_count 18",
+					label, tc.name, paged.Items, tc.wantAssets)
+			}
+
+			listed, err := repo.ListVolumes(ctx, tc.scope, storage.VolumeReadFilter{SeriesID: serID})
+			if err != nil {
+				t.Fatalf("%s (%s) ListVolumes: %v", label, tc.name, err)
+			}
+			if len(listed) != 1 || len(listed[0].Assets) != tc.wantAssets ||
+				listed[0].PageCount != 18 || app.VolumeFromDomain(listed[0]).PageCount != 18 {
+				t.Fatalf("%s (%s) ListVolumes = %+v, want 1 item with %d assets and page_count 18",
+					label, tc.name, listed, tc.wantAssets)
+			}
+
+			files, err := repo.ListAuthorizedVolumeAssetFiles(ctx, tc.scope, volID)
+			if err != nil {
+				t.Fatalf("%s (%s) ListAuthorizedVolumeAssetFiles: %v", label, tc.name, err)
+			}
+			if len(files) != 1 || files[0].AssetID != oldAsset || files[0].PageCount != 18 {
+				t.Fatalf("%s (%s) ListAuthorizedVolumeAssetFiles = %+v, want [%s (18)]", label, tc.name, files, oldAsset)
+			}
+
+			pref, err := repo.SelectPreferredAssetFileForVolume(ctx, tc.scope, volID)
+			if err != nil {
+				t.Fatalf("%s (%s) SelectPreferredAssetFileForVolume: %v", label, tc.name, err)
+			}
+			if pref.AssetID != oldAsset || pref.PageCount != 18 {
+				t.Fatalf("%s (%s) SelectPreferredAssetFileForVolume = (%s, %d), want (%s, 18)",
+					label, tc.name, pref.AssetID, pref.PageCount, oldAsset)
+			}
+		}
+	}
+
+	trashedPref := newAsset
+	if _, err := cat.tdb.Exec(ctx, `UPDATE volumes SET preferred_asset_id = $1 WHERE id = $2`, trashedPref, volID); err != nil {
+		t.Fatalf("set preferred_asset_id = trashed newAsset: %v", err)
+	}
+	assertTrashAgreement("trashed manual preference", &trashedPref)
+
+	if _, err := cat.tdb.Exec(ctx, `UPDATE volumes SET preferred_asset_id = NULL WHERE id = $1`, volID); err != nil {
+		t.Fatalf("clear preferred_asset_id: %v", err)
+	}
+	assertTrashAgreement("trashed admin locator", nil)
 }

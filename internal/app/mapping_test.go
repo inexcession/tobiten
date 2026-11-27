@@ -299,11 +299,22 @@ func TestVolumeFromDomain_LocatorAssetPreferenceAndJSONShape(t *testing.T) {
 		t.Fatalf("VolumeFromDomain fallback PageCount = %d, want 18", dtoFallback.PageCount)
 	}
 
+	// Trashed manual preference and trashed locator are skipped in favor of the oldest readable variant.
+	vol.Assets[2].Trashed = true
+	vol.Assets[1].Trashed = true
+	vol.PreferredAssetID = &manual.ID
+	vol.LocatorAssetID = locator.ID
+	dtoTrashedPrefAndLoc := VolumeFromDomain(vol)
+	if dtoTrashedPrefAndLoc.PageCount != 18 {
+		t.Fatalf("VolumeFromDomain trashed preference+locator PageCount = %d, want 18", dtoTrashedPrefAndLoc.PageCount)
+	}
+
 	raw, err := json.Marshal(dto)
 	if err != nil {
 		t.Fatalf("json.Marshal(Volume): %v", err)
 	}
-	if strings.Contains(string(raw), "locator_asset_id") || strings.Contains(string(raw), "LocatorAssetID") {
-		t.Fatalf("Volume DTO JSON shape unexpectedly contains locator_asset_id: %s", raw)
+	if strings.Contains(string(raw), "locator_asset_id") || strings.Contains(string(raw), "LocatorAssetID") ||
+		strings.Contains(string(raw), "trashed") || strings.Contains(string(raw), "Trashed") {
+		t.Fatalf("Volume DTO JSON shape unexpectedly contains internal fields: %s", raw)
 	}
 }
