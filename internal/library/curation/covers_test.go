@@ -1440,6 +1440,15 @@ func TestCoverService_PoolLifecycleAndRestartRegeneration(t *testing.T) {
 	if _, err := curation.NewCoverService(curation.CoverServiceOptions{Cache: cache, Pipelines: reg, WaitTimeout: -time.Second}); !errors.Is(err, curation.ErrInvalidCoverWaitTimeout) {
 		t.Fatalf("negative wait timeout err = %v, want ErrInvalidCoverWaitTimeout", err)
 	}
+	if _, err := curation.NewCoverService(curation.CoverServiceOptions{Cache: cache, Pipelines: reg, MaxQueueSize: -1}); !errors.Is(err, curation.ErrInvalidCoverQueueSize) {
+		t.Fatalf("negative max queue size err = %v, want ErrInvalidCoverQueueSize", err)
+	}
+	if _, err := curation.NewCoverService(curation.CoverServiceOptions{Cache: cache, Pipelines: reg, FailureMemoCapacity: -1}); !errors.Is(err, curation.ErrInvalidCoverFailureMemoCapacity) {
+		t.Fatalf("negative failure memo capacity err = %v, want ErrInvalidCoverFailureMemoCapacity", err)
+	}
+	if _, err := curation.NewCoverService(curation.CoverServiceOptions{Cache: cache, Pipelines: reg, FailureMemoTTL: -time.Second}); !errors.Is(err, curation.ErrInvalidCoverFailureMemoTTL) {
+		t.Fatalf("negative failure memo TTL err = %v, want ErrInvalidCoverFailureMemoTTL", err)
+	}
 
 	rootDir := filepath.Join(t.TempDir(), "lifecycle-root")
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
@@ -3024,4 +3033,448 @@ func TestCoverService_PageLimiterBoundaryAndRepeatedReadsAfterOverrun(t *testing
 				bytesAtOverrun, bytesAfterRepeated, callsAtOverrun, callsAfterRepeated)
 		}
 	})
+}
+
+func TestCoverService_FailureMemoDeduplicatesBoundsAndExpires(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "memo-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	healthyPNG := makeSolidPNG(t, 64, 96, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	bluePNG := makeSolidPNG(t, 64, 96, color.RGBA{R: 30, G: 40, B: 220, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "corrupt_a.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-a")})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "corrupt_a_dup.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-a")})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "corrupt_b.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-b")})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "corrupt_c.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-c")})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "modifiable.cbz")), cbzEntry{name: "001.png", data: []byte("\x89PNG\r\n\x1a\ncorrupt-mod")})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "healthy.cbz")), cbzEntry{name: "001.png", data: bluePNG})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	ctx := t.Context()
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+
+	var nowMu sync.Mutex
+	curNow := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	advanceClock := func(d time.Duration) {
+		nowMu.Lock()
+		curNow = curNow.Add(d)
+		nowMu.Unlock()
+	}
+	clockNow := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return curNow
+	}
+
+	var openMu sync.Mutex
+	openCounts := make(map[string]int)
+	countOpen := func(name string) int {
+		openMu.Lock()
+		defer openMu.Unlock()
+		return openCounts[name]
+	}
+
+	_, reg := newSpyImagePipeline(t, nil)
+	svc, _ := newTestCoverService(t, tx, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+		o.FailureMemoCapacity = 2
+		o.FailureMemoTTL = 10 * time.Second
+		o.Now = clockNow
+		o.OpenFile = func(openCtx context.Context, rawPath []byte) (curation.ReadAtCloser, error) {
+			if err := openCtx.Err(); err != nil {
+				return nil, err
+			}
+			openMu.Lock()
+			openCounts[filepath.Base(string(rawPath))]++
+			openMu.Unlock()
+			return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		}
+	})
+	principal := seedReaderPrincipal(t, tx)
+
+	// First request for corrupt_a opens the archive once and records the failure.
+	_, err = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a.cbz"].VolumeID)
+	if !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("first corrupt_a err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("corrupt_a.cbz"); got != 1 {
+		t.Fatalf("corrupt_a opens after first request = %d, want 1", got)
+	}
+
+	// Second request within TTL does not open the archive again.
+	advanceClock(5 * time.Second)
+	_, err = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a.cbz"].VolumeID)
+	if !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("second corrupt_a err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("corrupt_a.cbz"); got != 1 {
+		t.Fatalf("corrupt_a opens within TTL = %d, want 1", got)
+	}
+
+	// Another volume with the same CoverKey also hits the memo and reports its own AssetID.
+	_, err = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a_dup.cbz"].VolumeID)
+	if !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("corrupt_a_dup err = %v, want ErrCoverUnavailable", err)
+	}
+	var unavail *curation.CoverUnavailableError
+	if !errors.As(err, &unavail) || unavail.AssetID != byRel["corrupt_a_dup.cbz"].ID {
+		t.Fatalf("corrupt_a_dup unavail = %+v, want AssetID=%s", unavail, byRel["corrupt_a_dup.cbz"].ID)
+	}
+	if got := countOpen("corrupt_a_dup.cbz"); got != 0 {
+		t.Fatalf("corrupt_a_dup opens = %d, want 0", got)
+	}
+
+	// Once TTL expires, the next request opens the archive again.
+	advanceClock(6 * time.Second)
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("expired corrupt_a err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("corrupt_a.cbz"); got != 2 {
+		t.Fatalf("corrupt_a opens after expiry = %d, want 2", got)
+	}
+
+	// Bounded capacity (2): inserting corrupt_b and corrupt_c evicts corrupt_a.
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_b.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("corrupt_b err = %v, want ErrCoverUnavailable", err)
+	}
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_c.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("corrupt_c err = %v, want ErrCoverUnavailable", err)
+	}
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_b.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("second corrupt_b err = %v, want ErrCoverUnavailable", err)
+	}
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_c.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("second corrupt_c err = %v, want ErrCoverUnavailable", err)
+	}
+	if countOpen("corrupt_b.cbz") != 1 || countOpen("corrupt_c.cbz") != 1 {
+		t.Fatalf("expected b and c to stay memoised (opens b=%d, c=%d)", countOpen("corrupt_b.cbz"), countOpen("corrupt_c.cbz"))
+	}
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("evicted corrupt_a err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("corrupt_a.cbz"); got != 3 {
+		t.Fatalf("evicted corrupt_a opens = %d, want 3", got)
+	}
+
+	// Modified archive gets a new digest/key and bypasses the old failure memo immediately.
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["modifiable.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("initial corrupt modifiable err = %v, want ErrCoverUnavailable", err)
+	}
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["modifiable.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("memoised modifiable err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("modifiable.cbz"); got != 1 {
+		t.Fatalf("modifiable opens before repair = %d, want 1", got)
+	}
+
+	modPath := filepath.Join(rootDir, "modifiable.cbz")
+	writeCBZ(t, []byte(modPath), cbzEntry{name: "001.png", data: healthyPNG})
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(modPath, future, future); err != nil {
+		t.Fatalf("chtimes modifiable.cbz: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("rescan repaired modifiable.cbz: %v", err)
+	}
+	repaired, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["modifiable.cbz"].VolumeID)
+	if err != nil {
+		t.Fatalf("repaired modifiable GetCover err = %v", err)
+	}
+	assertDominantColor(t, repaired.Data, 30, 210, 30)
+	if got := countOpen("modifiable.cbz"); got != 2 {
+		t.Fatalf("modifiable opens after repair = %d, want 2", got)
+	}
+
+	// Successful generation is never memoised as a failure.
+	firstHealthy, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["healthy.cbz"].VolumeID)
+	if err != nil {
+		t.Fatalf("first healthy GetCover err = %v", err)
+	}
+	assertDominantColor(t, firstHealthy.Data, 30, 40, 220)
+	secondHealthy, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["healthy.cbz"].VolumeID)
+	if err != nil {
+		t.Fatalf("second healthy GetCover err = %v", err)
+	}
+	assertDominantColor(t, secondHealthy.Data, 30, 40, 220)
+	if got := countOpen("healthy.cbz"); got != 1 {
+		t.Fatalf("healthy opens = %d, want 1", got)
+	}
+}
+
+func TestCoverService_QueueCapReturnsServiceBusyWithoutGrowing(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "queue-cap-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	img := makeSolidPNG(t, 64, 96, color.RGBA{R: 30, G: 210, B: 30, A: 255})
+	const numBooks = 5
+	for i := range numBooks {
+		name := filepath.Join(rootDir, fmt.Sprintf("q%d.cbz", i+1))
+		writeCBZ(t, []byte(name), cbzEntry{name: "001.png", data: append(slices.Clone(img), byte(i))})
+	}
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	ctx := t.Context()
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	byRel := make(map[string]domain.MediaAsset, len(assets))
+	for _, a := range assets {
+		byRel[a.RelPathDisplay] = a
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		ser := domain.Series{
+			ID: "ser-q5", LibraryID: lib.ID, Title: "Queue Five", TitleSort: "queue five",
+			Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := st.CatalogueWrites().CreateSeries(ctx, &ser); err != nil {
+			return err
+		}
+		p1 := 1.0
+		return st.SeriesMemberships().SetVolumeMemberships(ctx, byRel["q5.cbz"].VolumeID, []domain.SeriesMembership{{
+			VolumeID: byRel["q5.cbz"].VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+			Position: &p1, Source: domain.MembershipSourceManual,
+		}})
+	}); err != nil {
+		t.Fatalf("seed ser-q5: %v", err)
+	}
+
+	gate := make(chan struct{})
+	firstStarted := make(chan struct{})
+	var firstOnce sync.Once
+	spy, reg := newSpyImagePipeline(t, func(renderCtx context.Context) error {
+		firstOnce.Do(func() { close(firstStarted) })
+		select {
+		case <-gate:
+			return nil
+		case <-renderCtx.Done():
+			return renderCtx.Err()
+		}
+	})
+
+	svc, _ := newTestCoverService(t, &armingReadTx{inner: tx}, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+		o.Workers = 1
+		o.MaxQueueSize = 2
+	})
+	principal := seedReaderPrincipal(t, tx)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+
+	// 1. Occupy the single worker with q1.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["q1.cbz"].VolumeID)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(3 * time.Second):
+		close(gate)
+		t.Fatal("timed out waiting for q1 worker to start")
+	}
+
+	// 2. Fill the 2-slot queue with q2 and q3 and wait until both reach waitForTask.
+	var queuedCount atomic.Int32
+	allQueued := make(chan struct{})
+	for idx, name := range []string{"q2.cbz", "q3.cbz"} {
+		slot := idx + 1
+		volID := byRel[name].VolumeID
+		waitCtx := &waitNotifyContext{
+			Context: ctx,
+			onWait: func() {
+				if queuedCount.Add(1) == 2 {
+					close(allQueued)
+				}
+			},
+		}
+		wg.Add(1)
+		go func(s int, id string, c context.Context) {
+			defer wg.Done()
+			_, errs[s] = svc.GetCover(c, principal, domain.ItemTypeVolume, id)
+		}(slot, volID, waitCtx)
+	}
+	select {
+	case <-allQueued:
+	case <-time.After(3 * time.Second):
+		close(gate)
+		wg.Wait()
+		t.Fatalf("timed out waiting for q2 and q3 to queue (%d/2)", queuedCount.Load())
+	}
+
+	// 3. Full queue rejects new keys immediately with ErrServiceBusy + ErrCoverQueueFull.
+	for _, tc := range []struct {
+		name     string
+		kind     domain.ItemType
+		targetID string
+	}{
+		{"volume q4", domain.ItemTypeVolume, byRel["q4.cbz"].VolumeID},
+		{"series q5", domain.ItemTypeSeries, "ser-q5"},
+	} {
+		start := time.Now()
+		_, fullErr := svc.GetCover(ctx, principal, tc.kind, tc.targetID)
+		if !errors.Is(fullErr, app.ErrServiceBusy) || !errors.Is(fullErr, curation.ErrCoverQueueFull) {
+			close(gate)
+			wg.Wait()
+			t.Fatalf("%s on full queue = %v, want ErrServiceBusy + ErrCoverQueueFull", tc.name, fullErr)
+		}
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			close(gate)
+			wg.Wait()
+			t.Fatalf("%s on full queue took %s, expected immediate rejection", tc.name, elapsed)
+		}
+	}
+
+	// 4. Shared wait for an already-queued key still joins without growing the queue.
+	joinedQueued := make(chan struct{})
+	joinCtx := &waitNotifyContext{
+		Context: ctx,
+		onWait:  func() { close(joinedQueued) },
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, errs[3] = svc.GetCover(joinCtx, principal, domain.ItemTypeVolume, byRel["q2.cbz"].VolumeID)
+	}()
+	select {
+	case <-joinedQueued:
+	case <-time.After(3 * time.Second):
+		close(gate)
+		wg.Wait()
+		t.Fatal("timed out waiting for shared caller to join queued q2")
+	}
+
+	// 5. Release worker; only q1, q2, q3 render (q4 and q5 were never enqueued).
+	close(gate)
+	wg.Wait()
+	for i, gErr := range errs {
+		if gErr != nil {
+			t.Fatalf("queued/joined caller %d err = %v", i, gErr)
+		}
+	}
+	if got := spy.calls.Load(); got != 3 {
+		t.Fatalf("render calls while queue capped = %d, want 3 (q4/q5 must not enqueue)", got)
+	}
+
+	// 6. After queue drains, q4 succeeds normally.
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["q4.cbz"].VolumeID); err != nil {
+		t.Fatalf("q4 after queue drain err = %v", err)
+	}
+	if got := spy.calls.Load(); got != 4 {
+		t.Fatalf("render calls after q4 = %d, want 4", got)
+	}
+}
+
+func TestCoverService_OfflineSeriesMatchesOfflineVolume(t *testing.T) {
+	t.Parallel()
+	rootDir := filepath.Join(t.TempDir(), "offline-series-root")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	red := makeSolidPNG(t, 64, 96, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+	writeCBZ(t, []byte(filepath.Join(rootDir, "offline.cbz")), cbzEntry{name: "001.png", data: red})
+
+	tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+	ctx := t.Context()
+	sc, err := scanner.NewScanner(tx, scanner.Options{})
+	if err != nil {
+		t.Fatalf("NewScanner: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	assets := listRootAssets(t, tx, root.ID)
+	if len(assets) != 1 {
+		t.Fatalf("assets = %d, want 1", len(assets))
+	}
+	offAsset := assets[0]
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := tx.WithTx(ctx, func(st storage.Tx) error {
+		cw := st.CatalogueWrites()
+		sm := st.SeriesMemberships()
+		for _, s := range []domain.Series{
+			{ID: "ser-off-only", LibraryID: lib.ID, Title: "Offline Only", TitleSort: "offline only", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+			{ID: "ser-off-then-empty", LibraryID: lib.ID, Title: "Offline Then Empty", TitleSort: "offline then empty", Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{}, CreatedAt: now, UpdatedAt: now},
+		} {
+			ser := s
+			if err := cw.CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+		}
+		emptyVol := domain.Volume{ID: "vol-off-empty", LibraryID: lib.ID, Kind: domain.VolumeKindVolume, PageCount: 0, CreatedAt: now, UpdatedAt: now}
+		if err := cw.CreateVolume(ctx, &emptyVol); err != nil {
+			return err
+		}
+		p1, p2 := 1.0, 2.0
+		if err := sm.SetVolumeMemberships(ctx, offAsset.VolumeID, []domain.SeriesMembership{
+			{VolumeID: offAsset.VolumeID, SeriesID: "ser-off-only", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+			{VolumeID: offAsset.VolumeID, SeriesID: "ser-off-then-empty", IsPrimary: false, Kind: domain.MembershipKindSeries, Position: &p1, Source: domain.MembershipSourceManual},
+		}); err != nil {
+			return err
+		}
+		return sm.SetVolumeMemberships(ctx, emptyVol.ID, []domain.SeriesMembership{
+			{VolumeID: emptyVol.ID, SeriesID: "ser-off-then-empty", IsPrimary: true, Kind: domain.MembershipKindSeries, Position: &p2, Source: domain.MembershipSourceManual},
+		})
+	}); err != nil {
+		t.Fatalf("seed offline series fixture: %v", err)
+	}
+
+	if err := os.RemoveAll(rootDir); err != nil {
+		t.Fatalf("remove rootDir: %v", err)
+	}
+	scanOffline, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{})
+	if err != nil {
+		t.Fatalf("offline ScanLibrary: %v", err)
+	}
+	if !scanOffline.Offline {
+		t.Fatalf("expected library OFFLINE after root removal, got %+v", scanOffline)
+	}
+
+	_, reg := newSpyImagePipeline(t, nil)
+	svc, _ := newTestCoverService(t, tx, reg, 2*time.Second)
+	principal := seedReaderPrincipal(t, tx)
+
+	for _, tc := range []struct {
+		name     string
+		kind     domain.ItemType
+		targetID string
+	}{
+		{"offline volume", domain.ItemTypeVolume, offAsset.VolumeID},
+		{"offline-only series", domain.ItemTypeSeries, "ser-off-only"},
+		{"offline then empty series", domain.ItemTypeSeries, "ser-off-then-empty"},
+	} {
+		_, gotErr := svc.GetCover(ctx, principal, tc.kind, tc.targetID)
+		if !errors.Is(gotErr, app.ErrServiceBusy) || !errors.Is(gotErr, curation.ErrCoverUnavailable) {
+			t.Fatalf("%s err = %v, want ErrServiceBusy + ErrCoverUnavailable", tc.name, gotErr)
+		}
+		var unavail *curation.CoverUnavailableError
+		if !errors.As(gotErr, &unavail) || unavail.Reason != "root_offline" {
+			t.Fatalf("%s unavail = %+v, want Reason=root_offline", tc.name, unavail)
+		}
+	}
 }

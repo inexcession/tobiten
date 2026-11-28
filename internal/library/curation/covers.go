@@ -5,6 +5,7 @@ package curation
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -41,6 +42,18 @@ const (
 	// cover generation (ADR-0015 §4, M1B-D8).
 	DefaultCoverWaitTimeout = 5 * time.Second
 
+	// DefaultCoverMaxQueueSize is the default maximum number of queued cover
+	// generation tasks waiting for a worker.
+	DefaultCoverMaxQueueSize = 64
+
+	// DefaultCoverFailureMemoCapacity is the default bounded capacity of the
+	// in-memory memo for deterministic cover unavailability results.
+	DefaultCoverFailureMemoCapacity = 256
+
+	// DefaultCoverFailureMemoTTL is the default expiry window for memoised
+	// cover unavailability results.
+	DefaultCoverFailureMemoTTL = 30 * time.Second
+
 	// defaultMaxCoverPageBytes bounds the compressed-or-uncompressed page stream
 	// read from an archive during cover generation.
 	defaultMaxCoverPageBytes = int64(64 << 20)
@@ -53,6 +66,8 @@ var (
 	// ErrCoverWaitTimeout means a caller waited past the configured wait timeout
 	// while shared cover generation continues in the background.
 	ErrCoverWaitTimeout = errors.New("curation: cover generation wait timed out")
+	// ErrCoverQueueFull means the cover generation queue has reached capacity.
+	ErrCoverQueueFull = errors.New("curation: cover generation queue is full")
 	// ErrCoverUnavailable means the target asset or its cover source cannot be served.
 	ErrCoverUnavailable = errors.New("curation: cover source unavailable")
 	// ErrCoverPoolClosed means the cover generation worker pool has been stopped.
@@ -65,6 +80,12 @@ var (
 	ErrInvalidCoverWorkers = errors.New("curation: cover generation worker count must be positive")
 	// ErrInvalidCoverWaitTimeout means the configured wait timeout is negative.
 	ErrInvalidCoverWaitTimeout = errors.New("curation: cover generation wait timeout must be positive")
+	// ErrInvalidCoverQueueSize means CoverServiceOptions.MaxQueueSize is negative.
+	ErrInvalidCoverQueueSize = errors.New("curation: cover generation queue size must be positive")
+	// ErrInvalidCoverFailureMemoCapacity means CoverServiceOptions.FailureMemoCapacity is negative.
+	ErrInvalidCoverFailureMemoCapacity = errors.New("curation: cover failure memo capacity must be positive")
+	// ErrInvalidCoverFailureMemoTTL means CoverServiceOptions.FailureMemoTTL is negative.
+	ErrInvalidCoverFailureMemoTTL = errors.New("curation: cover failure memo TTL must be positive")
 	// ErrMissingCoverCache means CoverServiceOptions.Cache is nil.
 	ErrMissingCoverCache = errors.New("curation: cover cache is required")
 	// ErrMissingImageRegistry means CoverServiceOptions.Pipelines is nil.
@@ -150,13 +171,17 @@ type coverAssetSource struct {
 // CoverServiceOptions configures a CoverService and its daemon-owned bounded
 // cover generation worker pool (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverServiceOptions struct {
-	ReadTx      storage.ReadTransactor
-	Cache       *image.CoverCache
-	Pipelines   *image.Registry
-	Formats     *container.FormatRegistry
-	Workers     int
-	WaitTimeout time.Duration
-	OpenFile    func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+	ReadTx              storage.ReadTransactor
+	Cache               *image.CoverCache
+	Pipelines           *image.Registry
+	Formats             *container.FormatRegistry
+	Workers             int
+	WaitTimeout         time.Duration
+	MaxQueueSize        int
+	FailureMemoCapacity int
+	FailureMemoTTL      time.Duration
+	Now                 func() time.Time
+	OpenFile            func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 }
 
 type coverTask struct {
@@ -166,6 +191,94 @@ type coverTask struct {
 	entry      image.CoverEntry
 	err        error
 	generateFn func(ctx context.Context) (image.CoverEntry, error)
+}
+
+type coverFailureMemoEntry struct {
+	key       image.CoverKey
+	reason    string
+	err       error
+	expiresAt time.Time
+}
+
+type coverFailureMemo struct {
+	capacity int
+	ttl      time.Duration
+	entries  map[image.CoverKey]*list.Element
+	order    *list.List
+}
+
+func newCoverFailureMemo(capacity int, ttl time.Duration) *coverFailureMemo {
+	return &coverFailureMemo{
+		capacity: capacity,
+		ttl:      ttl,
+		entries:  make(map[image.CoverKey]*list.Element),
+		order:    list.New(),
+	}
+}
+
+func (m *coverFailureMemo) clear() {
+	clear(m.entries)
+	m.order.Init()
+}
+
+func (m *coverFailureMemo) removeElem(elem *list.Element, key image.CoverKey) {
+	delete(m.entries, key)
+	m.order.Remove(elem)
+}
+
+func (m *coverFailureMemo) evictExpired(now time.Time) {
+	for elem := m.order.Back(); elem != nil; {
+		prev := elem.Prev()
+		entry := elem.Value.(*coverFailureMemoEntry)
+		if !now.Before(entry.expiresAt) {
+			m.removeElem(elem, entry.key)
+		}
+		elem = prev
+	}
+}
+
+func (m *coverFailureMemo) lookup(key image.CoverKey, now time.Time) (coverFailureMemoEntry, bool) {
+	elem, ok := m.entries[key]
+	if !ok {
+		return coverFailureMemoEntry{}, false
+	}
+	entry := elem.Value.(*coverFailureMemoEntry)
+	if !now.Before(entry.expiresAt) {
+		m.removeElem(elem, entry.key)
+		return coverFailureMemoEntry{}, false
+	}
+	m.order.MoveToFront(elem)
+	return *entry, true
+}
+
+func (m *coverFailureMemo) put(key image.CoverKey, reason string, err error, now time.Time) {
+	if m.capacity <= 0 || m.ttl <= 0 {
+		return
+	}
+	if elem, ok := m.entries[key]; ok {
+		entry := elem.Value.(*coverFailureMemoEntry)
+		entry.reason = reason
+		entry.err = err
+		entry.expiresAt = now.Add(m.ttl)
+		m.order.MoveToFront(elem)
+		return
+	}
+	m.evictExpired(now)
+	for len(m.entries) >= m.capacity {
+		oldest := m.order.Back()
+		if oldest == nil {
+			break
+		}
+		entry := oldest.Value.(*coverFailureMemoEntry)
+		m.removeElem(oldest, entry.key)
+	}
+	entry := &coverFailureMemoEntry{
+		key:       key,
+		reason:    reason,
+		err:       err,
+		expiresAt: now.Add(m.ttl),
+	}
+	m.entries[key] = m.order.PushFront(entry)
 }
 
 type archiveCoverSpec struct {
@@ -184,23 +297,26 @@ var _ app.CurationService = (*CoverService)(nil)
 // on a daemon-owned bounded in-process worker pool deduplicated by full CoverKey
 // (ADR-0015 §4, ADR-0017 §6, M1B-D8).
 type CoverService struct {
-	readTx      storage.ReadTransactor
-	cache       *image.CoverCache
-	pipelines   *image.Registry
-	formats     *container.FormatRegistry
-	workers     int
-	waitTimeout time.Duration
-	openFile    func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
+	readTx       storage.ReadTransactor
+	cache        *image.CoverCache
+	pipelines    *image.Registry
+	formats      *container.FormatRegistry
+	workers      int
+	waitTimeout  time.Duration
+	maxQueueSize int
+	now          func() time.Time
+	openFile     func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	running   bool
-	closed    bool
-	genCancel context.CancelFunc
-	stopAfter func() bool
-	inflight  map[image.CoverKey]*coverTask
-	queue     []*coverTask
-	wg        sync.WaitGroup
+	mu          sync.Mutex
+	cond        *sync.Cond
+	running     bool
+	closed      bool
+	genCancel   context.CancelFunc
+	stopAfter   func() bool
+	inflight    map[image.CoverKey]*coverTask
+	queue       []*coverTask
+	failureMemo *coverFailureMemo
+	wg          sync.WaitGroup
 }
 
 // NewCoverService constructs a CoverService with the provided dependencies and options.
@@ -217,6 +333,15 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 	if opts.WaitTimeout < 0 {
 		return nil, ErrInvalidCoverWaitTimeout
 	}
+	if opts.MaxQueueSize < 0 {
+		return nil, ErrInvalidCoverQueueSize
+	}
+	if opts.FailureMemoCapacity < 0 {
+		return nil, ErrInvalidCoverFailureMemoCapacity
+	}
+	if opts.FailureMemoTTL < 0 {
+		return nil, ErrInvalidCoverFailureMemoTTL
+	}
 
 	workers := opts.Workers
 	if workers == 0 {
@@ -225,6 +350,22 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 	waitTimeout := opts.WaitTimeout
 	if waitTimeout == 0 {
 		waitTimeout = DefaultCoverWaitTimeout
+	}
+	maxQueueSize := opts.MaxQueueSize
+	if maxQueueSize == 0 {
+		maxQueueSize = DefaultCoverMaxQueueSize
+	}
+	memoCapacity := opts.FailureMemoCapacity
+	if memoCapacity == 0 {
+		memoCapacity = DefaultCoverFailureMemoCapacity
+	}
+	memoTTL := opts.FailureMemoTTL
+	if memoTTL == 0 {
+		memoTTL = DefaultCoverFailureMemoTTL
+	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
 	}
 
 	formats := opts.Formats
@@ -241,14 +382,17 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 	}
 
 	svc := &CoverService{
-		readTx:      opts.ReadTx,
-		cache:       opts.Cache,
-		pipelines:   opts.Pipelines,
-		formats:     formats,
-		workers:     workers,
-		waitTimeout: waitTimeout,
-		openFile:    openFn,
-		inflight:    make(map[image.CoverKey]*coverTask),
+		readTx:       opts.ReadTx,
+		cache:        opts.Cache,
+		pipelines:    opts.Pipelines,
+		formats:      formats,
+		workers:      workers,
+		waitTimeout:  waitTimeout,
+		maxQueueSize: maxQueueSize,
+		now:          nowFn,
+		openFile:     openFn,
+		inflight:     make(map[image.CoverKey]*coverTask),
+		failureMemo:  newCoverFailureMemo(memoCapacity, memoTTL),
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	return svc, nil
@@ -295,6 +439,7 @@ func (s *CoverService) Start(ctx context.Context) error {
 	s.running = true
 	s.inflight = make(map[image.CoverKey]*coverTask)
 	s.queue = nil
+	s.failureMemo.clear()
 	s.stopAfter = context.AfterFunc(genCtx, func() {
 		s.mu.Lock()
 		s.closeQueueLocked()
@@ -502,6 +647,18 @@ func (s *CoverService) joinOrEnqueue(
 		return existing, nil
 	}
 
+	if memoEntry, ok := s.failureMemo.lookup(key, s.now()); ok {
+		return nil, &CoverUnavailableError{
+			AssetID: assetID,
+			Reason:  memoEntry.reason,
+			Err:     memoEntry.err,
+		}
+	}
+
+	if len(s.queue) >= s.maxQueueSize {
+		return nil, ErrCoverQueueFull
+	}
+
 	task := &coverTask{
 		key:        key,
 		assetID:    assetID,
@@ -602,12 +759,37 @@ func (s *CoverService) runTask(genCtx context.Context, task *coverTask) {
 		s.mu.Lock()
 		task.entry = entry
 		task.err = err
+		if genCtx.Err() == nil && shouldMemoizeCoverFailure(err) {
+			var unavail *CoverUnavailableError
+			if errors.As(err, &unavail) {
+				s.failureMemo.put(task.key, unavail.Reason, unavail.Err, s.now())
+			}
+		}
 		delete(s.inflight, task.key)
 		close(task.done)
 		s.mu.Unlock()
 	}()
 
 	entry, err = s.executeTask(genCtx, task)
+}
+
+func shouldMemoizeCoverFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unavail *CoverUnavailableError
+	if !errors.As(err, &unavail) {
+		return false
+	}
+	switch unavail.Reason {
+	case "corrupt_or_unsupported_archive",
+		"corrupt_or_unsupported_image",
+		"page_too_large",
+		"no_displayable_page":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *CoverService) executeTask(genCtx context.Context, task *coverTask) (image.CoverEntry, error) {
@@ -955,7 +1137,7 @@ func (s *CoverService) getVolumeCover(
 		return nil, app.ErrNotFound
 	}
 
-	rendition, sawOffline, lastUnavail, err := s.tryVolumeAssetCandidates(
+	rendition, offlineErr, lastUnavail, err := s.tryVolumeAssetCandidates(
 		ctx, domain.ItemTypeVolume, volumeID, volumeID, files, deadline, totalWait,
 	)
 	if err != nil {
@@ -964,8 +1146,8 @@ func (s *CoverService) getVolumeCover(
 	if rendition != nil {
 		return rendition, nil
 	}
-	if sawOffline {
-		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
+	if offlineErr != nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, offlineErr)
 	}
 	if lastUnavail != nil {
 		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
@@ -982,6 +1164,7 @@ func (s *CoverService) getSeriesCover(
 ) (*app.CoverRendition, error) {
 	var (
 		after       *storage.SeriesCoverCursor
+		offlineErr  error
 		lastUnavail error
 	)
 	for {
@@ -990,39 +1173,26 @@ func (s *CoverService) getSeriesCover(
 				Timeout: totalWait,
 			})
 		}
-		var batch []storage.SeriesCoverCandidate
-		err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
-			catRepo := tx.Catalogue()
-			if catRepo == nil {
-				return errors.New("curation: read transaction missing catalogue repository")
-			}
-			var listErr error
-			batch, listErr = catRepo.ListSeriesCoverCandidates(ctx, scope, seriesID, seriesCoverBatchSize, after)
-			return listErr
-		})
+		batch, err := s.listSeriesCoverBatch(ctx, scope, seriesID, after)
 		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				return nil, app.ErrNotFound
-			}
 			return nil, err
 		}
 		if len(batch) == 0 {
 			break
 		}
 
-		for _, volCand := range batch {
-			rendition, _, unavailErr, tryErr := s.tryVolumeAssetCandidates(
-				ctx, domain.ItemTypeSeries, seriesID, volCand.VolumeID, volCand.Files, deadline, totalWait,
-			)
-			if tryErr != nil {
-				return nil, tryErr
-			}
-			if rendition != nil {
-				return rendition, nil
-			}
-			if unavailErr != nil {
-				lastUnavail = unavailErr
-			}
+		rendition, batchOffline, batchUnavail, err := s.trySeriesCoverBatch(ctx, seriesID, batch, deadline, totalWait)
+		if err != nil {
+			return nil, err
+		}
+		if rendition != nil {
+			return rendition, nil
+		}
+		if batchOffline != nil && offlineErr == nil {
+			offlineErr = batchOffline
+		}
+		if batchUnavail != nil {
+			lastUnavail = batchUnavail
 		}
 
 		if len(batch) < seriesCoverBatchSize {
@@ -1032,10 +1202,65 @@ func (s *CoverService) getSeriesCover(
 		after = &cursor
 	}
 
+	if offlineErr != nil {
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, offlineErr)
+	}
 	if lastUnavail != nil {
 		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
 	}
 	return nil, app.ErrNotFound
+}
+
+func (s *CoverService) listSeriesCoverBatch(
+	ctx context.Context,
+	scope storage.CatalogueReadScope,
+	seriesID string,
+	after *storage.SeriesCoverCursor,
+) ([]storage.SeriesCoverCandidate, error) {
+	var batch []storage.SeriesCoverCandidate
+	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
+		catRepo := tx.Catalogue()
+		if catRepo == nil {
+			return errors.New("curation: read transaction missing catalogue repository")
+		}
+		var listErr error
+		batch, listErr = catRepo.ListSeriesCoverCandidates(ctx, scope, seriesID, seriesCoverBatchSize, after)
+		return listErr
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, app.ErrNotFound
+		}
+		return nil, err
+	}
+	return batch, nil
+}
+
+func (s *CoverService) trySeriesCoverBatch(
+	ctx context.Context,
+	seriesID string,
+	batch []storage.SeriesCoverCandidate,
+	deadline time.Time,
+	totalWait time.Duration,
+) (rendition *app.CoverRendition, offlineErr error, lastUnavail error, err error) {
+	for _, volCand := range batch {
+		rendition, volOfflineErr, unavailErr, tryErr := s.tryVolumeAssetCandidates(
+			ctx, domain.ItemTypeSeries, seriesID, volCand.VolumeID, volCand.Files, deadline, totalWait,
+		)
+		if tryErr != nil {
+			return nil, nil, nil, tryErr
+		}
+		if rendition != nil {
+			return rendition, nil, nil, nil
+		}
+		if volOfflineErr != nil && offlineErr == nil {
+			offlineErr = volOfflineErr
+		}
+		if unavailErr != nil {
+			lastUnavail = unavailErr
+		}
+	}
+	return nil, offlineErr, lastUnavail, nil
 }
 
 func (s *CoverService) tryVolumeAssetCandidates(
@@ -1046,11 +1271,11 @@ func (s *CoverService) tryVolumeAssetCandidates(
 	files []storage.AuthorizedAssetFile,
 	deadline time.Time,
 	totalWait time.Duration,
-) (rendition *app.CoverRendition, sawOffline bool, lastUnavail error, err error) {
+) (rendition *app.CoverRendition, offlineErr error, lastUnavail error, err error) {
 	for i := range files {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, false, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, &CoverWaitTimeoutError{
+			return nil, nil, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, &CoverWaitTimeoutError{
 				Timeout: totalWait,
 			})
 		}
@@ -1062,22 +1287,22 @@ func (s *CoverService) tryVolumeAssetCandidates(
 				ContentType: entry.ContentType,
 				Data:        entry.Data,
 				ETag:        computeCoverETag(targetKind, targetID, volumeID, src.AssetID, entry),
-			}, false, nil, nil
+			}, nil, nil, nil
 		}
-		if errors.Is(genErr, ErrCoverPoolNotRunning) || errors.Is(genErr, ErrCoverPoolClosed) || errors.Is(genErr, ErrCoverWaitTimeout) {
-			return nil, false, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, genErr)
+		if errors.Is(genErr, ErrCoverPoolNotRunning) || errors.Is(genErr, ErrCoverPoolClosed) || errors.Is(genErr, ErrCoverWaitTimeout) || errors.Is(genErr, ErrCoverQueueFull) {
+			return nil, nil, nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, genErr)
 		}
 		if isCandidateUnavailableError(genErr) {
 			var unavail *CoverUnavailableError
-			if errors.As(genErr, &unavail) && unavail.Reason == "root_offline" {
-				sawOffline = true
+			if errors.As(genErr, &unavail) && unavail.Reason == "root_offline" && offlineErr == nil {
+				offlineErr = genErr
 			}
 			lastUnavail = genErr
 			continue
 		}
-		return nil, false, nil, genErr
+		return nil, nil, nil, genErr
 	}
-	return nil, sawOffline, lastUnavail, nil
+	return nil, offlineErr, lastUnavail, nil
 }
 
 func coverAssetSourceFromAuthorizedFile(file *storage.AuthorizedAssetFile) coverAssetSource {
