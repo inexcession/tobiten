@@ -3114,27 +3114,44 @@ func TestCoverService_FailureMemoDeduplicatesBoundsAndExpires(t *testing.T) {
 		t.Fatalf("corrupt_a opens after first request = %d, want 1", got)
 	}
 
-	// Second request within TTL does not open the archive again.
+	// Second request within TTL does not open the archive again and retains caller-specific asset context.
 	advanceClock(5 * time.Second)
 	_, err = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a.cbz"].VolumeID)
 	if !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("second corrupt_a err = %v, want ErrCoverUnavailable", err)
 	}
+	var unavail *curation.CoverUnavailableError
+	if !errors.As(err, &unavail) || unavail.AssetID != byRel["corrupt_a.cbz"].ID {
+		t.Fatalf("second corrupt_a unavail = %+v, want AssetID=%s", unavail, byRel["corrupt_a.cbz"].ID)
+	}
+	if unavail.Err == nil || !strings.Contains(unavail.Err.Error(), byRel["corrupt_a.cbz"].ID) {
+		t.Fatalf("second corrupt_a inner err = %v, want asset ID %s in cause", unavail.Err, byRel["corrupt_a.cbz"].ID)
+	}
 	if got := countOpen("corrupt_a.cbz"); got != 1 {
 		t.Fatalf("corrupt_a opens within TTL = %d, want 1", got)
 	}
 
-	// Another volume with the same CoverKey also hits the memo and reports its own AssetID.
+	// Another volume with the same CoverKey is not blocked by corrupt_a's memo entry
+	// and preserves its own AssetID in both outer and wrapped cause errors.
 	_, err = svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a_dup.cbz"].VolumeID)
 	if !errors.Is(err, curation.ErrCoverUnavailable) {
 		t.Fatalf("corrupt_a_dup err = %v, want ErrCoverUnavailable", err)
 	}
-	var unavail *curation.CoverUnavailableError
 	if !errors.As(err, &unavail) || unavail.AssetID != byRel["corrupt_a_dup.cbz"].ID {
 		t.Fatalf("corrupt_a_dup unavail = %+v, want AssetID=%s", unavail, byRel["corrupt_a_dup.cbz"].ID)
 	}
-	if got := countOpen("corrupt_a_dup.cbz"); got != 0 {
-		t.Fatalf("corrupt_a_dup opens = %d, want 0", got)
+	if unavail.Err == nil || !strings.Contains(unavail.Err.Error(), byRel["corrupt_a_dup.cbz"].ID) {
+		t.Fatalf("corrupt_a_dup inner err = %v, want asset ID %s in cause", unavail.Err, byRel["corrupt_a_dup.cbz"].ID)
+	}
+	if got := countOpen("corrupt_a_dup.cbz"); got != 1 {
+		t.Fatalf("corrupt_a_dup opens = %d, want 1", got)
+	}
+	// A repeat request for corrupt_a_dup hits its own memo entry without re-opening.
+	if _, err := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["corrupt_a_dup.cbz"].VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+		t.Fatalf("second corrupt_a_dup err = %v, want ErrCoverUnavailable", err)
+	}
+	if got := countOpen("corrupt_a_dup.cbz"); got != 1 {
+		t.Fatalf("corrupt_a_dup opens on repeat = %d, want 1", got)
 	}
 
 	// Once TTL expires, the next request opens the archive again.
@@ -3212,6 +3229,323 @@ func TestCoverService_FailureMemoDeduplicatesBoundsAndExpires(t *testing.T) {
 	if got := countOpen("healthy.cbz"); got != 1 {
 		t.Fatalf("healthy opens = %d, want 1", got)
 	}
+
+	t.Run("page read EIO on first copy does not block healthy copy with same cover key", func(t *testing.T) {
+		var largePNGBuf bytes.Buffer
+		largeImg := image.NewRGBA(image.Rect(0, 0, 160, 160))
+		for y := range 160 {
+			for x := range 160 {
+				// High-entropy pattern prevents tiny deflate compression so payload spans >16 KiB.
+				largeImg.SetRGBA(x, y, color.RGBA{
+					R: uint8((x*37 + y*13) ^ 0x55),
+					G: uint8((x*17 + y*53) ^ 0xaa),
+					B: uint8((x*7 + y*29) ^ 0x33),
+					A: 255,
+				})
+			}
+		}
+		if err := png.Encode(&largePNGBuf, largeImg); err != nil {
+			t.Fatalf("encode large png: %v", err)
+		}
+		var cbzBuf bytes.Buffer
+		zw := zip.NewWriter(&cbzBuf)
+		fh := &zip.FileHeader{Name: "001.png", Method: zip.Store}
+		w, err := zw.CreateHeader(fh)
+		if err != nil {
+			t.Fatalf("create stored png header: %v", err)
+		}
+		if _, err := w.Write(largePNGBuf.Bytes()); err != nil {
+			t.Fatalf("write stored png: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close stored cbz: %v", err)
+		}
+		validCBZ := cbzBuf.Bytes()
+		if len(validCBZ) < 16*1024 {
+			t.Fatalf("expected stored CBZ >= 16 KiB to leave middle payload outside partial fingerprint, got %d", len(validCBZ))
+		}
+
+		copy1Path := filepath.Join(rootDir, "eio_copy1.cbz")
+		copy2Path := filepath.Join(rootDir, "eio_copy2.cbz")
+		if err := os.WriteFile(copy1Path, validCBZ, 0o644); err != nil {
+			t.Fatalf("write eio_copy1: %v", err)
+		}
+		if err := os.WriteFile(copy2Path, validCBZ, 0o644); err != nil {
+			t.Fatalf("write eio_copy2: %v", err)
+		}
+		if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+			t.Fatalf("ScanLibrary eio fixtures: %v", err)
+		}
+		curAssets := listRootAssets(t, tx, root.ID)
+		curByRel := make(map[string]domain.MediaAsset, len(curAssets))
+		for _, a := range curAssets {
+			curByRel[a.RelPathDisplay] = a
+		}
+		a1 := curByRel["eio_copy1.cbz"]
+		a2 := curByRel["eio_copy2.cbz"]
+
+		if err := tx.WithTx(ctx, func(st storage.Tx) error {
+			ser := domain.Series{
+				ID: "ser-eio-fallback", LibraryID: lib.ID, Title: "EIO Fallback", TitleSort: "eio fallback",
+				Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{},
+				CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+			}
+			if err := st.CatalogueWrites().CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+			p1, p2 := 1.0, 2.0
+			if err := st.SeriesMemberships().SetVolumeMemberships(ctx, a1.VolumeID, []domain.SeriesMembership{{
+				VolumeID: a1.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+				Position: &p1, Source: domain.MembershipSourceManual,
+			}}); err != nil {
+				return err
+			}
+			return st.SeriesMemberships().SetVolumeMemberships(ctx, a2.VolumeID, []domain.SeriesMembership{{
+				VolumeID: a2.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+				Position: &p2, Source: domain.MembershipSourceManual,
+			}})
+		}); err != nil {
+			t.Fatalf("seed ser-eio-fallback: %v", err)
+		}
+
+		var eioMu sync.Mutex
+		eioOpens := make(map[string]int)
+		countEIOOpen := func(name string) int {
+			eioMu.Lock()
+			defer eioMu.Unlock()
+			return eioOpens[name]
+		}
+		_, eioReg := newSpyImagePipeline(t, nil)
+		eioSvc, eioCache := newTestCoverService(t, tx, eioReg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.OpenFile = func(openCtx context.Context, rawPath []byte) (curation.ReadAtCloser, error) {
+				if err := openCtx.Err(); err != nil {
+					return nil, err
+				}
+				base := filepath.Base(string(rawPath))
+				eioMu.Lock()
+				eioOpens[base]++
+				eioMu.Unlock()
+				f, openErr := os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+				if openErr != nil {
+					return nil, openErr
+				}
+				if base == "eio_copy1.cbz" {
+					return &payloadEIOReadAtCloser{inner: f, failStart: 4096, failEnd: int64(len(validCBZ)) - 4096}, nil
+				}
+				return f, nil
+			}
+		})
+
+		// Requesting copy1 fails with EIO as file_unreadable.
+		_, err = eioSvc.GetCover(ctx, principal, domain.ItemTypeVolume, a1.VolumeID)
+		if !errors.Is(err, curation.ErrCoverUnavailable) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("eio_copy1 err = %v, want ErrCoverUnavailable + EIO", err)
+		}
+		// Separate request for copy2 (identical CoverKey) opens copy2 and serves its cover.
+		gotCopy2, err := eioSvc.GetCover(ctx, principal, domain.ItemTypeVolume, a2.VolumeID)
+		if err != nil {
+			t.Fatalf("eio_copy2 err = %v", err)
+		}
+		if len(gotCopy2.Data) == 0 {
+			t.Fatal("expected non-empty JPEG for eio_copy2")
+		}
+		if got := countEIOOpen("eio_copy2.cbz"); got != 1 {
+			t.Fatalf("eio_copy2 opens = %d, want 1", got)
+		}
+
+		// Clearing cache and requesting the fallback series tries copy1 then falls back to copy2.
+		d1, _ := a1.CurrentDigest(domain.DigestKindXXH364Partial)
+		if _, err := eioCache.Invalidate(ctx, tobitenimage.ArchiveCoverKey(d1.Value, 0, tobitenimage.DefaultCoverOptions()).Source()); err != nil {
+			t.Fatalf("invalidate eio cache key: %v", err)
+		}
+		gotSeries, err := eioSvc.GetCover(ctx, principal, domain.ItemTypeSeries, "ser-eio-fallback")
+		if err != nil {
+			t.Fatalf("ser-eio-fallback err = %v", err)
+		}
+		if len(gotSeries.Data) == 0 {
+			t.Fatal("expected non-empty JPEG for ser-eio-fallback")
+		}
+		if countEIOOpen("eio_copy1.cbz") != 2 || countEIOOpen("eio_copy2.cbz") != 2 {
+			t.Fatalf("expected series fallback to open both copies (copy1=%d, copy2=%d)", countEIOOpen("eio_copy1.cbz"), countEIOOpen("eio_copy2.cbz"))
+		}
+	})
+
+	t.Run("damaged middle bytes on first copy do not block healthy copy with same cover key", func(t *testing.T) {
+		var largePNGBuf bytes.Buffer
+		largeImg := image.NewRGBA(image.Rect(0, 0, 160, 160))
+		for y := range 160 {
+			for x := range 160 {
+				largeImg.SetRGBA(x, y, color.RGBA{
+					R: uint8((x*41 + y*19) ^ 0x22),
+					G: uint8((x*23 + y*59) ^ 0x77),
+					B: uint8((x*11 + y*31) ^ 0x99),
+					A: 255,
+				})
+			}
+		}
+		if err := png.Encode(&largePNGBuf, largeImg); err != nil {
+			t.Fatalf("encode large png: %v", err)
+		}
+		var cbzBuf bytes.Buffer
+		zw := zip.NewWriter(&cbzBuf)
+		fh := &zip.FileHeader{Name: "001.png", Method: zip.Store}
+		w, err := zw.CreateHeader(fh)
+		if err != nil {
+			t.Fatalf("create stored png header: %v", err)
+		}
+		if _, err := w.Write(largePNGBuf.Bytes()); err != nil {
+			t.Fatalf("write stored png: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close stored cbz: %v", err)
+		}
+		healthyCBZ := cbzBuf.Bytes()
+		if len(healthyCBZ) < 16*1024 {
+			t.Fatalf("expected stored CBZ >= 16 KiB, got %d", len(healthyCBZ))
+		}
+		damagedCBZ := slices.Clone(healthyCBZ)
+		for i := 6000; i < 6064; i++ {
+			damagedCBZ[i] ^= 0xff
+		}
+
+		fpHealthy, err := scanner.PartialFingerprint(bytes.NewReader(healthyCBZ), int64(len(healthyCBZ)))
+		if err != nil {
+			t.Fatalf("PartialFingerprint healthy: %v", err)
+		}
+		fpDamaged, err := scanner.PartialFingerprint(bytes.NewReader(damagedCBZ), int64(len(damagedCBZ)))
+		if err != nil {
+			t.Fatalf("PartialFingerprint damaged: %v", err)
+		}
+		if fpHealthy != fpDamaged {
+			t.Fatalf("expected identical partial fingerprints, got %s vs %s", fpHealthy, fpDamaged)
+		}
+
+		dmgPath1 := filepath.Join(rootDir, "dmg_copy1.cbz")
+		dmgPath2 := filepath.Join(rootDir, "dmg_copy2.cbz")
+		if err := os.WriteFile(dmgPath1, damagedCBZ, 0o644); err != nil {
+			t.Fatalf("write dmg_copy1: %v", err)
+		}
+		if err := os.WriteFile(dmgPath2, healthyCBZ, 0o644); err != nil {
+			t.Fatalf("write dmg_copy2: %v", err)
+		}
+		if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+			t.Fatalf("ScanLibrary dmg fixtures: %v", err)
+		}
+		curAssets := listRootAssets(t, tx, root.ID)
+		curByRel := make(map[string]domain.MediaAsset, len(curAssets))
+		for _, a := range curAssets {
+			curByRel[a.RelPathDisplay] = a
+		}
+		dmgA1 := curByRel["dmg_copy1.cbz"]
+		dmgA2 := curByRel["dmg_copy2.cbz"]
+
+		if err := tx.WithTx(ctx, func(st storage.Tx) error {
+			ser := domain.Series{
+				ID: "ser-dmg-fallback", LibraryID: lib.ID, Title: "Damaged Fallback", TitleSort: "damaged fallback",
+				Status: domain.SeriesStatusOngoing, Genres: []string{}, Tags: []string{},
+				CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+			}
+			if err := st.CatalogueWrites().CreateSeries(ctx, &ser); err != nil {
+				return err
+			}
+			p1, p2 := 1.0, 2.0
+			if err := st.SeriesMemberships().SetVolumeMemberships(ctx, dmgA1.VolumeID, []domain.SeriesMembership{{
+				VolumeID: dmgA1.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+				Position: &p1, Source: domain.MembershipSourceManual,
+			}}); err != nil {
+				return err
+			}
+			return st.SeriesMemberships().SetVolumeMemberships(ctx, dmgA2.VolumeID, []domain.SeriesMembership{{
+				VolumeID: dmgA2.VolumeID, SeriesID: ser.ID, IsPrimary: true, Kind: domain.MembershipKindSeries,
+				Position: &p2, Source: domain.MembershipSourceManual,
+			}})
+		}); err != nil {
+			t.Fatalf("seed ser-dmg-fallback: %v", err)
+		}
+
+		var dmgMu sync.Mutex
+		dmgOpens := make(map[string]int)
+		countDmgOpen := func(name string) int {
+			dmgMu.Lock()
+			defer dmgMu.Unlock()
+			return dmgOpens[name]
+		}
+		_, dmgReg := newSpyImagePipeline(t, nil)
+		dmgSvc, dmgCache := newTestCoverService(t, tx, dmgReg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.FailureMemoCapacity = 8
+			o.FailureMemoTTL = 10 * time.Second
+			o.Now = clockNow
+			o.OpenFile = func(openCtx context.Context, rawPath []byte) (curation.ReadAtCloser, error) {
+				if err := openCtx.Err(); err != nil {
+					return nil, err
+				}
+				dmgMu.Lock()
+				dmgOpens[filepath.Base(string(rawPath))]++
+				dmgMu.Unlock()
+				return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			}
+		})
+
+		// First and second requests for damaged copy1 open copy1 once (bounded by memo).
+		if _, err := dmgSvc.GetCover(ctx, principal, domain.ItemTypeVolume, dmgA1.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+			t.Fatalf("first dmg_copy1 err = %v, want ErrCoverUnavailable", err)
+		}
+		if _, err := dmgSvc.GetCover(ctx, principal, domain.ItemTypeVolume, dmgA1.VolumeID); !errors.Is(err, curation.ErrCoverUnavailable) {
+			t.Fatalf("second dmg_copy1 err = %v, want ErrCoverUnavailable", err)
+		}
+		if got := countDmgOpen("dmg_copy1.cbz"); got != 1 {
+			t.Fatalf("dmg_copy1 opens within TTL = %d, want 1", got)
+		}
+
+		// Separate request for healthy copy2 with the identical CoverKey opens copy2 and succeeds.
+		gotDmg2, err := dmgSvc.GetCover(ctx, principal, domain.ItemTypeVolume, dmgA2.VolumeID)
+		if err != nil {
+			t.Fatalf("dmg_copy2 err = %v", err)
+		}
+		if len(gotDmg2.Data) == 0 {
+			t.Fatal("expected non-empty JPEG for dmg_copy2")
+		}
+		if got := countDmgOpen("dmg_copy2.cbz"); got != 1 {
+			t.Fatalf("dmg_copy2 opens = %d, want 1", got)
+		}
+
+		// Invalidate disk cache and request the fallback series: damaged copy1 stays memoised (opens stays 1)
+		// while healthy copy2 is opened and served.
+		if _, err := dmgCache.Invalidate(ctx, tobitenimage.ArchiveCoverKey(fpHealthy, 0, tobitenimage.DefaultCoverOptions()).Source()); err != nil {
+			t.Fatalf("invalidate dmg cache key: %v", err)
+		}
+		gotSeries, err := dmgSvc.GetCover(ctx, principal, domain.ItemTypeSeries, "ser-dmg-fallback")
+		if err != nil {
+			t.Fatalf("ser-dmg-fallback err = %v", err)
+		}
+		if len(gotSeries.Data) == 0 {
+			t.Fatal("expected non-empty JPEG for ser-dmg-fallback")
+		}
+		if countDmgOpen("dmg_copy1.cbz") != 1 || countDmgOpen("dmg_copy2.cbz") != 2 {
+			t.Fatalf("unexpected fallback open counts (copy1=%d, copy2=%d, want 1 and 2)", countDmgOpen("dmg_copy1.cbz"), countDmgOpen("dmg_copy2.cbz"))
+		}
+	})
+}
+
+type payloadEIOReadAtCloser struct {
+	inner     *os.File
+	failStart int64
+	failEnd   int64
+}
+
+func (p *payloadEIOReadAtCloser) ReadAt(dst []byte, off int64) (int, error) {
+	if len(dst) > 0 && off < p.failEnd && off+int64(len(dst)) > p.failStart {
+		return 0, syscall.EIO
+	}
+	return p.inner.ReadAt(dst, off)
+}
+
+func (p *payloadEIOReadAtCloser) Stat() (os.FileInfo, error) {
+	return p.inner.Stat()
+}
+
+func (p *payloadEIOReadAtCloser) Close() error {
+	return p.inner.Close()
 }
 
 func TestCoverService_QueueCapReturnsServiceBusyWithoutGrowing(t *testing.T) {

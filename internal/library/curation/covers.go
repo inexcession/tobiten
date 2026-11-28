@@ -4,7 +4,9 @@
 package curation
 
 import (
+	"archive/zip"
 	"bytes"
+	"compress/flate"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -186,6 +188,7 @@ type CoverServiceOptions struct {
 
 type coverTask struct {
 	key        image.CoverKey
+	memoKey    coverFailureMemoKey
 	assetID    string
 	done       chan struct{}
 	entry      image.CoverEntry
@@ -193,8 +196,14 @@ type coverTask struct {
 	generateFn func(ctx context.Context) (image.CoverEntry, error)
 }
 
+type coverFailureMemoKey struct {
+	assetID  string
+	path     string
+	coverKey image.CoverKey
+}
+
 type coverFailureMemoEntry struct {
-	key       image.CoverKey
+	key       coverFailureMemoKey
 	reason    string
 	err       error
 	expiresAt time.Time
@@ -203,7 +212,7 @@ type coverFailureMemoEntry struct {
 type coverFailureMemo struct {
 	capacity int
 	ttl      time.Duration
-	entries  map[image.CoverKey]*list.Element
+	entries  map[coverFailureMemoKey]*list.Element
 	order    *list.List
 }
 
@@ -211,7 +220,7 @@ func newCoverFailureMemo(capacity int, ttl time.Duration) *coverFailureMemo {
 	return &coverFailureMemo{
 		capacity: capacity,
 		ttl:      ttl,
-		entries:  make(map[image.CoverKey]*list.Element),
+		entries:  make(map[coverFailureMemoKey]*list.Element),
 		order:    list.New(),
 	}
 }
@@ -221,7 +230,7 @@ func (m *coverFailureMemo) clear() {
 	m.order.Init()
 }
 
-func (m *coverFailureMemo) removeElem(elem *list.Element, key image.CoverKey) {
+func (m *coverFailureMemo) removeElem(elem *list.Element, key coverFailureMemoKey) {
 	delete(m.entries, key)
 	m.order.Remove(elem)
 }
@@ -237,7 +246,7 @@ func (m *coverFailureMemo) evictExpired(now time.Time) {
 	}
 }
 
-func (m *coverFailureMemo) lookup(key image.CoverKey, now time.Time) (coverFailureMemoEntry, bool) {
+func (m *coverFailureMemo) lookup(key coverFailureMemoKey, now time.Time) (coverFailureMemoEntry, bool) {
 	elem, ok := m.entries[key]
 	if !ok {
 		return coverFailureMemoEntry{}, false
@@ -251,7 +260,7 @@ func (m *coverFailureMemo) lookup(key image.CoverKey, now time.Time) (coverFailu
 	return *entry, true
 }
 
-func (m *coverFailureMemo) put(key image.CoverKey, reason string, err error, now time.Time) {
+func (m *coverFailureMemo) put(key coverFailureMemoKey, reason string, err error, now time.Time) {
 	if m.capacity <= 0 || m.ttl <= 0 {
 		return
 	}
@@ -534,14 +543,30 @@ func (s *CoverService) getOrGenerateCover(
 		return image.CoverEntry{}, err
 	}
 
-	task, err := s.joinOrEnqueue(spec.key, spec.assetID, func(genCtx context.Context) (image.CoverEntry, error) {
-		return s.generateArchiveCover(genCtx, spec)
-	})
-	if err != nil {
-		return image.CoverEntry{}, err
-	}
+	deadline := time.Now().Add(waitTimeout)
+	var lastEntry image.CoverEntry
+	var lastErr error
+	for range 2 {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return image.CoverEntry{}, &CoverWaitTimeoutError{
+				Key:     spec.key,
+				Timeout: waitTimeout,
+			}
+		}
+		task, err := s.joinOrEnqueue(spec, func(genCtx context.Context) (image.CoverEntry, error) {
+			return s.generateArchiveCover(genCtx, spec)
+		})
+		if err != nil {
+			return image.CoverEntry{}, err
+		}
 
-	return waitForTask(ctx, spec.key, task, waitTimeout)
+		lastEntry, lastErr = waitForTask(ctx, spec.key, task, remaining)
+		if lastErr == nil || task.assetID == spec.assetID || !isCandidateUnavailableError(lastErr) {
+			return lastEntry, lastErr
+		}
+	}
+	return lastEntry, lastErr
 }
 
 func (s *CoverService) ensurePoolOpen() error {
@@ -629,8 +654,7 @@ func resolveCoverPageIndex(pageCount, recordedCoverIndex int, suppressedPages []
 }
 
 func (s *CoverService) joinOrEnqueue(
-	key image.CoverKey,
-	assetID string,
+	spec archiveCoverSpec,
 	generateFn func(ctx context.Context) (image.CoverEntry, error),
 ) (*coverTask, error) {
 	s.mu.Lock()
@@ -643,13 +667,18 @@ func (s *CoverService) joinOrEnqueue(
 		return nil, ErrCoverPoolNotRunning
 	}
 
-	if existing, ok := s.inflight[key]; ok {
+	if existing, ok := s.inflight[spec.key]; ok {
 		return existing, nil
 	}
 
-	if memoEntry, ok := s.failureMemo.lookup(key, s.now()); ok {
+	memoKey := coverFailureMemoKey{
+		assetID:  spec.assetID,
+		path:     string(spec.joinedPath),
+		coverKey: spec.key,
+	}
+	if memoEntry, ok := s.failureMemo.lookup(memoKey, s.now()); ok {
 		return nil, &CoverUnavailableError{
-			AssetID: assetID,
+			AssetID: spec.assetID,
 			Reason:  memoEntry.reason,
 			Err:     memoEntry.err,
 		}
@@ -660,12 +689,13 @@ func (s *CoverService) joinOrEnqueue(
 	}
 
 	task := &coverTask{
-		key:        key,
-		assetID:    assetID,
+		key:        spec.key,
+		memoKey:    memoKey,
+		assetID:    spec.assetID,
 		done:       make(chan struct{}),
 		generateFn: generateFn,
 	}
-	s.inflight[key] = task
+	s.inflight[spec.key] = task
 	s.queue = append(s.queue, task)
 	s.cond.Signal()
 	return task, nil
@@ -762,7 +792,7 @@ func (s *CoverService) runTask(genCtx context.Context, task *coverTask) {
 		if genCtx.Err() == nil && shouldMemoizeCoverFailure(err) {
 			var unavail *CoverUnavailableError
 			if errors.As(err, &unavail) {
-				s.failureMemo.put(task.key, unavail.Reason, unavail.Err, s.now())
+				s.failureMemo.put(task.memoKey, unavail.Reason, unavail.Err, s.now())
 			}
 		}
 		delete(s.inflight, task.key)
@@ -826,12 +856,13 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 		return image.CoverEntry{}, err
 	}
 
-	cr, err := s.formats.Open(f, obs0.size)
+	trackedF := &errTrackingReaderAt{ra: f}
+	cr, err := s.formats.Open(trackedF, obs0.size)
 	if err != nil {
 		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
 			return image.CoverEntry{}, chErr
 		}
-		return image.CoverEntry{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open archive %s: %w", spec.assetID, err))
+		return image.CoverEntry{}, classifyArchiveReadError(genCtx, spec.assetID, "open archive", trackedF.readErr(), err)
 	}
 	defer func() {
 		_ = cr.Close()
@@ -846,7 +877,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 	}
 
 	pageEntry := pages[spec.pageIdx]
-	rendered, err := s.renderArchiveCoverPage(genCtx, f, cr, obs0, spec, pageEntry)
+	rendered, err := s.renderArchiveCoverPage(genCtx, f, trackedF, cr, obs0, spec, pageEntry)
 	if err != nil {
 		return image.CoverEntry{}, err
 	}
@@ -865,6 +896,7 @@ func (s *CoverService) generateArchiveCover(genCtx context.Context, spec archive
 func (s *CoverService) renderArchiveCoverPage(
 	genCtx context.Context,
 	f ReadAtCloser,
+	trackedF *errTrackingReaderAt,
 	cr container.ContainerReader,
 	obs0 archiveObservation,
 	spec archiveCoverSpec,
@@ -875,7 +907,8 @@ func (s *CoverService) renderArchiveCoverPage(
 		if chErr := checkOpenedArchiveUnchanged(f, spec, obs0); chErr != nil {
 			return image.Result{}, chErr
 		}
-		return image.Result{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: open cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
+		op := fmt.Sprintf("open cover page %d of", spec.pageIdx)
+		return image.Result{}, classifyArchiveReadError(genCtx, spec.assetID, op, trackedF.readErr(), err)
 	}
 	defer func() {
 		_ = rc.Close()
@@ -907,7 +940,12 @@ func (s *CoverService) renderArchiveCoverPage(
 			Err:     fmt.Errorf("%w (%d bytes)", errCoverPageLimitExceeded, defaultMaxCoverPageBytes),
 		}
 	}
-	return image.Result{}, classifySourceCoverError(spec.assetID, fmt.Errorf("curation: render cover page %d of %s: %w", spec.pageIdx, spec.assetID, err))
+	readErr := limitedRC.readErr
+	if readErr == nil {
+		readErr = trackedF.readErr()
+	}
+	op := fmt.Sprintf("render cover page %d of", spec.pageIdx)
+	return image.Result{}, classifyArchiveReadError(genCtx, spec.assetID, op, readErr, err)
 }
 
 type archiveObservation struct {
@@ -1004,10 +1042,36 @@ func verifyOpenedArchive(
 
 const seriesCoverBatchSize = 8
 
+type errTrackingReaderAt struct {
+	ra io.ReaderAt
+
+	mu  sync.Mutex
+	err error
+}
+
+func (t *errTrackingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := t.ra.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return n, err
+}
+
+func (t *errTrackingReaderAt) readErr() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
 type limitedCoverPageReader struct {
 	r         io.Reader
 	remaining int64
 	exceeded  bool
+	readErr   error
 }
 
 func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
@@ -1024,6 +1088,7 @@ func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
 			lr.exceeded = true
 			return 0, errCoverPageLimitExceeded
 		}
+		lr.recordReadErr(err)
 		return 0, err
 	}
 	if int64(len(dst)) > lr.remaining {
@@ -1033,7 +1098,40 @@ func (lr *limitedCoverPageReader) Read(dst []byte) (int, error) {
 	if n > 0 {
 		lr.remaining -= int64(n)
 	}
+	lr.recordReadErr(err)
 	return n, err
+}
+
+func (lr *limitedCoverPageReader) recordReadErr(err error) {
+	if err != nil && !errors.Is(err, io.EOF) && !isStreamCorruptionError(err) && lr.readErr == nil {
+		lr.readErr = err
+	}
+}
+
+func isStreamCorruptionError(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, zip.ErrFormat) ||
+		errors.Is(err, zip.ErrAlgorithm) ||
+		errors.Is(err, zip.ErrChecksum) {
+		return true
+	}
+	var corruptFlate flate.CorruptInputError
+	var internalFlate flate.InternalError
+	return errors.As(err, &corruptFlate) || errors.As(err, &internalFlate)
+}
+
+func classifyArchiveReadError(genCtx context.Context, assetID, op string, readErr, opErr error) error {
+	if readErr != nil {
+		if genCtx.Err() != nil && (errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded)) {
+			return readErr
+		}
+		return &CoverUnavailableError{
+			AssetID: assetID,
+			Reason:  "file_unreadable",
+			Err:     fmt.Errorf("curation: %s %s: %w", op, assetID, readErr),
+		}
+	}
+	return classifySourceCoverError(assetID, fmt.Errorf("curation: %s %s: %w", op, assetID, opErr))
 }
 
 func classifySourceCoverError(assetID string, err error) error {
