@@ -3749,7 +3749,10 @@ func TestCoverService_SharedTaskFailureRetriesCallerSource(t *testing.T) {
 
 		fail1Opening := make(chan struct{})
 		releaseFail1 := make(chan struct{})
-		var fail1Once sync.Once
+		fail2Opening := make(chan struct{})
+		healthyOpening := make(chan struct{})
+		releaseRetry := make(chan struct{})
+		var fail1Once, fail2Once, healthyOnce sync.Once
 		var openMu sync.Mutex
 		openCounts := make(map[string]int)
 		countOpen := func(name string) int {
@@ -3769,10 +3772,25 @@ func TestCoverService_SharedTaskFailureRetriesCallerSource(t *testing.T) {
 				openMu.Lock()
 				openCounts[base]++
 				openMu.Unlock()
-				if base == "shared_fail1.cbz" {
+				switch base {
+				case "shared_fail1.cbz":
 					fail1Once.Do(func() { close(fail1Opening) })
 					select {
 					case <-releaseFail1:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				case "shared_fail2.cbz":
+					fail2Once.Do(func() { close(fail2Opening) })
+					select {
+					case <-releaseRetry:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				case "shared_healthy.cbz":
+					healthyOnce.Do(func() { close(healthyOpening) })
+					select {
+					case <-releaseRetry:
 					case <-openCtx.Done():
 						return nil, openCtx.Err()
 					}
@@ -3791,6 +3809,7 @@ func TestCoverService_SharedTaskFailureRetriesCallerSource(t *testing.T) {
 		case <-fail1Opening:
 		case <-time.After(3 * time.Second):
 			close(releaseFail1)
+			close(releaseRetry)
 			t.Fatal("timed out waiting for shared_fail1.cbz to open")
 		}
 
@@ -3823,15 +3842,31 @@ func TestCoverService_SharedTaskFailureRetriesCallerSource(t *testing.T) {
 		case <-bothJoined:
 		case <-time.After(3 * time.Second):
 			close(releaseFail1)
+			close(releaseRetry)
 			t.Fatalf("timed out waiting for overlapping callers to join (%d/2)", joinedCount.Load())
 		}
 
-		// Releasing shared_fail1 fails it; shared_healthy must still open its own source and succeed,
-		// even when shared_fail2 concurrently retries and fails on the same CoverKey.
+		// Releasing shared_fail1 fails it; hold shared_fail2 in flight until shared_healthy
+		// also reaches its own opener so neither can hit a cache entry published by the other.
 		close(releaseFail1)
 		if err := <-fail1ErrCh; !errors.Is(err, curation.ErrCoverUnavailable) {
+			close(releaseRetry)
 			t.Fatalf("shared_fail1 err = %v, want ErrCoverUnavailable", err)
 		}
+		select {
+		case <-fail2Opening:
+		case <-time.After(3 * time.Second):
+			close(releaseRetry)
+			t.Fatal("timed out waiting for shared_fail2.cbz to reach its opener")
+		}
+		select {
+		case <-healthyOpening:
+		case <-time.After(3 * time.Second):
+			close(releaseRetry)
+			t.Fatal("timed out waiting for shared_healthy.cbz to reach its opener")
+		}
+		close(releaseRetry)
+
 		if err := <-fail2Ch; !errors.Is(err, curation.ErrCoverUnavailable) {
 			t.Fatalf("shared_fail2 err = %v, want ErrCoverUnavailable", err)
 		}
