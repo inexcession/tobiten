@@ -189,6 +189,7 @@ type CoverServiceOptions struct {
 type coverTask struct {
 	key        image.CoverKey
 	memoKey    coverFailureMemoKey
+	shared     bool
 	assetID    string
 	done       chan struct{}
 	entry      image.CoverEntry
@@ -316,16 +317,17 @@ type CoverService struct {
 	now          func() time.Time
 	openFile     func(ctx context.Context, rawPath []byte) (ReadAtCloser, error)
 
-	mu          sync.Mutex
-	cond        *sync.Cond
-	running     bool
-	closed      bool
-	genCancel   context.CancelFunc
-	stopAfter   func() bool
-	inflight    map[image.CoverKey]*coverTask
-	queue       []*coverTask
-	failureMemo *coverFailureMemo
-	wg          sync.WaitGroup
+	mu               sync.Mutex
+	cond             *sync.Cond
+	running          bool
+	closed           bool
+	genCancel        context.CancelFunc
+	stopAfter        func() bool
+	inflight         map[image.CoverKey]*coverTask
+	isolatedInflight map[coverFailureMemoKey]*coverTask
+	queue            []*coverTask
+	failureMemo      *coverFailureMemo
+	wg               sync.WaitGroup
 }
 
 // NewCoverService constructs a CoverService with the provided dependencies and options.
@@ -391,17 +393,18 @@ func NewCoverService(opts CoverServiceOptions) (*CoverService, error) {
 	}
 
 	svc := &CoverService{
-		readTx:       opts.ReadTx,
-		cache:        opts.Cache,
-		pipelines:    opts.Pipelines,
-		formats:      formats,
-		workers:      workers,
-		waitTimeout:  waitTimeout,
-		maxQueueSize: maxQueueSize,
-		now:          nowFn,
-		openFile:     openFn,
-		inflight:     make(map[image.CoverKey]*coverTask),
-		failureMemo:  newCoverFailureMemo(memoCapacity, memoTTL),
+		readTx:           opts.ReadTx,
+		cache:            opts.Cache,
+		pipelines:        opts.Pipelines,
+		formats:          formats,
+		workers:          workers,
+		waitTimeout:      waitTimeout,
+		maxQueueSize:     maxQueueSize,
+		now:              nowFn,
+		openFile:         openFn,
+		inflight:         make(map[image.CoverKey]*coverTask),
+		isolatedInflight: make(map[coverFailureMemoKey]*coverTask),
+		failureMemo:      newCoverFailureMemo(memoCapacity, memoTTL),
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	return svc, nil
@@ -447,6 +450,7 @@ func (s *CoverService) Start(ctx context.Context) error {
 	s.closed = false
 	s.running = true
 	s.inflight = make(map[image.CoverKey]*coverTask)
+	s.isolatedInflight = make(map[coverFailureMemoKey]*coverTask)
 	s.queue = nil
 	s.failureMemo.clear()
 	s.stopAfter = context.AfterFunc(genCtx, func() {
@@ -496,12 +500,24 @@ func (s *CoverService) Stop() {
 func (s *CoverService) closeQueueLocked() {
 	s.closed = true
 	for _, task := range s.queue {
-		delete(s.inflight, task.key)
+		s.removeInflightLocked(task)
 		task.err = ErrCoverPoolClosed
 		close(task.done)
 	}
 	s.queue = nil
 	s.cond.Broadcast()
+}
+
+func (s *CoverService) removeInflightLocked(task *coverTask) {
+	if task.shared {
+		if s.inflight[task.key] == task {
+			delete(s.inflight, task.key)
+		}
+		return
+	}
+	if s.isolatedInflight[task.memoKey] == task {
+		delete(s.isolatedInflight, task.memoKey)
+	}
 }
 
 // getOrGenerateCover validates src availability, checks CoverCache, and on a
@@ -543,10 +559,24 @@ func (s *CoverService) getOrGenerateCover(
 		return image.CoverEntry{}, err
 	}
 
+	specMemoKey := coverFailureMemoKey{
+		assetID:  spec.assetID,
+		path:     string(spec.joinedPath),
+		coverKey: spec.key,
+	}
 	deadline := time.Now().Add(waitTimeout)
-	var lastEntry image.CoverEntry
-	var lastErr error
-	for range 2 {
+	for attempt := range 2 {
+		allowForeignJoin := attempt == 0
+		if attempt > 0 {
+			cached, cacheErr := s.cache.Get(ctx, spec.key)
+			if cacheErr == nil {
+				return cached, nil
+			}
+			if !errors.Is(cacheErr, image.ErrCacheMiss) {
+				return image.CoverEntry{}, cacheErr
+			}
+		}
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return image.CoverEntry{}, &CoverWaitTimeoutError{
@@ -554,19 +584,22 @@ func (s *CoverService) getOrGenerateCover(
 				Timeout: waitTimeout,
 			}
 		}
-		task, err := s.joinOrEnqueue(spec, func(genCtx context.Context) (image.CoverEntry, error) {
+		task, err := s.joinOrEnqueue(spec, allowForeignJoin, func(genCtx context.Context) (image.CoverEntry, error) {
 			return s.generateArchiveCover(genCtx, spec)
 		})
 		if err != nil {
 			return image.CoverEntry{}, err
 		}
 
-		lastEntry, lastErr = waitForTask(ctx, spec.key, task, remaining)
-		if lastErr == nil || task.assetID == spec.assetID || !isCandidateUnavailableError(lastErr) {
-			return lastEntry, lastErr
+		entry, err := waitForTask(ctx, spec.key, task, remaining)
+		if err == nil || !allowForeignJoin || task.memoKey == specMemoKey || !isCandidateUnavailableError(err) {
+			return entry, err
 		}
 	}
-	return lastEntry, lastErr
+	return image.CoverEntry{}, &CoverWaitTimeoutError{
+		Key:     spec.key,
+		Timeout: waitTimeout,
+	}
 }
 
 func (s *CoverService) ensurePoolOpen() error {
@@ -655,6 +688,7 @@ func resolveCoverPageIndex(pageCount, recordedCoverIndex int, suppressedPages []
 
 func (s *CoverService) joinOrEnqueue(
 	spec archiveCoverSpec,
+	allowForeignJoin bool,
 	generateFn func(ctx context.Context) (image.CoverEntry, error),
 ) (*coverTask, error) {
 	s.mu.Lock()
@@ -667,15 +701,21 @@ func (s *CoverService) joinOrEnqueue(
 		return nil, ErrCoverPoolNotRunning
 	}
 
-	if existing, ok := s.inflight[spec.key]; ok {
-		return existing, nil
-	}
-
 	memoKey := coverFailureMemoKey{
 		assetID:  spec.assetID,
 		path:     string(spec.joinedPath),
 		coverKey: spec.key,
 	}
+
+	if existing, ok := s.isolatedInflight[memoKey]; ok {
+		return existing, nil
+	}
+	if existing, ok := s.inflight[spec.key]; ok {
+		if allowForeignJoin || existing.memoKey == memoKey {
+			return existing, nil
+		}
+	}
+
 	if memoEntry, ok := s.failureMemo.lookup(memoKey, s.now()); ok {
 		return nil, &CoverUnavailableError{
 			AssetID: spec.assetID,
@@ -688,14 +728,21 @@ func (s *CoverService) joinOrEnqueue(
 		return nil, ErrCoverQueueFull
 	}
 
+	_, hasShared := s.inflight[spec.key]
+	shared := !hasShared
 	task := &coverTask{
 		key:        spec.key,
 		memoKey:    memoKey,
+		shared:     shared,
 		assetID:    spec.assetID,
 		done:       make(chan struct{}),
 		generateFn: generateFn,
 	}
-	s.inflight[spec.key] = task
+	if shared {
+		s.inflight[spec.key] = task
+	} else {
+		s.isolatedInflight[memoKey] = task
+	}
 	s.queue = append(s.queue, task)
 	s.cond.Signal()
 	return task, nil
@@ -795,7 +842,7 @@ func (s *CoverService) runTask(genCtx context.Context, task *coverTask) {
 				s.failureMemo.put(task.memoKey, unavail.Reason, unavail.Err, s.now())
 			}
 		}
-		delete(s.inflight, task.key)
+		s.removeInflightLocked(task)
 		close(task.done)
 		s.mu.Unlock()
 	}()

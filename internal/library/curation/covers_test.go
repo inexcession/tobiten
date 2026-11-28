@@ -3548,6 +3548,307 @@ func (p *payloadEIOReadAtCloser) Close() error {
 	return p.inner.Close()
 }
 
+func TestCoverService_SharedTaskFailureRetriesCallerSource(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	t.Run("relocated path with same asset ID retries new path after joined old-path failure", func(t *testing.T) {
+		rootDir := filepath.Join(t.TempDir(), "reloc-shared-root")
+		if err := os.MkdirAll(rootDir, 0o755); err != nil {
+			t.Fatalf("mkdir root: %v", err)
+		}
+		red := makeSolidPNG(t, 64, 96, color.RGBA{R: 220, G: 30, B: 30, A: 255})
+		oldPath := filepath.Join(rootDir, "reloc_old.cbz")
+		newPath := filepath.Join(rootDir, "reloc_new.cbz")
+		writeCBZ(t, []byte(oldPath), cbzEntry{name: "001.png", data: red})
+
+		tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+		sc, err := scanner.NewScanner(tx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+			t.Fatalf("ScanLibrary: %v", err)
+		}
+		assets := listRootAssets(t, tx, root.ID)
+		if len(assets) != 1 {
+			t.Fatalf("assets = %d, want 1", len(assets))
+		}
+		asset := assets[0]
+
+		// Move the file on disk before Request 1 reaches OpenFile.
+		if err := os.Rename(oldPath, newPath); err != nil {
+			t.Fatalf("rename cbz: %v", err)
+		}
+
+		oldOpening := make(chan struct{})
+		releaseOld := make(chan struct{})
+		var oldOpenOnce sync.Once
+		var openMu sync.Mutex
+		openCounts := make(map[string]int)
+		countOpen := func(name string) int {
+			openMu.Lock()
+			defer openMu.Unlock()
+			return openCounts[name]
+		}
+
+		_, reg := newSpyImagePipeline(t, nil)
+		svc, _ := newTestCoverService(t, &armingReadTx{inner: tx}, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.Workers = 2
+			o.OpenFile = func(openCtx context.Context, rawPath []byte) (curation.ReadAtCloser, error) {
+				if err := openCtx.Err(); err != nil {
+					return nil, err
+				}
+				base := filepath.Base(string(rawPath))
+				openMu.Lock()
+				openCounts[base]++
+				openMu.Unlock()
+				if base == "reloc_old.cbz" {
+					oldOpenOnce.Do(func() { close(oldOpening) })
+					select {
+					case <-releaseOld:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				}
+				return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			}
+		})
+		principal := seedReaderPrincipal(t, tx)
+
+		// Request 1 starts against reloc_old.cbz and pauses before opening.
+		errCh1 := make(chan error, 1)
+		go func() {
+			_, gErr := svc.GetCover(ctx, principal, domain.ItemTypeVolume, asset.VolumeID)
+			errCh1 <- gErr
+		}()
+		select {
+		case <-oldOpening:
+		case <-time.After(3 * time.Second):
+			close(releaseOld)
+			t.Fatal("timed out waiting for reloc_old.cbz open attempt")
+		}
+
+		// Update the asset path in storage to reloc_new.cbz while Request 1 is still in-flight.
+		if err := tx.WithTx(ctx, func(st storage.Tx) error {
+			a, getErr := st.CatalogueWrites().GetAssetByIDForUpdate(ctx, asset.ID)
+			if getErr != nil {
+				return getErr
+			}
+			a.RelPathBytes = []byte("reloc_new.cbz")
+			a.RelPathDisplay = "reloc_new.cbz"
+			a.RelPathMatch = "reloc_new.cbz"
+			return st.CatalogueWrites().UpdateAsset(ctx, a)
+		}); err != nil {
+			close(releaseOld)
+			t.Fatalf("update relocated path: %v", err)
+		}
+
+		// Request 2 reads the new path (same asset ID, same CoverKey) and joins Request 1 in-flight.
+		joinedOld := make(chan struct{})
+		waitCtx := &waitNotifyContext{
+			Context: ctx,
+			onWait:  func() { close(joinedOld) },
+		}
+		type coverRes struct {
+			rendition *app.CoverRendition
+			err       error
+		}
+		resCh2 := make(chan coverRes, 1)
+		go func() {
+			r, gErr := svc.GetCover(waitCtx, principal, domain.ItemTypeVolume, asset.VolumeID)
+			resCh2 <- coverRes{rendition: r, err: gErr}
+		}()
+		select {
+		case <-joinedOld:
+		case <-time.After(3 * time.Second):
+			close(releaseOld)
+			t.Fatal("timed out waiting for relocated request to join in-flight task")
+		}
+
+		// Release Request 1 so reloc_old.cbz fails with file_missing; Request 2 must retry reloc_new.cbz and succeed.
+		close(releaseOld)
+		if err1 := <-errCh1; !errors.Is(err1, curation.ErrCoverUnavailable) {
+			t.Fatalf("old-path request err = %v, want ErrCoverUnavailable", err1)
+		}
+		res2 := <-resCh2
+		if res2.err != nil {
+			t.Fatalf("relocated new-path request err = %v", res2.err)
+		}
+		assertDominantColor(t, res2.rendition.Data, 220, 30, 30)
+		if countOpen("reloc_old.cbz") != 1 || countOpen("reloc_new.cbz") != 1 {
+			t.Fatalf("unexpected open counts: old=%d, new=%d, want 1 and 1", countOpen("reloc_old.cbz"), countOpen("reloc_new.cbz"))
+		}
+	})
+
+	t.Run("distinct overlapping sources sharing cover key never let foreign failures hide healthy source", func(t *testing.T) {
+		rootDir := filepath.Join(t.TempDir(), "distinct-shared-root")
+		if err := os.MkdirAll(rootDir, 0o755); err != nil {
+			t.Fatalf("mkdir root: %v", err)
+		}
+
+		var largePNGBuf bytes.Buffer
+		largeImg := image.NewRGBA(image.Rect(0, 0, 160, 160))
+		for y := range 160 {
+			for x := range 160 {
+				largeImg.SetRGBA(x, y, color.RGBA{
+					R: uint8((x*43 + y*29) ^ 0x11),
+					G: uint8((x*19 + y*47) ^ 0x66),
+					B: uint8((x*13 + y*37) ^ 0x88),
+					A: 255,
+				})
+			}
+		}
+		if err := png.Encode(&largePNGBuf, largeImg); err != nil {
+			t.Fatalf("encode large png: %v", err)
+		}
+		var cbzBuf bytes.Buffer
+		zw := zip.NewWriter(&cbzBuf)
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: "001.png", Method: zip.Store})
+		if err != nil {
+			t.Fatalf("create stored png header: %v", err)
+		}
+		if _, err := w.Write(largePNGBuf.Bytes()); err != nil {
+			t.Fatalf("write stored png: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close stored cbz: %v", err)
+		}
+		healthyCBZ := cbzBuf.Bytes()
+		if len(healthyCBZ) < 16*1024 {
+			t.Fatalf("expected stored CBZ >= 16 KiB, got %d", len(healthyCBZ))
+		}
+		damagedCBZ := slices.Clone(healthyCBZ)
+		for i := 6000; i < 6064; i++ {
+			damagedCBZ[i] ^= 0xff
+		}
+
+		if err := os.WriteFile(filepath.Join(rootDir, "shared_fail1.cbz"), damagedCBZ, 0o644); err != nil {
+			t.Fatalf("write shared_fail1: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rootDir, "shared_fail2.cbz"), damagedCBZ, 0o644); err != nil {
+			t.Fatalf("write shared_fail2: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rootDir, "shared_healthy.cbz"), healthyCBZ, 0o644); err != nil {
+			t.Fatalf("write shared_healthy: %v", err)
+		}
+
+		tx, lib, root := setupDBAndLibrary(t, []byte(rootDir))
+		sc, err := scanner.NewScanner(tx, scanner.Options{})
+		if err != nil {
+			t.Fatalf("NewScanner: %v", err)
+		}
+		if _, err := sc.ScanLibrary(ctx, lib.ID, scanner.ScanOptions{}); err != nil {
+			t.Fatalf("ScanLibrary: %v", err)
+		}
+		assets := listRootAssets(t, tx, root.ID)
+		byRel := make(map[string]domain.MediaAsset, len(assets))
+		for _, a := range assets {
+			byRel[a.RelPathDisplay] = a
+		}
+
+		fail1Opening := make(chan struct{})
+		releaseFail1 := make(chan struct{})
+		var fail1Once sync.Once
+		var openMu sync.Mutex
+		openCounts := make(map[string]int)
+		countOpen := func(name string) int {
+			openMu.Lock()
+			defer openMu.Unlock()
+			return openCounts[name]
+		}
+
+		_, reg := newSpyImagePipeline(t, nil)
+		svc, _ := newTestCoverService(t, &armingReadTx{inner: tx}, reg, 5*time.Second, func(o *curation.CoverServiceOptions) {
+			o.Workers = 2
+			o.OpenFile = func(openCtx context.Context, rawPath []byte) (curation.ReadAtCloser, error) {
+				if err := openCtx.Err(); err != nil {
+					return nil, err
+				}
+				base := filepath.Base(string(rawPath))
+				openMu.Lock()
+				openCounts[base]++
+				openMu.Unlock()
+				if base == "shared_fail1.cbz" {
+					fail1Once.Do(func() { close(fail1Opening) })
+					select {
+					case <-releaseFail1:
+					case <-openCtx.Done():
+						return nil, openCtx.Err()
+					}
+				}
+				return os.OpenFile(string(rawPath), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			}
+		})
+		principal := seedReaderPrincipal(t, tx)
+
+		fail1ErrCh := make(chan error, 1)
+		go func() {
+			_, gErr := svc.GetCover(ctx, principal, domain.ItemTypeVolume, byRel["shared_fail1.cbz"].VolumeID)
+			fail1ErrCh <- gErr
+		}()
+		select {
+		case <-fail1Opening:
+		case <-time.After(3 * time.Second):
+			close(releaseFail1)
+			t.Fatal("timed out waiting for shared_fail1.cbz to open")
+		}
+
+		// Both shared_healthy and shared_fail2 join shared_fail1's in-flight task while it is running.
+		var joinedCount atomic.Int32
+		bothJoined := make(chan struct{})
+		onJoin := func() {
+			if joinedCount.Add(1) == 2 {
+				close(bothJoined)
+			}
+		}
+		healthyCtx := &waitNotifyContext{Context: ctx, onWait: onJoin}
+		fail2Ctx := &waitNotifyContext{Context: ctx, onWait: onJoin}
+
+		type coverRes struct {
+			rendition *app.CoverRendition
+			err       error
+		}
+		healthyCh := make(chan coverRes, 1)
+		fail2Ch := make(chan error, 1)
+		go func() {
+			r, gErr := svc.GetCover(healthyCtx, principal, domain.ItemTypeVolume, byRel["shared_healthy.cbz"].VolumeID)
+			healthyCh <- coverRes{rendition: r, err: gErr}
+		}()
+		go func() {
+			_, gErr := svc.GetCover(fail2Ctx, principal, domain.ItemTypeVolume, byRel["shared_fail2.cbz"].VolumeID)
+			fail2Ch <- gErr
+		}()
+		select {
+		case <-bothJoined:
+		case <-time.After(3 * time.Second):
+			close(releaseFail1)
+			t.Fatalf("timed out waiting for overlapping callers to join (%d/2)", joinedCount.Load())
+		}
+
+		// Releasing shared_fail1 fails it; shared_healthy must still open its own source and succeed,
+		// even when shared_fail2 concurrently retries and fails on the same CoverKey.
+		close(releaseFail1)
+		if err := <-fail1ErrCh; !errors.Is(err, curation.ErrCoverUnavailable) {
+			t.Fatalf("shared_fail1 err = %v, want ErrCoverUnavailable", err)
+		}
+		if err := <-fail2Ch; !errors.Is(err, curation.ErrCoverUnavailable) {
+			t.Fatalf("shared_fail2 err = %v, want ErrCoverUnavailable", err)
+		}
+		healthyRes := <-healthyCh
+		if healthyRes.err != nil {
+			t.Fatalf("shared_healthy err = %v", healthyRes.err)
+		}
+		if len(healthyRes.rendition.Data) == 0 {
+			t.Fatal("expected non-empty JPEG from shared_healthy")
+		}
+		if countOpen("shared_healthy.cbz") != 1 || countOpen("shared_fail1.cbz") != 1 || countOpen("shared_fail2.cbz") != 1 {
+			t.Fatalf("unexpected open counts: fail1=%d, fail2=%d, healthy=%d (want 1 each)",
+				countOpen("shared_fail1.cbz"), countOpen("shared_fail2.cbz"), countOpen("shared_healthy.cbz"))
+		}
+	})
+}
+
 func TestCoverService_QueueCapReturnsServiceBusyWithoutGrowing(t *testing.T) {
 	t.Parallel()
 	rootDir := filepath.Join(t.TempDir(), "queue-cap-root")
