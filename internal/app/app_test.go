@@ -159,12 +159,15 @@ func TestStubCurationService(t *testing.T) {
 	svc := NewStubCurationService()
 	ctx := context.Background()
 
-	cover, err := svc.GetCover(ctx, nil, "vol-1")
+	cover, err := svc.GetCover(ctx, nil, domain.ItemTypeVolume, "vol-1")
 	if err != nil {
 		t.Fatalf("GetCover error: %v", err)
 	}
 	if cover.ContentType != "image/jpeg" || len(cover.Data) == 0 {
 		t.Errorf("unexpected cover: %+v", cover)
+	}
+	if _, err := svc.GetCover(ctx, nil, domain.ItemTypeAsset, "asset-1"); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("GetCover(invalid kind) = %v, want ErrInvalidInput", err)
 	}
 
 	if err := svc.HidePage(ctx, nil, HidePageRequest{AssetID: "asset-1", PageIndex: 0, Suppressed: true}); err != nil {

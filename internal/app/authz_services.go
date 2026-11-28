@@ -237,12 +237,12 @@ func NewAuthorizingCurationService(next CurationService) CurationService {
 	return &authorizingCurationService{next: next}
 }
 
-func (s *authorizingCurationService) GetCover(ctx context.Context, principal *domain.Principal, targetID string) (*CoverRendition, error) {
+func (s *authorizingCurationService) GetCover(ctx context.Context, principal *domain.Principal, kind domain.ItemType, targetID string) (*CoverRendition, error) {
 	return AuthorizeValue(principal, domain.PermissionLibraryRead, func() (*CoverRendition, error) {
 		if s.next == nil {
 			return nil, ErrNotImplemented
 		}
-		return s.next.GetCover(ctx, principal, targetID)
+		return s.next.GetCover(ctx, principal, kind, targetID)
 	})
 }
 

@@ -43,30 +43,10 @@ type PurgeTrashRequest struct {
 
 // CurationService defines use-cases for covers, ad suppression, and two-stage deletion.
 type CurationService interface {
-	GetCover(ctx context.Context, principal *domain.Principal, targetID string) (*CoverRendition, error)
+	GetCover(ctx context.Context, principal *domain.Principal, kind domain.ItemType, targetID string) (*CoverRendition, error)
 	HidePage(ctx context.Context, principal *domain.Principal, req HidePageRequest) error
 	StageTrash(ctx context.Context, principal *domain.Principal, req StageTrashRequest) error
 	ListTrash(ctx context.Context, principal *domain.Principal) ([]TrashItem, error)
 	RestoreTrash(ctx context.Context, principal *domain.Principal, itemID string) error
 	PurgeTrash(ctx context.Context, principal *domain.Principal, req PurgeTrashRequest) (string, error)
-}
-
-type coverTargetKindCtxKey struct{}
-
-// ContextWithCoverTargetKind scopes CurationService.GetCover to a specific target kind
-// (domain.ItemTypeVolume or domain.ItemTypeSeries).
-func ContextWithCoverTargetKind(ctx context.Context, kind domain.ItemType) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, coverTargetKindCtxKey{}, kind)
-}
-
-// CoverTargetKindFromContext extracts the requested cover target kind from ctx, if set.
-func CoverTargetKindFromContext(ctx context.Context) (domain.ItemType, bool) {
-	if ctx == nil {
-		return "", false
-	}
-	kind, ok := ctx.Value(coverTargetKindCtxKey{}).(domain.ItemType)
-	return kind, ok && kind != ""
 }

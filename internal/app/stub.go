@@ -276,7 +276,10 @@ func NewStubCurationService() *StubCurationService {
 	}
 }
 
-func (s *StubCurationService) GetCover(_ context.Context, _ *domain.Principal, targetID string) (*CoverRendition, error) {
+func (s *StubCurationService) GetCover(_ context.Context, _ *domain.Principal, kind domain.ItemType, targetID string) (*CoverRendition, error) {
+	if kind != domain.ItemTypeVolume && kind != domain.ItemTypeSeries {
+		return nil, ErrInvalidInput
+	}
 	return &CoverRendition{
 		TargetID:    targetID,
 		ContentType: "image/jpeg",

@@ -184,13 +184,12 @@ func TestRunDaemon_OwnsCoverPoolWithConfiguredWaitTimeout(t *testing.T) {
 			return errors.New("missing Admin role")
 		}
 		principal := domain.NewPrincipal(adminUser, []domain.Role{adminRole}, domain.CredentialKindPassword, "c-daemon-cover", nil)
-		volCtx := app.ContextWithCoverTargetKind(serveCtx, domain.ItemTypeVolume)
 
 		if !errors.Is(capturedCover.Start(serveCtx), curation.ErrCoverPoolAlreadyRunning) {
 			return errors.New("expected daemon-owned cover pool to be running during serve")
 		}
 
-		rendition, err := capturedCover.GetCover(volCtx, principal, assets[0].VolumeID)
+		rendition, err := capturedCover.GetCover(serveCtx, principal, domain.ItemTypeVolume, assets[0].VolumeID)
 		if err != nil {
 			return err
 		}

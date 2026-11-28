@@ -97,7 +97,7 @@ type spyCurationService struct {
 	writeCalls int
 }
 
-func (s *spyCurationService) GetCover(context.Context, *domain.Principal, string) (*CoverRendition, error) {
+func (s *spyCurationService) GetCover(context.Context, *domain.Principal, domain.ItemType, string) (*CoverRendition, error) {
 	s.readCalls++
 	return &CoverRendition{ContentType: "image/webp"}, nil
 }
@@ -352,7 +352,7 @@ func TestAuthorizingServices_ReadScopedPATCannotWriteProgressOrMetadata(t *testi
 	if _, err := svcs.Reading.GetProgress(ctx, readPATPrincipal, "vol-1"); err != nil {
 		t.Fatalf("GetProgress(read PAT) = %v, want nil", err)
 	}
-	if _, err := svcs.Curation.GetCover(ctx, readPATPrincipal, "vol-1"); err != nil {
+	if _, err := svcs.Curation.GetCover(ctx, readPATPrincipal, domain.ItemTypeVolume, "vol-1"); err != nil {
 		t.Fatalf("GetCover(read PAT) = %v, want nil", err)
 	}
 	if libSpy.calls != 3 || readSpy.readCalls != 1 || curSpy.readCalls != 1 {

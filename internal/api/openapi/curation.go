@@ -42,8 +42,7 @@ func (m *Module) handleGetThumbnail(w http.ResponseWriter, r *http.Request, kind
 		return
 	}
 
-	ctx := app.ContextWithCoverTargetKind(r.Context(), kind)
-	rendition, err := svc.GetCover(ctx, p, id)
+	rendition, err := svc.GetCover(r.Context(), p, kind, id)
 	if err != nil {
 		middleware.WriteAppError(w, r, err)
 		return

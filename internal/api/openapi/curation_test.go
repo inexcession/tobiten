@@ -18,17 +18,16 @@ type recordingCurationService struct {
 	lastPrincipal  *domain.Principal
 	lastTargetID   string
 	lastTargetKind domain.ItemType
-	hasTargetKind  bool
 	renditions     map[string]*app.CoverRendition
 	errByID        map[string]error
 	defaultErr     error
 }
 
-func (r *recordingCurationService) GetCover(ctx context.Context, principal *domain.Principal, targetID string) (*app.CoverRendition, error) {
+func (r *recordingCurationService) GetCover(_ context.Context, principal *domain.Principal, kind domain.ItemType, targetID string) (*app.CoverRendition, error) {
 	r.calls++
 	r.lastPrincipal = principal
 	r.lastTargetID = targetID
-	r.lastTargetKind, r.hasTargetKind = app.CoverTargetKindFromContext(ctx)
+	r.lastTargetKind = kind
 	if err, ok := r.errByID[targetID]; ok {
 		return nil, err
 	}
@@ -156,8 +155,8 @@ func TestThumbnailRoutes_AuthPermissionsCachingAndErrors(t *testing.T) {
 			if recOK.Code != http.StatusOK {
 				t.Fatalf("GET %s = %d, want 200 (body=%s)", tc.path, recOK.Code, recOK.Body.String())
 			}
-			if !recSvc.hasTargetKind || recSvc.lastTargetKind != tc.wantKind || recSvc.lastTargetID != tc.targetID {
-				t.Fatalf("GetCover target = (%q, %v, %q), want (%q, true, %q)", recSvc.lastTargetKind, recSvc.hasTargetKind, recSvc.lastTargetID, tc.wantKind, tc.targetID)
+			if recSvc.lastTargetKind != tc.wantKind || recSvc.lastTargetID != tc.targetID {
+				t.Fatalf("GetCover target = (%q, %q), want (%q, %q)", recSvc.lastTargetKind, recSvc.lastTargetID, tc.wantKind, tc.targetID)
 			}
 			if gotCT := recOK.Header().Get("Content-Type"); gotCT != "image/jpeg" {
 				t.Fatalf("Content-Type = %q, want image/jpeg", gotCT)
@@ -258,13 +257,13 @@ func TestThumbnailRoutes_AuthPermissionsCachingAndErrors(t *testing.T) {
 
 	t.Run("NewAuthorizingServices enforces library:read on CurationService.GetCover", func(t *testing.T) {
 		authSvcs := app.NewAuthorizingServices(&app.Services{Curation: recSvc})
-		if _, err := authSvcs.Curation.GetCover(context.Background(), nil, "vol-1"); !errors.Is(err, app.ErrUnauthorized) {
+		if _, err := authSvcs.Curation.GetCover(context.Background(), nil, domain.ItemTypeVolume, "vol-1"); !errors.Is(err, app.ErrUnauthorized) {
 			t.Fatalf("nil principal GetCover = %v, want ErrUnauthorized", err)
 		}
-		if _, err := authSvcs.Curation.GetCover(context.Background(), noRead, "vol-1"); !errors.Is(err, app.ErrForbidden) {
+		if _, err := authSvcs.Curation.GetCover(context.Background(), noRead, domain.ItemTypeVolume, "vol-1"); !errors.Is(err, app.ErrForbidden) {
 			t.Fatalf("no library:read GetCover = %v, want ErrForbidden", err)
 		}
-		got, err := authSvcs.Curation.GetCover(context.Background(), reader, "vol-1")
+		got, err := authSvcs.Curation.GetCover(context.Background(), reader, domain.ItemTypeVolume, "vol-1")
 		if err != nil || got.ETag != `"vol-1-strong-etag"` {
 			t.Fatalf("authorized GetCover = (%+v, %v)", got, err)
 		}

@@ -885,10 +885,11 @@ func isCandidateUnavailableError(err error) bool {
 		errors.Is(err, image.ErrPreflightLimitExceeded)
 }
 
-// GetCover resolves targetID under principal's SERVER-label policies and serves
-// its rendered JPEG cover and strong ETag through the daemon-owned cover pool
-// (ADR-0006 §5, ADR-0010 §2, ADR-0015 §4).
-func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal, targetID string) (*app.CoverRendition, error) {
+// GetCover resolves targetID of the given target kind (VOLUME or SERIES) under
+// principal's SERVER-label policies and serves its rendered JPEG cover and
+// strong ETag through the daemon-owned cover pool (ADR-0006 §5, ADR-0010 §2,
+// ADR-0015 §4).
+func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal, kind domain.ItemType, targetID string) (*app.CoverRendition, error) {
 	if s == nil {
 		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, ErrCoverPoolNotRunning)
 	}
@@ -901,12 +902,11 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 	if principal == nil || strings.TrimSpace(principal.User.ID) == "" {
 		return nil, app.ErrUnauthorized
 	}
+	if kind != domain.ItemTypeVolume && kind != domain.ItemTypeSeries {
+		return nil, fmt.Errorf("%w: unsupported cover target kind %q", app.ErrInvalidInput, kind)
+	}
 	if strings.TrimSpace(targetID) == "" {
 		return nil, fmt.Errorf("%w: target id is required", app.ErrInvalidInput)
-	}
-	targetKind, hasTargetKind := app.CoverTargetKindFromContext(ctx)
-	if hasTargetKind && targetKind != domain.ItemTypeVolume && targetKind != domain.ItemTypeSeries {
-		return nil, fmt.Errorf("%w: unsupported cover target kind %q", app.ErrInvalidInput, targetKind)
 	}
 	if s.readTx == nil {
 		return nil, ErrMissingTransactor
@@ -922,16 +922,9 @@ func (s *CoverService) GetCover(ctx context.Context, principal *domain.Principal
 	}
 	deadline := time.Now().Add(waitTimeout)
 
-	if !hasTargetKind || targetKind == domain.ItemTypeVolume {
-		rendition, handled, err := s.getVolumeCover(ctx, scope, targetID, deadline, waitTimeout)
-		if handled {
-			return rendition, err
-		}
-		if hasTargetKind && targetKind == domain.ItemTypeVolume {
-			return nil, app.ErrNotFound
-		}
+	if kind == domain.ItemTypeVolume {
+		return s.getVolumeCover(ctx, scope, targetID, deadline, waitTimeout)
 	}
-
 	return s.getSeriesCover(ctx, scope, targetID, deadline, waitTimeout)
 }
 
@@ -941,7 +934,7 @@ func (s *CoverService) getVolumeCover(
 	volumeID string,
 	deadline time.Time,
 	totalWait time.Duration,
-) (*app.CoverRendition, bool, error) {
+) (*app.CoverRendition, error) {
 	var files []storage.AuthorizedAssetFile
 	err := s.readTx.WithRepeatableReadTx(ctx, func(tx storage.ReadTx) error {
 		catRepo := tx.Catalogue()
@@ -954,30 +947,30 @@ func (s *CoverService) getVolumeCover(
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil, false, nil
+			return nil, app.ErrNotFound
 		}
-		return nil, true, err
+		return nil, err
 	}
 	if len(files) == 0 {
-		return nil, false, nil
+		return nil, app.ErrNotFound
 	}
 
 	rendition, sawOffline, lastUnavail, err := s.tryVolumeAssetCandidates(
 		ctx, domain.ItemTypeVolume, volumeID, volumeID, files, deadline, totalWait,
 	)
 	if err != nil {
-		return nil, true, err
+		return nil, err
 	}
 	if rendition != nil {
-		return rendition, true, nil
+		return rendition, nil
 	}
 	if sawOffline {
-		return nil, true, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
+		return nil, fmt.Errorf("%w: %w", app.ErrServiceBusy, lastUnavail)
 	}
 	if lastUnavail != nil {
-		return nil, true, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
+		return nil, fmt.Errorf("%w: %w", app.ErrNotFound, lastUnavail)
 	}
-	return nil, true, app.ErrNotFound
+	return nil, app.ErrNotFound
 }
 
 func (s *CoverService) getSeriesCover(
